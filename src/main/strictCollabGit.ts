@@ -732,7 +732,7 @@ export async function previewStrictPush(
     groups: changeGroups(files),
     files,
     suggestedCollabBranchName: null,
-    notice: `只允许推送到 ${STRICT_REPOSITORY.githubRepository} 的 main；推送前会执行完整严格门禁。`,
+    notice: `只允许推送到 ${STRICT_REPOSITORY.githubRepository} 的 main；推送前会执行严格发布门禁。`,
     executionBlockReason,
   };
 }
@@ -803,10 +803,17 @@ export async function pushStrictMain(
   if (publishedOid !== localHead) {
     throw new Error('GitHub main 未包含本机最新提交，不能报告推送成功。');
   }
-  await run(
+  const trackingAfterPush = await run(
     repoPath,
-    ['update-ref', 'refs/remotes/origin/main', localHead, remoteAfter],
+    ['rev-parse', '--verify', 'refs/remotes/origin/main'],
+    { allowFailure: true },
   );
+  if (trackingAfterPush !== localHead) {
+    await run(
+      repoPath,
+      ['update-ref', 'refs/remotes/origin/main', localHead],
+    );
+  }
   return {
     status: await buildStatus(repoPath),
     changedPaths: aheadFiles.map((item) => item.path),

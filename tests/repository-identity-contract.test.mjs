@@ -82,6 +82,7 @@ test('network git retries terminate the whole process tree and verify GitHub mai
     collabSource.includes("'update-ref', 'refs/remotes/origin/main'"),
     true,
   );
+  assert.match(collabSource, /if \(trackingAfterPush !== localHead\)/);
 });
 
 test('maintenance push uses the bounded publish gate instead of stale full-suite fixtures', () => {
