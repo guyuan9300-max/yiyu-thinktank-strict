@@ -362,13 +362,16 @@ async function verifyRemoteRepositoryIdentity(): Promise<void> {
 
 async function readRemoteMainOid(): Promise<string> {
   await verifyRemoteRepositoryIdentity();
+  const cacheBuster = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const response = await fetch(
-    `https://api.github.com/repos/${STRICT_REPOSITORY.githubRepository}/git/ref/heads/${STRICT_REPOSITORY.targetBranch}`,
+    `https://api.github.com/repos/${STRICT_REPOSITORY.githubRepository}/git/ref/heads/${STRICT_REPOSITORY.targetBranch}?strict_collab=${cacheBuster}`,
     {
       headers: {
         Accept: 'application/vnd.github+json',
+        'Cache-Control': 'no-cache',
         'User-Agent': 'yiyu-thinktank-strict-desktop',
       },
+      cache: 'no-store',
       signal: AbortSignal.timeout(15_000),
     },
   );

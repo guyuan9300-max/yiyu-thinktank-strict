@@ -73,9 +73,11 @@ test('network git retries terminate the whole process tree and verify GitHub mai
   assert.match(collabSource, /taskkill[\s\S]*'\/T'[\s\S]*'\/F'/);
   assert.match(collabSource, /async function readRemoteMainOid/);
   assert.equal(
-    collabSource.includes('git/ref/heads/${STRICT_REPOSITORY.targetBranch}'),
+    collabSource.includes('git/ref/heads/${STRICT_REPOSITORY.targetBranch}?strict_collab=${cacheBuster}'),
     true,
   );
+  assert.match(collabSource, /'Cache-Control': 'no-cache'/);
+  assert.match(collabSource, /cache: 'no-store'/);
   assert.equal(
     collabSource.includes("'update-ref', 'refs/remotes/origin/main'"),
     true,
