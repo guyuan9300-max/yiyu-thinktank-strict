@@ -10401,13 +10401,18 @@ export default function App() {
     }
     const nextRepoPath = normalizeInitialCollabRepoPath(await selectCollabRepoBridge());
     if (!nextRepoPath) return null;
-    setCollabRepoPath(nextRepoPath);
+    const selectedStatus = await refreshCollabStatus(nextRepoPath);
+    if (!selectedStatus?.isValid || !selectedStatus.repoPath) {
+      flash('error', selectedStatus?.statusText || '所选目录不是有效的严格新版源码仓库。');
+      return null;
+    }
+    setCollabRepoPath(selectedStatus.repoPath);
     setCollabDialogState(null);
     setCollabSelectedPaths([]);
     setCollabCommitMessage('');
     setCollabDialogError(null);
     flash('success', '源码目录已绑定，后续协作按钮会围绕这个仓库工作。');
-    return nextRepoPath;
+    return selectedStatus.repoPath;
   }
 
   async function handlePreviewPush() {

@@ -25,6 +25,7 @@
     "audit:ui-handlers": "uv run python scripts/audit_ui_domain_handlers.py",
     "report:ui-runtime-coverage": "uv run python scripts/report_ui_route_runtime_coverage.py",
     "audit:artifacts": "uv run python scripts/audit_tracked_artifacts.py",
+    "verify:strict-maintenance": "node --test tests/repository-identity-contract.test.mjs && npm run audit:artifacts && npm run audit:strict && npm run build:main && npm run build:renderer",
     "verify:strict-sync": "npm run audit:artifacts && npm run audit:strict && npm run test:strict && npm run build:main && npm run build:renderer && npm run build:python",
     "package:mac-local": "electron-builder --dir --mac dir --arm64 -c.electronDist=node_modules/electron/dist -c.mac.identity=null -c.mac.hardenedRuntime=false -c.mac.gatekeeperAssess=false -c.mac.forceCodeSigning=false -c.mac.notarize=false",
     "dist:mac-local": "npm run build && npm run package:mac-local",

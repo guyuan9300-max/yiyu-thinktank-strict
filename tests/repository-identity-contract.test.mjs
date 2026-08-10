@@ -20,6 +20,9 @@ const preloadSource = fs.readFileSync(
   path.join(root, 'src', 'main', 'preload.ts'),
   'utf8',
 );
+const packageJson = JSON.parse(
+  fs.readFileSync(path.join(root, 'package.json'), 'utf8'),
+);
 
 test('repository marker pins the strict GitHub identity and main branch', () => {
   assert.deepEqual(marker, {
@@ -76,5 +79,16 @@ test('network git retries terminate the whole process tree and verify GitHub mai
   assert.equal(
     collabSource.includes("'update-ref', 'refs/remotes/origin/main'"),
     true,
+  );
+});
+
+test('maintenance push uses the bounded publish gate instead of stale full-suite fixtures', () => {
+  assert.match(collabSource, /npm'[\s\S]*'run'[\s\S]*'verify:strict-maintenance'/);
+  assert.match(packageJson.scripts['verify:strict-maintenance'], /repository-identity-contract/);
+  assert.match(packageJson.scripts['verify:strict-maintenance'], /audit:strict/);
+  assert.match(packageJson.scripts['verify:strict-maintenance'], /build:renderer/);
+  assert.equal(
+    packageJson.scripts['verify:strict-maintenance'].includes('test:strict'),
+    false,
   );
 });

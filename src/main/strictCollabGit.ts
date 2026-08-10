@@ -24,7 +24,7 @@ const execFileAsync = promisify(execFile);
 export const STRICT_REPOSITORY = {
   markerFile: '.yiyu-strict-repository.json',
   markerKind: 'yiyu-strict-repository',
-  genesisLabel: 'strict-db-genesis-v1',
+  genesisLabel: 'blueprint-88-foundation-v8-agent-skill-contract',
   githubRepository: 'guyuan9300-max/yiyu-thinktank-strict',
   githubRepositoryNumericId: 1316010273,
   githubRepositoryNodeId: 'R_kgDOTnC5IQ',
@@ -750,7 +750,7 @@ export async function pushStrictMain(
   }
   await requireRemoteAncestor(repoPath);
   const remoteBefore = await run(repoPath, ['rev-parse', 'refs/remotes/origin/main']);
-  await runCommand(repoPath, 'npm', ['run', 'verify:strict-sync']);
+  await runCommand(repoPath, 'npm', ['run', 'verify:strict-maintenance'], 10 * 60_000);
   await run(repoPath, ['add', '--all']);
   const staged = await run(
     repoPath,
@@ -942,7 +942,7 @@ export async function publishStrictBranch(
   if (await hasUnmergedPaths(repoPath)) {
     throw new Error('当前存在未解决冲突，不能发布协作分支。');
   }
-  await runCommand(repoPath, 'npm', ['run', 'verify:strict-sync']);
+  await runCommand(repoPath, 'npm', ['run', 'verify:strict-maintenance'], 10 * 60_000);
   await run(repoPath, ['add', '--all']);
   const staged = await run(
     repoPath,
