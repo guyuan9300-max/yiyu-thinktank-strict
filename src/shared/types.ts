@@ -7936,11 +7936,13 @@ export interface CollabRepoStatus {
   workingRepoPath?: string | null;
   workingBranch?: string | null;
   workingChangeCount?: number;
+  permissionOnlyChangeCount?: number;
   isConfigured: boolean;
   isValid: boolean;
   branch: string | null;
   isMainBranch: boolean;
   hasLocalChanges: boolean;
+  hasPermissionOnlyChanges?: boolean;
   hasUnmergedPaths: boolean;
   aheadCount: number;
   behindCount: number;

@@ -496,11 +496,31 @@ function parseNameStatus(output: string): CollabFileChange[] {
   return items;
 }
 
-async function workingTreeChanges(repoPath: string): Promise<CollabFileChange[]> {
-  const output = await run(repoPath, ['status', '--porcelain=v1', '--untracked-files=all']);
-  if (!output) return [];
+type WorkingTreeInspection = {
+  changes: CollabFileChange[];
+  permissionOnlyChangeCount: number;
+};
+
+export function classifyWorkingTreeChanges(
+  statusOutput: string,
+  numstatOutput: string,
+  summaryOutput: string,
+): WorkingTreeInspection {
+  const zeroContentPaths = new Set<string>();
+  for (const line of numstatOutput.split('\n')) {
+    if (!line.trim()) continue;
+    const [added, deleted, filePath] = line.split('\t');
+    if (added === '0' && deleted === '0' && filePath) zeroContentPaths.add(filePath);
+  }
+  const modeChangePaths = new Set<string>();
+  for (const line of summaryOutput.split('\n')) {
+    const match = line.match(/^\s*mode change \d+ => \d+ (.+)$/);
+    if (match?.[1]) modeChangePaths.add(match[1]);
+  }
+
   const items: CollabFileChange[] = [];
-  for (const line of output.split('\n')) {
+  let permissionOnlyChangeCount = 0;
+  for (const line of statusOutput.split('\n')) {
     if (line.length < 4) continue;
     const code = line.slice(0, 2);
     const value = line.slice(3);
@@ -513,6 +533,15 @@ async function workingTreeChanges(repoPath: string): Promise<CollabFileChange[]>
       items.push(fileChange(nextPath, 'renamed', previousPath));
       continue;
     }
+    const isOrdinaryModification = /^[ M]{2}$/.test(code) && code.includes('M');
+    if (
+      isOrdinaryModification
+      && zeroContentPaths.has(value)
+      && modeChangePaths.has(value)
+    ) {
+      permissionOnlyChangeCount += 1;
+      continue;
+    }
     const type: CollabFileChangeType = code.includes('A')
       ? 'added'
       : code.includes('D')
@@ -520,7 +549,16 @@ async function workingTreeChanges(repoPath: string): Promise<CollabFileChange[]>
         : 'modified';
     items.push(fileChange(value, type));
   }
-  return items;
+  return { changes: items, permissionOnlyChangeCount };
+}
+
+async function workingTreeInspection(repoPath: string): Promise<WorkingTreeInspection> {
+  const [statusOutput, numstatOutput, summaryOutput] = await Promise.all([
+    run(repoPath, ['status', '--porcelain=v1', '--untracked-files=all']),
+    run(repoPath, ['diff', '--numstat', 'HEAD', '--'], { allowFailure: true }),
+    run(repoPath, ['diff', '--summary', 'HEAD', '--'], { allowFailure: true }),
+  ]);
+  return classifyWorkingTreeChanges(statusOutput, numstatOutput, summaryOutput);
 }
 
 function uniqueFiles(files: CollabFileChange[]): CollabFileChange[] {
@@ -592,7 +630,8 @@ async function buildStatus(
   suggestedRepoPath: string | null = repoPath,
 ): Promise<CollabRepoStatus> {
   const branch = await run(repoPath, ['branch', '--show-current']);
-  const localChanges = await workingTreeChanges(repoPath);
+  const workingTree = await workingTreeInspection(repoPath);
+  const localChanges = workingTree.changes;
   const unmerged = await hasUnmergedPaths(repoPath);
   const [aheadCount, behindCount] = await countAheadBehind(repoPath);
   return {
@@ -602,11 +641,13 @@ async function buildStatus(
     workingRepoPath: repoPath,
     workingBranch: branch || null,
     workingChangeCount: localChanges.length,
+    permissionOnlyChangeCount: workingTree.permissionOnlyChangeCount,
     isConfigured: true,
     isValid: true,
     branch: branch || null,
     isMainBranch: branch === STRICT_REPOSITORY.targetBranch,
     hasLocalChanges: localChanges.length > 0,
+    hasPermissionOnlyChanges: workingTree.permissionOnlyChangeCount > 0,
     hasUnmergedPaths: unmerged,
     aheadCount,
     behindCount,
@@ -614,6 +655,8 @@ async function buildStatus(
     remoteChangeCount: behindCount,
     statusText: unmerged
       ? '存在未解决冲突，已停止协作操作。'
+      : workingTree.permissionOnlyChangeCount > 0
+        ? `检测到 ${workingTree.permissionOnlyChangeCount} 个文件权限异常；代码内容未改变，请先修复源码目录权限。`
       : `严格新版仓库已绑定：${STRICT_REPOSITORY.githubRepository} · main`,
   };
 }
@@ -629,11 +672,13 @@ function invalidStatus(
     workingRepoPath: null,
     workingBranch: null,
     workingChangeCount: 0,
+    permissionOnlyChangeCount: 0,
     isConfigured: Boolean(requestedPath),
     isValid: false,
     branch: null,
     isMainBranch: false,
     hasLocalChanges: false,
+    hasPermissionOnlyChanges: false,
     hasUnmergedPaths: false,
     aheadCount: 0,
     behindCount: 0,
@@ -702,7 +747,8 @@ async function localPublishFiles(repoPath: string): Promise<CollabFileChange[]> 
       { allowFailure: true },
     ),
   );
-  return uniqueFiles([...committed, ...await workingTreeChanges(repoPath)]);
+  const workingTree = await workingTreeInspection(repoPath);
+  return uniqueFiles([...committed, ...workingTree.changes]);
 }
 
 export async function previewStrictPush(
@@ -715,6 +761,8 @@ export async function previewStrictPush(
   let executionBlockReason: string | null = null;
   if (status.hasUnmergedPaths) {
     executionBlockReason = '当前存在未解决冲突，不能推送。';
+  } else if (status.hasPermissionOnlyChanges) {
+    executionBlockReason = `检测到 ${status.permissionOnlyChangeCount || 0} 个文件仅有权限位异常，代码内容没有改变。请先修复源码目录权限后再推送。`;
   } else {
     try {
       await requireRemoteAncestor(validated);
@@ -750,6 +798,12 @@ export async function pushStrictMain(
   await fetchMain(repoPath);
   if (await hasUnmergedPaths(repoPath)) {
     throw new Error('当前存在未解决冲突，已停止推送。');
+  }
+  const workingTree = await workingTreeInspection(repoPath);
+  if (workingTree.permissionOnlyChangeCount > 0) {
+    throw new Error(
+      `检测到 ${workingTree.permissionOnlyChangeCount} 个文件仅有权限位异常，代码内容没有改变。请先修复源码目录权限后再推送。`,
+    );
   }
   await requireRemoteAncestor(repoPath);
   const remoteBefore = await run(repoPath, ['rev-parse', 'refs/remotes/origin/main']);
@@ -868,12 +922,15 @@ export async function previewStrictPull(repoPath: string): Promise<PullPreview> 
   );
   const canFastForwardMain = status.isMainBranch
     && !status.hasLocalChanges
+    && !status.hasPermissionOnlyChanges
     && !status.hasUnmergedPaths
     && status.aheadCount === 0
     && status.behindCount > 0;
   let executionBlockReason: string | null = null;
   if (!status.isMainBranch) {
     executionBlockReason = '接收远端 main 前，请先切回本地 main 分支。';
+  } else if (status.hasPermissionOnlyChanges) {
+    executionBlockReason = `检测到 ${status.permissionOnlyChangeCount || 0} 个文件权限异常；代码内容未改变，请先修复源码目录权限。`;
   } else if (status.hasLocalChanges || status.hasUnmergedPaths) {
     executionBlockReason = '本机仍有未提交修改或冲突，不能快进接收 main。';
   } else if (status.aheadCount > 0) {
@@ -911,6 +968,11 @@ export async function fastForwardStrictMain(
   }
   if (status.hasLocalChanges || status.hasUnmergedPaths) {
     throw new Error('本机仍有未提交修改或冲突，不能快进接收 main。');
+  }
+  if (status.hasPermissionOnlyChanges) {
+    throw new Error(
+      `检测到 ${status.permissionOnlyChangeCount || 0} 个文件权限异常；代码内容未改变，请先修复源码目录权限。`,
+    );
   }
   if (status.aheadCount > 0) {
     throw new Error('本机包含尚未推送的提交，请先安全推送。');
