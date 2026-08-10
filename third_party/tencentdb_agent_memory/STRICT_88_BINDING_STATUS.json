@@ -1,0 +1,134 @@
+{
+  "schemaVersion": 1,
+  "generatedOn": "2026-08-05",
+  "state": "blocked_schema_extension_pending",
+  "tableCountInvariant": 88,
+  "tableBindings": {
+    "chatMemory": [
+      "source_assets",
+      "object_manifests",
+      "source_sets",
+      "source_set_members",
+      "atomic_facts",
+      "evidence_links",
+      "ai_context_manifests",
+      "ai_answers",
+      "derivation_lineage",
+      "cache_entries"
+    ],
+    "skill": [
+      "automation_rules",
+      "bot_definitions",
+      "execution_runs",
+      "ai_proposals",
+      "ai_approvals",
+      "secured_resources",
+      "object_grants"
+    ],
+    "wiki": [
+      "knowledge_documents",
+      "document_versions",
+      "content_chunks",
+      "atomic_facts",
+      "evidence_links",
+      "relationship_triples",
+      "search_index_manifests",
+      "vector_index_manifests",
+      "derivation_lineage"
+    ],
+    "reliability": [
+      "commands",
+      "idempotency_records",
+      "lifecycle_events",
+      "purge_ledger",
+      "audit_events"
+    ],
+    "organizationModel": [
+      "provider_resources"
+    ]
+  },
+  "builtInAgents": [
+    {
+      "agentKind": "project_workspace",
+      "label": "项目工作台",
+      "handle": "project-workspace"
+    },
+    {
+      "agentKind": "task_planning",
+      "label": "任务计划",
+      "handle": "task-planning"
+    },
+    {
+      "agentKind": "meeting_minutes",
+      "label": "会议纪要",
+      "handle": "meeting-minutes"
+    },
+    {
+      "agentKind": "strategy_companion",
+      "label": "战略陪伴",
+      "handle": "strategy-companion"
+    },
+    {
+      "agentKind": "intelligence_research",
+      "label": "情报研究",
+      "handle": "intelligence-research"
+    },
+    {
+      "agentKind": "growth_companion",
+      "label": "成长陪伴",
+      "handle": "growth-companion"
+    }
+  ],
+  "organizationModelRule": {
+    "table": "provider_resources",
+    "resourceKind": "organization_ai_configuration",
+    "ownerKind": "organization",
+    "secretExposure": "forbidden"
+  },
+  "local": {
+    "tableCount": 88,
+    "ready": false,
+    "missingTables": [],
+    "missingFields": [
+      {
+        "table": "source_sets",
+        "field": "client_id"
+      },
+      {
+        "table": "ai_answers",
+        "field": "client_id"
+      },
+      {
+        "table": "ai_answers",
+        "field": "bot_id"
+      },
+      {
+        "table": "bot_definitions",
+        "field": "agent_kind"
+      }
+    ]
+  },
+  "cloud": {
+    "tableCount": 88,
+    "ready": false,
+    "missingTables": [],
+    "missingFields": [
+      {
+        "table": "source_sets",
+        "field": "client_id"
+      },
+      {
+        "table": "ai_answers",
+        "field": "client_id"
+      },
+      {
+        "table": "ai_answers",
+        "field": "bot_id"
+      },
+      {
+        "table": "bot_definitions",
+        "field": "agent_kind"
+      }
+    ]
+  }
+}

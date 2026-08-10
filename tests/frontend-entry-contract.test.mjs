@@ -1,0 +1,343 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+
+const root = process.cwd();
+const sourceRoots = [
+  path.join(root, 'src', 'renderer'),
+  path.join(root, 'src', 'shared'),
+];
+
+function allSource(directory) {
+  return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const full = path.join(directory, entry.name);
+    if (entry.isDirectory()) return allSource(full);
+    if (!/\.(tsx?|css)$/.test(entry.name)) return [];
+    return [fs.readFileSync(full, 'utf8')];
+  }).join('\n');
+}
+
+const source = sourceRoots.map(allSource).join('\n');
+const appSource = fs.readFileSync(
+  path.join(root, 'src', 'renderer', 'App.tsx'),
+  'utf8',
+);
+const apiSource = fs.readFileSync(
+  path.join(root, 'src', 'renderer', 'lib', 'api.ts'),
+  'utf8',
+);
+const uiCompatSource = fs.readFileSync(
+  path.join(root, 'backend', 'app', 'ui_compat.py'),
+  'utf8',
+);
+const styles = fs.readFileSync(
+  path.join(root, 'src', 'renderer', 'styles.css'),
+  'utf8',
+);
+const intelligenceSource = fs.readFileSync(
+  path.join(root, 'src', 'renderer', 'components', 'intelligence', 'IntelligenceStationView.tsx'),
+  'utf8',
+);
+const topicsSource = fs.readFileSync(
+  path.join(root, 'src', 'renderer', 'components', 'topics', 'TopicsManagementView.tsx'),
+  'utf8',
+);
+const teamSyncSource = fs.readFileSync(
+  path.join(root, 'src', 'renderer', 'components', 'settings', 'TeamSyncPanel.tsx'),
+  'utf8',
+);
+const systemStatusSource = fs.readFileSync(
+  path.join(root, 'src', 'renderer', 'components', 'global', 'SystemStatusPanel.tsx'),
+  'utf8',
+);
+
+test('all frozen user-facing entry points remain present', () => {
+  const required = [
+    '任务与日程', '工作台', '战略陪伴', '资讯情报站', '成长中心',
+    '协作收件箱', '任务列表', '我的月历', '组织计划', '事件线',
+    '周复盘', '新建任务', '复杂任务 → AI 拆解+审批',
+    '近期项目', '结构化问答引擎', '智能编辑', '文件', '收藏', '快捷工具',
+    '目标与背景', '里程碑', '证据补充', '主线还原', '报告骨架', '项目报告',
+    '客户档案', '判断 & 思考',
+    '品牌监测', '时效情报',
+    '经验墙', '能力成长', '徽章与排行',
+    '账户', '组织与权限', 'AI 与云端', '飞书自建应用 · 身份绑定',
+    '音频转文字', '后台深度解析', '音频与附件托管',
+    '成长手册', '系统日志', '关于本软件', '反馈与建议',
+    '登录组织', '加入组织', '创建组织', '工作空间',
+  ];
+  const missing = required.filter((label) => !source.includes(label));
+  assert.deepEqual(missing, [], `missing frontend entries: ${missing.join('、')}`);
+});
+
+test('renderer only calls v2 and never calls legacy endpoints', () => {
+  assert.equal(source.includes('/api/v1'), false);
+  assert.equal(source.includes('latest.yml'), false);
+  assert.equal(source.includes('organization_cloud_proxy'), false);
+  assert.ok(source.includes('/api/v2'));
+});
+
+test('all renderer mutations carry one stable idempotency key across retries', () => {
+  assert.match(
+    apiSource,
+    /function _stableMutationOptions[\s\S]+headers\.set\('Idempotency-Key', idempotencyKey\)/,
+  );
+  assert.match(
+    apiSource,
+    /const stableOptions = _stableMutationOptions\(method, options\);[\s\S]+while \(true\)/,
+  );
+  assert.match(
+    apiSource,
+    /async function requestForm[\s\S]+const stableOptions = _stableMutationOptions\(method, options\)/,
+  );
+});
+
+test('unsupported capabilities fail explicitly instead of returning fake empty data', () => {
+  assert.ok(uiCompatSource.includes('capability_not_connected'));
+  assert.ok(uiCompatSource.includes('_not_connected(path)'));
+  assert.equal(source.includes('尚未接入严格新版数据'), false);
+});
+
+test('desktop surfaces fill the available window width', () => {
+  assert.match(appSource, /className="min-h-screen bg-\[#F9FAFB\] flex/);
+  assert.match(appSource, /className=\{`flex-1 ml-\[60px\].*flex flex-col/s);
+  assert.match(styles, /html,\s*body,\s*#root\s*\{\s*min-height:\s*100%/s);
+});
+
+test('workspace recovery opens target login and only lists organizations', () => {
+  assert.match(appSource, /error instanceof ApiRequestError/);
+  assert.match(appSource, /'workspace_secret_missing'/);
+  assert.match(
+    appSource,
+    /cloudApiUrl:\s*targetWorkspace\.cloudApiUrl/,
+  );
+  assert.match(
+    appSource,
+    /openCloudAuthModal\('login',\s*\{[\s\S]{0,180}cloudApiUrl:\s*targetWorkspace\.cloudApiUrl,[\s\S]{0,180}organizationName:/,
+  );
+  assert.match(
+    appSource,
+    /seed\.clearRememberedAccount\s*\?\s*''\s*:\s*\(currentSessionUser\?\.email/,
+  );
+  assert.match(
+    appSource,
+    /\.filter\(\s*\(workspace\) => workspace\.kind === 'organization'/s,
+  );
+  assert.match(
+    appSource,
+    /await refreshWorkspaceAwareState\(response, transitionToken\);[\s\S]{0,180}setWorkspaceManagerOpen\(false\);[\s\S]{0,180}已切换工作空间/,
+  );
+  assert.match(appSource, /'尚未登录组织'/);
+  assert.match(appSource, /'没有活动组织工作空间'/);
+  assert.equal(appSource.includes('工作空间：未连接组织'), false);
+  assert.equal(appSource.includes('`未连接组织 · ${sidebarVisibleClientCount} 客户`'), false);
+});
+
+test('workspace bootstrap only loads administrator surfaces for administrators', () => {
+  assert.match(
+    appSource,
+    /name: 'activity-logs'[\s\S]{0,500}primaryRole === 'admin'[\s\S]{0,500}setLogs\(\[\]\)/,
+  );
+  assert.match(
+    appSource,
+    /name: nextAuth\.user\?\.primaryRole === 'admin'[\s\S]{0,120}system-admin-settings[\s\S]{0,700}primaryRole === 'admin'[\s\S]{0,700}loadOrgModelBlock/,
+  );
+  assert.match(
+    appSource,
+    /正在加载 \$\{nextActiveWorkspace\?\.name[\s\S]{0,1500}nextAuth\.user\?\.primaryRole === 'admin'[\s\S]{0,300}loadSystemAdminSettingsBlock[\s\S]{0,300}loadOrgModelBlock/,
+  );
+  assert.match(
+    appSource,
+    /blocked · 仅组织管理员可查看业务操作审计/,
+  );
+  assert.match(
+    appSource,
+    /children:\s*canManageOrganization\s*\?[\s\S]{0,160}<TeamSyncPanel/,
+  );
+  assert.match(
+    appSource,
+    /currentSessionUser\?\.primaryRole === 'admin'[\s\S]{0,240}<BotMembersPanel/,
+  );
+  assert.match(
+    appSource,
+    /身份受限 · 仅组织管理员可查看和触发组织级团队同步/,
+  );
+});
+
+test('member task pages skip administrator diagnostics and optimistic draft fetches', () => {
+  assert.match(
+    appSource,
+    /if \(currentSessionUser\?\.primaryRole === 'admin'\) \{\s+void resolveDataCenterKernel\(\{\s+scope:\s+\{\s+page: 'task_detail'/,
+  );
+  assert.match(
+    appSource,
+    /const canRunAdminDiagnostics = currentSessionUser\?\.primaryRole === 'admin';[\s\S]{0,120}if \(canRunAdminDiagnostics\) \{[\s\S]{0,240}resolveDataCenterKernel/,
+  );
+  assert.match(
+    appSource,
+    /\.filter\(\(task\) => \(\s*!isLocalDraftTaskId\(task\.id\)[\s\S]{0,160}task\.scopeMode !== 'PERSONAL_ONLY'/,
+  );
+  assert.match(
+    appSource,
+    /if \(\s*isLocalDraftTaskId\(task\.id\)[\s\S]{0,180}taskContextBriefs\[task\.id\]\s*\) return;/,
+  );
+  assert.match(
+    appSource,
+    /!isCollapsing && !isLocalDraftTaskId\(taskId\) && !taskSmartBriefs\[taskId\]/,
+  );
+});
+
+test('task entry points use membership identity and never force a synthetic inbox list', () => {
+  assert.match(
+    appSource,
+    /tasksViewBridgeRef\.current = \{[\s\S]{0,260}viewerAuthorization/,
+  );
+  assert.match(
+    appSource,
+    /viewerAuthorization: currentViewerAuthorization[\s\S]{0,6200}const currentTaskMembershipId = currentViewerAuthorization\?\.membershipId \|\| null/,
+  );
+  for (const dynamicValue of [
+    'workspacesState',
+    'strictPlanWorkshopState',
+    'isOrganizationPlanningLoading',
+    'organizationPlanningLoadError',
+    'hasRawAuthenticatedSession',
+    'recordingSession',
+  ]) {
+    assert.match(
+      appSource,
+      new RegExp(`tasksViewBridgeRef\\.current = \\{[\\s\\S]{0,7000}\\b${dynamicValue}\\b`),
+    );
+  }
+  assert.match(
+    appSource,
+    /const membershipId = currentTaskMembershipId \|\| '';[\s\S]{0,220}id: membershipId/,
+  );
+  assert.equal(appSource.includes("|| 'list-0'"), false);
+  assert.equal(appSource.includes('ownerId: currentSessionUser?.id'), false);
+});
+
+test('customer meetings retain task editor people and join inbox, plan, list and calendar surfaces', () => {
+  assert.match(
+    appSource,
+    /recordMode: event\.target\.checked \? 'customer_meeting' : 'task'[\s\S]{0,260}collaborators: previous\.collaborators\.length/,
+  );
+  assert.match(appSource, /collaboratorMembershipIds: selectedTaskCollaborators\.map/);
+  assert.match(appSource, /planningCycleId: editingTask\.planLinkSource === 'manager'/);
+  assert.ok(appSource.includes('filteredInboundPendingMeetings'));
+  assert.ok(appSource.includes('filteredOutboundPendingMeetings'));
+  assert.ok(appSource.includes('onToggleMeetingStatus={handleToggleMeetingCompletion}'));
+});
+
+test('workbench exposes project knowledge source counts and material boundary', () => {
+  assert.ok(appSource.includes('项目知识上下文'));
+  assert.ok(appSource.includes('组织共享'));
+  assert.ok(appSource.includes('本机私有'));
+  assert.ok(appSource.includes('组织云只返回已发布摘要和关系，不下载源文件正文'));
+  assert.ok(appSource.includes('本机私有资料不会上传组织云'));
+  assert.ok(appSource.includes('整理资料 · 从本机正文生成并发布组织共享摘要'));
+  assert.ok(appSource.includes('生成并发布共享摘要'));
+  assert.match(appSource, /onClick:\s*\(\) => void handlePreviewDocumentAutoRepair\(\)/);
+  assert.ok(appSource.includes('源文件和正文始终留在本机，只向当前组织发布摘要与来源校验信息'));
+  assert.ok(uiCompatSource.includes('"knowledgeContext": knowledge_context'));
+});
+
+test('workbench explains text correction and clears a stale selection immediately', () => {
+  assert.ok(appSource.includes('如需纠错或补充，请选中相关文本'));
+  assert.ok(appSource.includes("document.addEventListener('selectionchange', clearStaleAnswerSelection)"));
+  assert.match(
+    appSource,
+    /selection\.isCollapsed[\s\S]{0,220}selection\.toString\(\)\.trim\(\) !== answerTextSelection\.selectedText[\s\S]{0,120}setAnswerTextSelection\(null\)/,
+  );
+});
+
+test('empty intelligence surfaces do not inject client-name mocks or example judgments', () => {
+  assert.equal(intelligenceSource.includes("selectedWorkObject?.name?.includes('测试机构A')"), false);
+  assert.equal(intelligenceSource.includes("targetName.includes('测试机构A')"), false);
+  assert.equal(intelligenceSource.includes('_mockOfficialChannelsFor'), false);
+  assert.match(
+    intelligenceSource,
+    /const STAKEHOLDER_PERCEIVABILITY_RESULTS:[^=]+=\s*\{\};/,
+  );
+  assert.ok(intelligenceSource.includes('not_connected · 尚无严格权威评分'));
+  assert.equal(appSource.includes('测试论坛A 面向基金会客户'), false);
+  assert.equal(topicsSource.includes('EXAMPLE_JUDGMENT'), false);
+  assert.ok(topicsSource.includes('系统不会用示例或宽泛内容制造“已有判断”的假象'));
+});
+
+test('cloud sessions immediately consume pending consultation knowledge and retry every minute', () => {
+  assert.ok(appSource.includes('processPendingConsultationKnowledgeRequests'));
+  assert.ok(appSource.includes('consultationKnowledgeSyncInFlightRef'));
+  assert.match(
+    appSource,
+    /if \(!hasAuthenticatedSession \|\| !isCloudSession\) return undefined;/,
+  );
+  assert.match(
+    appSource,
+    /const summary = await processPendingConsultationKnowledgeRequests\(\);/,
+  );
+  assert.match(
+    appSource,
+    /void run\(\);[\s\S]{0,120}window\.setInterval\(\(\) => \{[\s\S]{0,80}void run\(\);[\s\S]{0,80}60_000/,
+  );
+  assert.ok(appSource.includes('[consultation-knowledge] pending sync failed'));
+  assert.ok(appSource.includes('[consultation-knowledge] pending sync completed with failures'));
+  assert.match(
+    appSource,
+    /summary\.items\.some\(\(item\) => item\.clientId === targetClientId\)[\s\S]{0,120}await refreshWorkspace\(targetClientId\);/,
+  );
+});
+
+test('empty workbench only offers real project creation, never fake demo data', () => {
+  assert.equal(appSource.includes('载入演示数据'), false);
+  assert.equal(appSource.includes('loadDemoData'), false);
+  assert.ok(appSource.includes('先创建一个真实项目'));
+});
+
+test('link import does not promise unavailable browser-cookie access', () => {
+  assert.equal(appSource.includes('使用浏览器登录态读取链接'), false);
+  assert.ok(appSource.includes('当前严格版不会读取浏览器 Cookie'));
+});
+
+test('team status panel reflects strict outbox evidence instead of a legacy file queue', () => {
+  assert.ok(teamSyncSource.includes('stats?.statusCounts'));
+  assert.ok(teamSyncSource.includes('不代表源文件上传队列'));
+  assert.ok(teamSyncSource.includes('成员源文件正文只保留在各自本机'));
+  assert.equal(teamSyncSource.includes('team_documents'), false);
+  assert.equal(teamSyncSource.includes('source_registry'), false);
+  assert.equal(teamSyncSource.includes('扫描新文件入队'), false);
+  assert.equal(teamSyncSource.includes('立即同步'), false);
+});
+
+test('logout immediately hides organization meetings and Yiyu-only maintenance controls', () => {
+  assert.match(
+    appSource,
+    /async function handleLogoutFromUi\(\)[\s\S]{0,900}resetBusinessWorkspaceTransientState\(\)[\s\S]{0,240}setAuthState\(response\)/,
+  );
+  assert.match(
+    appSource,
+    /const resetBusinessWorkspaceTransientState = \(\) => \{[\s\S]{0,2200}setCustomerMeetings\(\[\]\)/,
+  );
+  assert.match(
+    appSource,
+    /if \(!hasAuthenticatedSession \|\| activeTab !== 'tasks'\) \{\s*setCustomerMeetings\(\[\]\)/,
+  );
+  assert.match(
+    appSource,
+    /const canShowMaintenanceSyncPanel = Boolean\(\s*canUseCollabSync\s*&& hasAuthenticatedSession\s*&& isCloudSession\s*&& currentMembershipStatus === 'approved'/,
+  );
+  assert.equal(appSource.includes('void logout().then'), false);
+});
+
+test('logged-out settings hide organization snapshots and never label a fallback model as connected', () => {
+  assert.match(
+    appSource,
+    /if \(!hasAuthenticatedSession\) \{[\s\S]{0,2600}组织名称、云地址、组织模型与集成配置已隐藏/,
+  );
+  assert.match(
+    systemStatusSource,
+    /if \(!canSyncOrganizationAi\) \{[\s\S]{0,260}value: '未接通'/,
+  );
+  assert.equal(systemStatusSource.includes('const shortName = shortAiModelLabel(\n        health.ai.provider'), false);
+});

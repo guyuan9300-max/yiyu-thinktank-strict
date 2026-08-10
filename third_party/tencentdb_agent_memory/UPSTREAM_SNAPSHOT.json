@@ -1,0 +1,620 @@
+{
+  "schemaVersion": 1,
+  "generatedOn": "2026-08-05",
+  "upstreamRepository": "https://github.com/Tencent/TencentDB-Agent-Memory.git",
+  "runtimeWired": false,
+  "snapshots": {
+    "main": {
+      "commit": "3c6fc6425f22d24c4917dc3b7791a175d2d13545",
+      "purpose": "Chat Memory stable baseline"
+    },
+    "teamBeta": {
+      "commit": "b44c6db5f5b1a011eed645efb1949840f99f961a",
+      "purpose": "Skill and Wiki beta source baseline"
+    }
+  },
+  "exclusions": [
+    "MemoryPanel/**",
+    "MemoryProxy/**",
+    "CodeGraph engine",
+    "independent identity and metadata server",
+    "gateway and global model proxy",
+    "SQLite/TCVDB authority and DDL",
+    "OpenClaw/Hermes host adapters",
+    "MemoryCore/src/core/skill/skill-store-ddl.ts",
+    "MemoryCore/src/core/skill/skill-store.ts",
+    "MemoryKnowledge/src/engines/wiki/index-db.ts",
+    "MemoryKnowledge/src/engines/wiki/ingest-v2/llm.ts"
+  ],
+  "counts": {
+    "total": 97,
+    "provenance": 5,
+    "chat_memory": 49,
+    "skill": 27,
+    "wiki": 16
+  },
+  "files": [
+    {
+      "path": "upstream/main/LICENSE",
+      "capability": "provenance",
+      "bytes": 1315,
+      "sha256": "bcaf06dea1a63d27aab5633035b620e0127295583456c2a9402565ef63ecb0b0"
+    },
+    {
+      "path": "upstream/main/package.json",
+      "capability": "provenance",
+      "bytes": 3694,
+      "sha256": "2878447ac8460d1c7345a82dc23ff9617b13a50b490141c87e9b9d1de0744bb9"
+    },
+    {
+      "path": "upstream/main/src/core/conversation/l0-recorder.ts",
+      "capability": "chat_memory",
+      "bytes": 21835,
+      "sha256": "116b9793e367acd8dd554daf80c6ebcc789be19db48e6905b8eb8bde4e75ab68"
+    },
+    {
+      "path": "upstream/main/src/core/hooks/auto-capture.ts",
+      "capability": "chat_memory",
+      "bytes": 14705,
+      "sha256": "3ffbb5244c89436cd9b6eb477c6a879c8ba99cded19e789dc0b4d6cf06d5f284"
+    },
+    {
+      "path": "upstream/main/src/core/hooks/auto-recall.ts",
+      "capability": "chat_memory",
+      "bytes": 35330,
+      "sha256": "9bcb6aa0defe3fc390f900c4897681740496d221703a635a99658c184de818c8"
+    },
+    {
+      "path": "upstream/main/src/core/persona/persona-generator.ts",
+      "capability": "chat_memory",
+      "bytes": 9003,
+      "sha256": "d6f9f1a74f245cafe75628c168a4cb3c02271ce876ddb1cf88071969061c4a59"
+    },
+    {
+      "path": "upstream/main/src/core/persona/persona-trigger.ts",
+      "capability": "chat_memory",
+      "bytes": 4270,
+      "sha256": "221bef85a64a13eff2404d472093cbed6cee35f61e47afe50b49e279e28fd75c"
+    },
+    {
+      "path": "upstream/main/src/core/profile/profile-sync.ts",
+      "capability": "chat_memory",
+      "bytes": 8100,
+      "sha256": "bc59357302998f9b935e253325eebad1c7eceea120c28edf58d35399a6c66293"
+    },
+    {
+      "path": "upstream/main/src/core/prompts/l1-dedup.ts",
+      "capability": "chat_memory",
+      "bytes": 7371,
+      "sha256": "bbab62383c09b8abfbacbc7c4abc1c9c4f69c4e4c4a55d041afde36cd0e45c85"
+    },
+    {
+      "path": "upstream/main/src/core/prompts/l1-extraction.ts",
+      "capability": "chat_memory",
+      "bytes": 6958,
+      "sha256": "c34f5a663e0bfa7dceb1a8bce945f9e5b02d0dda05751c91a15d879dae01584f"
+    },
+    {
+      "path": "upstream/main/src/core/prompts/persona-generation.ts",
+      "capability": "chat_memory",
+      "bytes": 8680,
+      "sha256": "ed8cb3eee55b970d26c6ee2cc9f7bdcb9108c0a49e8a6c80e346712132077964"
+    },
+    {
+      "path": "upstream/main/src/core/prompts/scene-extraction.ts",
+      "capability": "chat_memory",
+      "bytes": 17313,
+      "sha256": "1df669c0cbdd91ba84b16ded810f54c1153422e9e7bfa451bd89782bfe8d119b"
+    },
+    {
+      "path": "upstream/main/src/core/record/l1-dedup.ts",
+      "capability": "chat_memory",
+      "bytes": 14752,
+      "sha256": "fe44fa2cdf9c3d445b86535c0d88b53ae7b7e9c8d8478e31a159860d4134b982"
+    },
+    {
+      "path": "upstream/main/src/core/record/l1-extractor.ts",
+      "capability": "chat_memory",
+      "bytes": 18107,
+      "sha256": "47df3e48332c7aecd16cb3ff05d92703f24deefdaf1b966071901f696774341a"
+    },
+    {
+      "path": "upstream/main/src/core/record/l1-reader.ts",
+      "capability": "chat_memory",
+      "bytes": 6390,
+      "sha256": "72141e6ca4050db22e4f0c00ef51ae9e1c7cc78892a736183d5b389e6a0d64c7"
+    },
+    {
+      "path": "upstream/main/src/core/record/l1-writer.ts",
+      "capability": "chat_memory",
+      "bytes": 9776,
+      "sha256": "a14266bb3076dade74e4dbac39f77be5e1c5051891a929fd07aa86cc48a37d38"
+    },
+    {
+      "path": "upstream/main/src/core/scene/filename-normalizer.ts",
+      "capability": "chat_memory",
+      "bytes": 7069,
+      "sha256": "4d494a80085f37dd72920f399c75b517d24746809b36406a6e87edf9363aca32"
+    },
+    {
+      "path": "upstream/main/src/core/scene/scene-extractor.ts",
+      "capability": "chat_memory",
+      "bytes": 20548,
+      "sha256": "971f527180124190d9022fec433b4205496b05297a5edbb66775a1a86f5a851b"
+    },
+    {
+      "path": "upstream/main/src/core/scene/scene-format.ts",
+      "capability": "chat_memory",
+      "bytes": 1926,
+      "sha256": "d4a7a908633869c3163f93d3ce8c08ce005b7afe745c4b3fa8f5e2bdad0604c6"
+    },
+    {
+      "path": "upstream/main/src/core/scene/scene-index.ts",
+      "capability": "chat_memory",
+      "bytes": 2887,
+      "sha256": "7fe69cb44e4fe8a76a04f929f5c6e887924b091b864b90ab37f1c13e2512086a"
+    },
+    {
+      "path": "upstream/main/src/core/scene/scene-navigation.ts",
+      "capability": "chat_memory",
+      "bytes": 2418,
+      "sha256": "416320ffc80dbafda28d3605001cec1d6c3cd3d70cabe8fadb756b3ea34acf7a"
+    },
+    {
+      "path": "upstream/main/src/core/store/bm25-local.ts",
+      "capability": "chat_memory",
+      "bytes": 2705,
+      "sha256": "f8fe0bd0f4c39d285139608e2743b50ec9d250e4467e963868d60b52d0eaf155"
+    },
+    {
+      "path": "upstream/main/src/core/store/embedding.ts",
+      "capability": "chat_memory",
+      "bytes": 31373,
+      "sha256": "c01dc7a7c54e17561fcbafc6dc60ee378c60c76df8f7b1f7f6cac59c8bd7128a"
+    },
+    {
+      "path": "upstream/main/src/core/store/search-utils.ts",
+      "capability": "chat_memory",
+      "bytes": 1829,
+      "sha256": "6288684358998c7be72aa882261074fdb68ca057691a4fc8605a2419b8e63ffe"
+    },
+    {
+      "path": "upstream/main/src/core/store/types.ts",
+      "capability": "chat_memory",
+      "bytes": 11445,
+      "sha256": "63cd6c7a6ed9884b6160be542f74dc8e92121f23725b25c246e12babac64d5d9"
+    },
+    {
+      "path": "upstream/main/src/core/tools/conversation-search.ts",
+      "capability": "chat_memory",
+      "bytes": 9068,
+      "sha256": "bc92e62d8dc09d3c5819510473dbdaf2bc62c7e315e505fde887c3fd4fca54c6"
+    },
+    {
+      "path": "upstream/main/src/core/tools/memory-search.ts",
+      "capability": "chat_memory",
+      "bytes": 9292,
+      "sha256": "dd4cdffe7b43277ebeae4a100bf9b990c5a70a7f177981f9396887e7b9b6fd1a"
+    },
+    {
+      "path": "upstream/main/src/core/types.ts",
+      "capability": "chat_memory",
+      "bytes": 8226,
+      "sha256": "45771dd66b794e9fd77a512405addabdd9663a12899b0ea7bbf70f6841fa0208"
+    },
+    {
+      "path": "upstream/main/src/offload/benchmark-token-estimate.ts",
+      "capability": "chat_memory",
+      "bytes": 3952,
+      "sha256": "c9d9a1d0b18ffe5dbaa77b7a30798c48f2275b4ca2cacc0fe4971bf382f2cfcc"
+    },
+    {
+      "path": "upstream/main/src/offload/context-token-tracker.ts",
+      "capability": "chat_memory",
+      "bytes": 5482,
+      "sha256": "69b5e2ec5adfcaec70bd2937bb3920af3002504fe0186a42a5c155f0bae1b63a"
+    },
+    {
+      "path": "upstream/main/src/offload/fast-token-estimate.ts",
+      "capability": "chat_memory",
+      "bytes": 9947,
+      "sha256": "0dc4c0155950d8726c26a9ed5c2f4c2f539445e0a26d2ef8ddf4376db3edf149"
+    },
+    {
+      "path": "upstream/main/src/offload/l3-token-counter.ts",
+      "capability": "chat_memory",
+      "bytes": 1306,
+      "sha256": "c160a89f4e32e35bce0915a94f754f0cb0f64e9b67c327147df54dfc218b4ed9"
+    },
+    {
+      "path": "upstream/main/src/offload/l3-token-helpers.ts",
+      "capability": "chat_memory",
+      "bytes": 582,
+      "sha256": "81d69215de75a7a64db86a6434c9fa5cc2a735b58ef7ef9a7bd2bb628963b63e"
+    },
+    {
+      "path": "upstream/main/src/offload/local-llm/parsers/json-utils.ts",
+      "capability": "chat_memory",
+      "bytes": 2895,
+      "sha256": "58511fee45e2e5e7b9c66219a91cd193a0a1aa332a7a7195fd9897a7f3205082"
+    },
+    {
+      "path": "upstream/main/src/offload/local-llm/parsers/l1-parser.ts",
+      "capability": "chat_memory",
+      "bytes": 1104,
+      "sha256": "6b20a9db920d83f1d2b097cac77eedaf57b1b07d5032164f1de73dbf4528db0d"
+    },
+    {
+      "path": "upstream/main/src/offload/local-llm/parsers/l15-parser.ts",
+      "capability": "chat_memory",
+      "bytes": 1262,
+      "sha256": "cb325e52ccd76bc2d599bce23019cc0f871930b65e49927e2610625d53819d9b"
+    },
+    {
+      "path": "upstream/main/src/offload/local-llm/parsers/l2-parser.ts",
+      "capability": "chat_memory",
+      "bytes": 2793,
+      "sha256": "abb0d9d1019621c34deb7eb8835a971e0c82c089470ee3b666034dc492ff6cce"
+    },
+    {
+      "path": "upstream/main/src/offload/local-llm/prompts/l1-prompt.ts",
+      "capability": "chat_memory",
+      "bytes": 5479,
+      "sha256": "967da8dce94f6d1850a07d748a59ed6276eedd77f62ab16d2b88e0721e1dc54d"
+    },
+    {
+      "path": "upstream/main/src/offload/local-llm/prompts/l15-prompt.ts",
+      "capability": "chat_memory",
+      "bytes": 5125,
+      "sha256": "36ee2f30af9e5d26145a8d398ddbd6cbc03f9e2dfd1cdf9f4db57b485a4cc2fe"
+    },
+    {
+      "path": "upstream/main/src/offload/local-llm/prompts/l2-prompt.ts",
+      "capability": "chat_memory",
+      "bytes": 7846,
+      "sha256": "d345727e571f1382d10001c41f2586dc73db4fa8ed30ebfb01d7378a08274f94"
+    },
+    {
+      "path": "upstream/main/src/offload/mmd-injector.ts",
+      "capability": "chat_memory",
+      "bytes": 14467,
+      "sha256": "60d5d14df70820e0466e87934a2fc9cbbfa6ee1add48c5151305e5e7a9274f82"
+    },
+    {
+      "path": "upstream/main/src/offload/mmd-meta.ts",
+      "capability": "chat_memory",
+      "bytes": 1910,
+      "sha256": "01626d194116112ac69eb495dc744eeb957c421c815b3ed8e1acd4ac1eb35601"
+    },
+    {
+      "path": "upstream/main/src/offload/pipelines/l2-mermaid.ts",
+      "capability": "chat_memory",
+      "bytes": 9550,
+      "sha256": "53f42e27934a492b3681c97154c2bde64b17d5b9e1f9ba6ca89614a453c8b705"
+    },
+    {
+      "path": "upstream/main/src/offload/time-utils.ts",
+      "capability": "chat_memory",
+      "bytes": 1171,
+      "sha256": "5f74857db8658ff2b56d01b92e191bc5ffd755b9b9daca4b8c5d6f2da1ecd105"
+    },
+    {
+      "path": "upstream/main/src/offload/types.ts",
+      "capability": "chat_memory",
+      "bytes": 8929,
+      "sha256": "fd36278eb9421de00330154cbbdc0ebd1c35b8142bc40265c30dcbbab10b163a"
+    },
+    {
+      "path": "upstream/main/src/utils/clean-context-runner.ts",
+      "capability": "chat_memory",
+      "bytes": 23879,
+      "sha256": "51b59dc6f2f2d8a560a87971a3e06ebc74ca46c7a461bda51093607a4ce15d37"
+    },
+    {
+      "path": "upstream/main/src/utils/managed-timer.ts",
+      "capability": "chat_memory",
+      "bytes": 4658,
+      "sha256": "ddf24a118fd1f69487dc6d9d3b985d94253b4175a49b65f468a0acb157019445"
+    },
+    {
+      "path": "upstream/main/src/utils/sanitize.ts",
+      "capability": "chat_memory",
+      "bytes": 16123,
+      "sha256": "3b0f86ded100ac6501828214474887521a3f5299faae23da109d9ab38edb7cee"
+    },
+    {
+      "path": "upstream/main/src/utils/serial-queue.ts",
+      "capability": "chat_memory",
+      "bytes": 3568,
+      "sha256": "9b832ad7d61dcbf10f00d5f220326344a85ab9b451265c46b12c9e5ff8bf9b12"
+    },
+    {
+      "path": "upstream/main/src/utils/text-utils.ts",
+      "capability": "chat_memory",
+      "bytes": 913,
+      "sha256": "cfdabd2467e2ba01e71538f4a85ff46d7d7e6e94cc73d8fb0561a8120c1c6fca"
+    },
+    {
+      "path": "upstream/main/src/utils/time.ts",
+      "capability": "chat_memory",
+      "bytes": 9784,
+      "sha256": "a3a8f4116bb9731e8c245b7e3df2523bc7f52f6a9506a8db6480393840c46c67"
+    },
+    {
+      "path": "upstream/team_beta/LICENSE",
+      "capability": "provenance",
+      "bytes": 1315,
+      "sha256": "bcaf06dea1a63d27aab5633035b620e0127295583456c2a9402565ef63ecb0b0"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/package.json",
+      "capability": "provenance",
+      "bytes": 6184,
+      "sha256": "d6926ac1db81fcc0bc5e0aec49b7fb6a0363ec18dab1fef28f9fd36eb1cd1b93"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/conversation-add/add-handler.ts",
+      "capability": "skill",
+      "bytes": 13389,
+      "sha256": "dac648c334829b82fed725e2f9c0469eba23a7af52944f481e5f696b4334eac7"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/conversation-add/agent-task-queue.ts",
+      "capability": "skill",
+      "bytes": 15966,
+      "sha256": "904300ea59212f568c570d78bf00bc37f1ae9ef779e9d6b1c1c34d4dfdaa6cf2"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/conversation-add/buffer-storage.ts",
+      "capability": "skill",
+      "bytes": 11155,
+      "sha256": "18fb29c22aae302fc92c4813316c8247f6c7c97ca75cb4dc8c646cab84bbb12c"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/conversation-add/extract-worker.ts",
+      "capability": "skill",
+      "bytes": 27060,
+      "sha256": "dda2afa31c5fdc8f855a00f7a87210b3abb190ea1b82eef6611ed452aab58f7a"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/conversation-add/index.ts",
+      "capability": "skill",
+      "bytes": 1812,
+      "sha256": "e5dc85beaf3e3ce9e6ef96769ad5188f49b958c3e9e40857ae184a49d03409b9"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/conversation-add/message-compressor.ts",
+      "capability": "skill",
+      "bytes": 3393,
+      "sha256": "043bcad0a6566fd8b080cd1b3e1a1d3ac3af188505a97c36c84b2cd2f8a17b2a"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/conversation-add/oversize-strategy.ts",
+      "capability": "skill",
+      "bytes": 4253,
+      "sha256": "6f045fdb095f681daccebb98bcf78e036adc8e4953d21127e69f50cc37bb477c"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/conversation-add/prepare-archive.ts",
+      "capability": "skill",
+      "bytes": 3352,
+      "sha256": "2bb122ead28e1510e8f00592240dd0119ffe859c943a0bfbae513f2c94cd3cd8"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/conversation-add/skill-core-sink.ts",
+      "capability": "skill",
+      "bytes": 3484,
+      "sha256": "5207230437cbf552a315e127eb17fd7ccc3664bbae1bbe4705f5e0a625362b94"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/conversation-add/trigger-service.ts",
+      "capability": "skill",
+      "bytes": 9459,
+      "sha256": "69a0a21f4188fd8a1b3213d1b58c98646f5eb57e9b745901d6a9469651471ff3"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/conversation-add/wire.ts",
+      "capability": "skill",
+      "bytes": 5382,
+      "sha256": "1bd99cd764a21791c635f2926b20beeaa3161b9947ddd857682139b3283e661f"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/index.ts",
+      "capability": "skill",
+      "bytes": 3111,
+      "sha256": "6a0e874504b3840b8b7c71fe528b5d58c2356af41a6551ef51c210ca1b8aedc3"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/prompts/skill-listing-prompt.ts",
+      "capability": "skill",
+      "bytes": 2359,
+      "sha256": "9169921acbef38d531577f3f6dc65f9053301c93a7112a80a829b7feda1d3261"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/prompts/skill-review-prompt.ts",
+      "capability": "skill",
+      "bytes": 14879,
+      "sha256": "ec0f0d4b05cac8f522f5cc388a499355355836268252ad9edadf312ea2d04964"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/queue/index.ts",
+      "capability": "skill",
+      "bytes": 768,
+      "sha256": "9198d38bffc6defe25576944ce0677cac32ffd09f4ef5182f0b815358cf31b11"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/queue/types.ts",
+      "capability": "skill",
+      "bytes": 3417,
+      "sha256": "0b64585c59445a38c207965918c3342ea49cf21b3ae5097f4b54dd4aa506e260"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/skill-config.ts",
+      "capability": "skill",
+      "bytes": 7545,
+      "sha256": "76606751594de2178e997f8ed84ea4919defe317112fa568a9b54b114a0faeec"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/skill-core.ts",
+      "capability": "skill",
+      "bytes": 26775,
+      "sha256": "6dd40b69fedfa01f3b290d250fea74c6c5fec403567ea47676a1fbfb4b20d388"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/skill-extractor.ts",
+      "capability": "skill",
+      "bytes": 15166,
+      "sha256": "46c45a0af3d61b0481e7287fba93a8464f8cf8260813ce0c19d35fa1b65088a4"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/skill-fast-path.ts",
+      "capability": "skill",
+      "bytes": 1958,
+      "sha256": "6b68aa8e1a4fe5b88bf87382b0f3322c26be2adf4cbf8d7911c424edf0e6f8a8"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/skill-format.ts",
+      "capability": "skill",
+      "bytes": 7733,
+      "sha256": "f7f2bc415da3d78947318a402439cc0a1babbc6cb40b3f069a204c45708e70b1"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/skill-permission.ts",
+      "capability": "skill",
+      "bytes": 2273,
+      "sha256": "77c411fd3bd1442e65a96f906b6271b46814ebe031aec95efcb835e502148cb5"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/skill-resource-store.ts",
+      "capability": "skill",
+      "bytes": 8868,
+      "sha256": "81dbaaeba0daa8b333ddacf7ba8aeeab246b0396ef32ece8a211c2415f6b6759"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/skill-store.interface.ts",
+      "capability": "skill",
+      "bytes": 5404,
+      "sha256": "c0ac3e2347cc04d56bbf144eb06e90360451612f516d9103b6ee1129bbf10ddc"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/skill-tools.ts",
+      "capability": "skill",
+      "bytes": 9192,
+      "sha256": "8393fbcfd84419866fcad3bd21ade082a322150d692f06b6273d5b5ddd40cf53"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/skill-versioning.ts",
+      "capability": "skill",
+      "bytes": 17616,
+      "sha256": "51c473ca300462279d2a5faa481021d6797ed803d47196c8c1916c886ff1d120"
+    },
+    {
+      "path": "upstream/team_beta/MemoryCore/src/core/skill/types.ts",
+      "capability": "skill",
+      "bytes": 10804,
+      "sha256": "e4ab5cf5c6d9e96710b7f9be8434317f7dc5247d7ee4d079bdf29000501bfeaf"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/package.json",
+      "capability": "provenance",
+      "bytes": 1975,
+      "sha256": "1946746cdedeb9e9758c9861d36165ca2c7a4a9665f66e6b2d2976e307f78832"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/graph-search.ts",
+      "capability": "wiki",
+      "bytes": 3020,
+      "sha256": "25914343c04494f334b714ccae73de78bdb0a8ab12ba086794caf2abf1ff94d5"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/index.ts",
+      "capability": "wiki",
+      "bytes": 292,
+      "sha256": "c710310ac462c3a081d95cb3ceda12d6cc86454487915ded81b545a45c0e6d6c"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/cascade.ts",
+      "capability": "wiki",
+      "bytes": 7175,
+      "sha256": "dc27fa3f33256be663176cbf9e7acf4aba2a5429a81cccc36bd27186d38819a7"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/chunker.ts",
+      "capability": "wiki",
+      "bytes": 3363,
+      "sha256": "19fc71ba1dc3f62332f0d8e3b2de8c51c3eacf4fc2c7751fe06b2d5eb868a396"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/file-protocol.ts",
+      "capability": "wiki",
+      "bytes": 3968,
+      "sha256": "2f7adce9a348ef91411af761eadd9743f660140117cdda7c77ec82533c394db7"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "capability": "wiki",
+      "bytes": 4101,
+      "sha256": "111932f6ea04bbf10caaec7d682e56a547530f02cc30e768673f195a6e801ba6"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/index-builder.ts",
+      "capability": "wiki",
+      "bytes": 4598,
+      "sha256": "2bacd9efdc91892d62df8bffb8f6d8856bbaddc0ef271fa955ce547a9df397b6"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/index.ts",
+      "capability": "wiki",
+      "bytes": 13759,
+      "sha256": "9ef406059d8e105ddb05f329ca8aa33894ecfa2c7e709394c119a785606ee82b"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/log-writer.ts",
+      "capability": "wiki",
+      "bytes": 2951,
+      "sha256": "bada19cda4a87ba17b8c9fea6d96a9138468d0f5f410366ab8a10bc2367ed2d7"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/merge.ts",
+      "capability": "wiki",
+      "bytes": 8230,
+      "sha256": "34b96a5460d96432f9a68bfc08fea53f2d540da159d12ed889218a0dc11a538a"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/overview.ts",
+      "capability": "wiki",
+      "bytes": 4083,
+      "sha256": "0a87fddcb4ed92e3c7d5b223f642a1af750395812ff5ad1386e2f0bdfcec8d62"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/prompts.ts",
+      "capability": "wiki",
+      "bytes": 10102,
+      "sha256": "8d3be0957b05770c5d88fcf4d6f7434c7cdfffc454ebb95f50ef7f59f4abc43c"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "capability": "wiki",
+      "bytes": 3154,
+      "sha256": "778b680e870be32ca13efc3c2df87ce621a7e39e9e24bb5a78b32a95097b0223"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/template.ts",
+      "capability": "wiki",
+      "bytes": 4401,
+      "sha256": "cac86db146c359923c28c30b0ec52c467a8305214b4388883d213e1f33e95e87"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/manager.ts",
+      "capability": "wiki",
+      "bytes": 35051,
+      "sha256": "b2000efd48934f468e6332dc4c1070a96756cec392cbdee12d8e6b6876b4f95a"
+    },
+    {
+      "path": "upstream/team_beta/MemoryKnowledge/src/engines/wiki/types.ts",
+      "capability": "wiki",
+      "bytes": 2141,
+      "sha256": "f46deb3eca6ebdcfa4d611026b04ce83d491a6aa95e1df0e558c850c4a891705"
+    }
+  ]
+}

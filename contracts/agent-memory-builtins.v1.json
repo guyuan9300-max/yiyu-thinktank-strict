@@ -1,0 +1,72 @@
+{
+  "formatVersion": 1,
+  "registryId": "yiyu.agent-memory.builtin-agents.v1",
+  "status": "FROZEN_FOR_IMPLEMENTATION",
+  "scopeKind": "organization",
+  "identityTable": "bot_definitions",
+  "securedResourceTable": "secured_resources",
+  "modelBinding": "organization_default",
+  "idRule": "bot_builtin_{sha256(organization_id|agent_kind)[:32]}",
+  "agents": [
+    {
+      "agentKind": "project_workspace",
+      "handle": "project-workspace",
+      "label": "项目工作台",
+      "capabilityPolicyVersion": "yiyu.project-workspace.v2",
+      "serviceGoal": "基于当前项目的本机可读原件、组织共享知识和官网权威事实完成证据优先的问答、搜索、智能编辑、模板与报告草稿。",
+      "directOutputs": ["只读回答", "检索结果", "编辑草稿", "报告草稿"],
+      "commandBoundaries": ["回答不得自行升级为正式事实", "业务写入必须经过正式命令、提案或审批", "不得代办其他内置 Agent 的岗位"],
+      "baseMode": "证据不足时只回答可由现有证据支持的部分，不使用通用背景补齐"
+    },
+    {
+      "agentKind": "task_planning",
+      "handle": "task-planning",
+      "label": "任务计划",
+      "capabilityPolicyVersion": "yiyu.task-planning.v2",
+      "serviceGoal": "维护项目安全关键词画像，并在任务编辑器中基于标题和说明确定性推荐最可能的项目，同时为任务、计划和复盘提供背景辅助。",
+      "directOutputs": ["项目关键词画像", "项目匹配建议", "任务前情", "计划建议", "复盘辅助"],
+      "commandBoundaries": ["不得覆盖用户手动选择的项目", "不得主动决定日期、优先级、负责人或协作者", "不得暗中创建或修改任务", "任务变化必须形成草稿、提案或正式命令", "不得代办其他内置 Agent 的岗位"],
+      "baseMode": "专门能力不可用时保留确定性任务功能并准确说明基础模式"
+    },
+    {
+      "agentKind": "meeting_minutes",
+      "handle": "meeting-minutes",
+      "label": "会议纪要",
+      "capabilityPolicyVersion": "yiyu.meeting-minutes.v2",
+      "serviceGoal": "在转写就绪后自动整理成员本机录音或转写，生成并发布版本化正式纪要，同时提取行动候选和未决线索。",
+      "directOutputs": ["转写整理", "正式纪要版本", "行动候选", "未决线索"],
+      "commandBoundaries": ["原录音和完整转写默认留在本机", "用户纠错必须生成新的正式纪要版本", "行动项只形成候选，不得暗中创建任务", "不得代办其他内置 Agent 的岗位"],
+      "baseMode": "专门能力不可用时保留已有录音与文本整理并准确说明基础模式"
+    },
+    {
+      "agentKind": "strategy_companion",
+      "handle": "strategy-companion",
+      "label": "战略陪伴",
+      "capabilityPolicyVersion": "yiyu.strategy-companion.v2",
+      "serviceGoal": "从 Wiki 证据与正式项目事实加工客户档案、关系卡、官网增量和战略材料。",
+      "directOutputs": ["客户档案版本", "关系卡", "战略判断候选", "下一步候选", "战略材料草稿"],
+      "commandBoundaries": ["档案必须先基于 Wiki 证据提炼再由人工事实校正", "不得直接展示纠错原文替代档案", "不得把候选暗中升级为任务或事实", "不得直接调用情报研究 Agent"],
+      "baseMode": "专门能力不可用时保留当前已核实档案并准确说明基础模式"
+    },
+    {
+      "agentKind": "intelligence_research",
+      "handle": "intelligence-research",
+      "label": "情报研究",
+      "capabilityPolicyVersion": "yiyu.intelligence-research.v2",
+      "serviceGoal": "将隐性官网权威采集与用户手动触发的显性议题情报研究分开执行，完成目标规划、公开来源检索、去重、核实和冲突发现。",
+      "directOutputs": ["官网采集版本", "显性情报记录", "无歧义官网事实", "待核实线索", "冲突提示"],
+      "commandBoundaries": ["官网隐性采集不得出现在情报站显性列表", "显性情报不得自动写入项目正式事实", "只有无歧义且无冲突的官网事实可按合同自动确认", "不得代办其他内置 Agent 的岗位"],
+      "baseMode": "外部来源不可用时保留已确认版本并准确显示可重试状态"
+    },
+    {
+      "agentKind": "growth_companion",
+      "handle": "growth-companion",
+      "label": "成长陪伴",
+      "capabilityPolicyVersion": "yiyu.growth-companion.v2",
+      "serviceGoal": "每周消费本人获授权的任务、会议、复盘、工作记录与稳定偏好，形成可纠正、可排除并可重算的个人成长解释和学习建议。",
+      "directOutputs": ["每周成长总结", "成长证据", "变化与模式", "盲点", "学习建议"],
+      "commandBoundaries": ["定位是个人成长教练而非绩效评价或排名", "不得把成长数据转换成 Skill", "不得把成长数据写为项目记忆", "不得修改任务或项目事实", "不得读取未授权的成员偏好"],
+      "baseMode": "专门能力不可用时保留确定性成长记录并准确说明基础模式"
+    }
+  ]
+}

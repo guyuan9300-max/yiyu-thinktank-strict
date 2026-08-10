@@ -1,0 +1,226 @@
+{
+  "schemaVersion": 1,
+  "generatedOn": "2026-08-05",
+  "source": "ADAPTATION_IMPORT_GAPS.json",
+  "hostContract": "src/shared/agentMemoryPorts.ts",
+  "decisionCount": 24,
+  "decisions": [
+    {
+      "target": "main/src/config.js",
+      "importedBy": [
+        "main/src/core/hooks/auto-capture.ts",
+        "main/src/core/hooks/auto-recall.ts"
+      ],
+      "resolution": "replace_explicit_input",
+      "reason": "配置与作用域必须由调用方显式传入"
+    },
+    {
+      "target": "main/src/core/report/reporter.js",
+      "importedBy": [
+        "main/src/core/persona/persona-generator.ts",
+        "main/src/core/record/l1-extractor.ts",
+        "main/src/core/scene/scene-extractor.ts",
+        "main/src/utils/clean-context-runner.ts"
+      ],
+      "resolution": "replace_audit_port",
+      "reason": "统一进入益语审计/可观测端口"
+    },
+    {
+      "target": "main/src/core/store/sqlite.js",
+      "importedBy": [
+        "main/src/core/hooks/auto-recall.ts",
+        "main/src/core/record/l1-dedup.ts",
+        "main/src/core/tools/conversation-search.ts",
+        "main/src/core/tools/memory-search.ts"
+      ],
+      "resolution": "replace_authority_port",
+      "reason": "不得搬回数据库、DDL或Store实现"
+    },
+    {
+      "target": "main/src/offload/l3-helpers.js",
+      "importedBy": [
+        "main/src/offload/mmd-injector.ts"
+      ],
+      "resolution": "replace_cache_or_orchestrator",
+      "reason": "只允许可重建缓存或益语持久作业编排"
+    },
+    {
+      "target": "main/src/offload/opik-tracer.js",
+      "importedBy": [
+        "main/src/offload/mmd-injector.ts"
+      ],
+      "resolution": "replace_audit_port",
+      "reason": "统一进入益语审计/可观测端口"
+    },
+    {
+      "target": "main/src/offload/state-manager.js",
+      "importedBy": [
+        "main/src/offload/mmd-injector.ts",
+        "main/src/offload/pipelines/l2-mermaid.ts"
+      ],
+      "resolution": "replace_cache_or_orchestrator",
+      "reason": "只允许可重建缓存或益语持久作业编排"
+    },
+    {
+      "target": "main/src/offload/storage.js",
+      "importedBy": [
+        "main/src/offload/mmd-injector.ts",
+        "main/src/offload/pipelines/l2-mermaid.ts"
+      ],
+      "resolution": "replace_cache_or_orchestrator",
+      "reason": "只允许可重建缓存或益语持久作业编排"
+    },
+    {
+      "target": "main/src/src/offload/fast-token-estimate.ts",
+      "importedBy": [
+        "main/src/offload/benchmark-token-estimate.ts"
+      ],
+      "resolution": "repair_internal_import",
+      "reason": "纯算法内部路径修正，不增加宿主依赖"
+    },
+    {
+      "target": "main/src/utils/backup.js",
+      "importedBy": [
+        "main/src/core/persona/persona-generator.ts",
+        "main/src/core/scene/scene-extractor.ts"
+      ],
+      "resolution": "replace_cache_or_orchestrator",
+      "reason": "只允许可重建缓存或益语持久作业编排"
+    },
+    {
+      "target": "main/src/utils/checkpoint.js",
+      "importedBy": [
+        "main/src/core/hooks/auto-capture.ts",
+        "main/src/core/persona/persona-generator.ts",
+        "main/src/core/persona/persona-trigger.ts",
+        "main/src/core/scene/scene-extractor.ts"
+      ],
+      "resolution": "replace_cache_or_orchestrator",
+      "reason": "只允许可重建缓存或益语持久作业编排"
+    },
+    {
+      "target": "main/src/utils/env.js",
+      "importedBy": [
+        "main/src/utils/clean-context-runner.ts"
+      ],
+      "resolution": "replace_explicit_input",
+      "reason": "配置与作用域必须由调用方显式传入"
+    },
+    {
+      "target": "main/src/utils/pipeline-manager.js",
+      "importedBy": [
+        "main/src/core/hooks/auto-capture.ts"
+      ],
+      "resolution": "replace_orchestrator",
+      "reason": "由益语有界队列和执行编排接管"
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/report/kafka-metric-producer.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/skill-extractor.ts"
+      ],
+      "resolution": "replace_audit_port",
+      "reason": "统一进入益语审计/可观测端口"
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/report/obs-logger.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/conversation-add/add-handler.ts",
+        "team_beta/MemoryCore/src/core/skill/conversation-add/extract-worker.ts",
+        "team_beta/MemoryCore/src/core/skill/conversation-add/trigger-service.ts",
+        "team_beta/MemoryCore/src/core/skill/skill-extractor.ts"
+      ],
+      "resolution": "replace_audit_port",
+      "reason": "统一进入益语审计/可观测端口"
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/report/otel-context.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/conversation-add/extract-worker.ts"
+      ],
+      "resolution": "replace_audit_port",
+      "reason": "统一进入益语审计/可观测端口"
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/report/trace.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/conversation-add/extract-worker.ts",
+        "team_beta/MemoryCore/src/core/skill/skill-extractor.ts"
+      ],
+      "resolution": "replace_audit_port",
+      "reason": "统一进入益语审计/可观测端口"
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/skill/skill-store-ddl.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/index.ts"
+      ],
+      "resolution": "replace_authority_port",
+      "reason": "不得搬回数据库、DDL或Store实现"
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/skill/skill-store.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/index.ts",
+        "team_beta/MemoryCore/src/core/skill/skill-versioning.ts"
+      ],
+      "resolution": "replace_authority_port",
+      "reason": "不得搬回数据库、DDL或Store实现"
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/storage/adapter.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/conversation-add/buffer-storage.ts",
+        "team_beta/MemoryCore/src/core/skill/conversation-add/wire.ts",
+        "team_beta/MemoryCore/src/core/skill/skill-resource-store.ts",
+        "team_beta/MemoryCore/src/core/skill/skill-versioning.ts"
+      ],
+      "resolution": "replace_cache_or_orchestrator",
+      "reason": "只允许可重建缓存或益语持久作业编排"
+    },
+    {
+      "target": "team_beta/MemoryCore/src/utils/short-id.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/skill-core.ts"
+      ],
+      "resolution": "replace_authority_id",
+      "reason": "ID由88表权威写入结果生成"
+    },
+    {
+      "target": "team_beta/MemoryKnowledge/src/engines/wiki/index-db.js",
+      "importedBy": [
+        "team_beta/MemoryKnowledge/src/engines/wiki/manager.ts"
+      ],
+      "resolution": "replace_authority_port",
+      "reason": "不得搬回数据库、DDL或Store实现"
+    },
+    {
+      "target": "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/llm.js",
+      "importedBy": [
+        "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/index.ts",
+        "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/merge.ts",
+        "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/overview.ts"
+      ],
+      "resolution": "replace_model_port",
+      "reason": "模型由组织配置宿主注入"
+    },
+    {
+      "target": "team_beta/MemoryKnowledge/src/logger.js",
+      "importedBy": [
+        "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/index.ts",
+        "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/overview.ts",
+        "team_beta/MemoryKnowledge/src/engines/wiki/manager.ts"
+      ],
+      "resolution": "replace_audit_port",
+      "reason": "统一进入益语审计/可观测端口"
+    },
+    {
+      "target": "team_beta/MemoryKnowledge/src/telemetry.js",
+      "importedBy": [
+        "team_beta/MemoryKnowledge/src/engines/wiki/manager.ts"
+      ],
+      "resolution": "replace_audit_port",
+      "reason": "统一进入益语审计/可观测端口"
+    }
+  ]
+}

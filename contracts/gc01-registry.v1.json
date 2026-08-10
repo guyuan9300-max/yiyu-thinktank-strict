@@ -1,0 +1,126 @@
+{
+  "formatVersion": 1,
+  "registryId": "yiyu.gc01.identity-access.v1",
+  "goldenChainId": "GC-01",
+  "definitionVersion": 3,
+  "stateContract": "strict-six-state-v1",
+  "status": "active",
+  "completionState": "contract_ready",
+  "evidenceRef": "contracts/GC01_IDENTITY_ACCESS_CONTRACT_V1.md",
+  "controls": [
+    {
+      "controlId": "gc01.control.auth.login",
+      "surface": "organization_auth_modal",
+      "intentKind": "command",
+      "operationId": "gc01.command.session.login",
+      "localRead": ["sandboxes", "schema_versions", "authorization_scopes", "commands", "idempotency_records", "organization_memberships", "organizations", "policy_versions", "principals", "viewer_projections"],
+      "localWrite": ["principals", "organizations", "authorization_scopes", "organization_memberships", "sandboxes", "policy_versions", "viewer_projections", "idempotency_records", "commands", "audit_events", "reconciliation_runs"],
+      "cloudRead": ["principals", "organizations", "authorization_scopes", "organization_memberships", "policy_versions", "viewer_projections", "commands", "sandboxes"],
+      "cloudWrite": ["sandboxes", "idempotency_records", "commands", "outbox_events", "audit_events"]
+    },
+    {
+      "controlId": "gc01.control.auth.relogin",
+      "surface": "organization_auth_modal",
+      "intentKind": "command",
+      "operationId": "gc01.command.session.login",
+      "localRead": ["sandboxes", "schema_versions", "authorization_scopes", "commands", "idempotency_records", "organization_memberships", "organizations", "policy_versions", "principals", "viewer_projections"],
+      "localWrite": ["principals", "organizations", "authorization_scopes", "organization_memberships", "sandboxes", "policy_versions", "viewer_projections", "idempotency_records", "commands", "audit_events", "reconciliation_runs"],
+      "cloudRead": ["principals", "organizations", "authorization_scopes", "organization_memberships", "policy_versions", "viewer_projections", "commands", "sandboxes"],
+      "cloudWrite": ["sandboxes", "idempotency_records", "commands", "outbox_events", "audit_events"]
+    },
+    {
+      "controlId": "gc01.control.auth.refresh",
+      "surface": "application_shell",
+      "intentKind": "command",
+      "operationId": "gc01.command.session.refresh",
+      "localRead": ["sandboxes", "authorization_scopes", "organization_memberships", "organizations", "principals", "policy_versions", "viewer_projections"],
+      "localWrite": ["sandboxes", "authorization_scopes", "organization_memberships", "policy_versions", "viewer_projections", "idempotency_records", "commands", "outbox_events", "audit_events"],
+      "cloudRead": ["sandboxes", "authorization_scopes", "organization_memberships", "organizations", "principals", "policy_versions", "viewer_projections", "commands"],
+      "cloudWrite": ["sandboxes", "viewer_projections", "idempotency_records", "commands", "outbox_events", "audit_events"]
+    },
+    {
+      "controlId": "gc01.control.workspace.selector",
+      "surface": "workspace_switcher",
+      "intentKind": "query",
+      "operationId": "gc01.query.workspaces.list",
+      "localRead": ["sandboxes", "authorization_scopes", "organizations"],
+      "localWrite": [],
+      "cloudRead": [],
+      "cloudWrite": []
+    },
+    {
+      "controlId": "gc01.control.workspace.switch",
+      "surface": "workspace_switcher",
+      "intentKind": "command",
+      "operationId": "gc01.command.workspace.switch",
+      "localRead": ["sandboxes", "authorization_scopes", "organizations", "organization_memberships", "principals", "policy_versions", "viewer_projections", "commands"],
+      "localWrite": ["sandboxes", "authorization_scopes", "organization_memberships", "policy_versions", "viewer_projections", "idempotency_records", "commands", "outbox_events", "audit_events"],
+      "cloudRead": ["sandboxes", "authorization_scopes", "organizations", "organization_memberships", "principals", "policy_versions", "viewer_projections"],
+      "cloudWrite": ["sandboxes", "viewer_projections", "idempotency_records", "commands", "outbox_events", "audit_events"]
+    },
+    {
+      "controlId": "gc01.control.identity.card",
+      "surface": "account_identity_card",
+      "intentKind": "query",
+      "operationId": "gc01.query.auth.current",
+      "localRead": ["sandboxes", "authorization_scopes", "organizations", "organization_memberships", "principals", "policy_versions", "viewer_projections"],
+      "localWrite": [],
+      "cloudRead": [],
+      "cloudWrite": []
+    },
+    {
+      "controlId": "gc01.control.authorization.surface",
+      "surface": "application_shell",
+      "intentKind": "query",
+      "operationId": "gc01.query.authorization.current",
+      "localRead": ["sandboxes", "authorization_scopes", "organizations", "organization_memberships", "principals", "policy_versions", "viewer_projections"],
+      "localWrite": [],
+      "cloudRead": [],
+      "cloudWrite": []
+    },
+    {
+      "controlId": "gc01.control.auth.logout",
+      "surface": "account_identity_card",
+      "intentKind": "command",
+      "operationId": "gc01.command.session.logout",
+      "localRead": ["sandboxes", "authorization_scopes", "organization_memberships", "organizations", "principals", "policy_versions", "viewer_projections"],
+      "localWrite": ["sandboxes", "idempotency_records", "commands", "outbox_events", "audit_events"],
+      "cloudRead": ["sandboxes", "authorization_scopes", "organization_memberships", "principals", "commands"],
+      "cloudWrite": ["sandboxes", "idempotency_records", "commands", "outbox_events", "audit_events"]
+    }
+  ],
+  "queries": [
+    {
+      "queryId": "gc01.query.auth.current",
+      "authorityKind": "cloud_authority_local_projection",
+      "projectionKind": "last_confirmed_identity",
+      "stalePolicy": "usable_read_only_until_lease_expiry",
+      "localRead": ["sandboxes", "authorization_scopes", "organizations", "organization_memberships", "principals", "policy_versions", "viewer_projections"],
+      "cloudRead": []
+    },
+    {
+      "queryId": "gc01.query.workspaces.list",
+      "authorityKind": "row_authority",
+      "projectionKind": "local_sandbox_with_cloud_identity_projection",
+      "stalePolicy": "show_last_confirmed_with_status",
+      "localRead": ["sandboxes", "authorization_scopes", "organizations"],
+      "cloudRead": []
+    },
+    {
+      "queryId": "gc01.query.workspace.current",
+      "authorityKind": "row_authority",
+      "projectionKind": "active_local_sandbox",
+      "stalePolicy": "fail_closed_when_identity_lease_expires",
+      "localRead": ["sandboxes", "authorization_scopes", "organizations", "organization_memberships", "principals", "policy_versions", "viewer_projections"],
+      "cloudRead": []
+    },
+    {
+      "queryId": "gc01.query.authorization.current",
+      "authorityKind": "cloud_authority_local_projection",
+      "projectionKind": "viewer_surfaces_and_capabilities",
+      "stalePolicy": "fail_closed_when_authorization_lease_expires",
+      "localRead": ["sandboxes", "authorization_scopes", "organizations", "organization_memberships", "principals", "policy_versions", "viewer_projections"],
+      "cloudRead": ["sandboxes", "authorization_scopes", "organization_memberships", "principals", "policy_versions", "viewer_projections"]
+    }
+  ]
+}

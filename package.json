@@ -1,0 +1,109 @@
+{
+  "name": "yiyu-thinktank-strict",
+  "version": "0.29.1",
+  "private": true,
+  "description": "益语智库AI严格数据库候选",
+  "type": "commonjs",
+  "main": "build/main/main/main.js",
+  "scripts": {
+    "dev:renderer": "vite --host 127.0.0.1 --port 4188 --strictPort",
+    "dev:main": "tsc -p tsconfig.node.json --watch",
+    "dev:electron": "wait-on tcp:4188 build/main/main/main.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:4188 electron .",
+    "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:main\" \"npm:dev:electron\"",
+    "typecheck:renderer": "tsc --noEmit --pretty false -p tsconfig.json",
+    "build:main": "tsc -p tsconfig.node.json",
+    "build:renderer": "npm run typecheck:renderer && vite build",
+    "build:python": "uv run python -m compileall backend cloud_backend strict_common scripts",
+    "build:backend-runtime": "uv run python scripts/build_backend_runtime.py",
+    "build": "npm run build:main && npm run build:renderer && npm run build:python && npm run build:backend-runtime",
+    "test:python": "uv run pytest -q",
+    "test:renderer": "tsx --test tests/frontend-entry-contract.test.mjs tests/repository-identity-contract.test.mjs src/renderer/lib/organizationEmployeeFilters.test.ts src/renderer/lib/scopedAsyncGate.test.ts src/shared/*.test.ts src/shared/*.test.mts",
+    "test:packaged": "node --test tests/packaged-candidate-contract.test.mjs",
+    "test:strict": "npm run test:python && npm run test:renderer",
+    "audit:strict": "uv run python scripts/audit_strict_candidate.py",
+    "audit:ui-routes": "node scripts/ui_route_inventory.mjs",
+    "audit:ui-handlers": "uv run python scripts/audit_ui_domain_handlers.py",
+    "report:ui-runtime-coverage": "uv run python scripts/report_ui_route_runtime_coverage.py",
+    "audit:artifacts": "uv run python scripts/audit_tracked_artifacts.py",
+    "verify:strict-sync": "npm run audit:artifacts && npm run audit:strict && npm run test:strict && npm run build:main && npm run build:renderer && npm run build:python",
+    "package:mac-local": "electron-builder --dir --mac dir --arm64 -c.electronDist=node_modules/electron/dist -c.mac.identity=null -c.mac.hardenedRuntime=false -c.mac.gatekeeperAssess=false -c.mac.forceCodeSigning=false -c.mac.notarize=false",
+    "dist:mac-local": "npm run build && npm run package:mac-local",
+    "start": "electron ."
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@electron/asar": "^3.4.1",
+    "@mdxeditor/editor": "4.0.0",
+    "@tailwindcss/typography": "^0.5.16",
+    "@types/node": "^22.13.9",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.21",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^37.6.1",
+    "electron-builder": "^26.0.12",
+    "lucide-react": "^0.511.0",
+    "postcss": "^8.5.3",
+    "qrcode": "1.5.4",
+    "react": "^18.3.1",
+    "react-activity-calendar": "3.2.0",
+    "react-dom": "^18.3.1",
+    "recharts": "3.8.1",
+    "tailwindcss": "^3.4.17",
+    "tsx": "4.23.1",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.1",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.yiyu.thinktank.strict",
+    "productName": "益语智库AI（新版）",
+    "asar": true,
+    "afterPack": "scripts/after_pack_strict.cjs",
+    "directories": {
+      "buildResources": "build-resources"
+    },
+    "files": [
+      "build/main/**/*",
+      "dist/renderer/**/*",
+      "package.json",
+      "!**/*.map"
+    ],
+    "extraResources": [
+      {
+        "from": "backend-dist",
+        "to": "backend-dist",
+        "filter": [
+          "yiyu-strict-backend*"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "build-resources/icon.icns",
+      "artifactName": "yiyu-thinktank-strict-${version}-${arch}.${ext}"
+    },
+    "win": {
+      "icon": "build-resources/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "yiyu-thinktank-strict-${version}-${arch}-setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "益语智库AI（新版）"
+    }
+  }
+}

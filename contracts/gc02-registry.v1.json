@@ -1,0 +1,153 @@
+{
+  "formatVersion": 1,
+  "registryId": "yiyu.gc02.client-sharing.v1",
+  "goldenChainId": "GC-02",
+  "definitionVersion": 2,
+  "stateContract": "strict-six-state-v1",
+  "status": "active",
+  "completionState": "runtime_verified",
+  "evidenceRef": "contracts/GC02_CLIENT_SHARING_CONTRACT_V1.md",
+  "runtimeEvidenceRef": "output/gc02-phase11/GC02_RUNTIME_VERIFICATION_20260807.md",
+  "controls": [
+    {
+      "controlId": "gc02.control.clients.list",
+      "surface": "project_workspace_selector",
+      "intentKind": "query",
+      "operationId": "gc02.query.clients.list",
+      "localRead": ["sandboxes", "clients", "viewer_projections", "policy_versions"],
+      "localWrite": [],
+      "cloudRead": ["clients", "secured_resources", "object_grants", "policy_versions", "organization_memberships"],
+      "cloudWrite": []
+    },
+    {
+      "controlId": "gc02.control.client.open",
+      "surface": "project_workspace",
+      "intentKind": "query",
+      "operationId": "gc02.query.client.detail",
+      "localRead": ["sandboxes", "clients", "viewer_projections", "policy_versions"],
+      "localWrite": [],
+      "cloudRead": ["clients", "secured_resources", "object_grants", "policy_versions", "organization_memberships"],
+      "cloudWrite": []
+    },
+    {
+      "controlId": "gc02.control.client.create",
+      "surface": "project_editor_modal",
+      "intentKind": "command",
+      "operationId": "gc02.command.client.create",
+      "localRead": ["sandboxes", "organization_memberships", "commands", "idempotency_records"],
+      "localWrite": ["clients", "viewer_projections", "policy_versions", "commands", "idempotency_records", "audit_events", "reconciliation_runs"],
+      "cloudRead": ["organization_memberships", "commands", "idempotency_records", "object_manifests"],
+      "cloudWrite": ["clients", "secured_resources", "object_grants", "policy_versions", "commands", "idempotency_records", "object_manifests", "outbox_events", "audit_events"]
+    },
+    {
+      "controlId": "gc02.control.client.edit",
+      "surface": "project_editor_modal",
+      "intentKind": "command",
+      "operationId": "gc02.command.client.edit",
+      "localRead": ["sandboxes", "clients", "commands", "idempotency_records"],
+      "localWrite": ["clients", "commands", "idempotency_records", "audit_events", "reconciliation_runs"],
+      "cloudRead": ["clients", "secured_resources", "object_grants", "policy_versions", "commands", "idempotency_records", "object_manifests"],
+      "cloudWrite": ["clients", "commands", "idempotency_records", "object_manifests", "outbox_events", "audit_events"]
+    },
+    {
+      "controlId": "gc02.control.client.share",
+      "surface": "project_editor_modal",
+      "intentKind": "command",
+      "operationId": "gc02.command.client.share",
+      "localRead": ["sandboxes", "clients", "organization_memberships", "policy_versions", "commands", "idempotency_records"],
+      "localWrite": ["clients", "object_grants", "policy_versions", "viewer_projections", "commands", "idempotency_records", "outbox_events", "audit_events", "reconciliation_runs"],
+      "cloudRead": ["clients", "secured_resources", "organization_memberships", "object_grants", "policy_versions", "commands", "idempotency_records"],
+      "cloudWrite": ["clients", "object_grants", "policy_versions", "viewer_projections", "commands", "idempotency_records", "outbox_events", "audit_events"]
+    },
+    {
+      "controlId": "gc02.control.client.revoke",
+      "surface": "project_editor_modal",
+      "intentKind": "command",
+      "operationId": "gc02.command.client.revoke",
+      "localRead": ["sandboxes", "clients", "object_grants", "policy_versions", "viewer_projections", "commands", "idempotency_records"],
+      "localWrite": ["clients", "object_grants", "policy_versions", "viewer_projections", "derivation_lineage", "search_index_manifests", "vector_index_manifests", "ai_context_manifests", "cache_entries", "export_grants", "commands", "idempotency_records", "outbox_events", "audit_events", "reconciliation_runs"],
+      "cloudRead": ["clients", "secured_resources", "object_grants", "policy_versions", "viewer_projections", "commands", "idempotency_records"],
+      "cloudWrite": ["clients", "object_grants", "policy_versions", "viewer_projections", "derivation_lineage", "search_index_manifests", "vector_index_manifests", "ai_context_manifests", "cache_entries", "export_grants", "commands", "idempotency_records", "outbox_events", "audit_events", "reconciliation_runs"]
+    },
+    {
+      "controlId": "gc02.control.client.archive",
+      "surface": "project_editor_modal",
+      "intentKind": "command",
+      "operationId": "gc02.command.client.archive",
+      "localRead": ["sandboxes", "clients", "commands", "idempotency_records"],
+      "localWrite": ["clients", "viewer_projections", "derivation_lineage", "commands", "idempotency_records", "outbox_events", "audit_events", "reconciliation_runs"],
+      "cloudRead": ["clients", "secured_resources", "object_grants", "policy_versions", "commands", "idempotency_records"],
+      "cloudWrite": ["clients", "viewer_projections", "derivation_lineage", "commands", "idempotency_records", "outbox_events", "audit_events"]
+    },
+    {
+      "controlId": "gc02.control.skill.share",
+      "surface": "workbench_skill_picker",
+      "intentKind": "command",
+      "operationId": "gc02.command.skill.share",
+      "localRead": ["sandboxes", "automation_rules", "organization_memberships", "object_grants", "policy_versions", "commands", "idempotency_records"],
+      "localWrite": ["automation_rules", "object_grants", "policy_versions", "commands", "idempotency_records", "outbox_events", "audit_events", "reconciliation_runs"],
+      "cloudRead": ["automation_rules", "secured_resources", "organization_memberships", "object_grants", "policy_versions", "commands", "idempotency_records"],
+      "cloudWrite": ["automation_rules", "object_grants", "policy_versions", "commands", "idempotency_records", "outbox_events", "audit_events"]
+    },
+    {
+      "controlId": "gc02.control.memory.sync",
+      "surface": "workbench_quick_tools",
+      "intentKind": "command",
+      "operationId": "gc02.command.memory.sync",
+      "localRead": ["sandboxes", "object_manifests", "outbox_events", "inbox_receipts", "reconciliation_runs", "commands", "idempotency_records"],
+      "localWrite": ["object_manifests", "outbox_events", "inbox_receipts", "reconciliation_runs", "commands", "idempotency_records", "audit_events"],
+      "cloudRead": ["object_manifests", "inbox_receipts", "reconciliation_runs", "commands", "idempotency_records"],
+      "cloudWrite": ["object_manifests", "inbox_receipts", "reconciliation_runs", "commands", "idempotency_records", "outbox_events", "audit_events"]
+    }
+  ],
+  "queries": [
+    {
+      "queryId": "gc02.query.clients.list",
+      "authorityKind": "cloud_authority_local_projection",
+      "projectionKind": "authorized_client_list",
+      "stalePolicy": "show_last_confirmed_until_authorization_lease_expiry",
+      "localRead": ["sandboxes", "clients", "viewer_projections", "policy_versions"],
+      "cloudRead": ["clients", "secured_resources", "object_grants", "policy_versions", "organization_memberships"]
+    },
+    {
+      "queryId": "gc02.query.client.detail",
+      "authorityKind": "cloud_authority_local_projection",
+      "projectionKind": "authorized_client_detail",
+      "stalePolicy": "show_last_confirmed_read_only_until_authorization_lease_expiry",
+      "localRead": ["sandboxes", "clients", "viewer_projections", "policy_versions"],
+      "cloudRead": ["clients", "secured_resources", "object_grants", "policy_versions", "organization_memberships"]
+    },
+    {
+      "queryId": "gc02.query.client.authorization",
+      "authorityKind": "cloud_authority_local_projection",
+      "projectionKind": "client_capability_projection",
+      "stalePolicy": "fail_closed_when_authorization_lease_expires",
+      "localRead": ["sandboxes", "clients", "viewer_projections", "policy_versions", "object_grants"],
+      "cloudRead": ["clients", "secured_resources", "object_grants", "policy_versions", "organization_memberships", "viewer_projections"]
+    },
+    {
+      "queryId": "gc02.query.shared.project.knowledge",
+      "authorityKind": "cloud_authority_filtered_by_client_grant",
+      "projectionKind": "authorized_shared_project_knowledge",
+      "stalePolicy": "fail_closed_when_client_grant_is_revoked",
+      "localRead": ["sandboxes", "clients", "knowledge_documents", "document_versions", "narrative_outputs", "artifact_versions", "atomic_facts", "viewer_projections", "policy_versions"],
+      "cloudRead": ["clients", "secured_resources", "object_grants", "policy_versions", "knowledge_documents", "document_versions", "narrative_outputs", "artifact_versions", "atomic_facts"]
+    },
+    {
+      "queryId": "gc02.query.memory.safe_manifest",
+      "authorityKind": "row_authority_safe_manifest_only",
+      "projectionKind": "member_project_memory_safe_manifest",
+      "stalePolicy": "show_local_summary_and_retry_cloud_sync",
+      "localRead": ["sandboxes", "object_manifests", "outbox_events", "inbox_receipts", "reconciliation_runs"],
+      "cloudRead": ["object_manifests", "inbox_receipts", "reconciliation_runs"]
+    },
+    {
+      "queryId": "gc02.query.skill.visibility",
+      "authorityKind": "cloud_authority_local_projection",
+      "projectionKind": "authorized_agent_skill_list",
+      "stalePolicy": "fail_closed_when_skill_grant_is_revoked",
+      "localRead": ["sandboxes", "automation_rules", "object_grants", "policy_versions", "organization_memberships"],
+      "cloudRead": ["automation_rules", "secured_resources", "object_grants", "policy_versions", "organization_memberships"]
+    }
+  ]
+}

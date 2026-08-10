@@ -1,0 +1,52 @@
+{
+  "formatVersion": 1,
+  "description": "严格新版成熟 renderer 路径的并行接通所有权；规则按顺序首个命中生效。",
+  "domains": [
+    {
+      "id": "project_materials",
+      "label": "项目、资料、文件夹、导入与共享知识",
+      "patterns": [
+        "^clients/:[^/]+/(?:documents|folders|link-materials|glossary(?:$|/)|glossary-attributes|glossary-drift-alerts|contradictions|duplicate-documents|entities|entity-merge-candidates|fact-bundle|knowledge-status|knowledge-context|feishu-doc-import)(?:/|$)",
+        "^clients(?:/:[^/]+)?$",
+        "^clients/:[^/]+/(?:freeze|unfreeze|delete-preview)$",
+        "^(?:smart-import|documents|imports|glossary|entities|contradictions)(?:/|$)"
+      ]
+    },
+    {
+      "id": "workbench_outputs",
+      "label": "工作台问答、分析、叙事、报告与收藏",
+      "patterns": [
+        "^clients(?:/|$)",
+    "^(?:agent-skills|analysis|analysis-tools|reports|report-artifacts|workspace-answer|workspace-answer-action-cards|workspace-answer-quality-failures|workspace-answer-value-reviews|workspace-answer-value-summary|workspace-value-validation-sessions|retrieval|writing-skills|memory|handbook|brain|digital-assets)(?:/|$)"
+      ]
+    },
+    {
+      "id": "workflow",
+      "label": "任务、事件线、计划与复盘",
+      "patterns": [
+        "^(?:tasks|task-lists|task-tags|task-views|event-lines|reviews|org-model|plan-link|meetings|gc04)(?:/|$)"
+      ]
+    },
+    {
+      "id": "intelligence_growth",
+      "label": "情报、主题、成长、提案与数据中心派生视图",
+      "patterns": [
+        "^(?:intelligence|topics|topic-candidates|growth|strategic|proposals|data-center|external-evidence-cards|execution-tickets|approvals|consultation|gc13)(?:/|$)"
+      ]
+    },
+    {
+      "id": "organization_access",
+      "label": "组织、成员、登录、工作空间、设置与后台管理",
+      "patterns": [
+        "^(?:auth|local-auth|admin|employees|org|me|workspaces|settings|local-input-memory|maintenance-mode|organization-directory)(?:/|$)"
+      ]
+    },
+    {
+      "id": "platform_integrations",
+      "label": "飞书、音频、本地模型、对象存储及其他平台能力",
+      "patterns": [
+        "^(?:agent-run-logs|ai-command|audio-transcription-jobs|feishu|feishu-doc-import|feishu-sync|local|local-ai|local-asr|logs|ollama|org-integrations|recordings|runtime|software-feedback|support-requests|system|tool-registry)(?:/|$)"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "formatVersion": 1,
+  "kind": "yiyu-strict-repository",
+  "genesisLabel": "blueprint-88-foundation-v8-agent-skill-contract",
+  "githubRepository": "guyuan9300-max/yiyu-thinktank-strict",
+  "githubRepositoryNumericId": 1316010273,
+  "githubRepositoryNodeId": "R_kgDOTnC5IQ",
+  "remoteUrl": "https://github.com/guyuan9300-max/yiyu-thinktank-strict.git",
+  "targetBranch": "main",
+  "localManifestHash": "19971bd3a3e1cf9beecdb5893b2b15fd6bc02c8951795fc828105ab481f20432",
+  "cloudManifestHash": "b1d65aa9e406398dd9692387406a3d8a27beb66c584bd6953c815eb413909a10"
+}

@@ -1,0 +1,37 @@
+{
+  "formatVersion": 1,
+  "policyId": "yiyu.gc01.organization-role-policy.v1",
+  "status": "active",
+  "policySpecSchemaVersion": "gc01.organization-role-policy.v1",
+  "viewerSurfacesSchemaVersion": "gc01.viewer-surfaces.v1",
+  "viewerCapabilitiesSchemaVersion": "gc01.viewer-capabilities.v1",
+  "leaseHours": 24,
+  "baselineProfile": "member",
+  "unknownRolePolicy": "baseline_least_privilege",
+  "profiles": {
+    "member": {
+      "surfaces": [
+        "application_shell",
+        "workspace_switcher",
+        "account_identity_card"
+      ],
+      "capabilities": [
+        "organization.read"
+      ]
+    },
+    "admin": {
+      "surfaces": [
+        "application_shell",
+        "workspace_switcher",
+        "account_identity_card",
+        "organization_administration"
+      ],
+      "capabilities": [
+        "organization.read",
+        "organization.manage",
+        "authorization.manage",
+        "organization_ai.manage"
+      ]
+    }
+  }
+}

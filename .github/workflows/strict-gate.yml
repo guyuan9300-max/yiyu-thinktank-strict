@@ -1,0 +1,33 @@
+name: strict-gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: strict-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  strict-gate:
+    name: strict-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.3"
+          enable-cache: true
+      - run: npm ci
+      - run: uv sync --frozen --dev
+      - run: npm run verify:strict-sync

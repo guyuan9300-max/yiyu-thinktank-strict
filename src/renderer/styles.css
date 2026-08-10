@@ -1,0 +1,349 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --window-drag-strip-height: 42px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: "PingFang SC", "SF Pro Display", "Helvetica Neue", sans-serif;
+  background-color: #f9fafb;
+  color: #1f2937;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.window-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.window-drag {
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+.window-drag-strip {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: var(--window-drag-strip-height);
+  z-index: 40;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+.workspace-thin-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.34) transparent;
+}
+
+.workspace-thin-scroll::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.workspace-thin-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.workspace-thin-scroll::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.32);
+  border-radius: 999px;
+}
+
+.workspace-thin-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(91, 123, 254, 0.42);
+}
+
+.animate-in {
+  animation: fadeIn 240ms ease-out both;
+}
+
+.fade-in {
+  animation: fadeIn 240ms ease-out both;
+}
+
+.slide-in-from-bottom-4,
+.slide-in-from-bottom-8 {
+  animation: slideInFromBottom 280ms ease-out both;
+}
+
+.slide-in-from-bottom,
+.slide-in-from-bottom-full {
+  animation: slideInFromBottomFull 320ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.slide-in-from-right {
+  animation: slideInFromRight 320ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.slide-in-from-top-5 {
+  animation: slideInFromTop 280ms ease-out both;
+}
+
+.zoom-in-95 {
+  animation: zoomIn95 220ms ease-out both;
+}
+
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+.line-clamp-3 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideInFromBottom {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideInFromBottomFull {
+  from {
+    opacity: 0;
+    transform: translateY(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideInFromRight {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes slideInFromTop {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -20px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+@keyframes zoomIn95 {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.thinking-orb {
+  position: relative;
+  z-index: 1;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #5b7bfe;
+  background: radial-gradient(circle at 30% 30%, rgba(126, 160, 255, 0.24), rgba(91, 123, 254, 0.08) 62%, rgba(91, 123, 254, 0.04));
+  border: 1px solid rgba(91, 123, 254, 0.16);
+  box-shadow: 0 10px 24px rgba(91, 123, 254, 0.14);
+  animation: thinkingFloat 2.8s ease-in-out infinite;
+}
+
+.thinking-ring {
+  position: absolute;
+  inset: -0.4rem;
+  border-radius: 1.25rem;
+  border: 1px solid rgba(91, 123, 254, 0.22);
+  opacity: 0;
+  animation: thinkingRingPulse 2.4s ease-out infinite;
+}
+
+.thinking-ring-delay {
+  animation-delay: 1.2s;
+}
+
+.thinking-progress-bar {
+  background: linear-gradient(90deg, #5b7bfe 0%, #8aa7ff 38%, #5b7bfe 72%, #b4c5ff 100%);
+  background-size: 200% 100%;
+  animation: thinkingShimmer 2.2s linear infinite;
+}
+
+.thinking-dot,
+.thinking-status-dot {
+  display: inline-block;
+  border-radius: 999px;
+  background: #5b7bfe;
+}
+
+.thinking-dot {
+  width: 0.4rem;
+  height: 0.4rem;
+  opacity: 0.35;
+  animation: thinkingDotWave 1.2s ease-in-out infinite;
+}
+
+.thinking-dot-delay-1 {
+  animation-delay: 0.18s;
+}
+
+.thinking-dot-delay-2 {
+  animation-delay: 0.36s;
+}
+
+.thinking-status-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  box-shadow: 0 0 0 0 rgba(91, 123, 254, 0.45);
+  animation: thinkingStatusPulse 1.8s ease-out infinite;
+}
+
+@keyframes thinkingFloat {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+@keyframes thinkingRingPulse {
+  0% {
+    opacity: 0;
+    transform: scale(0.9);
+  }
+  30% {
+    opacity: 0.55;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.18);
+  }
+}
+
+@keyframes thinkingShimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+@keyframes thinkingDotWave {
+  0%,
+  80%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.28;
+  }
+  40% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+@keyframes thinkingStatusPulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(91, 123, 254, 0.42);
+  }
+  70% {
+    box-shadow: 0 0 0 0.45rem rgba(91, 123, 254, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(91, 123, 254, 0);
+  }
+}
+
+@keyframes yiyu-thinking-shimmer {
+  0% { background-position: 200% 50%; }
+  100% { background-position: -200% 50%; }
+}
+
+@keyframes yiyu-thinking-fade {
+  0% { opacity: 0; transform: translateY(2px); }
+  20% { opacity: 1; transform: translateY(0); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes yiyu_quick_progress {
+  0% { transform: translateX(-110%); }
+  50% { transform: translateX(80%); }
+  100% { transform: translateX(260%); }
+}
+
+/* 工作台文档编辑器 (RichTextDocumentEditor / MDXEditor) placeholder 调浅
+   顾源源 5/26: 颜色太深, 大家下意识要删. 它是提醒不是命令, 浅灰即可.
+   用 attribute selector 真稳 (跨 MDXEditor 版本 hash 变化也命中). */
+.mdx-placeholder-light [class*='_placeholder_'] {
+  color: rgb(209 213 219) !important;
+}
+
+/* 事件线归档筛选使用浏览器原生 checkbox 状态，不依赖 React 异步状态或后端重载。 */
+.event-lines-panel:has(.event-lines-hide-archived-toggle:checked)
+  .event-line-card[data-event-line-status='archived'] {
+  display: none;
+}
+
+.event-lines-hide-archived-toggle:checked
+  ~ .event-lines-archive-toggle-track
+  .event-lines-archive-toggle-thumb {
+  transform: translateX(1rem);
+}

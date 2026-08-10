@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "generatedOn": "2026-08-05",
+  "purpose": "环节2必须替换为益语宿主适配或明确删除的上游相对导入；本文件不是运行时配置。",
+  "typescriptFilesScanned": 92,
+  "missingRelativeTargetCount": 24,
+  "gaps": [
+    {
+      "target": "main/src/config.js",
+      "importedBy": [
+        "main/src/core/hooks/auto-capture.ts",
+        "main/src/core/hooks/auto-recall.ts"
+      ]
+    },
+    {
+      "target": "main/src/core/report/reporter.js",
+      "importedBy": [
+        "main/src/core/persona/persona-generator.ts",
+        "main/src/core/record/l1-extractor.ts",
+        "main/src/core/scene/scene-extractor.ts",
+        "main/src/utils/clean-context-runner.ts"
+      ]
+    },
+    {
+      "target": "main/src/core/store/sqlite.js",
+      "importedBy": [
+        "main/src/core/hooks/auto-recall.ts",
+        "main/src/core/record/l1-dedup.ts",
+        "main/src/core/tools/conversation-search.ts",
+        "main/src/core/tools/memory-search.ts"
+      ]
+    },
+    {
+      "target": "main/src/offload/l3-helpers.js",
+      "importedBy": [
+        "main/src/offload/mmd-injector.ts"
+      ]
+    },
+    {
+      "target": "main/src/offload/opik-tracer.js",
+      "importedBy": [
+        "main/src/offload/mmd-injector.ts"
+      ]
+    },
+    {
+      "target": "main/src/offload/state-manager.js",
+      "importedBy": [
+        "main/src/offload/mmd-injector.ts",
+        "main/src/offload/pipelines/l2-mermaid.ts"
+      ]
+    },
+    {
+      "target": "main/src/offload/storage.js",
+      "importedBy": [
+        "main/src/offload/mmd-injector.ts",
+        "main/src/offload/pipelines/l2-mermaid.ts"
+      ]
+    },
+    {
+      "target": "main/src/src/offload/fast-token-estimate.ts",
+      "importedBy": [
+        "main/src/offload/benchmark-token-estimate.ts"
+      ]
+    },
+    {
+      "target": "main/src/utils/backup.js",
+      "importedBy": [
+        "main/src/core/persona/persona-generator.ts",
+        "main/src/core/scene/scene-extractor.ts"
+      ]
+    },
+    {
+      "target": "main/src/utils/checkpoint.js",
+      "importedBy": [
+        "main/src/core/hooks/auto-capture.ts",
+        "main/src/core/persona/persona-generator.ts",
+        "main/src/core/persona/persona-trigger.ts",
+        "main/src/core/scene/scene-extractor.ts"
+      ]
+    },
+    {
+      "target": "main/src/utils/env.js",
+      "importedBy": [
+        "main/src/utils/clean-context-runner.ts"
+      ]
+    },
+    {
+      "target": "main/src/utils/pipeline-manager.js",
+      "importedBy": [
+        "main/src/core/hooks/auto-capture.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/report/kafka-metric-producer.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/skill-extractor.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/report/obs-logger.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/conversation-add/add-handler.ts",
+        "team_beta/MemoryCore/src/core/skill/conversation-add/extract-worker.ts",
+        "team_beta/MemoryCore/src/core/skill/conversation-add/trigger-service.ts",
+        "team_beta/MemoryCore/src/core/skill/skill-extractor.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/report/otel-context.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/conversation-add/extract-worker.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/report/trace.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/conversation-add/extract-worker.ts",
+        "team_beta/MemoryCore/src/core/skill/skill-extractor.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/skill/skill-store-ddl.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/index.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/skill/skill-store.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/index.ts",
+        "team_beta/MemoryCore/src/core/skill/skill-versioning.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryCore/src/core/storage/adapter.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/conversation-add/buffer-storage.ts",
+        "team_beta/MemoryCore/src/core/skill/conversation-add/wire.ts",
+        "team_beta/MemoryCore/src/core/skill/skill-resource-store.ts",
+        "team_beta/MemoryCore/src/core/skill/skill-versioning.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryCore/src/utils/short-id.js",
+      "importedBy": [
+        "team_beta/MemoryCore/src/core/skill/skill-core.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryKnowledge/src/engines/wiki/index-db.js",
+      "importedBy": [
+        "team_beta/MemoryKnowledge/src/engines/wiki/manager.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/llm.js",
+      "importedBy": [
+        "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/index.ts",
+        "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/merge.ts",
+        "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/overview.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryKnowledge/src/logger.js",
+      "importedBy": [
+        "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/index.ts",
+        "team_beta/MemoryKnowledge/src/engines/wiki/ingest-v2/overview.ts",
+        "team_beta/MemoryKnowledge/src/engines/wiki/manager.ts"
+      ]
+    },
+    {
+      "target": "team_beta/MemoryKnowledge/src/telemetry.js",
+      "importedBy": [
+        "team_beta/MemoryKnowledge/src/engines/wiki/manager.ts"
+      ]
+    }
+  ]
+}
