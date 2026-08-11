@@ -1,9 +1,11 @@
 from pathlib import Path
 from types import SimpleNamespace
+from contextlib import contextmanager
 import threading
 import time
 
 from backend.app.ui_domains import task_attachments as local_task_attachments
+from backend.app.ui_domains.project_materials import register_and_process_local_materials
 from backend.app.ui_domains.routing import UiRequest
 from cloud_backend.app.repositories.gc04_tasks import GC04TaskRepository
 from cloud_backend.app.repositories.project_materials import GC07ProjectMaterialsRepository
@@ -22,9 +24,16 @@ def test_task_transcription_starts_in_background_without_blocking_task_save(
         database_path = tmp_path / "strict-local.db"
 
         @staticmethod
-        def _current_context(*, require_ready: bool):
-            assert require_ready
-            return SimpleNamespace(sandbox_id="sandbox-test")
+        def capture_sandbox_context():
+            return SimpleNamespace(
+                sandbox_id="sandbox-test",
+                workspace_context=SimpleNamespace(sandbox_id="sandbox-test"),
+            )
+
+        @staticmethod
+        @contextmanager
+        def prebound_sandbox_context(_context):
+            yield
 
     class Store:
         states: list[str] = []
@@ -76,6 +85,15 @@ def test_task_transcription_starts_in_background_without_blocking_task_save(
             release_worker.wait(2),
             {"text": "转写正文"},
         )[1],
+    )
+    monkeypatch.setattr(
+        local_task_attachments,
+        "register_and_process_local_materials",
+        lambda **_kwargs: {
+            "documentIds": ["cloud-transcript-1"],
+            "cloudMetadataState": "ready",
+            "overallState": "ready",
+        },
     )
     monkeypatch.setattr(
         local_task_attachments,
@@ -155,6 +173,71 @@ def test_task_attachment_registers_only_safe_project_metadata(tmp_path: Path) ->
         ).fetchone()[0]
         assert "/" not in str(receipt).replace("local_private_metadata_only", "")
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_transcript_material_registers_metadata_then_settles_local_processing() -> None:
+    calls: list[tuple[str, object]] = []
+
+    class Runtime:
+        @staticmethod
+        def cloud_command(method, path, *, payload, idempotency_key, refresh_business):
+            calls.append(("cloud", payload))
+            assert method == "POST"
+            assert path.endswith("/materials/register-metadata")
+            assert idempotency_key == "transcript-once:metadata"
+            assert refresh_business is False
+            material = payload["materials"][0]
+            assert "managedPath" not in material
+            assert "originalSourcePath" not in material
+            return {
+                "documents": [{
+                    "documentId": "cloud-transcript-1",
+                    "localSourceId": material["localSourceId"],
+                    "version": 1,
+                }]
+            }
+
+    class Store:
+        @staticmethod
+        def bind_pending_materials(**_kwargs):
+            calls.append(("pending", None))
+
+        @staticmethod
+        def bind_cloud_documents(**_kwargs):
+            calls.append(("bound", _kwargs["cloud_documents"][0]["documentId"]))
+
+        @staticmethod
+        def process_pending_documents(**_kwargs):
+            calls.append(("processed", tuple(_kwargs["document_ids"])))
+            return {
+                "items": [{
+                    "documentId": "cloud-transcript-1",
+                    "parseStatus": "ready",
+                    "wikiStatus": "ready",
+                }]
+            }
+
+    result = register_and_process_local_materials(
+        runtime=Runtime(),
+        store=Store(),
+        project_id="client-1",
+        local_materials=[{
+            "localSourceId": "local-transcript-1",
+            "fileName": "访谈-录音转写.txt",
+            "contentHash": "a" * 64,
+            "byteSize": 18,
+            "mediaType": "text/plain",
+            "managedPath": "/private/device/transcript.txt",
+            "originalSourcePath": "/private/device/source.txt",
+        }],
+        relation_kind="task",
+        relation_id="task-1",
+        idempotency_key="transcript-once",
+    )
+    assert result["documentIds"] == ["cloud-transcript-1"]
+    assert result["cloudMetadataState"] == "ready"
+    assert result["overallState"] == "ready"
+    assert [item[0] for item in calls] == ["pending", "cloud", "bound", "processed"]
 
 
 def test_task_tags_use_task_views_without_parallel_tag_tables(tmp_path: Path) -> None:

@@ -347,7 +347,7 @@ def test_gc01_local_login_is_atomic_replayable_and_uses_cloud_scope(tmp_path: Pa
     assert cloud.login_keys == ["renderer-login-once", "renderer-login-once"]
 
 
-def test_gc01_local_login_failure_preserves_previous_workspace_and_secret(
+def test_gc01_same_contact_can_login_to_two_independent_organization_clouds(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "strict-local.db"
@@ -376,23 +376,33 @@ def test_gc01_local_login_failure_preserves_previous_workspace_and_secret(
         idempotency_key="first-login",
     )
     first_sandbox = first["sandbox"]["sandboxId"]
-    counts_before_failure = _counts(database)
-    secrets_before_failure = dict(secrets.values)
-
-    with pytest.raises(LocalRuntimeError) as failure:
-        runtime.login(
-            cloud_api_url="http://second.local",
-            identifier=second_cloud.email,
-            password="test-password",
-            idempotency_key="second-login",
-        )
-    assert failure.value.code == "local_login_apply_failed"
+    second = runtime.login(
+        cloud_api_url="http://second.local",
+        identifier=second_cloud.email,
+        password="test-password",
+        idempotency_key="second-login",
+    )
     current = runtime.current()
-    assert current["sandbox"]["sandboxId"] == first_sandbox
+    assert current["sandbox"]["sandboxId"] == second["sandbox"]["sandboxId"]
     assert current["runtimeStatus"] == "ready"
-    assert _counts(database) == counts_before_failure
-    assert secrets.values == secrets_before_failure
+    assert current["sessionSnapshot"]["organization"]["organizationId"] == "org_second"
+    listed = runtime.list_workspaces()
+    assert {item["organizationId"] for item in listed} == {"org_first", "org_second"}
+    assert sum(bool(item["isActive"]) for item in listed) == 1
+    restored = runtime.switch(first_sandbox)
+    assert restored["sandbox"]["organizationId"] == "org_first"
+    assert restored["sessionSnapshot"]["principal"]["contacts"] == [
+        {
+            "type": "email",
+            "value": "shared-contact@example.com",
+            "verificationState": "verified",
+        }
+    ]
     with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM principals WHERE normalized_contact=?",
+            ("shared-contact@example.com",),
+        ).fetchone()[0] == 1
         assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 

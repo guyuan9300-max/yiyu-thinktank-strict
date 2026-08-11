@@ -37,7 +37,7 @@ export function isActiveOrganizationEmployee(
 ): boolean {
   const membershipStatus = employee.membershipStatus as MembershipStatus | string | null | undefined;
   return isActiveOrganizationAccountStatus(employee.accountStatus)
-    && (!membershipStatus || membershipStatus === 'approved');
+    && (!membershipStatus || membershipStatus === 'approved' || membershipStatus === 'active');
 }
 
 /**

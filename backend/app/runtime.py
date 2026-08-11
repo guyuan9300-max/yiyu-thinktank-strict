@@ -366,6 +366,7 @@ class WorkspaceRuntime:
                 "/api/v2/organization-access/feishu/member-authorization",
                 "/api/v2/organization-access/feishu/delivery-profile",
                 "/api/v2/organization-access/members",
+                "/api/v2/organization-access/management-titles",
                 "/api/v2/organization-access/bots",
                 "/api/v2/organization-access/activity-logs",
                 "/api/v2/organization-access/settings/system-admin",
@@ -765,7 +766,7 @@ class WorkspaceRuntime:
                     path,
                 )
                 or re.fullmatch(
-                    r"/api/v2/organization-access/members/[^/]+/(?:role|department)",
+                    r"/api/v2/organization-access/members/[^/]+/(?:role|department|management-title)",
                     path,
                 )
                 or re.fullmatch(r"/api/v2/organization-access/bots/[^/]+", path)
@@ -1561,16 +1562,30 @@ class WorkspaceRuntime:
                 "lastError": exc.message,
                 "usingCachedConfig": False,
             }
+        provider_key = str(provider.get("provider") or "openai_compatible")
+        model_name = str(provider.get("modelName") or "")
+        normalized_model = model_name.casefold().replace(".", "-").replace("_", "-")
+        if "doubao" in normalized_model and "seed" in normalized_model:
+            provider_label = (
+                "豆包 Seed 2.1 Pro"
+                if "2-1" in normalized_model
+                else "豆包 Seed Pro"
+            )
+        elif provider_key == "doubao":
+            provider_label = "豆包"
+        else:
+            provider_label = str(
+                provider.get("providerLabel")
+                or model_name
+                or provider_key
+                or "组织统一模型"
+            )
         return {
             "state": "ready_direct",
             "source": "organization_direct",
-            "provider": str(provider.get("provider") or "openai_compatible"),
-            "providerLabel": str(
-                provider.get("providerLabel")
-                or provider.get("provider")
-                or "组织统一模型"
-            ),
-            "model": str(provider.get("modelName") or ""),
+            "provider": provider_key,
+            "providerLabel": provider_label,
+            "model": model_name,
             "configVersion": str(provider.get("version") or ""),
             "fingerprint": provider.get("keyFingerprint"),
             "syncedAt": provider.get("updatedAt"),
@@ -2308,12 +2323,47 @@ class WorkspaceRuntime:
             sandboxes = connection.execute(
                 """
                 SELECT * FROM sandboxes WHERE record_kind='sandbox'
-                  AND lifecycle_state='active' ORDER BY created_at
+                  AND lifecycle_state!='deleted' ORDER BY created_at
                 """
             ).fetchall()
-            result = []
+            # ``lifecycle_state='archived'`` means "not currently selected"
+            # for organization sandboxes; it must not remove a valid signed-in
+            # organization from the workspace switcher.  Older pre-cutover
+            # rows can coexist with the canonical 88-table sandbox, so expose
+            # only the best row for each cloud organization.
+            selected: dict[tuple[str, str], Any] = {}
             for sandbox in sandboxes:
+                scope = connection.execute(
+                    "SELECT organization_id FROM authorization_scopes WHERE id=?",
+                    (sandbox["scope_id"],),
+                ).fetchone()
+                organization_id = str(scope["organization_id"] or "") if scope else ""
+                key = (str(sandbox["cloud_instance_id"] or ""), organization_id)
+                current = selected.get(key)
+                score = (
+                    2 if str(sandbox["runtime_status"] or "") in {"ready", "sync_degraded"} else 1,
+                    1 if str(sandbox["lifecycle_state"] or "") == "active" else 0,
+                    str(sandbox["updated_at"] or ""),
+                )
+                if current is None:
+                    selected[key] = sandbox
+                    continue
+                current_score = (
+                    2 if str(current["runtime_status"] or "") in {"ready", "sync_degraded"} else 1,
+                    1 if str(current["lifecycle_state"] or "") == "active" else 0,
+                    str(current["updated_at"] or ""),
+                )
+                if score > current_score:
+                    selected[key] = sandbox
+            result = []
+            for sandbox in sorted(
+                selected.values(), key=lambda item: str(item["created_at"] or "")
+            ):
                 binding = self._binding_for(connection, sandbox)
+                scope = connection.execute(
+                    "SELECT organization_id FROM authorization_scopes WHERE id=?",
+                    (sandbox["scope_id"],),
+                ).fetchone()
                 result.append({
                     "sandboxId": sandbox["id"],
                     "kind": "organization",
@@ -2321,10 +2371,7 @@ class WorkspaceRuntime:
                     "displayName": sandbox["display_name"],
                     "isActive": sandbox["lifecycle_state"] == "active",
                     "cloudInstanceId": sandbox["cloud_instance_id"],
-                    "organizationId": connection.execute(
-                        "SELECT organization_id FROM authorization_scopes WHERE id=?",
-                        (sandbox["scope_id"],),
-                    ).fetchone()[0],
+                    "organizationId": str(scope["organization_id"] or "") if scope else "",
                     "cloudApiUrl": binding["cloud_api_url"] if binding else sandbox["cloud_api_url"],
                     "identityState": binding["runtime_status"] if binding else sandbox["runtime_status"],
                     "updatedAt": sandbox["updated_at"],
@@ -2917,8 +2964,24 @@ class WorkspaceRuntime:
                     contact_value = str(contact.get("value") or "").strip()
                     if not contact_type or not contact_value:
                         continue
-                    contact_id = self._stable_id(
-                        "contact", cloud_instance_id, contact_type, contact_value
+                    # The local 88-table contract makes a normalized contact
+                    # globally unique.  The same human may legitimately use
+                    # the same email/phone in two independent organization
+                    # clouds whose principal IDs differ.  Reuse that one local
+                    # contact projection and point it at the identity of the
+                    # workspace being activated; creating an instance-scoped
+                    # second row violates uq_principals_01 and used to roll the
+                    # whole successful cloud login back.
+                    existing_contact = connection.execute(
+                        "SELECT id FROM principals WHERE normalized_contact=?",
+                        (contact_value,),
+                    ).fetchone()
+                    contact_id = (
+                        str(existing_contact["id"])
+                        if existing_contact is not None
+                        else self._stable_id(
+                            "contact", contact_type, contact_value
+                        )
                     )
                     connection.execute(
                         """
@@ -3530,6 +3593,7 @@ class WorkspaceRuntime:
         payload: dict[str, Any],
     ) -> None:
         snapshot = payload.get("sessionSnapshot") or {}
+        principal = snapshot.get("principal") or {}
         authorization = snapshot.get("authorization") or {}
         scope_id = str(authorization["scopeId"])
         principal_id = str(authorization["principalId"])
@@ -3603,6 +3667,60 @@ class WorkspaceRuntime:
                     principal_id,
                 ),
             )
+            # Contacts are globally unique in the local 88-table contract.
+            # Logging into a second organization re-parents the shared local
+            # contact projection to that cloud principal.  Switching back must
+            # perform the same projection step; otherwise the restored session
+            # is valid but its email/phone disappears from the local snapshot.
+            for contact in principal.get("contacts") or []:
+                if not isinstance(contact, dict):
+                    continue
+                contact_type = str(contact.get("type") or "").strip()
+                contact_value = str(contact.get("value") or "").strip()
+                if not contact_type or not contact_value:
+                    continue
+                existing_contact = connection.execute(
+                    "SELECT id FROM principals WHERE normalized_contact=?",
+                    (contact_value,),
+                ).fetchone()
+                contact_id = (
+                    str(existing_contact["id"])
+                    if existing_contact is not None
+                    else self._stable_id("contact", contact_type, contact_value)
+                )
+                connection.execute(
+                    """
+                    INSERT INTO principals (
+                        id, status, identity_version, updated_at,
+                        principal_kind, parent_principal_id, contact_type,
+                        normalized_contact, verification_state, version,
+                        lifecycle_state, created_at, deleted_at, sandbox_id,
+                        source_version, projection_state, projected_at,
+                        stale_at, lease_expires_at
+                    ) VALUES (?, 'active', 1, ?, 'contact', ?, ?, ?, ?, 1,
+                              'active', ?, NULL, NULL, 1, 'fresh', ?, NULL, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        parent_principal_id=excluded.parent_principal_id,
+                        contact_type=excluded.contact_type,
+                        normalized_contact=excluded.normalized_contact,
+                        verification_state=excluded.verification_state,
+                        status='active', lifecycle_state='active',
+                        deleted_at=NULL, updated_at=excluded.updated_at,
+                        projection_state='fresh', projected_at=excluded.projected_at,
+                        stale_at=NULL, lease_expires_at=excluded.lease_expires_at
+                    """,
+                    (
+                        contact_id,
+                        now,
+                        principal_id,
+                        contact_type,
+                        contact_value,
+                        contact.get("verificationState") or "verified",
+                        now,
+                        now,
+                        lease_expires_at,
+                    ),
+                )
             connection.execute(
                 """
                 INSERT INTO policy_versions (

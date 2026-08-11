@@ -1378,6 +1378,21 @@ def register_routes(
             idempotency_key=idempotency_key or new_id(),
         )
 
+    @app.patch("/api/v2/organization-access/members/{membership_id}/management-title")
+    def update_management_title(
+        membership_id: str,
+        payload: dict[str, Any],
+        identity: SessionIdentity = Depends(identity_dependency),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        title_id = payload.get("managementTitleId")
+        return strict_directory.set_member_management_title(
+            identity,
+            membership_id=membership_id,
+            title_id=(str(title_id).strip() if title_id is not None else None) or None,
+            idempotency_key=idempotency_key or new_id(),
+        )
+
     @app.post("/api/v2/organization-access/admin/transfer")
     def transfer_admin(
         payload: dict[str, Any],

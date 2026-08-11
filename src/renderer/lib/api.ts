@@ -70,6 +70,7 @@ import type {
   EmployeeRecord,
   EmployeeRejectPayload,
   EmployeeDepartmentPayload,
+  EmployeeManagementTitlePayload,
   FeishuBotSettings,
   FeishuMeetingLaunchResult,
   FeishuBotSettingsPayload,
@@ -2776,6 +2777,16 @@ export async function transferAdmin(payload: AdminTransferPayload) {
 
 export async function updateEmployeeDepartment(id: string, payload: EmployeeDepartmentPayload) {
   return request<EmployeeRecord>(`/api/v2/ui/admin/employees/${id}/department`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateEmployeeManagementTitle(
+  id: string,
+  payload: EmployeeManagementTitlePayload,
+) {
+  return request<EmployeeRecord>(`/api/v2/ui/admin/employees/${id}/management-title`, {
     method: 'PATCH',
     body: JSON.stringify(payload),
   });

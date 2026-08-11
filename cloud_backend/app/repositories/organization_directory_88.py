@@ -245,10 +245,23 @@ class StrictOrganizationDirectoryRepository:
     @staticmethod
     def _department_assignment(connection: Any, scope_id: str, membership_id: str) -> Any | None:
         return connection.execute(
-            "SELECT a.*,d.name AS department_name FROM organization_memberships a "
+            "SELECT a.*,d.name AS department_name "
+            "FROM organization_memberships a "
             "LEFT JOIN organizations d ON d.id=a.department_id "
             "AND d.record_kind='department' WHERE a.scope_id=? "
             "AND a.record_kind='department_assignment' "
+            "AND a.parent_membership_id=? AND a.lifecycle_state='active' "
+            "ORDER BY a.updated_at DESC,a.id DESC LIMIT 1",
+            (scope_id, membership_id),
+        ).fetchone()
+
+    @staticmethod
+    def _title_assignment(connection: Any, scope_id: str, membership_id: str) -> Any | None:
+        return connection.execute(
+            "SELECT a.*,t.name AS title_name FROM organization_memberships a "
+            "JOIN organizations t ON t.id=a.title_id "
+            "AND t.record_kind='management_title' WHERE a.scope_id=? "
+            "AND a.record_kind='title_assignment' "
             "AND a.parent_membership_id=? AND a.lifecycle_state='active' "
             "ORDER BY a.updated_at DESC,a.id DESC LIMIT 1",
             (scope_id, membership_id),
@@ -265,6 +278,7 @@ class StrictOrganizationDirectoryRepository:
         if row is None:
             raise RepositoryError(404, "membership_missing", "组织成员不存在")
         assignment = self._department_assignment(connection, identity.scope_id, membership_id)
+        title_assignment = self._title_assignment(connection, identity.scope_id, membership_id)
         application = connection.execute(
             "SELECT * FROM organization_memberships WHERE scope_id=? AND principal_id=? "
             "AND record_kind='application' AND lifecycle_state='active' "
@@ -290,8 +304,14 @@ class StrictOrganizationDirectoryRepository:
             "isBot": str(row["principal_kind"] or "human") == "bot" if "principal_kind" in row.keys() else False,
             "isDepartmentLead": bool(assignment and str(assignment["role_key"] or "") == "department_lead"),
             "visibilityScope": str(row["visibility_scope"] or "self"),
-            "managementTitleId": str(assignment["title_id"] or "") if assignment and assignment["title_id"] else None,
-            "managementTitleName": None,
+            "managementTitleId": (
+                str(title_assignment["title_id"] or "")
+                if title_assignment and title_assignment["title_id"] else None
+            ),
+            "managementTitleName": (
+                str(title_assignment["title_name"] or "")
+                if title_assignment and title_assignment["title_name"] else None
+            ),
             "approvedAt": str(row["updated_at"] or ""),
             "rejectedReason": None,
             "disabledAt": str(row["updated_at"] or "") if str(row["status"] or "") != "active" else None,
@@ -650,6 +670,70 @@ class StrictOrganizationDirectoryRepository:
                 "departmentId": department_id,
                 "departmentLead": department_lead,
             },
+            aggregate_type="organization_membership",
+            aggregate_id=membership_id,
+            mutation=mutation,
+        )
+
+    def set_member_management_title(
+        self,
+        identity: SessionIdentity,
+        *,
+        membership_id: str,
+        title_id: str | None,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        self._require_admin(identity)
+
+        def mutation(connection: Any, now: str) -> tuple[dict[str, Any], int]:
+            self._member(connection, identity, membership_id)
+            if title_id:
+                title = connection.execute(
+                    "SELECT id FROM organizations WHERE id=? "
+                    "AND record_kind='management_title' "
+                    "AND parent_record_id=? AND lifecycle_state='active'",
+                    (title_id, identity.organization_id),
+                ).fetchone()
+                if title is None:
+                    raise RepositoryError(404, "management_title_missing", "所选管理层头衔不存在")
+            current = self._title_assignment(connection, identity.scope_id, membership_id)
+            assignment_id = (
+                str(current["id"])
+                if current is not None
+                else _id("title_assignment", identity.scope_id, membership_id)
+            )
+            version = int(current["version"] or 1) + 1 if current else 1
+            if current is None and title_id:
+                connection.execute(
+                    "INSERT INTO organization_memberships (id,scope_id,principal_id,role_key,"
+                    "status,version,record_kind,parent_membership_id,department_id,title_id,"
+                    "manager_membership_id,visibility_scope,capability_set_schema_version,"
+                    "capability_set,target_type,target_id,expires_at,lifecycle_state,created_at,"
+                    "updated_at,deleted_at) VALUES "
+                    "(?,?,NULL,'member','active',1,'title_assignment',?,NULL,?,NULL,"
+                    "NULL,NULL,NULL,NULL,NULL,NULL,'active',?,?,NULL)",
+                    (assignment_id, identity.scope_id, membership_id, title_id, now, now),
+                )
+            elif current is not None:
+                if not title_id:
+                    connection.execute(
+                        "UPDATE organization_memberships SET title_id=NULL,lifecycle_state='deleted',"
+                        "deleted_at=?,updated_at=?,version=? WHERE id=?",
+                        (now, now, version, assignment_id),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE organization_memberships SET title_id=?,status='active',"
+                        "lifecycle_state='active',deleted_at=NULL,version=?,updated_at=? WHERE id=?",
+                        (title_id, version, now, assignment_id),
+                    )
+            return self._member(connection, identity, membership_id), version
+
+        return self._mutate(
+            identity,
+            command_type="organization.member.management_title_updated",
+            idempotency_key=idempotency_key,
+            payload={"membershipId": membership_id, "managementTitleId": title_id},
             aggregate_type="organization_membership",
             aggregate_id=membership_id,
             mutation=mutation,

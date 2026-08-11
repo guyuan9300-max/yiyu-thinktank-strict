@@ -28,6 +28,106 @@ def _segment(value: str) -> str:
     return quote(str(value), safe="")
 
 
+def register_and_process_local_materials(
+    *,
+    runtime: Any,
+    store: LocalProjectMaterialsRepository,
+    project_id: str,
+    local_materials: list[Mapping[str, Any]],
+    relation_kind: str,
+    relation_id: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Finish the same material lifecycle used by direct workbench imports.
+
+    Recording transcription runs in a background thread.  It must not stop at
+    a ``local-pending`` workbench card: safe metadata is registered in the
+    organization cloud and the local body is parsed/indexed on this device.
+    If the cloud is temporarily unavailable, local parsing still settles so
+    the transcript remains readable and editable; metadata sync stays
+    explicitly retryable instead of masquerading as a 0% running job.
+    """
+
+    materials = [dict(item) for item in local_materials]
+    store.bind_pending_materials(
+        project_id=project_id,
+        local_materials=materials,
+    )
+    document_ids = [
+        f"local-pending:{item['localSourceId']}"
+        for item in materials
+        if str(item.get("localSourceId") or "")
+    ]
+    cloud_state = "failed_retryable"
+    cloud_error: dict[str, Any] | None = None
+    try:
+        registered = runtime.cloud_command(
+            "POST",
+            f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
+            "/materials/register-metadata",
+            payload={
+                "materials": [
+                    {
+                        "localSourceId": item["localSourceId"],
+                        "fileName": item["fileName"],
+                        "contentHash": item["contentHash"],
+                        "byteSize": item["byteSize"],
+                        "mediaType": item["mediaType"],
+                        "relationKind": relation_kind,
+                        "relationId": relation_id,
+                    }
+                    for item in materials
+                ]
+            },
+            idempotency_key=f"{idempotency_key}:metadata",
+            refresh_business=False,
+        )
+        documents = [
+            dict(item)
+            for item in registered.get("documents") or []
+            if isinstance(item, Mapping) and str(item.get("documentId") or "")
+        ]
+        if len(documents) != len(materials):
+            raise LocalRuntimeError(
+                502,
+                "project_material_metadata_invalid",
+                "组织云资料元数据回执不完整",
+            )
+        store.bind_cloud_documents(
+            project_id=project_id,
+            local_materials=materials,
+            cloud_documents=documents,
+        )
+        document_ids = [str(item["documentId"]) for item in documents]
+        cloud_state = "ready"
+    except LocalRuntimeError as exc:
+        cloud_error = {
+            "code": exc.code,
+            "message": exc.message,
+            "retryable": exc.status_code >= 500 or exc.status_code in {408, 409, 429},
+        }
+
+    processing = store.process_pending_documents(
+        project_id=project_id,
+        document_ids=document_ids,
+    )
+    return {
+        "documentIds": document_ids,
+        "cloudMetadataState": cloud_state,
+        "cloudError": cloud_error,
+        "processing": processing,
+        "overallState": (
+            "ready"
+            if cloud_state == "ready"
+            and all(
+                str(item.get("parseStatus") or "") == "ready"
+                for item in processing.get("items") or []
+            )
+            else "failed_retryable"
+        ),
+    }
+
+
 def _client(project: Mapping[str, Any]) -> dict[str, Any]:
     project_id = str(project.get("projectId") or "")
     lifecycle = str(project.get("lifecycleState") or "active")

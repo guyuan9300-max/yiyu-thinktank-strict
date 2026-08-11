@@ -13,6 +13,7 @@ from ..local_asr.models import SENSE_VOICE_MODEL, model_ready
 from ..local_asr.subprocess_runner import run_local_asr_subprocess
 from ..runtime import LocalRuntimeError
 from .gc04_tasks import _task_ui
+from .project_materials import register_and_process_local_materials
 from .routing import UiDomainRouter, UiRequest
 
 
@@ -231,7 +232,10 @@ def retry_task_transcription(compatibility: Any, request: UiRequest, match: Any)
     task_id = unquote(match.group("task_id"))
     attachment_id = unquote(match.group("attachment_id"))
     runtime = compatibility.runtime
-    pinned_context = runtime._current_context(require_ready=True)  # noqa: SLF001
+    pinned_sandbox = runtime.capture_sandbox_context()
+    pinned_context = pinned_sandbox.workspace_context
+    if pinned_context is None:
+        raise LocalRuntimeError(409, "workspace_not_ready", "当前组织工作空间尚未就绪")
     store = LocalProjectMaterialsRepository(runtime, context_provider=lambda: pinned_context)
     attachment = next(
         (item for item in store.task_attachments(task_id) if item["id"] == attachment_id),
@@ -275,33 +279,46 @@ def retry_task_transcription(compatibility: Any, request: UiRequest, match: Any)
             )
 
         try:
-            output = run_local_asr_subprocess(
-                model_root=model_root,
-                audio_path=Path(str(attachment["path"])),
-                language="auto",
-                progress_callback=report,
-            )
-            text = str(output.get("dialogue_text") or output.get("dialogueText") or output.get("text") or "").strip()
-            if not text:
-                raise RuntimeError("TaskTranscriptionEmpty")
-            transcript = store.save_task_transcript(
-                task_id=task_id,
-                attachment_id=attachment_id,
-                text=text,
-                preserve_original=True,
-            )
-            material = store.import_text(
-                project_id=project_id,
-                title=f"{Path(str(attachment.get('title') or '任务录音')).stem}-录音转写",
-                content=text,
-                idempotency_key=f"task-transcript:{task_id}:{attachment_id}:{transcript.get('version') or 1}",
-            )
-            store.bind_pending_materials(project_id=project_id, local_materials=[material])
-            store.bind_task_attachment(
-                project_id=project_id,
-                document_id=f"local-pending:{material['localSourceId']}",
-                task_id=task_id,
-            )
+            with runtime.prebound_sandbox_context(pinned_sandbox):
+                output = run_local_asr_subprocess(
+                    model_root=model_root,
+                    audio_path=Path(str(attachment["path"])),
+                    language="auto",
+                    progress_callback=report,
+                )
+                text = str(output.get("dialogue_text") or output.get("dialogueText") or output.get("text") or "").strip()
+                if not text:
+                    raise RuntimeError("TaskTranscriptionEmpty")
+                transcript = store.save_task_transcript(
+                    task_id=task_id,
+                    attachment_id=attachment_id,
+                    text=text,
+                    preserve_original=True,
+                )
+                operation_key = (
+                    f"task-transcript:{task_id}:{attachment_id}:"
+                    f"{transcript.get('version') or 1}"
+                )
+                material = store.import_text(
+                    project_id=project_id,
+                    title=f"{Path(str(attachment.get('title') or '任务录音')).stem}-录音转写",
+                    content=text,
+                    idempotency_key=operation_key,
+                )
+                settled = register_and_process_local_materials(
+                    runtime=runtime,
+                    store=store,
+                    project_id=project_id,
+                    local_materials=[material],
+                    relation_kind="task",
+                    relation_id=task_id,
+                    idempotency_key=operation_key,
+                )
+                store.bind_task_attachment(
+                    project_id=project_id,
+                    document_id=str(settled["documentIds"][0]),
+                    task_id=task_id,
+                )
         except Exception as exc:  # noqa: BLE001
             store.set_task_transcription_state(
                 task_id=task_id,

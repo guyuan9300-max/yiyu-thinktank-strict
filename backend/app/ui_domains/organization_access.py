@@ -595,6 +595,19 @@ def update_employee_department(
     )
 
 
+@router.patch(r"admin/employees/([^/]+)/management-title")
+def update_employee_management_title(
+    compatibility: Any, request: UiRequest, match: Any
+) -> dict[str, Any]:
+    return _member_command(
+        compatibility,
+        request,
+        match.group(1),
+        "management-title",
+        method="PATCH",
+    )
+
+
 @router.post(r"admin/employees/transfer-admin")
 def transfer_admin(compatibility: Any, request: UiRequest, _: Any) -> dict[str, Any]:
     return _cloud_command(

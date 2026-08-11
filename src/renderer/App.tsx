@@ -536,6 +536,7 @@ import {
   getClientMessage,
   updateEmployeeRole,
   updateEmployeeDepartment,
+  updateEmployeeManagementTitle,
   transferAdmin,
   adoptTaskSmartBriefAction,
   updateEventLine,
@@ -556,7 +557,6 @@ import {
   syncOrgAiRuntime,
   updateClientDnaDocument,
   updateHandbookSettings,
-  updateOrgModelProfile,
   parseOrgIntroDocument,
   updateProfile,
   updateSystemAdminSettings,
@@ -12645,6 +12645,10 @@ export default function App() {
         '[project-materials] processing trigger failed',
         error instanceof Error ? error.message : String(error),
       );
+    }).finally(() => {
+      // A transient backend/cloud failure must not permanently suppress this
+      // exact document set.  The next explicit refresh may retry it.
+      projectMaterialProcessingKeysRef.current.delete(key);
     });
   }, [
     activeTab,
@@ -32465,10 +32469,11 @@ export default function App() {
                         <ExternalLink size={16} />
                       </button>
                       {(() => {
-                        // 仅对 Word 文档 (.docx/.doc) 显示"用智能编辑器打开"按钮
+                        // 可可靠读取为文本的资料均可进入智能编辑；录音转写
+                        // 是 .txt，不应仅因扩展名不是 Word 而被挡在入口外。
                         const lowered = (path || '').toLowerCase();
-                        const isWord = lowered.endsWith('.docx') || lowered.endsWith('.doc');
-                        if (!isWord || !documentId) return null;
+                        const isTextEditable = /\.(?:docx?|txt|md|markdown|rtf)$/i.test(lowered);
+                        if (!isTextEditable || !documentId || parseStatus !== 'ready') return null;
                         // 智能编辑器已经打开时锁住此按钮,避免覆盖当前正在编辑的内容
                         const editorBusy = clientWorkspaceInlineEditor !== null;
                         return (
@@ -34386,12 +34391,72 @@ export default function App() {
 	    setOrgModelDraft(nextDraft);
 	    setIsSavingOrgModel(true);
 	    try {
-	      const next = await updateOrgModelProfile(nextDraft);
+	      const previousBindings = new Map(orgModelState.bindings.map((item) => [item.userId, item]));
+	      const nextBindings = new Map(nextDraft.bindings.map((item) => [item.userId, item]));
+	      const changedDepartmentBindings = [...new Set([
+	        ...previousBindings.keys(),
+	        ...nextBindings.keys(),
+	      ])].filter((userId) => {
+	        const previous = previousBindings.get(userId);
+	        const current = nextBindings.get(userId);
+	        return (previous?.departmentId || null) !== (current?.departmentId || null)
+	          || Boolean(previous?.isManager) !== Boolean(current?.isManager);
+	      });
+	      const changedManagementTitles = [...new Set([
+	        ...previousBindings.keys(),
+	        ...nextBindings.keys(),
+	      ])].some((userId) => (
+	        (previousBindings.get(userId)?.primaryRoleId || null)
+	        !== (nextBindings.get(userId)?.primaryRoleId || null)
+	      ));
+	      const departmentShape = (value: OrgModelSettings) => JSON.stringify(
+	        value.departments.map((item) => ({
+	          id: item.id,
+	          name: item.name,
+	          color: item.color,
+	          parentDepartmentId: item.parentDepartmentId || null,
+	          active: item.active !== false,
+	        })),
+	      );
+	      const roleShape = (value: OrgModelSettings) => JSON.stringify(
+	        value.roles.map((item) => ({ id: item.id, name: item.name, active: item.active !== false })),
+	      );
+	      if (
+	        departmentShape(nextDraft) !== departmentShape(orgModelState)
+	        || roleShape(nextDraft) !== roleShape(orgModelState)
+	      ) {
+	        flash('error', '部门成员和负责人可直接保存；部门或管理层头衔的增删改尚需使用对应增量命令。');
+	        return false;
+	      }
+	      await Promise.all(changedDepartmentBindings.map((userId) => {
+	        const binding = nextBindings.get(userId);
+	        return updateEmployeeDepartment(userId, {
+	          departmentId: binding?.departmentId || null,
+	          departmentLead: Boolean(binding?.departmentId && binding?.isManager),
+	        });
+	      }));
+	      if (changedManagementTitles) {
+	        await Promise.all([...new Set([
+	          ...previousBindings.keys(),
+	          ...nextBindings.keys(),
+	        ])].filter((userId) => (
+	          (previousBindings.get(userId)?.primaryRoleId || null)
+	          !== (nextBindings.get(userId)?.primaryRoleId || null)
+	        )).map((userId) => updateEmployeeManagementTitle(userId, {
+	          managementTitleId: nextBindings.get(userId)?.primaryRoleId || null,
+	        })));
+	      }
+	      const next = await getOrgModelProfile();
 	      setOrgModelState(next);
 	      setOrgModelDraft(next);
 	      clearOrgSetupInputDrafts();
 	      setIsOrgModelDraftDirty(false);
-	      flash('success', '组织底盘已保存');
+	      flash(
+	        'success',
+	        changedDepartmentBindings.length > 0 || changedManagementTitles
+	          ? '组织成员身份已保存'
+	          : '组织结构已是最新状态',
+	      );
 
 	      // reload + backfill 火-忘：失败不影响"保存成功"反馈
 	      void (async () => {
@@ -34574,57 +34639,6 @@ export default function App() {
     const handleChangeOrgModelDraft = (nextDraft: OrgModelSettings) => {
       setIsOrgModelDraftDirty(true);
       setOrgModelDraft(nextDraft);
-    };
-
-    const handleSaveOrgModel = async (nextDraft: OrgModelSettings = orgModelDraft): Promise<boolean> => {
-      if (!guardWorkspaceWrite('保存组织底盘')) return false;
-      setOrgModelDraft(nextDraft);
-      setIsSavingOrgModel(true);
-      try {
-        // ① 真保存：等这一步成功就立刻报"已保存"，不让 reload/backfill 阻塞反馈
-        const next = await updateOrgModelProfile(nextDraft);
-        setOrgModelState(next);
-        setOrgModelDraft(next);
-        clearOrgSetupInputDrafts();
-        setIsOrgModelDraftDirty(false);
-        flash('success', '组织底盘已保存');
-
-        // ② reload + backfill 火-忘：失败不影响"保存成功"反馈
-        // （之前是串联 await，任一抛错都会让保存看起来失败，但其实后端已 200）
-        void (async () => {
-          try {
-            const defaultReviewPerspective = resolveDefaultReviewPerspectiveForUser(currentSessionUser);
-            await Promise.all([
-              loadEmployeeReviewBlock(),
-              loadTaskBlock(),
-              loadReviewBlock(resolveSelectedReviewWeekLabel(), {
-                skipAi: true,
-                perspective: defaultReviewPerspective,
-                departmentId: resolveDefaultReviewDepartmentIdForUser(currentSessionUser, defaultReviewPerspective),
-              }),
-            ]);
-          } catch (error) {
-            console.warn('[org-model save] post-save reload failed (data is saved, UI may need manual refresh)', error);
-          }
-          try {
-            const backfill = await backfillOrgTaskLinks();
-            const touchedCount = backfill.createdLinks + backfill.updatedLinks;
-            if (touchedCount > 0) {
-              flash('info', `任务关联已同步 ${touchedCount} 条`);
-            }
-          } catch (error) {
-            console.warn('[org-model save] backfill failed', error);
-            flash('error', error instanceof Error ? `任务关联回填失败：${error.message}` : '任务关联回填失败（组织底盘已保存）');
-          }
-        })();
-
-        return true;
-      } catch (error) {
-        flash('error', error instanceof Error ? error.message : '组织底盘保存失败');
-        return false;
-      } finally {
-        setIsSavingOrgModel(false);
-      }
     };
 
     const handleDeleteTag = async (tag: TaskTag) => {
@@ -35635,7 +35649,11 @@ export default function App() {
                 label: '文字模型',
                 valueText: textModelReady
                   ? (organizationDirectReady
-                      ? (orgAiRuntimeStatus?.providerLabel || orgAiRuntimeStatus?.model || '组织 AI')
+                      ? aiModelDisplayLabel(
+                          orgAiRuntimeStatus?.provider,
+                          orgAiRuntimeStatus?.model,
+                          orgAiRuntimeStatus?.providerLabel,
+                        )
                       : (draft.aiProviderLabel || aiModelDisplayLabel(draft.aiProvider, draft.aiModel, draft.aiProviderLabel)))
                   : '未接入',
                 accent: textModelReady ? 'success' : 'warning',

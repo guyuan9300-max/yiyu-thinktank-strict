@@ -37,7 +37,7 @@ test('strict active and transitional approved both mean an active account', () =
 });
 
 test('active cloud members remain visible and assignable', () => {
-  const active = employee('active');
+  const active = employee('active', 'active');
   assert.equal(isActiveOrganizationEmployee(active), true);
   assert.equal(isAssignableOrganizationEmployee(active), true);
 });

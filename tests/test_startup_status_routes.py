@@ -23,6 +23,45 @@ class _Runtime:
             }
         }
 
+    def cloud_query(self, path: str) -> dict:
+        if path == "/api/v2/organization-access/members":
+            return {
+                "items": [
+                    {
+                        "id": "membership_startup_status",
+                        "fullName": "部门负责人",
+                        "primaryRole": "admin",
+                        "accountStatus": "approved",
+                        "membershipStatus": "active",
+                        "departmentId": "department_startup_status",
+                        "managementTitleId": "title_ceo",
+                        "isDepartmentLead": True,
+                        "visibilityScope": "organization",
+                        "version": 3,
+                    }
+                ]
+            }
+        if path == "/api/v2/organization-access/management-titles":
+            return {
+                "items": [
+                    {
+                        "id": "title_ceo",
+                        "name": "CEO",
+                        "state": "active",
+                        "version": 2,
+                        "updatedAt": "2026-08-07T00:00:00Z",
+                    },
+                    {
+                        "id": "title_advisor",
+                        "name": "顾问",
+                        "state": "active",
+                        "version": 1,
+                        "updatedAt": "2026-08-07T00:00:00Z",
+                    },
+                ]
+            }
+        raise AssertionError(path)
+
     def current(self) -> dict:
         return {
             "sandbox": {"sandboxId": "sandbox_startup_status"},
@@ -37,6 +76,29 @@ class _Runtime:
                         "departmentId": "department_startup_status",
                         "name": "技术创新部",
                         "color": "#2563eb",
+                        "lifecycleState": "active",
+                        "version": 2,
+                    }
+                ],
+                "members": [
+                    {
+                        "membershipId": "membership_startup_status",
+                        "principalId": "principal_startup_status",
+                        "displayName": "部门负责人",
+                        "systemRole": "admin",
+                        "status": "active",
+                        "version": 3,
+                    }
+                ],
+                "departmentAssignments": [
+                    {
+                        "assignmentId": "assignment_startup_status",
+                        "membershipId": "membership_startup_status",
+                        "departmentId": "department_startup_status",
+                        "assignmentRole": "department_lead",
+                        "status": "active",
+                        "version": 2,
+                        "lifecycleState": "active",
                     }
                 ],
             },
@@ -167,4 +229,29 @@ def test_startup_statuses_are_responsive_and_do_not_fake_empty_authority(
     }
     assert profile["organization"]["organizationId"] == "org_startup_status"
     assert profile["departments"][0]["name"] == "技术创新部"
+    assert profile["departments"][0]["leaderUserId"] == "membership_startup_status"
+    assert profile["departments"][0]["leaderName"] == "部门负责人"
+    assert profile["bindings"] == [
+        {
+            "userId": "membership_startup_status",
+            "version": 3,
+            "departmentId": "department_startup_status",
+            "primaryRoleId": "title_ceo",
+            "managerUserId": None,
+            "isManager": True,
+            "visibilityScope": "organization",
+            "projectRoleLabels": [],
+            "currentFocus": "",
+            "taskEditScope": "self",
+            "canApproveTasks": False,
+            "canReassignTasks": False,
+            "canChangeDeadline": False,
+            "updatedAt": "2026-08-07T00:00:00Z",
+        }
+    ]
+    assert [item["name"] for item in profile["roles"]] == ["CEO", "顾问"]
     assert profile["authorityStates"]["identityStructure"]["state"] == "ready"
+    assert (
+        profile["authorityStates"]["unfrozenSemanticFields"]["state"]
+        == "not_connected"
+    )

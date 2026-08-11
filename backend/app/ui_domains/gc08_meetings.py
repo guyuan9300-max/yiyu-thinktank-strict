@@ -23,6 +23,7 @@ from ..project_materials_local import LocalProjectMaterialsRepository
 from ..local_asr.models import SENSE_VOICE_MODEL, model_ready
 from ..local_asr.subprocess_runner import run_local_asr_subprocess
 from ..runtime import LocalRuntimeError
+from .project_materials import register_and_process_local_materials
 from .routing import UiDomainRouter, UiRequest
 
 
@@ -601,7 +602,10 @@ def transcribe(
     # 后续明确动作，不能因后续云端闸门失败而把已成功的本机转写
     # 伪装成失败，也不能在用户只点击“开始转写”时静默发布纪要。
     runtime = compatibility.runtime
-    pinned_workspace_context = runtime._current_context(require_ready=True)  # noqa: SLF001
+    pinned_sandbox = runtime.capture_sandbox_context()
+    pinned_workspace_context = pinned_sandbox.workspace_context
+    if pinned_workspace_context is None:
+        raise LocalRuntimeError(409, "workspace_not_ready", "当前组织工作空间尚未就绪")
     pinned_context = _context_provider(runtime)()
     requested_language = str(request.body.get("language") or "auto")
     requested_force = bool(request.body.get("force"))
@@ -643,14 +647,15 @@ def transcribe(
                 )
 
             try:
-                result = repository.transcribe(
-                    client_id=client_id,
-                    meeting_id=meeting_id,
-                    recording_id=recording_id,
-                    language=requested_language,
-                    force=requested_force,
-                    progress_callback=report,
-                )
+                with runtime.prebound_sandbox_context(pinned_sandbox):
+                    result = repository.transcribe(
+                        client_id=client_id,
+                        meeting_id=meeting_id,
+                        recording_id=recording_id,
+                        language=requested_language,
+                        force=requested_force,
+                        progress_callback=report,
+                    )
                 transcript_path = str(
                     (result.get("localFiles") or {}).get("transcriptionPath") or ""
                 ).strip()
@@ -673,16 +678,26 @@ def transcribe(
                                 f"{(result.get('transcription') or {}).get('version') or 1}"
                             ),
                         )
-                        material_store.bind_pending_materials(
-                            project_id=client_id,
-                            local_materials=imported["materials"],
+                        operation_key = (
+                            f"meeting-transcript:{recording_id}:"
+                            f"{(result.get('transcription') or {}).get('version') or 1}"
                         )
-                        material_store.bind_meeting_materials(
-                            project_id=client_id,
-                            meeting_id=meeting_id,
-                            local_materials=imported["materials"],
-                        )
-                        archive_status = "ready"
+                        with runtime.prebound_sandbox_context(pinned_sandbox):
+                            settled = register_and_process_local_materials(
+                                runtime=runtime,
+                                store=material_store,
+                                project_id=client_id,
+                                local_materials=imported["materials"],
+                                relation_kind="meeting",
+                                relation_id=meeting_id,
+                                idempotency_key=operation_key,
+                            )
+                            material_store.bind_meeting_materials(
+                                project_id=client_id,
+                                meeting_id=meeting_id,
+                                local_materials=imported["materials"],
+                            )
+                        archive_status = str(settled.get("overallState") or "failed_retryable")
                     except Exception:  # noqa: BLE001
                         archive_status = "failed_retryable"
                 terminal = str(

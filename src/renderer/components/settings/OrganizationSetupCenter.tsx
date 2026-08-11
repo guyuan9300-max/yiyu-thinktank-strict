@@ -1740,36 +1740,11 @@ export function OrganizationSetupCenter({
     || visibleLeaderNameInput(organizationLeaderNameInput) !== visibleLeaderNameInput(value.organization.leaderName)
     || introDocumentChanged(pendingOrganizationIntroDocument, value.organization.introDocument)
     || (editingNodeId === tree.id && editingText.trim().length > 0 && editingText.trim() !== tree.name);
-  const semanticAuthority = value.authorityStates?.unfrozenSemanticFields;
-  const roleProcessAutomation = value.authorityStates?.roleProcessAutomation;
-
   return (
     <div className="space-y-6">
       {toast ? (
         <div className="fixed top-6 left-1/2 z-50 -translate-x-1/2 rounded-full bg-gray-900/90 px-5 py-2.5 text-[13px] font-medium text-white shadow-lg">
           {toast}
-        </div>
-      ) : null}
-
-      {semanticAuthority?.state === 'blocked' ? (
-        <div className="rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-[13px] leading-6 text-amber-900">
-          <div className="font-bold">部分组织语义字段尚未接通</div>
-          <div className="mt-1">
-            {semanticAuthority.message || '当前仅组织身份结构与组织计划是严格权威数据。'}
-          </div>
-          <div className="mt-1 text-[12px] text-amber-700">
-            未接通字段显示的空白不是“组织没有数据”，保存这些字段会被阻止。
-          </div>
-        </div>
-      ) : null}
-
-      {roleProcessAutomation?.state === 'blocked' ? (
-        <div className="rounded-2xl border border-blue-200 bg-blue-50 px-5 py-4 text-[13px] leading-6 text-blue-900">
-          <div className="font-bold">角色流程模板可保存，自动执行尚未接通</div>
-          <div className="mt-1">
-            {roleProcessAutomation.message
-              || '当前可配置和共享模板；触发后不会创建假的执行记录。'}
-          </div>
         </div>
       ) : null}
 

@@ -19,7 +19,7 @@ export type AiModelMode = 'auto' | 'online_first' | 'local_first' | 'local_only'
 export type AiModelProfileKey = 'online_primary' | 'local_text_deep' | 'local_vision_ocr' | 'local_fast';
 export type AiModelCapability = 'online_primary' | 'deep_analysis' | 'vision_ocr' | 'fast_structured';
 export type AccountStatus = 'pending' | 'approved' | 'active' | 'rejected' | 'disabled';
-export type MembershipStatus = 'none' | 'pending' | 'approved' | 'rejected';
+export type MembershipStatus = 'none' | 'pending' | 'approved' | 'active' | 'rejected';
 // [B] 5/25 PM (顾源源 path C): 加 'ai_agent' 让真 bot 同事 (庆华等) 能作为组织成员存在.
 // 跟 admin/employee 一样平权, 但 isLegacyOrganizationEmployee 永远放行.
 export type EmployeeRole = 'admin' | 'employee' | 'ai_agent';
@@ -703,7 +703,7 @@ export interface OrgModelSettings {
     identityStructure?: { state: string; authority?: string[] };
     organizationPlans?: { state: string; authority?: string[] };
     unfrozenSemanticFields?: {
-      state: 'blocked' | 'ready';
+      state: 'blocked' | 'ready' | 'not_connected';
       reasonCode?: string;
       message?: string;
       fields?: string[];
@@ -7533,6 +7533,11 @@ export interface EmployeeRolePayload {
 
 export interface EmployeeDepartmentPayload {
   departmentId?: string | null;
+  departmentLead?: boolean;
+}
+
+export interface EmployeeManagementTitlePayload {
+  managementTitleId?: string | null;
 }
 
 export interface AdminTransferPayload {
