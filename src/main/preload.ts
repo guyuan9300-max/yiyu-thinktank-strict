@@ -43,9 +43,8 @@ contextBridge.exposeInMainWorld('yiyuWorkbench', {
   stopCollabPreview: () => Promise.reject(
     new Error('当前没有由严格新版启动的协作预览。'),
   ),
-  rebuildAndInstallFromRepo: () => Promise.reject(
-    new Error('自动覆盖安装暂未开放，请先验收同步后的源码。'),
-  ),
+  rebuildAndInstallFromRepo: (repoPath: string) =>
+    ipcRenderer.invoke('strict:rebuild-and-install-from-repo', repoPath),
   setWorkspaceInteractionState: (payload: {
     active: boolean;
     source: string;

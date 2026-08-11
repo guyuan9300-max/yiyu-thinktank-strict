@@ -11,7 +11,7 @@
     "dev:electron": "wait-on tcp:4188 build/main/main/main.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:4188 electron .",
     "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:main\" \"npm:dev:electron\"",
     "typecheck:renderer": "tsc --noEmit --pretty false -p tsconfig.json",
-    "build:main": "tsc -p tsconfig.node.json",
+    "build:main": "node scripts/clean_main_build.mjs && tsc -p tsconfig.node.json",
     "build:renderer": "npm run typecheck:renderer && vite build",
     "build:python": "uv run python -m compileall backend cloud_backend strict_common scripts",
     "build:backend-runtime": "uv run python scripts/build_backend_runtime.py",

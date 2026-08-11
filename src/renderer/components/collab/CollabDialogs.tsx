@@ -131,7 +131,7 @@ export function CollabPreviewDialog({
       ? '当前已经是最新版本'
       : mode === 'push'
         ? '安全推送到 main'
-        : '快进接收 main';
+        : '快进接收并更新';
   const confirmDisabled = busy
     || Boolean(preview.executionBlockReason)
     || (mode === 'pull' && !pullPreview?.canFastForwardMain);
@@ -491,7 +491,7 @@ export function CollabPreviewDialog({
                         {mode === 'push'
                           ? `将把 ${preview.files.length} 个底层文件对应的修改安全推送到 main。`
                           : pullPreview?.canFastForwardMain
-                            ? '当前可安全快进接收 origin/main。'
+                            ? '将安全接收 origin/main，并自动重建、覆盖安装和重启本机软件。'
                             : '当前不能直接接收，可开启隔离预览。'}
                       </p>
                     </div>

@@ -10498,10 +10498,12 @@ export default function App() {
       await refreshCollabStatus(repoPath);
       if (mode === 'pull') {
         await loadSystemAdminSettingsBlock(currentSessionUser?.primaryRole === 'admin');
-        const shouldRebuild = window.confirm('源码已经同步完成。要不要继续自动更新本机安装版？');
-        if (shouldRebuild) {
+        if (desktopAppInfo?.isPackaged) {
           setCollabBusyAction('rebuild');
+          flash('success', '源码已同步，正在构建并覆盖安装；完成后软件会自动重启。');
           await rebuildAndInstallFromRepo(repoPath);
+        } else {
+          flash('success', '源码已同步；当前开发版会直接读取最新界面。');
         }
       }
     } catch (error) {

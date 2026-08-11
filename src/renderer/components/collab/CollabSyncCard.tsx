@@ -69,7 +69,7 @@ export function CollabSyncCard({
             disabled={actionDisabled}
             title="预览 main 和协作分支修改"
           >
-            {busyAction === 'pull' ? <RefreshCw size={14} className="animate-spin" /> : <Download size={14} />}
+            {busyAction === 'pull' || busyAction === 'rebuild' ? <RefreshCw size={14} className="animate-spin" /> : <Download size={14} />}
           </button>
         </div>
       </div>
@@ -135,8 +135,8 @@ export function CollabSyncCard({
             onClick={onPreviewPull}
             disabled={actionDisabled}
           >
-            {busyAction === 'pull' ? <RefreshCw size={11} className="animate-spin" /> : <Download size={11} />}
-            预览
+            {busyAction === 'pull' || busyAction === 'rebuild' ? <RefreshCw size={11} className="animate-spin" /> : <Download size={11} />}
+            {busyAction === 'rebuild' ? '更新中' : '预览'}
           </button>
         </div>
       </div>

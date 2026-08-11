@@ -2,6 +2,8 @@ import { createHash, randomBytes } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { createWriteStream, mkdirSync } from 'node:fs';
 import {
+  access,
+  chmod,
   copyFile,
   readFile,
   writeFile,
@@ -45,6 +47,172 @@ app.setPath(
   'userData',
   explicitDataDir || path.join(app.getPath('appData'), DATA_DIR_NAME),
 );
+
+function runUpdateCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+  logPath: string,
+  timeoutMs: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const logStream = createWriteStream(logPath, { flags: 'a' });
+    const child = spawn(command, args, {
+      cwd,
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: '0',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout?.pipe(logStream, { end: false });
+    child.stderr?.pipe(logStream, { end: false });
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      logStream.end();
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      finish(new Error('自动更新构建超时，请查看更新日志后重试。'));
+    }, timeoutMs);
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      finish(error);
+    });
+    child.once('close', (code) => {
+      clearTimeout(timer);
+      finish(code === 0 ? undefined : new Error(`自动更新命令失败（退出码 ${code ?? '未知'}），请查看更新日志。`));
+    });
+  });
+}
+
+async function rebuildAndInstallStrictApp(repoPath: string): Promise<boolean> {
+  if (!app.isPackaged) {
+    return false;
+  }
+  if (process.platform !== 'darwin' || process.arch !== 'arm64') {
+    throw new Error('当前自动覆盖安装仅支持 Apple Silicon 版 macOS。');
+  }
+
+  const resolution = await resolveStrictRepository(
+    repoPath,
+    app.getPath('userData'),
+    app.getAppPath(),
+  );
+  if (!resolution.repoPath) {
+    throw new Error(resolution.error || '严格新版源码目录无效。');
+  }
+  const status = await getStrictCollabRepoStatus(
+    resolution.repoPath,
+    app.getPath('userData'),
+    app.getAppPath(),
+  );
+  if (!status.isMainBranch || status.hasUnmergedPaths || status.hasLocalChanges) {
+    throw new Error('自动更新只允许使用无冲突、无未提交修改的 main 源码。');
+  }
+  if ((status.aheadCount || 0) !== 0 || (status.behindCount || 0) !== 0) {
+    throw new Error('源码尚未与 GitHub main 完全同步，不能覆盖安装。');
+  }
+
+  const currentBundlePath = path.resolve(path.dirname(process.execPath), '..', '..');
+  if (path.dirname(currentBundlePath) !== '/Applications' || path.extname(currentBundlePath) !== '.app') {
+    throw new Error('请先把益语智库AI（新版）安装到 /Applications，再使用自动更新。');
+  }
+
+  const updateId = new Date().toISOString().replace(/[^0-9]/g, '');
+  const updateRoot = path.join(app.getPath('userData'), 'updates', updateId);
+  const logPath = path.join(updateRoot, 'update.log');
+  mkdirSync(updateRoot, { recursive: true });
+  await writeFile(
+    logPath,
+    `${new Date().toISOString()} start ${resolution.repoPath}\n`,
+    { encoding: 'utf8', mode: 0o600 },
+  );
+
+  await runUpdateCommand(
+    '/bin/zsh',
+    [
+      '-lc',
+      'if [ ! -x node_modules/.bin/electron-builder ]; then npm ci; fi; npm run dist:mac-local',
+    ],
+    resolution.repoPath,
+    logPath,
+    30 * 60_000,
+  );
+
+  const candidatePath = path.join(
+    resolution.repoPath,
+    'dist',
+    'mac-arm64',
+    `${APP_NAME}.app`,
+  );
+  await access(path.join(candidatePath, 'Contents', 'Info.plist'));
+
+  const stagedBundlePath = path.join('/Applications', `.${APP_NAME}.update-${updateId}.app`);
+  await runUpdateCommand(
+    '/usr/bin/ditto',
+    [candidatePath, stagedBundlePath],
+    resolution.repoPath,
+    logPath,
+    5 * 60_000,
+  );
+  await access(path.join(stagedBundlePath, 'Contents', 'Info.plist'));
+
+  const backupBundlePath = path.join('/Applications', `.${APP_NAME}.previous.app`);
+  const updaterScriptPath = path.join(updateRoot, 'install-update.sh');
+  await writeFile(
+    updaterScriptPath,
+    `#!/bin/sh
+set -eu
+STAGED="$1"
+TARGET="$2"
+BACKUP="$3"
+OLD_PID="$4"
+LOG_FILE="$5"
+exec >>"$LOG_FILE" 2>&1
+case "$STAGED" in /Applications/*.app) ;; *) exit 64 ;; esac
+case "$TARGET" in /Applications/*.app) ;; *) exit 64 ;; esac
+COUNT=0
+while kill -0 "$OLD_PID" 2>/dev/null; do
+  COUNT=$((COUNT + 1))
+  [ "$COUNT" -ge 300 ] && exit 70
+  sleep 0.2
+done
+[ -e "$BACKUP" ] && /bin/rm -rf "$BACKUP"
+[ -e "$TARGET" ] && /bin/mv "$TARGET" "$BACKUP"
+if /bin/mv "$STAGED" "$TARGET"; then
+  /usr/bin/xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
+  /usr/bin/open "$TARGET"
+  exit 0
+fi
+[ ! -e "$TARGET" ] && [ -e "$BACKUP" ] && /bin/mv "$BACKUP" "$TARGET"
+/usr/bin/open "$TARGET" 2>/dev/null || true
+exit 71
+`,
+    { encoding: 'utf8', mode: 0o700 },
+  );
+  await chmod(updaterScriptPath, 0o700);
+
+  const updater = spawn(
+    '/bin/sh',
+    [
+      updaterScriptPath,
+      stagedBundlePath,
+      currentBundlePath,
+      backupBundlePath,
+      String(process.pid),
+      logPath,
+    ],
+    { detached: true, stdio: 'ignore' },
+  );
+  updater.unref();
+  setTimeout(() => app.quit(), 300);
+  return true;
+}
 
 const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) {
@@ -566,6 +734,11 @@ ipcMain.handle(
   'strict:fast-forward-main',
   (_event, payload: FastForwardMainPayload) =>
     fastForwardStrictMain(payload),
+);
+
+ipcMain.handle(
+  'strict:rebuild-and-install-from-repo',
+  (_event, repoPath: string) => rebuildAndInstallStrictApp(repoPath),
 );
 
 ipcMain.handle('strict:read-text-file', async (_event, targetPath: string) =>
