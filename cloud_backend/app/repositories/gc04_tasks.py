@@ -621,7 +621,11 @@ class GC04TaskRepository:
         identity: SessionIdentity,
         row: sqlite3.Row,
     ) -> bool:
-        if identity.is_admin or str(row["creator_membership_id"] or "") == identity.membership_id:
+        # A client/project is context for a task, not its permission parent.
+        # Project access must never make every project task visible.  Normal
+        # task views follow the task's own participants/visibility contract;
+        # administrative audit access belongs in a separate, explicit lane.
+        if str(row["creator_membership_id"] or "") == identity.membership_id:
             return True
         collaborator = connection.execute(
             "SELECT 1 FROM task_collaborators WHERE scope_id=? AND task_id=? "
@@ -631,15 +635,6 @@ class GC04TaskRepository:
         ).fetchone()
         if collaborator is not None:
             return True
-        client_id = _text(row["client_id"])
-        if client_id:
-            try:
-                self._require_project_capability(
-                    connection, identity, client_id=client_id, write=False
-                )
-                return True
-            except RepositoryError:
-                return False
         return str(row["visibility_scope"] or "participants") == "organization"
 
     def _require_task_read(
@@ -659,7 +654,7 @@ class GC04TaskRepository:
         identity: SessionIdentity,
         row: sqlite3.Row,
     ) -> bool:
-        if identity.is_admin or str(row["creator_membership_id"] or "") == identity.membership_id:
+        if str(row["creator_membership_id"] or "") == identity.membership_id:
             return True
         owner = connection.execute(
             "SELECT 1 FROM task_collaborators WHERE scope_id=? AND task_id=? "
@@ -670,15 +665,6 @@ class GC04TaskRepository:
         ).fetchone()
         if owner is not None:
             return True
-        client_id = _text(row["client_id"])
-        if client_id:
-            try:
-                self._require_project_capability(
-                    connection, identity, client_id=client_id, write=True
-                )
-                return True
-            except RepositoryError:
-                return False
         return False
 
     def _require_task_write(

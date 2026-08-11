@@ -1602,6 +1602,32 @@ class LocalProjectMaterialsRepository:
                     "当前项目尚未形成可验证的本机投影",
                 )
             connection.execute("BEGIN IMMEDIATE")
+            # A freshly imported local file is already represented by its
+            # local storage-object id.  After cloud metadata registration the
+            # project state also gains a cloud document id, but the strict
+            # schema intentionally permits only one source asset per
+            # (project, content hash).  Reuse that existing source asset
+            # instead of trying to insert a second identity and leaving the
+            # document forever in the misleading "0% processing" state.
+            existing = connection.execute(
+                """
+                SELECT id
+                FROM source_assets
+                WHERE scope_id=? AND client_id=? AND content_hash=?
+                ORDER BY CASE WHEN id=? THEN 0 WHEN id=? THEN 1 ELSE 2 END,
+                         updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (
+                    scope_id,
+                    project_id,
+                    str(source["content_hash"]),
+                    source_asset_id,
+                    local_object_id,
+                ),
+            ).fetchone()
+            if existing is not None:
+                source_asset_id = str(existing["id"])
             connection.execute(
                 """
                 INSERT INTO secured_resources (
@@ -1715,14 +1741,22 @@ class LocalProjectMaterialsRepository:
         return dict(row) if row is not None else None
 
     def processing_state(self, entry: Mapping[str, Any]) -> dict[str, Any]:
-        source_asset_id = str(
+        cloud_source_asset_id = str(
             entry.get("cloudDocumentId")
             or entry.get("documentId")
             or ""
         ).strip()
-        if source_asset_id.startswith("local-pending:"):
-            source_asset_id = str(entry.get("localSourceId") or "").strip()
-        if not source_asset_id:
+        local_source_asset_id = str(entry.get("localSourceId") or "").strip()
+        if cloud_source_asset_id.startswith("local-pending:"):
+            cloud_source_asset_id = ""
+        source_asset_ids = list(
+            dict.fromkeys(
+                value
+                for value in (cloud_source_asset_id, local_source_asset_id)
+                if value
+            )
+        )
+        if not source_asset_ids:
             return {
                 "parseStatus": "blocked",
                 "wikiStatus": "not_requested",
@@ -1730,14 +1764,20 @@ class LocalProjectMaterialsRepository:
                 "processingMessage": "本机资料缺少稳定来源标识",
                 "processingRetryable": False,
             }
-        parsed = self._latest_processing_attempt(
-            source_asset_id,
-            processor_kind="local_text_extraction",
-        )
-        wiki = self._latest_processing_attempt(
-            source_asset_id,
-            processor_kind="local_wiki_projection",
-        )
+        parsed = None
+        wiki = None
+        for source_asset_id in source_asset_ids:
+            candidate = self._latest_processing_attempt(
+                source_asset_id,
+                processor_kind="local_text_extraction",
+            )
+            if candidate is not None:
+                parsed = candidate
+                wiki = self._latest_processing_attempt(
+                    source_asset_id,
+                    processor_kind="local_wiki_projection",
+                )
+                break
         if parsed is None:
             return {
                 "parseStatus": "not_requested",

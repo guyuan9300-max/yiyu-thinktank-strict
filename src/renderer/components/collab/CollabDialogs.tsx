@@ -459,7 +459,7 @@ export function CollabPreviewDialog({
                     </div>
                     <div className="flex items-start gap-2">
                       <CheckCircle2 size={15} className="mt-1 shrink-0 text-emerald-500" />
-                      <span>{mode === 'push' ? '推送会优先进入 main；遇到真实冲突或异常时会停住，不覆盖对方修改。' : '只有本地干净且 main 可快进时，才允许直接接收。'}</span>
+                      <span>{mode === 'push' ? '推送前会自动接入可安全快进的远端 main；遇到真实冲突或异常时会停住，不覆盖任何一方修改。' : '远端 main 可快进且不覆盖本机修改时即可接收；普通未提交修改不再一刀切阻止。'}</span>
                     </div>
                     <div className="flex items-start gap-2">
                       <AlertCircle size={15} className="mt-1 shrink-0 text-amber-500" />

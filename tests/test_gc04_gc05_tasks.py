@@ -196,6 +196,81 @@ def test_task_unrelated_fields_remain_editable_after_event_line_archive(
     assert updated["due_date"] == "2026-08-09"
 
 
+def test_project_access_does_not_leak_participant_task(
+    tmp_path: Path,
+) -> None:
+    repository, admin, seed_payload = _repository(tmp_path)
+    peer = _second_member(repository, admin)
+    domain = GC04TaskRepository(repository)
+    project_id = seed_payload["projectId"]
+
+    # Make the peer the project owner to prove that even explicit project
+    # write access is not inherited by participant-only task records.
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        connection.execute(
+            "UPDATE clients SET owner_membership_id=?,visibility_scope='organization' "
+            "WHERE id=? AND scope_id=?",
+            (peer.membership_id, project_id, admin.scope_id),
+        )
+        connection.commit()
+
+    private_task = _create(
+        domain,
+        admin,
+        "gc04-project-permission-isolation",
+        "仅发起人与负责人可见",
+        clientId=project_id,
+        ownerMembershipId=admin.membership_id,
+        visibilityScope="participants",
+    )["task"]
+
+    assert private_task["client_id"] == project_id
+    assert [item["id"] for item in domain.board(peer)["tasks"]] == []
+    with pytest.raises(RepositoryError, match="任务不存在或已不可用"):
+        domain.task_detail(peer, task_id=private_task["id"])
+    with pytest.raises(RepositoryError, match="任务不存在或已不可用"):
+        domain.update_task(
+            peer,
+            task_id=private_task["id"],
+            payload={"expectedVersion": 1, "title": "项目负责人不得越权修改"},
+            idempotency_key="gc04-project-permission-isolation-write",
+        )
+
+    shared_task = _create(
+        domain,
+        admin,
+        "gc04-organization-visible-task",
+        "明确组织可见任务",
+        clientId=project_id,
+        ownerMembershipId=admin.membership_id,
+        visibilityScope="organization",
+    )["task"]
+    assert [item["id"] for item in domain.board(peer)["tasks"]] == [
+        shared_task["id"]
+    ]
+
+
+def test_administrator_does_not_bypass_participant_task_visibility(
+    tmp_path: Path,
+) -> None:
+    repository, admin, _ = _repository(tmp_path)
+    peer = _second_member(repository, admin)
+    domain = GC04TaskRepository(repository)
+
+    private_task = _create(
+        domain,
+        peer,
+        "gc04-admin-no-content-bypass",
+        "成员私有参与者任务",
+        ownerMembershipId=peer.membership_id,
+        visibilityScope="participants",
+    )["task"]
+
+    assert [item["id"] for item in domain.board(admin)["tasks"]] == []
+    with pytest.raises(RepositoryError, match="任务不存在或已不可用"):
+        domain.task_detail(admin, task_id=private_task["id"])
+
+
 def test_gc04_task_cas_collaboration_calendar_list_lifecycle_and_proposal(
     tmp_path: Path,
 ) -> None:

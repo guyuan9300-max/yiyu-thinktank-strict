@@ -565,11 +565,11 @@ def local_knowledge_progress(
         item
         for item in documents
         if str(item.get("parseStatus") or "")
-        in {"not_requested", "queued", "processing"}
+        in {"queued", "processing"}
         or (
             str(item.get("parseStatus") or "") == "ready"
             and str(item.get("wikiStatus") or "")
-            in {"not_requested", "queued", "processing"}
+            in {"queued", "processing"}
         )
     ]
     running = [

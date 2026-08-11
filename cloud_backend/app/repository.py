@@ -155,6 +155,11 @@ class CloudRepository:
                     or capabilities.get("write")
                     or capabilities.get("contributeKnowledge")
                 ),
+                "knowledge_read": bool(
+                    capabilities.get("read")
+                    or capabilities.get("write")
+                    or capabilities.get("contributeKnowledge")
+                ),
                 "project_write": bool(capabilities.get("write")),
                 "knowledge_write": bool(
                     capabilities.get("contributeKnowledge")
@@ -603,6 +608,19 @@ class CloudRepository:
                             "session_replay_unavailable",
                             "该登录操作对应的会话已失效，请使用新的幂等键重新登录",
                         )
+                    try:
+                        renew_authorization_projection_for_session(
+                            connection,
+                            scope_id=scope_id,
+                            membership_id=membership_id,
+                            now=utc_now(),
+                        )
+                    except AuthorizationProjectionError as exc:
+                        raise RepositoryError(
+                            exc.status_code,
+                            exc.code,
+                            exc.message,
+                        ) from exc
                     connection.commit()
                     session = self._load_session_secret(str(replay["secret_reference"]))
                 else:
@@ -613,6 +631,19 @@ class CloudRepository:
                         scope_id=scope_id,
                     )
                     secret_to_remove = str(session["_secretReference"])
+                    try:
+                        renew_authorization_projection_for_session(
+                            connection,
+                            scope_id=scope_id,
+                            membership_id=membership_id,
+                            now=utc_now(),
+                        )
+                    except AuthorizationProjectionError as exc:
+                        raise RepositoryError(
+                            exc.status_code,
+                            exc.code,
+                            exc.message,
+                        ) from exc
                     self._record_session_operation(
                         connection,
                         scope_id=scope_id,

@@ -726,15 +726,44 @@ async function fetchMain(repoPath: string): Promise<void> {
 }
 
 async function requireRemoteAncestor(repoPath: string): Promise<void> {
+  if (!(await isGitAncestor(repoPath, 'refs/remotes/origin/main', 'HEAD'))) {
+    throw new Error(
+      '远端 main 含有本机尚未接入的提交。请先预览并快进接收，禁止强制覆盖。',
+    );
+  }
+}
+
+async function isGitAncestor(
+  repoPath: string,
+  ancestor: string,
+  descendant: string,
+): Promise<boolean> {
   try {
     await execFileAsync(
       'git',
-      ['merge-base', '--is-ancestor', 'refs/remotes/origin/main', 'HEAD'],
+      ['merge-base', '--is-ancestor', ancestor, descendant],
       { cwd: repoPath, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } },
     );
+    return true;
   } catch {
+    return false;
+  }
+}
+
+async function fastForwardRemoteMainIfNeeded(repoPath: string): Promise<boolean> {
+  if (await isGitAncestor(repoPath, 'refs/remotes/origin/main', 'HEAD')) return false;
+  if (!(await isGitAncestor(repoPath, 'HEAD', 'refs/remotes/origin/main'))) {
     throw new Error(
-      '远端 main 含有本机尚未接入的提交。请先预览并快进接收，禁止强制覆盖。',
+      '本机 main 与远端 main 已分别产生提交，不能自动合并。请交给开发工具处理真实提交冲突。',
+    );
+  }
+  try {
+    await run(repoPath, ['merge', '--ff-only', 'refs/remotes/origin/main']);
+    return true;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `远端 main 与本机未提交修改涉及相同文件，已安全停止且未覆盖本机修改。${detail ? `\n${detail}` : ''}`,
     );
   }
 }
@@ -763,12 +792,11 @@ export async function previewStrictPush(
     executionBlockReason = '当前存在未解决冲突，不能推送。';
   } else if (status.hasPermissionOnlyChanges) {
     executionBlockReason = `检测到 ${status.permissionOnlyChangeCount || 0} 个文件仅有权限位异常，代码内容没有改变。请先修复源码目录权限后再推送。`;
-  } else {
-    try {
-      await requireRemoteAncestor(validated);
-    } catch (error) {
-      executionBlockReason = error instanceof Error ? error.message : String(error);
-    }
+  } else if (
+    !(await isGitAncestor(validated, 'refs/remotes/origin/main', 'HEAD'))
+    && !(await isGitAncestor(validated, 'HEAD', 'refs/remotes/origin/main'))
+  ) {
+    executionBlockReason = '本机 main 与远端 main 已分别产生提交，不能自动合并。请交给开发工具处理真实提交冲突。';
   }
   if (!executionBlockReason && files.length === 0 && status.aheadCount === 0) {
     executionBlockReason = '当前没有可提交的本地文件改动。';
@@ -805,7 +833,7 @@ export async function pushStrictMain(
       `检测到 ${workingTree.permissionOnlyChangeCount} 个文件仅有权限位异常，代码内容没有改变。请先修复源码目录权限后再推送。`,
     );
   }
-  await requireRemoteAncestor(repoPath);
+  await fastForwardRemoteMainIfNeeded(repoPath);
   const remoteBefore = await run(repoPath, ['rev-parse', 'refs/remotes/origin/main']);
   await runCommand(repoPath, 'npm', ['run', 'verify:strict-maintenance'], 10 * 60_000);
   await run(repoPath, ['add', '--all']);
@@ -921,7 +949,6 @@ export async function previewStrictPull(repoPath: string): Promise<PullPreview> 
     ),
   );
   const canFastForwardMain = status.isMainBranch
-    && !status.hasLocalChanges
     && !status.hasPermissionOnlyChanges
     && !status.hasUnmergedPaths
     && status.aheadCount === 0
@@ -931,8 +958,8 @@ export async function previewStrictPull(repoPath: string): Promise<PullPreview> 
     executionBlockReason = '接收远端 main 前，请先切回本地 main 分支。';
   } else if (status.hasPermissionOnlyChanges) {
     executionBlockReason = `检测到 ${status.permissionOnlyChangeCount || 0} 个文件权限异常；代码内容未改变，请先修复源码目录权限。`;
-  } else if (status.hasLocalChanges || status.hasUnmergedPaths) {
-    executionBlockReason = '本机仍有未提交修改或冲突，不能快进接收 main。';
+  } else if (status.hasUnmergedPaths) {
+    executionBlockReason = '本机存在未解决冲突，不能快进接收 main。';
   } else if (status.aheadCount > 0) {
     executionBlockReason = '本机包含尚未推送的提交，请先安全推送。';
   } else if (status.behindCount === 0) {
@@ -966,8 +993,8 @@ export async function fastForwardStrictMain(
   if (!status.isMainBranch) {
     throw new Error('当前不在 main 分支，不能接收远端 main。');
   }
-  if (status.hasLocalChanges || status.hasUnmergedPaths) {
-    throw new Error('本机仍有未提交修改或冲突，不能快进接收 main。');
+  if (status.hasUnmergedPaths) {
+    throw new Error('本机存在未解决冲突，不能快进接收 main。');
   }
   if (status.hasPermissionOnlyChanges) {
     throw new Error(
@@ -984,7 +1011,7 @@ export async function fastForwardStrictMain(
       { allowFailure: true },
     ),
   );
-  await run(repoPath, ['merge', '--ff-only', 'refs/remotes/origin/main']);
+  await fastForwardRemoteMainIfNeeded(repoPath);
   return {
     status: await buildStatus(repoPath),
     changedPaths: files.map((item) => item.path),

@@ -918,6 +918,25 @@ def test_gc01_session_login_refresh_and_logout_are_replayable_and_audited(
             )
             connection.commit()
 
+        reconnected = client.post(
+            "/api/v2/auth/login",
+            headers={"Idempotency-Key": "gc01-login-after-expired-lease"},
+            json=credentials,
+        )
+        assert reconnected.status_code == 200, reconnected.text
+        renewed_authorization = reconnected.json()["sessionSnapshot"]["authorization"]
+        assert renewed_authorization["state"] == "ready"
+        assert renewed_authorization["leaseExpiresAt"] > _future(-1)
+
+        with runtime_connection(database, "cloud") as connection:
+            connection.execute(
+                "UPDATE viewer_projections SET lease_expires_at=? "
+                "WHERE viewer_membership_id='membership_admin' "
+                "AND invalidated_at IS NULL",
+                (_future(-1),),
+            )
+            connection.commit()
+
         refresh_headers = {"Idempotency-Key": "gc01-refresh-operation"}
         refreshed = client.post(
             "/api/v2/auth/refresh",
@@ -983,14 +1002,14 @@ def test_gc01_session_login_refresh_and_logout_are_replayable_and_audited(
             "outbox_events",
             "audit_events",
         }
-        assert counts_after["commands"] - counts_before["commands"] == 3
+        assert counts_after["commands"] - counts_before["commands"] == 4
         assert (
             counts_after["idempotency_records"]
             - counts_before["idempotency_records"]
-            == 3
+            == 4
         )
-        assert counts_after["outbox_events"] - counts_before["outbox_events"] == 3
-        assert counts_after["audit_events"] - counts_before["audit_events"] == 3
+        assert counts_after["outbox_events"] - counts_before["outbox_events"] == 4
+        assert counts_after["audit_events"] - counts_before["audit_events"] == 4
         session = connection.execute(
             "SELECT runtime_status, lifecycle_state, version, secret_reference "
             "FROM sandboxes WHERE id=?",
@@ -1008,6 +1027,8 @@ def test_gc01_session_login_refresh_and_logout_are_replayable_and_audited(
         "gc01-admin-password",
         str(first.json()["accessToken"]),
         str(first.json()["refreshToken"]),
+        str(reconnected.json()["accessToken"]),
+        str(reconnected.json()["refreshToken"]),
         str(refreshed.json()["accessToken"]),
         str(refreshed.json()["refreshToken"]),
     ):

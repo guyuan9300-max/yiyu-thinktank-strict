@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from strict_common.ids import utc_now
 from strict_common.schema import runtime_connection
 from tests.test_gc14_workbench_answer import _repository
 
 from cloud_backend.app.repositories.knowledge_governance_88 import (
     KnowledgeGovernance88Repository,
 )
+from cloud_backend.app.repository import SessionIdentity
 from backend.app.ui_domains.project_materials import router
 from backend.app.ui_domains.routing import UiRequest
 
@@ -52,6 +54,53 @@ def test_governance_decision_is_versioned_and_idempotent_on_88_tables(
             "SELECT COUNT(*) FROM ai_proposals WHERE operation_kind='fact_contradiction_review'"
         ).fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM ai_approvals").fetchone()[0] == 1
+
+
+def test_shared_project_member_can_read_governance_decisions(tmp_path: Path) -> None:
+    repository, owner, payload = _repository(tmp_path)
+    now = utc_now()
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        connection.execute(
+            "INSERT INTO principals (id,status,identity_version,updated_at,"
+            "principal_kind,display_name,version,lifecycle_state,created_at,deleted_at) "
+            "VALUES ('principal_shared','active',1,?,'person','共享成员',1,'active',?,NULL)",
+            (now, now),
+        )
+        connection.execute(
+            "INSERT INTO organization_memberships (id,scope_id,principal_id,role_key,"
+            "status,version,record_kind,visibility_scope,lifecycle_state,created_at,"
+            "updated_at,deleted_at) VALUES ('membership_shared',?,'principal_shared',"
+            "'member','active',1,'membership','organization','active',?,?,NULL)",
+            (owner.scope_id, now, now),
+        )
+        connection.execute(
+            "INSERT INTO object_grants (id,scope_id,secured_resource_id,policy_version_id,"
+            "subject_principal_id,subject_membership_id,capability_set_schema_version,"
+            "capability_set,grant_generation,status,grant_source_set_id,created_at,"
+            "updated_at,revoked_at,version,lifecycle_state,deleted_at) VALUES "
+            "('grant_shared',?,?,'policy_gc14_project',NULL,'membership_shared','1',"
+            "'{\"read\":true,\"write\":false,\"contributeKnowledge\":true,"
+            "\"manageSharing\":false}',1,'active',NULL,?,?,NULL,1,'active',NULL)",
+            (owner.scope_id, payload["projectId"], now, now),
+        )
+        connection.commit()
+    shared = SessionIdentity(
+        session_id="session_shared",
+        principal_id="principal_shared",
+        membership_id="membership_shared",
+        organization_id=owner.organization_id,
+        cloud_instance_id=owner.cloud_instance_id,
+        scope_id=owner.scope_id,
+        system_role="member",
+        visibility_scope="organization",
+        display_name="共享成员",
+    )
+    listed = KnowledgeGovernance88Repository(repository).list_decisions(
+        shared,
+        project_id=payload["projectId"],
+        decision_kind="glossary_drift",
+    )
+    assert listed == {"decisions": [], "count": 0}
 
 
 def test_ui_contradiction_review_keeps_project_scope_and_reviews_real_facts() -> None:

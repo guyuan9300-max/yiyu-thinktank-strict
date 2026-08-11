@@ -413,6 +413,9 @@ function createWindow(): void {
       path.join(app.getAppPath(), 'dist', 'renderer', 'index.html'),
     );
   }
+  mainWindow.once('closed', () => {
+    mainWindow = null;
+  });
 }
 
 ipcMain.handle('strict:get-runtime', () => ({
@@ -632,7 +635,8 @@ ipcMain.handle('strict:read-recording-file', async (_event, absolutePath: string
 });
 
 app.on('second-instance', () => {
-  if (!mainWindow) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    mainWindow = null;
     return;
   }
   if (mainWindow.isMinimized()) {
