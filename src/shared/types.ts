@@ -826,6 +826,10 @@ export interface ClientSummary {
   //   relatedUserIds：勾选的相关同事 user.id（批 3 接通 cloud sync 后驱动跨用户可见）
   //   isDataCenterIncluded：是否进入数据中心计算（false = 仅工作台可见）
   relatedUserIds?: string[];
+  /** Project creator plus explicitly shared organization administrators. */
+  managerNames?: string[];
+  /** Explicitly shared ordinary members, excluding project managers. */
+  sharedMemberCount?: number;
   isDataCenterIncluded?: boolean;
   isDefaultInternalProject?: boolean;
   // 全局冷冻:true 表示该项目被冷冻,所有自动 job/列表/下拉都跳过

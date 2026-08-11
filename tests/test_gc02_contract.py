@@ -169,6 +169,9 @@ def test_gc02_project_create_edit_cas_and_replay_are_one_authority_transaction(
             "membership_admin",
             "membership_member",
         ]
+        assert project["managerMembershipIds"] == ["membership_admin"]
+        assert project["managerNames"] == ["admin"]
+        assert project["sharedMemberCount"] == 1
         assert project["authorizationProjection"]["viewerMembershipId"] == (
             "membership_admin"
         )

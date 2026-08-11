@@ -158,6 +158,12 @@ def _client(project: Mapping[str, Any]) -> dict[str, Any]:
             if str(membership_id)
             != str(project.get("ownerMembershipId") or "")
         ],
+        "managerNames": [
+            str(name)
+            for name in project.get("managerNames") or []
+            if str(name or "").strip()
+        ],
+        "sharedMemberCount": int(project.get("sharedMemberCount") or 0),
         "isDataCenterIncluded": True,
         "isDefaultInternalProject": bool(
             project.get("isDefaultInternalProject")

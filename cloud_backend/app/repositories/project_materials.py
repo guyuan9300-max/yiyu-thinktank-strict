@@ -759,6 +759,50 @@ class GC07ProjectMaterialsRepository:
         }
         if row["owner_membership_id"]:
             participants.add(str(row["owner_membership_id"]))
+        participant_directory: dict[str, dict[str, str]] = {}
+        if participants:
+            placeholders = ",".join("?" for _ in participants)
+            directory_rows = connection.execute(
+                f"""
+                SELECT memberships.id AS membership_id,
+                       memberships.role_key AS role_key,
+                       principals.display_name AS display_name
+                FROM organization_memberships AS memberships
+                JOIN principals
+                  ON principals.id=memberships.principal_id
+                 AND principals.lifecycle_state='active'
+                WHERE memberships.scope_id=?
+                  AND memberships.id IN ({placeholders})
+                  AND memberships.record_kind='membership'
+                  AND memberships.status='active'
+                  AND memberships.lifecycle_state='active'
+                """,
+                (identity.scope_id, *sorted(participants)),
+            ).fetchall()
+            participant_directory = {
+                str(item["membership_id"]): {
+                    "roleKey": str(item["role_key"] or "member"),
+                    "displayName": str(item["display_name"] or "").strip(),
+                }
+                for item in directory_rows
+            }
+        owner_membership_id = str(row["owner_membership_id"] or "")
+        manager_membership_ids = (
+            [owner_membership_id]
+            if owner_membership_id in participants
+            else []
+        ) + [
+            membership_id
+            for membership_id in sorted(participants)
+            if membership_id != owner_membership_id
+            and participant_directory.get(membership_id, {}).get("roleKey") == "admin"
+        ]
+        manager_names = [
+            participant_directory[membership_id]["displayName"]
+            for membership_id in manager_membership_ids
+            if participant_directory.get(membership_id, {}).get("displayName")
+        ]
+        shared_member_count = len(participants - set(manager_membership_ids))
         document_count = connection.execute(
             """
             SELECT COUNT(*) AS count
@@ -816,6 +860,9 @@ class GC07ProjectMaterialsRepository:
             "createdAt": str(row["created_at"]),
             "updatedAt": str(row["updated_at"]),
             "participantMembershipIds": sorted(participants),
+            "managerMembershipIds": manager_membership_ids,
+            "managerNames": manager_names,
+            "sharedMemberCount": shared_member_count,
             "documentCount": int(document_count),
             "taskCount": int(task_count),
             "folderState": "local_only",

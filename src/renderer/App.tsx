@@ -214,7 +214,6 @@ import type {
   ReviewActionExecutionResult,
   ReviewDashboardCardTarget,
   ReviewDashboardDrillTargetResponse,
-  ReportArtifactSummary,
   ReportArtifactVersionSummary,
   OrgModelSettings,
   OrgDepartmentPlanSettings,
@@ -343,7 +342,6 @@ import {
   documentAiAction,
   type DocumentAiAction,
   renderReportArtifact,
-  listClientReportArtifacts,
   listReportArtifactVersions,
   restoreReportArtifactVersion,
   updateReportArtifact,
@@ -620,7 +618,6 @@ import { useTypewriter } from './lib/useTypewriter';
 import { ClientProjectSetupPage } from './components/client_workspace/ClientProjectSetupPage';
 import { EventLineClarificationComposer } from './components/tasks/EventLineClarificationComposer';
 import EventLineReportPanel from './components/tasks/EventLineReportPanel';
-import AIReportGeneratorModal from './components/reports/AIReportGeneratorModal';
 import { TaskTemplateEditorModal } from './components/tasks/TaskTemplateEditorModal';
 import type { TemplateData } from './components/tasks/TaskTemplateEditorModal';
 import { SmartTaskParseModal } from './components/tasks/SmartTaskParseModal';
@@ -8480,12 +8477,6 @@ export default function App() {
   // runs in the background. This is not a second authority or persistent fallback: the
   // cache dies with the renderer and every entry came from the strict v2 workspace route.
   const workspaceByClientRef = useRef<Map<string, ClientWorkspace>>(new Map());
-  const [clientReportArtifacts, setClientReportArtifacts] = useState<ReportArtifactSummary[]>([]);
-  const [clientReportArtifactsClientId, setClientReportArtifactsClientId] = useState('');
-  const [isClientReportArtifactsLoading, setIsClientReportArtifactsLoading] = useState(false);
-  const [clientReportArtifactsError, setClientReportArtifactsError] = useState<string | null>(null);
-  const [projectReportGeneratorOpen, setProjectReportGeneratorOpen] = useState(false);
-  const clientReportArtifactRequestRef = useRef(0);
   const [workspacePageContext, setWorkspacePageContext] = useState<PageContextPack | null>(null);
   const [workspacePageContextError, setWorkspacePageContextError] = useState<string | null>(null);
   const [growthContextJump, setGrowthContextJump] = useState<GrowthContextJumpRequest | null>(null);
@@ -9489,11 +9480,6 @@ export default function App() {
     setClients([]);
     setCurrentClientId('');
     setWorkspace(null);
-    clientReportArtifactRequestRef.current += 1;
-    setClientReportArtifacts([]);
-    setClientReportArtifactsClientId('');
-    setIsClientReportArtifactsLoading(false);
-    setClientReportArtifactsError(null);
     setWorkspacePageContext(null);
     setWorkspacePageContextError(null);
     setWorkspacePersistedProposalDrafts([]);
@@ -12578,7 +12564,6 @@ export default function App() {
     void loadClientPageContextBlock(targetClientId);
     void loadWorkspacePersistedProposalDraftsBlock(targetClientId);
     void loadProposalBlock(targetClientId);
-    void refreshClientReportArtifacts(targetClientId);
     return nextWorkspace;
   }
 
@@ -12657,36 +12642,6 @@ export default function App() {
     workspacesState?.activeSandboxId,
   ]);
 
-  async function refreshClientReportArtifacts(clientId: string) {
-    const targetClientId = clientId.trim();
-    if (!targetClientId) return;
-    const requestId = ++clientReportArtifactRequestRef.current;
-    const startedSandboxId = currentActiveSandboxId();
-    setIsClientReportArtifactsLoading(true);
-    setClientReportArtifactsError(null);
-    try {
-      const artifacts = await listClientReportArtifacts(targetClientId);
-      if (
-        requestId !== clientReportArtifactRequestRef.current
-        || !shouldApplyWorkspaceLoad(null, startedSandboxId)
-      ) return;
-      setClientReportArtifacts(artifacts);
-      setClientReportArtifactsClientId(targetClientId);
-    } catch (error) {
-      if (
-        requestId !== clientReportArtifactRequestRef.current
-        || !shouldApplyWorkspaceLoad(null, startedSandboxId)
-      ) return;
-      setClientReportArtifacts([]);
-      setClientReportArtifactsClientId(targetClientId);
-      setClientReportArtifactsError(error instanceof Error ? error.message : '项目报告加载失败');
-    } finally {
-      if (requestId === clientReportArtifactRequestRef.current) {
-        setIsClientReportArtifactsLoading(false);
-      }
-    }
-  }
-
   function applyWorkspaceKnowledgeProgress(progress: Awaited<ReturnType<typeof getClientKnowledgeProgress>>, startedSandboxId = currentActiveSandboxId()) {
     if (!shouldApplyWorkspaceLoad(null, startedSandboxId)) return;
     setWorkspace((prev) => {
@@ -12726,16 +12681,10 @@ export default function App() {
       setWorkspacePageContext(null);
       setWorkspacePersistedProposalDrafts([]);
       setWorkspacePersistedProposalDraftsError(null);
-      clientReportArtifactRequestRef.current += 1;
-      setClientReportArtifacts([]);
-      setClientReportArtifactsClientId('');
-      setIsClientReportArtifactsLoading(false);
-      setClientReportArtifactsError(null);
       return;
     }
     void loadClientPageContextBlock(currentClientId);
     void loadWorkspacePersistedProposalDraftsBlock(currentClientId);
-    void refreshClientReportArtifacts(currentClientId);
   }, [currentClientId]);
 
   const requestGrowthContextJump = (context: GrowthContextLink) => {
@@ -22796,8 +22745,6 @@ export default function App() {
                 enableDraftPersist: true,
                 recoveredFromDraft: Boolean(recovered),
               });
-              setClientReportArtifacts((prev) => [artifact, ...prev.filter((item) => item.id !== artifact.id)]);
-              setClientReportArtifactsClientId(targetClientId);
               setCurrentClientId(targetClientId);
               setReportEventLineId(null);
             }}
@@ -24756,35 +24703,6 @@ export default function App() {
     const [searchQuery, setSearchQuery] = useState('');
     // P9：左侧项目列表可收起。文档编辑模式或屏幕窄时主区会更宽。
     const [isClientListCollapsed, setIsClientListCollapsed] = useState(false);
-    // 「近期项目」排序 — 本机记录"最近切到哪个客户"
-    // 用 localStorage 而非后端字段:零后端改动,每台机器各自的"最近用"独立(更符合个人体感)
-    // 切换 client(由 useEffect 监听 currentClientId 触发)时记录 timestamp
-    const RECENT_CLIENTS_LS_KEY = 'yiyu.workspace.recentClients.v1';
-    const [recentClientUsage, setRecentClientUsage] = useState<Record<string, number>>(() => {
-      if (typeof window === 'undefined') return {};
-      try {
-        const raw = window.localStorage.getItem(RECENT_CLIENTS_LS_KEY);
-        return raw ? (JSON.parse(raw) as Record<string, number>) : {};
-      } catch {
-        return {};
-      }
-    });
-    useEffect(() => {
-      if (!currentClientId) return;
-      setRecentClientUsage((prev) => {
-        const next = { ...prev, [currentClientId]: Date.now() };
-        // 只保留最近 80 个,避免 localStorage 无限增长
-        const trimmed = Object.fromEntries(
-          Object.entries(next).sort((a, b) => b[1] - a[1]).slice(0, 80),
-        );
-        try {
-          window.localStorage.setItem(RECENT_CLIENTS_LS_KEY, JSON.stringify(trimmed));
-        } catch {
-          // localStorage 满或被禁:静默忽略,本次会话内仍按 state 排序
-        }
-        return trimmed;
-      });
-    }, [currentClientId]);
     // 隐藏项目订阅已经提到主组件层(hiddenClientsVersion 闭包外层),这里不再重复订阅
     const workspaceClientUiKey = currentClientId || WORKSPACE_COMPOSER_NO_CLIENT_KEY;
     const workspaceRightTab = getWorkspaceRightTab(workspaceClientUiState, workspaceClientUiKey);
@@ -26001,18 +25919,31 @@ export default function App() {
       : workspaceResolutionTrace?.fallbackReason || '当前暂无主链判断';
     const hasWorkspaceBootstrapSignals = Boolean(
       sourceDocumentCount > 0 ||
+      (workspace?.threads.length || 0) > 0 ||
       (workspace?.recentMessages.length || 0) > 0 ||
       (workspace?.meetings.length || 0) > 0 ||
       (workspace?.goals.length || 0) > 0,
     );
 
     useEffect(() => {
-      const workspaceClientId = workspace?.client.id || currentClientId || null;
-      if (workspaceClientId == null) return;
+      const workspaceClientId = workspace?.client.id || null;
+      // 项目切换期间 currentClientId 会先变化，目标 workspace 随后才返回。
+      // 在目标数据完整到达前不得把“尚未加载”误判成“真正空白项目”。
+      if (!currentClientId || workspaceClientId !== currentClientId) return;
+      // 项目详情和问答线程分批返回时，不能让较早到达的“无资料”状态
+      // 把项目永久锁在初始导入页。只要已有任何真实工作台内容，就直接
+      // 回到工作区；初始引导仅保留给真正空白的新项目。
+      if (hasWorkspaceBootstrapSignals) {
+        setupModeClientIdRef.current = workspaceClientId;
+        if (clientWorkspaceSurfaceMode !== 'workspace') {
+          setClientWorkspaceSurfaceMode('workspace');
+        }
+        return;
+      }
       if (setupModeClientIdRef.current === workspaceClientId) return;
       setupModeClientIdRef.current = workspaceClientId;
       setClientWorkspaceSurfaceMode(clientNeedsProjectSetup && hasWorkspaceBootstrapSignals === false ? 'setup' : 'workspace');
-    }, [currentClientId, workspace?.client.id, clientNeedsProjectSetup, hasWorkspaceBootstrapSignals]);
+    }, [currentClientId, workspace?.client.id, clientNeedsProjectSetup, hasWorkspaceBootstrapSignals, clientWorkspaceSurfaceMode]);
 
     const buildTemplateFillDialogInitialState = (templatePath: string): TemplateFillDialogState => ({
       open: true,
@@ -26508,8 +26439,7 @@ export default function App() {
       };
     }, [currentClientId, isImportSubmitting, workspace?.knowledgeStatus?.lastJobStatus]);
 
-    // 工作台左栏「近期项目」排序 — localStorage 维护本机的"最后访问"字典
-    // 切到某个客户时写入 timestamp;排序时按它 DESC,未访问过的按 lastActivityAt 兜底
+    // 工作台左栏项目顺序固定按中文拼音排列；选择项目只改变选中态，不改变位置。
     // 隐藏的项目:
     //   - 无搜索时:从列表里隐去(默认看不到)
     //   - 有搜索时:仍然出现(便于用户找回),但需要 UI 上标 "已隐藏"
@@ -26524,13 +26454,15 @@ export default function App() {
         if (!query) return true;
         return `${client.name}${client.alias}${client.domain}`.includes(query);
       });
-      return [...matched].sort((a, b) => {
-        const aTime = recentClientUsage[a.id] || 0;
-        const bTime = recentClientUsage[b.id] || 0;
-        if (aTime !== bTime) return bTime - aTime;
-        return (b.lastActivityAt || '').localeCompare(a.lastActivityAt || '');
+      const pinyinCollator = new Intl.Collator('zh-Hans-CN-u-co-pinyin', {
+        sensitivity: 'base',
+        numeric: true,
       });
-    }, [clients, recentClientUsage, searchQuery, hiddenClientsVersion]);
+      return [...matched].sort((a, b) => (
+        pinyinCollator.compare(a.name.trim(), b.name.trim())
+        || a.id.localeCompare(b.id)
+      ));
+    }, [clients, searchQuery, hiddenClientsVersion]);
 
     // 「已冷冻 · 搜索匹配」:仅在用户搜索时出现,展示冷冻项目让他能临时进入
     // 点击只是 setCurrentClientId(临时访问),并不会让它出现在主列表 — 必须解冻才回归
@@ -29035,6 +28967,7 @@ export default function App() {
                           type="button"
                           onClick={() => {
                             resetFilesTabSearchForClientSwitch();
+                            dispatchWorkspaceClientUi({ type: 'setSurfaceMode', clientId: client.id, mode: 'workspace' });
                             setCurrentClientId(client.id);
                             void refreshWorkspace(client.id);
                             setActiveMessageId(null);
@@ -29102,6 +29035,7 @@ export default function App() {
                               type="button"
                               onClick={() => {
                                 resetFilesTabSearchForClientSwitch();
+                                dispatchWorkspaceClientUi({ type: 'setSurfaceMode', clientId: client.id, mode: 'workspace' });
                                 setCurrentClientId(client.id);
                                 void refreshWorkspace(client.id);
                                 setActiveMessageId(null);
@@ -29145,18 +29079,15 @@ export default function App() {
                 <h2 className="mt-0.5 text-[18px] xl:text-[20px] font-light tracking-tight text-gray-900 truncate">
                   {currentClient?.name || '未选择客户'}
                 </h2>
+                {currentClient && (
+                  <p className="mt-0.5 truncate text-[11px] text-gray-400">
+                    管理者：{currentClient.managerNames?.join('、') || '待同步'}
+                    <span className="ml-3">共享者：其他{currentClient.sharedMemberCount ?? 0}人</span>
+                  </p>
+                )}
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 <div className="hidden lg:flex gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => setClientOverlayMode('meeting')}
-                    className="inline-flex items-center gap-1.5 rounded-full border border-indigo-100 bg-indigo-50 px-2.5 py-1.5 text-[10px] font-bold text-indigo-700 transition-colors hover:border-indigo-200 hover:bg-indigo-100"
-                    title="打开当前项目的客户会议流"
-                  >
-                    <Layers size={11} />
-                    会议
-                  </button>
                   <button
                     type="button"
                     onClick={() => setClientOverlayMode('dna')}
@@ -31094,9 +31025,6 @@ export default function App() {
                               sourceArtifactStale: artifact.is_stale,
                               recoveredFromDraft: false,
                             } : prev);
-                            setClientReportArtifacts((prev) =>
-                              prev.map((item) => item.id === artifact.id ? artifact : item),
-                            );
                             flash('success', `报告已保存为第 ${artifact.latest_version} 版`);
                             return;
                           }
@@ -31218,9 +31146,6 @@ export default function App() {
                                             sourceArtifactStale: artifact.is_stale,
                                             recoveredFromDraft: false,
                                           } : prev);
-                                          setClientReportArtifacts((prev) =>
-                                            prev.map((item) => item.id === artifact.id ? artifact : item),
-                                          );
                                           setInlineReportVersions(await listReportArtifactVersions(artifactId));
                                           flash('success', `已恢复第 ${version.version} 版，并保存为第 ${artifact.latest_version} 版`);
                                         } catch (error) {
@@ -31339,7 +31264,7 @@ export default function App() {
                             if (sourceArtifactId) {
                               let expectedVersion = clientWorkspaceInlineEditor?.sourceArtifactVersion;
                               if (!expectedVersion) {
-                                throw new Error('项目报告上下文缺失，请关闭后重新打开报告');
+                                throw new Error('事件线报告上下文缺失，请关闭后重新打开报告');
                               }
                               const title = clientWorkspaceInlineEditor?.title.trim() || '未命名报告';
                               const hasUnsavedChanges =
@@ -31364,9 +31289,6 @@ export default function App() {
                                   sourceArtifactSavedContent: savedArtifact.latest.content_markdown,
                                   recoveredFromDraft: false,
                                 } : prev);
-                                setClientReportArtifacts((prev) =>
-                                  prev.map((item) => item.id === savedArtifact.id ? savedArtifact : item),
-                                );
                               }
                               const rendered = await renderReportArtifact(sourceArtifactId, 'docx');
                               const savedPath = await saveFileAsBridge(rendered.file_path, rendered.file_name);
@@ -32553,33 +32475,6 @@ export default function App() {
                 filesTabSearchResult
                 && filesTabSearchResult.clientId === currentClientId,
               );
-              const visibleReportArtifacts = clientReportArtifactsClientId === currentClientId
-                ? clientReportArtifacts
-                : [];
-              const openReportArtifactInEditor = (artifact: ReportArtifactSummary) => {
-                if (!currentClientId) return;
-                if (artifact.availability_status === 'blocked') {
-                  flash('error', artifact.availability_reason || '当前报告因证据权限或生命周期变化暂不可编辑');
-                  return;
-                }
-                const draftStorageKey = `report:${activeSandboxIdRef.current}:${artifact.id}`;
-                const recovered = readInlineEditorDraft(draftStorageKey);
-                setClientWorkspaceInlineEditor({
-                  clientId: currentClientId,
-                  title: recovered?.title || artifact.latest.title || artifact.title,
-                  content: recovered?.content || artifact.latest.content_markdown,
-                  titleEdited: Boolean(recovered?.title),
-                  sourceArtifactId: artifact.id,
-                  sourceArtifactVersion: artifact.latest_version,
-                  sourceArtifactSavedTitle: artifact.latest.title,
-                  sourceArtifactSavedContent: artifact.latest.content_markdown,
-                  sourceSetId: artifact.latest.source_set_id,
-                  sourceArtifactStale: artifact.is_stale,
-                  draftStorageKey,
-                  enableDraftPersist: true,
-                  recoveredFromDraft: Boolean(recovered),
-                });
-              };
               return (
                 <div className="flex-1 overflow-y-auto p-5 xl:p-6 bg-white">
 	                  <div className="mb-3 flex items-center gap-2">
@@ -32630,38 +32525,6 @@ export default function App() {
                       {isFilesTabSearching ? '搜索中' : 'AI 搜'}
                     </Button>
 	                  </div>
-	                  {!searchActive && (
-	                    <div className="mb-3 flex items-center justify-between rounded-xl border border-blue-100 bg-blue-50/40 px-3 py-2.5">
-	                      <div className="min-w-0">
-	                        <div className="text-[11.5px] font-bold text-slate-700">项目报告</div>
-	                        <div className="mt-0.5 truncate text-[10px] text-slate-500">基于共享知识、已选本机资料、模板与当前 Skill 生成</div>
-	                      </div>
-	                      <button
-	                        type="button"
-	                        onClick={() => setProjectReportGeneratorOpen(true)}
-	                        className="ml-3 inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-[#5B7BFE] px-3 py-1.5 text-[10.5px] font-bold text-white hover:bg-[#4F6DE8]"
-	                      >
-	                        <Sparkles size={12} /> 生成报告
-	                      </button>
-	                    </div>
-	                  )}
-	                  {projectReportGeneratorOpen && currentClientId && (
-	                    <AIReportGeneratorModal
-	                      clientId={currentClientId}
-	                      clientName={workspace?.client?.name || clients.find((item) => item.id === currentClientId)?.name}
-	                      workingDocuments={activeWorkingDocuments.map((item) => ({ documentId: item.documentId, title: item.title }))}
-	                      activeAgentSkills={activeAgentSkills.map((item) => ({ skillId: item.skillId, shortName: item.shortName }))}
-	                      onClose={() => setProjectReportGeneratorOpen(false)}
-	                      onSaved={(artifact) => {
-	                        setClientReportArtifacts((current) => [artifact, ...current.filter((item) => item.id !== artifact.id)]);
-	                        setClientReportArtifactsClientId(currentClientId);
-	                      }}
-	                      onOpenSmartEditor={(artifact) => {
-	                        openReportArtifactInEditor(artifact);
-	                        setProjectReportGeneratorOpen(false);
-	                      }}
-	                    />
-	                  )}
 	                  {searchActive && (
                     <div className="mb-3 space-y-2.5">
                       <div className="flex items-center justify-between gap-2 text-[11px] font-bold text-slate-500">
@@ -32702,87 +32565,6 @@ export default function App() {
                     </div>
                   )}
                   <div className="space-y-2.5">
-                    {!searchActive && visibleReportArtifacts.map((artifact) => (
-                      <div
-                        key={`report-${artifact.id}`}
-                        className="overflow-hidden rounded-xl border border-blue-100 bg-blue-50/30 transition-shadow hover:shadow-sm"
-                      >
-                        <div className="flex items-start gap-3 px-3 pb-1.5 pt-2.5">
-                          <div className="mt-0.5 flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-lg bg-blue-100 text-[#4F67D7]">
-                            <BookOpen size={17} />
-                          </div>
-                          <div className="min-w-0 flex-1 pt-0.5">
-                            <p className="break-words text-[13px] font-semibold leading-snug text-slate-900">
-                              {artifact.title || '未命名报告'}
-                            </p>
-                            <p className="mt-1 text-[10.5px] text-slate-500">
-                              项目报告 · 第 {artifact.latest_version} 版
-                              {artifact.availability_status === 'blocked'
-                                ? ' · 暂不可用'
-                                : artifact.is_stale
-                                  ? ' · 证据已变化'
-                                  : ''}
-                            </p>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-1 px-3 pb-2.5 pt-1.5">
-                          <button
-                            type="button"
-                            disabled={clientWorkspaceInlineEditor !== null || artifact.availability_status === 'blocked'}
-                            onClick={() => openReportArtifactInEditor(artifact)}
-                            className={`rounded-lg p-1.5 transition-colors ${
-                              clientWorkspaceInlineEditor !== null || artifact.availability_status === 'blocked'
-                                ? 'cursor-not-allowed text-slate-300'
-                                : 'text-slate-500 hover:bg-blue-100 hover:text-[#5B7BFE]'
-                            }`}
-                            title={artifact.availability_status === 'blocked'
-                              ? artifact.availability_reason || '当前报告暂不可编辑'
-                              : clientWorkspaceInlineEditor !== null
-                                ? '请先关闭当前编辑器'
-                                : '继续编辑这份报告'}
-                            aria-label="继续编辑报告"
-                          >
-                            <PenTool size={16} />
-                          </button>
-                          <button
-                            type="button"
-                            disabled={artifact.availability_status === 'blocked'}
-                            onClick={() => {
-                              void (async () => {
-                                try {
-                                  const rendered = await renderReportArtifact(artifact.id, 'docx');
-                                  const saved = await saveFileAsBridge(rendered.file_path, rendered.file_name);
-                                  if (saved) flash('success', `报告已保存到 ${saved}`);
-                                } catch (error) {
-                                  flash('error', error instanceof Error ? error.message : '报告下载失败');
-                                }
-                              })();
-                            }}
-                            className="rounded-lg p-1.5 text-slate-500 transition-colors hover:bg-blue-100 hover:text-[#5B7BFE] disabled:cursor-not-allowed disabled:text-slate-300"
-                            title={artifact.availability_status === 'blocked'
-                              ? artifact.availability_reason || '当前报告暂不可下载'
-                              : '下载最近一次保存的 Word 报告'}
-                            aria-label="下载报告"
-                          >
-                            <Download size={16} />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                    {!searchActive && isClientReportArtifactsLoading && visibleReportArtifacts.length === 0 && (
-                      <div className="rounded-xl border border-dashed border-blue-100 bg-blue-50/30 px-3 py-3 text-[11px] text-slate-500">
-                        正在同步项目报告…
-                      </div>
-                    )}
-                    {!searchActive && clientReportArtifactsError && (
-                      <button
-                        type="button"
-                        onClick={() => currentClientId && void refreshClientReportArtifacts(currentClientId)}
-                        className="w-full rounded-xl border border-amber-100 bg-amber-50 px-3 py-3 text-left text-[11px] text-amber-800"
-                      >
-                        项目报告暂未同步，点击重试
-                      </button>
-                    )}
                     {!searchActive && (() => {
                       // 文件 tab 只显示用户主动导入的原始文件 + 用户在工具/编辑器里产出的成品文档。
                       // 过滤掉所有系统过程文件（AI 衍生 md、事件线/任务/复盘的 md 镜像、导入中间产物等）。
@@ -32842,7 +32624,6 @@ export default function App() {
                         }))
                         .sort((a, b) => b.lastTouchedAt - a.lastTouchedAt);
                       if (combined.length === 0) {
-                        if (visibleReportArtifacts.length > 0 || isClientReportArtifactsLoading) return null;
                         return (
                           <div className="rounded-2xl border border-dashed border-gray-200 bg-gray-50/70 px-4 py-6 text-center text-[12px] text-gray-500">
                             这个客户还没有上传任何文件。
