@@ -337,6 +337,7 @@ export interface ConsultationKnowledgeRequestRecord {
   clientName?: string | null;
   taskId?: string | null;
   eventLineId?: string | null;
+  planningCycleId?: string | null;
   question: string;
   answer: string;
   errorMessage?: string | null;
@@ -627,6 +628,7 @@ export interface OrgDepartmentPlanSettings {
   clientId?: string | null;
   weekLabel: string;
   ownerUserId?: string | null;
+  title?: string;
   summary: string;
   majorRisks: string[];
   dependencies: string[];
@@ -637,6 +639,7 @@ export interface OrgDepartmentPlanSettings {
 
 export interface TaskPlanLinkRecord {
   taskId: string;
+  planningCycleId?: string | null;
   departmentPlanItemId?: string | null;
   focusItemId?: string | null;
   linkedBy: TaskPlanLinkSource;
@@ -645,6 +648,7 @@ export interface TaskPlanLinkRecord {
 }
 
 export interface TaskPlanLinkUpsertPayload {
+  planningCycleId?: string | null;
   departmentPlanItemId?: string | null;
   focusItemId?: string | null;
 }
@@ -2924,6 +2928,7 @@ export interface Task {
   clientName?: string | null;
   eventLineId?: string | null;
   eventLineName?: string | null;
+  planningCycleId?: string | null;
   projectModuleId?: string | null;
   projectModuleName?: string | null;
   projectFlowId?: string | null;
@@ -7386,6 +7391,7 @@ export interface TaskMutationPayload {
   scopeMode?: TaskScopeMode;
   clientId?: string | null;
   eventLineId?: string | null;
+  planningCycleId?: string | null;
   projectModuleId?: string | null;
   projectFlowId?: string | null;
   ddl: string;

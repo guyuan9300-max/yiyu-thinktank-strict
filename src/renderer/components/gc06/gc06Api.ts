@@ -40,8 +40,10 @@ export const gc06Api = {
       { method: 'POST', body: JSON.stringify({ expectedVersion: eventLine.version }) },
     );
   },
-  listPlanningCycles() {
-    return request<GC06PlanningCycle[]>(`${ROOT}/planning-cycles`);
+  listPlanningCycles(includeArchived = false) {
+    return request<GC06PlanningCycle[]>(
+      `${ROOT}/planning-cycles${encodeQuery({ includeArchived: includeArchived ? 'true' : undefined })}`,
+    );
   },
   createPlanningCycle(payload: Record<string, unknown>) {
     return request<{ planningCycle: GC06PlanningCycle }>(`${ROOT}/planning-cycles`, {
@@ -55,6 +57,12 @@ export const gc06Api = {
         method: 'PATCH',
         body: JSON.stringify({ ...payload, expectedVersion: cycle.version }),
       },
+    );
+  },
+  deletePlanningCycle(cycle: GC06PlanningCycle) {
+    return request<{ planningCycle: GC06PlanningCycle }>(
+      `${ROOT}/planning-cycles/${cycle.id}`,
+      { method: 'DELETE', body: JSON.stringify({ expectedVersion: cycle.version }) },
     );
   },
   listWeeklyReviews(planningCycleId?: string) {

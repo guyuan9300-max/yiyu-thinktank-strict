@@ -34,8 +34,8 @@ test('repository marker pins the strict GitHub identity and main branch', () => 
     githubRepositoryNodeId: 'R_kgDOTnC5IQ',
     remoteUrl: 'https://github.com/guyuan9300-max/yiyu-thinktank-strict.git',
     targetBranch: 'main',
-    localManifestHash: '19971bd3a3e1cf9beecdb5893b2b15fd6bc02c8951795fc828105ab481f20432',
-    cloudManifestHash: 'b1d65aa9e406398dd9692387406a3d8a27beb66c584bd6953c815eb413909a10',
+    localManifestHash: '3b55180712dac2fac2e4257937aecc3afc583398fc61a8953ed390d82cf21d39',
+    cloudManifestHash: '02c3d8ffe1b0d15dea14e70ff4e2b0cf53e1a19196cb42c72f34f72f9a848594',
   });
 });
 
@@ -86,7 +86,11 @@ test('network git retries terminate the whole process tree and verify GitHub mai
 });
 
 test('maintenance push uses the bounded publish gate instead of stale full-suite fixtures', () => {
-  assert.match(collabSource, /npm'[\s\S]*'run'[\s\S]*'verify:strict-maintenance'/);
+  assert.match(collabSource, /resolveMaintenanceNpm/);
+  assert.match(collabSource, /'\/usr\/local\/bin\/npm'/);
+  assert.match(collabSource, /'\/opt\/homebrew\/bin\/npm'/);
+  assert.match(collabSource, /runMaintenanceGate\(repoPath\)/);
+  assert.match(collabSource, /\['run', 'verify:strict-maintenance'\]/);
   assert.match(packageJson.scripts['verify:strict-maintenance'], /repository-identity-contract/);
   assert.match(packageJson.scripts['verify:strict-maintenance'], /audit:strict/);
   assert.match(packageJson.scripts['verify:strict-maintenance'], /build:renderer/);

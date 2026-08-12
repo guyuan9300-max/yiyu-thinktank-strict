@@ -2,9 +2,9 @@
   "formatVersion": 1,
   "manifestId": "yiyu.strict.local.blueprint88.v1",
   "status": "FROZEN_FOR_IMPLEMENTATION",
-  "contractDate": "2026-08-06",
+  "contractDate": "2026-08-12",
   "schemaFamily": "yiyu-blueprint-88-v1",
-  "contractVersion": "8",
+  "contractVersion": "9",
   "databaseRole": "local_blueprint_88_authority_and_projection",
   "databaseEngine": "SQLite 3 STRICT tables",
   "requiredPragmas": {
@@ -23,7 +23,8 @@
     "ddlBoundary": "DDL 只允许集中建库器和离线迁移器执行；运行时 authorizer 拒绝 DDL、ATTACH 和表外访问",
     "deletionBoundary": "默认 CAS 墹碑；清除只经 purge_ledger 分层结算；外键统一 RESTRICT",
     "agentMemoryFoundation": "六个内置功能 Agent 以 bot_definitions 组织作用域权威行登记；项目问答显式绑定 client_id 与 bot_id。",
-    "agentSkillFoundation": "Skill 以 automation_rules(record_kind=agent_skill) 为唯一权威；内置 Agent 核心岗位版本继续由 bot_definitions 权威登记。"
+    "agentSkillFoundation": "Skill 以 automation_rules(record_kind=agent_skill) 为唯一权威；内置 Agent 核心岗位版本继续由 bot_definitions 权威登记。",
+    "flatPlanning": "计划是 planning_cycles 中可直接选择的独立对象；tasks/meetings 通过 planning_cycle_id 多对一关联。decision_actions 不再充当计划步骤或主要任务槽位。"
   },
   "sourceOfTruthBoundary": "本地仅裁决设备、sandbox、本机原件与明确本地偏好；组织事实保留同名投影行，不得反向覆盖云端权威。",
   "forbiddenRuntime": {
@@ -3124,6 +3125,20 @@
           }
         },
         {
+          "name": "planning_cycle_id",
+          "type": "TEXT",
+          "nullable": true,
+          "default": null,
+          "primary_key": false,
+          "reference": {
+            "kind": "foreign_key",
+            "target_table": "planning_cycles",
+            "target_field": "id",
+            "on_delete": "RESTRICT",
+            "source": "2026-08-12 产品裁决：任务和会议直接关联独立计划"
+          }
+        },
+        {
           "name": "lifecycle_state",
           "type": "TEXT",
           "nullable": false,
@@ -4229,20 +4244,6 @@
           }
         },
         {
-          "name": "parent_plan_id",
-          "type": "TEXT",
-          "nullable": true,
-          "default": null,
-          "primary_key": false,
-          "reference": {
-            "kind": "foreign_key",
-            "target_table": "planning_cycles",
-            "target_field": "id",
-            "on_delete": "RESTRICT",
-            "source": "终审补充"
-          }
-        },
-        {
           "name": "department_id",
           "type": "TEXT",
           "nullable": true,
@@ -4449,7 +4450,10 @@
           "expression": "(lifecycle_state='deleted' AND deleted_at IS NOT NULL) OR (lifecycle_state!='deleted' AND deleted_at IS NULL)"
         }
       ],
-      "command_invariants": [],
+      "command_invariants": [
+        "每条 planning_cycles 行即用户可直接选择的独立计划；组织与部门只决定归属和权限，不形成父子计划。",
+        "同一计划允许被多条 tasks 或 meetings 关联；单个任务或会议至多关联一个计划。"
+      ],
       "deletion_policy": {
         "mode": "tombstone_then_purge",
         "rule": "CAS 写 lifecycle_state=deleted 与 deleted_at；影响预检后由 purge_ledger 分层清除。",
@@ -4994,20 +4998,6 @@
           }
         },
         {
-          "name": "task_id",
-          "type": "TEXT",
-          "nullable": true,
-          "default": null,
-          "primary_key": false,
-          "reference": {
-            "kind": "foreign_key",
-            "target_table": "tasks",
-            "target_field": "id",
-            "on_delete": "RESTRICT",
-            "source": "蓝图保留"
-          }
-        },
-        {
           "name": "decision_state",
           "type": "TEXT",
           "nullable": false,
@@ -5192,15 +5182,7 @@
           "reference": null
         }
       ],
-      "unique_constraints": [
-        {
-          "name": "uq_decision_actions_01",
-          "fields": [
-            "task_id"
-          ],
-          "where": "task_id IS NOT NULL"
-        }
-      ],
+      "unique_constraints": [],
       "composite_foreign_keys": [],
       "check_constraints": [
         {
@@ -5216,15 +5198,14 @@
           "expression": "record_kind IN ('decision','plan_action')"
         },
         {
-          "name": "ck_primary_task_unique_role",
-          "expression": "task_id IS NULL OR record_kind IN ('decision','plan_action')"
-        },
-        {
           "name": "ck_tombstone_time",
           "expression": "(lifecycle_state='deleted' AND deleted_at IS NOT NULL) OR (lifecycle_state!='deleted' AND deleted_at IS NULL)"
         }
       ],
-      "command_invariants": [],
+      "command_invariants": [
+        "decision_actions 只承载复盘、会议、情报、战略或 AI 形成的待确认行动建议，不作为计划子层级。",
+        "行动建议转任务或转计划必须调用各自正式命令；不得用 decision_actions 保存主要任务槽位。"
+      ],
       "deletion_policy": {
         "mode": "tombstone_then_purge",
         "rule": "CAS 写 lifecycle_state=deleted 与 deleted_at；影响预检后由 purge_ledger 分层清除。",
@@ -5290,6 +5271,20 @@
             "target_field": "id",
             "on_delete": "RESTRICT",
             "source": "蓝图保留"
+          }
+        },
+        {
+          "name": "planning_cycle_id",
+          "type": "TEXT",
+          "nullable": true,
+          "default": null,
+          "primary_key": false,
+          "reference": {
+            "kind": "foreign_key",
+            "target_table": "planning_cycles",
+            "target_field": "id",
+            "on_delete": "RESTRICT",
+            "source": "2026-08-12 产品裁决：任务和会议直接关联独立计划"
           }
         },
         {

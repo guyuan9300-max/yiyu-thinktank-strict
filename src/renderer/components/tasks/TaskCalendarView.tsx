@@ -25,10 +25,12 @@ import {
   taskDateForCalendar as resolveTaskCalendarDate,
   taskOverlapsCalendarWindow,
 } from '../../lib/taskTimeline';
+import { useRuntimeUiSessionState } from '../../lib/runtimeUiSessionStore';
 
 type CalendarDisplayMode = 'month' | 'week';
 
 type TaskCalendarViewProps = {
+  uiSessionScopeKey: string;
   tasks: Task[];
   meetings?: GC06Meeting[];
   clientColorById?: Record<string, string>;
@@ -361,6 +363,7 @@ function buildWeekTaskDisplayItems(items: TimedWeekTask[]) {
 }
 
 export function TaskCalendarView({
+  uiSessionScopeKey,
   tasks,
   meetings = [],
   clientColorById,
@@ -405,14 +408,22 @@ export function TaskCalendarView({
     window.addEventListener('mousedown', handleOutsideClick);
     return () => window.removeEventListener('mousedown', handleOutsideClick);
   }, [expandedAggregateKey]);
-  const [expandedCalendarDays, setExpandedCalendarDays] = useState<Set<string>>(new Set());
+  const [expandedCalendarDayKeys, setExpandedCalendarDayKeys] = useRuntimeUiSessionState<string[]>(`${uiSessionScopeKey}:expanded-days`, []);
+  const expandedCalendarDays = useMemo(() => new Set(expandedCalendarDayKeys), [expandedCalendarDayKeys]);
+  const setExpandedCalendarDays = useCallback((update: Set<string> | ((previous: Set<string>) => Set<string>)) => {
+    setExpandedCalendarDayKeys((previousKeys) => {
+      const previous = new Set(previousKeys);
+      const next = typeof update === 'function' ? update(previous) : update;
+      return Array.from(next);
+    });
+  }, [setExpandedCalendarDayKeys]);
   const dragDropHandledRef = useRef(false);
   const [resizingTaskId, setResizingTaskId] = useState<string | null>(null);
   const [resizePreviewMinutes, setResizePreviewMinutes] = useState<number | null>(null);
   // 5/26 加 ⑨: 顶部 resize 改 startMinute, preview 需要显示新 start
   const [resizePreviewStartMinute, setResizePreviewStartMinute] = useState<number | null>(null);
   const [weekCreateSelection, setWeekCreateSelection] = useState<WeekCreateSelection | null>(null);
-  const [visibleWeekPageIndex, setVisibleWeekPageIndex] = useState(1);
+  const [visibleWeekPageIndex, setVisibleWeekPageIndex] = useRuntimeUiSessionState(`${uiSessionScopeKey}:visible-week-page`, 1);
   const [isWeekPaging, setIsWeekPaging] = useState(false);
   const resizePreviewRef = useRef<number | null>(null);
   // 5/26 ⑨: top resize 时, mouseUp 用 ref 读最新 startMinute (state 会有 stale closure)

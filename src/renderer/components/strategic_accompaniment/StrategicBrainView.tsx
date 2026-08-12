@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
+  readRuntimeUiSessionValue,
+  useRuntimeUiSessionState,
+  writeRuntimeUiSessionValue,
+} from '../../lib/runtimeUiSessionStore';
+import {
   BrainCircuit, Sparkles, FileText, CheckCircle,
   GitBranch, Award, Layers,
   AlertCircle, ClipboardList, Check, Folder, Target, FolderTree,
@@ -1429,6 +1434,7 @@ function ThoughtScopeSelect({
 // ================= MAIN EXPORT =================
 
 export type StrategicBrainViewProps = {
+  uiSessionScopeKey?: string;
   clients?: Array<{ id: string; name: string }>;
   currentClientId?: string | null;
   onClientChange?: (clientId: string) => void;
@@ -1993,14 +1999,15 @@ export function StrategicBrainView({
   onCreateTaskFromThought,
   onPromoteTodo,
   flash,
+  uiSessionScopeKey = 'strategic:local:anonymous',
 }: StrategicBrainViewProps) {
   // 战略陪伴当前只剩 2 个 tab：客户档案（即 contradictions/事实澄清模块）/ 判断 & 思考
   // 原"客户档案/DigitalAssetsTab" 已下线；资料健康 / 输出沉淀 也已删除。
-  const [activeTab, setActiveTab] = useState('contradictions');
+  const [activeTab, setActiveTab] = useRuntimeUiSessionState(`${uiSessionScopeKey}:tab`, 'contradictions');
   const [thoughts, setThoughts] = useState<StrategicThought[]>([]);
   const [thoughtsLoading, setThoughtsLoading] = useState(false);
   const [thoughtsError, setThoughtsError] = useState<string | null>(null);
-  const [thoughtClientId, setThoughtClientId] = useState(currentClientId || '');
+  const [thoughtClientId, setThoughtClientId] = useRuntimeUiSessionState(`${uiSessionScopeKey}:client`, currentClientId || '');
   const thoughtClientIdRef = useRef(thoughtClientId);
   useEffect(() => {
     thoughtClientIdRef.current = thoughtClientId;
@@ -2008,6 +2015,19 @@ export function StrategicBrainView({
   // 兜底:让 AI 全面重新理解这个客户(同时跑 analysis_job + refresh strategic_thoughts)
   const [globalRefreshing, setGlobalRefreshing] = useState(false);
   const [globalRefreshMsg, setGlobalRefreshMsg] = useState<string | null>(null);
+  const contentScrollRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const container = contentScrollRef.current;
+    if (!container) return undefined;
+    const scrollKey = `${uiSessionScopeKey}:${activeTab}:scroll-top`;
+    container.scrollTop = readRuntimeUiSessionValue(scrollKey, 0);
+    const remember = () => writeRuntimeUiSessionValue(scrollKey, container.scrollTop);
+    container.addEventListener('scroll', remember, { passive: true });
+    return () => {
+      remember();
+      container.removeEventListener('scroll', remember);
+    };
+  }, [activeTab, uiSessionScopeKey]);
 
   const thoughtClientOptions = useMemo(() => {
     const map = new Map<string, { id: string; name: string }>();
@@ -2223,7 +2243,7 @@ export function StrategicBrainView({
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto px-6 py-5">
+      <div ref={contentScrollRef} className="flex-1 overflow-y-auto px-6 py-5">
         <div className="max-w-full mx-auto">
           {activeTab === 'thoughts' && (
             <ThoughtsTab

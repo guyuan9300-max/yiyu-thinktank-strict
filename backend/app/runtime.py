@@ -775,6 +775,8 @@ class WorkspaceRuntime:
             return bool(
                 path == "/api/v2/organization-access/feishu/member-authorization"
                 or
+                re.fullmatch(r"/api/v2/gc06/planning-cycles/[^/]+", path)
+                or
                 re.fullmatch(r"/api/v2/domain/tasks/[^/]+", path)
                 or re.fullmatch(r"/api/v2/domain/tasks/lists/[^/]+", path)
                 or re.fullmatch(r"/api/v2/domain/tasks/tags/[^/]+", path)

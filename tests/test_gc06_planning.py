@@ -30,6 +30,7 @@ from cloud_backend.app.repositories.gc06_planning import (
     create_event_line,
     create_meeting,
     create_planning_cycle,
+    delete_planning_cycle,
     derive_task_calendar_projection,
     list_calendar_entries,
     list_event_lines,
@@ -44,6 +45,7 @@ from cloud_backend.app.repositories.gc06_planning import (
     update_decision_action,
     update_event_line,
     update_meeting,
+    update_planning_cycle,
     set_task_plan_link,
 )
 from cloud_backend.app.repositories.gc06_task_command_port import (
@@ -458,6 +460,80 @@ def _create_plan(repository, identity, client_id: str, event_line_id: str):
     )["planningCycle"]
 
 
+def test_planning_cycle_delete_and_archive_are_mutually_exclusive(tmp_path: Path) -> None:
+    repository, identity, seed = _repository(tmp_path)
+    unused = create_planning_cycle(
+        repository,
+        identity,
+        payload={
+            "planningCycleId": "unused_plan_lifecycle",
+            "recordKind": "organization_plan",
+            "periodKind": "month",
+            "periodStart": "2026-08-01",
+            "periodEnd": "2026-08-31",
+            "title": "尚未关联任务的计划",
+            "status": "published",
+        },
+        idempotency_key="create-unused-plan-lifecycle",
+    )["planningCycle"]
+    with pytest.raises(RepositoryError) as archive_error:
+        update_planning_cycle(
+            repository,
+            identity,
+            planning_cycle_id=unused["id"],
+            payload={"expectedVersion": unused["version"], "status": "archived"},
+            idempotency_key="archive-unused-plan-lifecycle",
+        )
+    assert archive_error.value.code == "unused_planning_cycle_must_be_deleted"
+    deleted = delete_planning_cycle(
+        repository,
+        identity,
+        planning_cycle_id=unused["id"],
+        expected_version=unused["version"],
+        idempotency_key="delete-unused-plan-lifecycle",
+    )["planningCycle"]
+    assert deleted["lifecycleState"] == "deleted"
+
+    linked = create_planning_cycle(
+        repository,
+        identity,
+        payload={
+            "planningCycleId": "linked_plan_lifecycle",
+            "recordKind": "organization_plan",
+            "periodKind": "month",
+            "periodStart": "2026-09-01",
+            "periodEnd": "2026-09-30",
+            "title": "已有任务承接的计划",
+            "status": "published",
+        },
+        idempotency_key="create-linked-plan-lifecycle",
+    )["planningCycle"]
+    _seed_task(repository, identity, task_id="linked_plan_task", client_id=seed["projectId"])
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        connection.execute(
+            "UPDATE tasks SET planning_cycle_id=? WHERE id=?",
+            (linked["id"], "linked_plan_task"),
+        )
+        connection.commit()
+    with pytest.raises(RepositoryError) as delete_error:
+        delete_planning_cycle(
+            repository,
+            identity,
+            planning_cycle_id=linked["id"],
+            expected_version=linked["version"],
+            idempotency_key="delete-linked-plan-lifecycle",
+        )
+    assert delete_error.value.code == "planning_cycle_has_dependants"
+    archived = update_planning_cycle(
+        repository,
+        identity,
+        planning_cycle_id=linked["id"],
+        payload={"expectedVersion": linked["version"], "status": "archived"},
+        idempotency_key="archive-linked-plan-lifecycle",
+    )["planningCycle"]
+    assert archived["lifecycleState"] == "archived"
+
+
 def _seed_task(
     repository,
     identity,
@@ -600,7 +676,6 @@ def test_plan_weekly_review_evidence_and_decision_action_are_versioned(
             "planningCycleId": "department_planning_cycle_gc06",
             "recordKind": "department_plan",
             "departmentId": "department_gc06",
-            "parentPlanId": plan["id"],
             "periodStart": "2026-08-03",
             "periodEnd": "2026-08-09",
             "title": "GC-06 部门周计划",
@@ -609,7 +684,7 @@ def test_plan_weekly_review_evidence_and_decision_action_are_versioned(
     )["planningCycle"]
     assert (department_plan["recordKind"], department_plan["parentPlanId"]) == (
         "department_plan",
-        plan["id"],
+        None,
     )
 
     first = save_weekly_review_draft(
@@ -670,7 +745,7 @@ def test_plan_weekly_review_evidence_and_decision_action_are_versioned(
         },
         idempotency_key="gc06-decision-action",
     )["decisionAction"]
-    assert action["recordKind"] == "plan_action"
+    assert action["recordKind"] == "decision"
     assert action["taskId"] is None
 
     with pytest.raises(RepositoryError) as unavailable:
@@ -899,7 +974,7 @@ def test_meeting_owner_invitation_and_plan_link_use_existing_88_tables(tmp_path:
     )
     assert created["planLink"]["planningCycleId"] == plan["id"]
     assert created["planLink"]["decisionActionId"] is None
-    assert created["planLink"]["sourceSetId"]
+    assert "sourceSetId" not in created["planLink"]
     invitee = replace(
         identity,
         principal_id="principal_meeting_invitee",
@@ -1014,10 +1089,8 @@ def test_gc03_to_gc06_one_record_vertical_path_uses_one_task_authority(
         task_command_port=GC04_FORMAL_TASK_COMMAND_PORT,
     )
     task = linked_action["task"]
-    assert list_plan_item_tasks(repository, identity)["counts"] == {action["id"]: 1}
-    assert get_task_plan_link(
-        repository, identity, task_id=task["id"]
-    )["departmentPlanItemId"] == action["id"]
+    assert list_plan_item_tasks(repository, identity)["counts"] == {}
+    assert get_task_plan_link(repository, identity, task_id=task["id"]) is None
     assert set_task_plan_link(
         repository,
         identity,
@@ -1030,16 +1103,17 @@ def test_gc03_to_gc06_one_record_vertical_path_uses_one_task_authority(
         repository,
         identity,
         task_id=task["id"],
-        action_id=action["id"],
+        action_id=plan["id"],
         idempotency_key="gc06-vertical-plan-link-restore",
     )
-    assert restored_link["departmentPlanItemId"] == action["id"]
+    assert restored_link["planningCycleId"] == plan["id"]
+    assert list_plan_item_tasks(repository, identity)["counts"] == {plan["id"]: 1}
     attached = attach_task_to_event_line(
         repository,
         identity,
         event_line_id=line["id"],
         task_id=task["id"],
-        expected_task_version=task["version"],
+        expected_task_version=restored_link["version"],
         allow_reassign=False,
         idempotency_key="gc03-vertical-task-event-line",
         task_command_port=GC04_FORMAL_TASK_COMMAND_PORT,
@@ -1087,8 +1161,7 @@ def test_gc03_to_gc06_one_record_vertical_path_uses_one_task_authority(
         ).fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
-    # 早期版本可能在任务墓碑后遗留 decision_actions.task_id。界面会显示 0 条
-    # 可见任务，新建却被 409 阻断。正式创建必须只把仍存活的任务视为占用。
+    # 删除一条已关联计划的任务不会占用计划；同一计划仍可继续承接新任务。
     with runtime_connection(repository.database_path, "cloud") as connection:
         deleted_task_version = connection.execute(
             "SELECT version FROM tasks WHERE id=?", (attached_task["id"],)
@@ -1099,27 +1172,24 @@ def test_gc03_to_gc06_one_record_vertical_path_uses_one_task_authority(
         expected_version=int(deleted_task_version),
         idempotency_key="gc06-vertical-task-delete",
     )
-    with runtime_connection(repository.database_path, "cloud") as connection:
-        connection.execute(
-            "UPDATE decision_actions SET task_id=?, version=version+1 WHERE id=?",
-            (attached_task["id"], action["id"]),
-        )
-        connection.commit()
     replacement = task_domain.create_task(
         identity,
         payload={
             "title": "墓碑关系解除后的正式任务",
             "priority": "normal",
             "clientId": seed["projectId"],
-            "sourceType": "decision_action",
-            "sourceId": action["id"],
+            "planningCycleId": plan["id"],
         },
         idempotency_key="gc06-vertical-task-replacement",
     )["task"]
     with runtime_connection(repository.database_path, "cloud") as connection:
         assert connection.execute(
-            "SELECT task_id FROM decision_actions WHERE id=?", (action["id"],)
-        ).fetchone()[0] == replacement["id"]
+            "SELECT planning_cycle_id FROM tasks WHERE id=?", (replacement["id"],)
+        ).fetchone()[0] == plan["id"]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM tasks WHERE planning_cycle_id=? AND lifecycle_state!='deleted'",
+            (plan["id"],),
+        ).fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -1430,7 +1500,7 @@ def test_gc06_detached_cloud_and_ui_registrars_are_complete(tmp_path: Path) -> N
         for route in app.routes
         if str(getattr(route, "path", "")).startswith("/api/v2/gc06/")
     ]
-    assert len(cloud_paths) == 28
+    assert len(cloud_paths) == 29
     assert "/api/v2/gc06/meetings/{meeting_id}/collaboration/{action}" in cloud_paths
     assert "/api/v2/gc06/plan-item-tasks" in cloud_paths
     assert "/api/v2/gc06/tasks/{task_id}/plan-link" in cloud_paths
@@ -1441,15 +1511,18 @@ def test_gc06_detached_cloud_and_ui_registrars_are_complete(tmp_path: Path) -> N
         "PATCH", "/api/v2/gc06/tasks/task_gc06/plan-link"
     )
     assert WorkspaceRuntime._connected_cloud_path_allowed(
+        "DELETE", "/api/v2/gc06/planning-cycles/plan_gc06"
+    )
+    assert WorkspaceRuntime._connected_cloud_path_allowed(
         "POST", "/api/v2/gc06/meetings/meeting_gc06/collaboration/accept"
     )
     assert cloud_paths.index("/api/v2/gc06/event-lines/{event_line_id}/activities") < (
         cloud_paths.index("/api/v2/gc06/event-lines/{event_line_id}/{transition}")
     )
-    assert len(gc06_ui_router.routes) == 60
+    assert len(gc06_ui_router.routes) == 61
     assert sum(
         route.pattern.startswith("gc06/") for route in gc06_ui_router.routes
-    ) == 22
+    ) == 23
     assert {
         (route.method, route.pattern)
         for route in gc06_ui_router.routes

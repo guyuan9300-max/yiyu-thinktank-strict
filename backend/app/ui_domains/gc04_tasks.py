@@ -196,6 +196,7 @@ def _task_ui(
         "clientName": client.get("name"),
         "eventLineId": row.get("event_line_id"),
         "eventLineName": event_line.get("name"),
+        "planningCycleId": row.get("planning_cycle_id"),
         "ownerId": owner.get("userId") if owner else None,
         "ownerName": owner.get("fullName") if owner else "未设置负责人",
         "sourceType": str(row.get("source_type") or "manual"),

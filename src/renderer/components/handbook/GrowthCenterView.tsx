@@ -1,5 +1,10 @@
 import React, { useEffect, useState, useMemo, useCallback } from 'react';
 import {
+  readRuntimeUiSessionValue,
+  useRuntimeUiSessionState,
+  writeRuntimeUiSessionValue,
+} from '../../lib/runtimeUiSessionStore';
+import {
   ArrowRight,
   BookOpen,
   BrainCircuit,
@@ -1314,11 +1319,11 @@ function AbilityRadar({ abilities, gaps }: { abilities: GrowthAbilityScore[]; ga
 /* ══════════════════════════════════════════════════════════════════════
    Tab 1: Quote Wall
    ══════════════════════════════════════════════════════════════════ */
-function ExperienceWallTab() {
+function ExperienceWallTab({ uiSessionScopeKey }: { uiSessionScopeKey: string }) {
   const [items, setItems] = useState<GrowthExperienceWallItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [cloudSyncError, setCloudSyncError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<'all' | 'month' | 'quarter'>('all');
+  const [filter, setFilter] = useRuntimeUiSessionState<'all' | 'month' | 'quarter'>(`${uiSessionScopeKey}:filter`, 'all');
   const [likingIds, setLikingIds] = useState<Set<string>>(() => new Set());
 
   const reloadExperienceWall = useCallback(async () => {
@@ -2102,11 +2107,24 @@ const TABS: { key: GrowthTab; label: string }[] = [
   { key: 'badges', label: '徽章与排行' },
 ];
 
-export function GrowthCenterView() {
-  const [activeTab, setActiveTab] = useState<GrowthTab>('experience');
+export function GrowthCenterView({ uiSessionScopeKey = 'growth:local:anonymous' }: { uiSessionScopeKey?: string }) {
+  const [activeTab, setActiveTab] = useRuntimeUiSessionState<GrowthTab>(`${uiSessionScopeKey}:tab`, 'experience');
   const growthState = useGrowthOverviewState();
   const refreshGrowthOverview = growthState?.refreshGrowthOverview;
   const [headerOverview, setHeaderOverview] = useState<GrowthOverview | null>(null);
+  const contentRef = React.useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const container = contentRef.current;
+    if (!container) return undefined;
+    const scrollKey = `${uiSessionScopeKey}:${activeTab}:scroll-top`;
+    container.scrollTop = readRuntimeUiSessionValue(scrollKey, 0);
+    const remember = () => writeRuntimeUiSessionValue(scrollKey, container.scrollTop);
+    container.addEventListener('scroll', remember, { passive: true });
+    return () => {
+      remember();
+      container.removeEventListener('scroll', remember);
+    };
+  }, [activeTab, uiSessionScopeKey]);
 
   // Inject CSS on mount
   useEffect(() => { injectGrowthCSS(); }, []);
@@ -2166,9 +2184,9 @@ export function GrowthCenterView() {
       </div>
 
       {/* Content */}
-      <div className="gc-content">
+      <div ref={contentRef} className="gc-content">
         <div className="gc-content-inner">
-          {activeTab === 'experience' && <ExperienceWallTab />}
+          {activeTab === 'experience' && <ExperienceWallTab uiSessionScopeKey={`${uiSessionScopeKey}:experience`} />}
           {activeTab === 'ability' && <AbilityGrowthTab overview={overview} />}
           {activeTab === 'badges' && <BadgesAndRankTab overview={overview} />}
         </div>

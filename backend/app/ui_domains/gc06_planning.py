@@ -753,11 +753,10 @@ def attach_task(compatibility: Any, request: UiRequest, match: Any) -> Any:
 def list_planning_cycles(compatibility: Any, request: UiRequest, _: Any) -> Any:
     result = _query(compatibility, "planning-cycles", request)
     projector = _planning_projector(compatibility)
-    if not result:
-        # 冷启动时云会话可能仍在恢复。空回包不能把租约内的严格投影伪装成
-        # “组织没有计划”；显示当前 sandbox 最后确认投影，后续成功查询再覆盖。
-        return projector.list_planning_cycles()
+    # A successful empty cloud result is authoritative.  Falling back to the
+    # last local projection here resurrects cloud tombstones after deletion.
     projector.apply_planning_cycles(result)
+    projector.reconcile_planning_cycles(result)
     return result
 
 
@@ -774,6 +773,18 @@ def update_planning_cycle(compatibility: Any, request: UiRequest, match: Any) ->
         compatibility,
         request,
         "PATCH",
+        f"planning-cycles/{match.group('planning_cycle_id')}",
+    )
+    _planning_projector(compatibility).apply_planning_cycles([result["planningCycle"]])
+    return result
+
+
+@router.delete(r"gc06/planning-cycles/(?P<planning_cycle_id>[^/]+)")
+def delete_planning_cycle(compatibility: Any, request: UiRequest, match: Any) -> Any:
+    result = _command(
+        compatibility,
+        request,
+        "DELETE",
         f"planning-cycles/{match.group('planning_cycle_id')}",
     )
     _planning_projector(compatibility).apply_planning_cycles([result["planningCycle"]])

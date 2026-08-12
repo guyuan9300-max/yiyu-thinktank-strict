@@ -1501,7 +1501,7 @@ def _planning_payload(row: sqlite3.Row) -> dict[str, Any]:
         "recordKind": str(row["record_kind"]),
         "clientId": row["client_id"],
         "eventLineId": row["event_line_id"],
-        "parentPlanId": row["parent_plan_id"],
+        "parentPlanId": None,
         "departmentId": row["department_id"],
         "ownerMembershipId": row["owner_membership_id"],
         "period": row["period"],
@@ -1578,7 +1578,6 @@ def create_planning_cycle(
         "recordKind": record_kind,
         "clientId": _text(payload.get("clientId"), limit=200) or None,
         "eventLineId": _text(payload.get("eventLineId"), limit=200) or None,
-        "parentPlanId": _text(payload.get("parentPlanId"), limit=200) or None,
         "departmentId": department_id,
         "ownerMembershipId": _text(payload.get("ownerMembershipId"), limit=200)
         or identity.membership_id,
@@ -1627,10 +1626,6 @@ def create_planning_cycle(
                 if department is None:
                     raise RepositoryError(404, "department_missing", "部门不存在")
             _membership_row(connection, identity, normalized["ownerMembershipId"])
-            if normalized["parentPlanId"]:
-                parent = _planning_row(connection, identity, normalized["parentPlanId"])
-                if str(parent["record_kind"]) != "organization_plan":
-                    raise RepositoryError(409, "parent_plan_invalid", "部门计划只能挂在组织计划下")
             client_id = normalized["clientId"]
             if client_id:
                 require_active_client(
@@ -1653,7 +1648,7 @@ def create_planning_cycle(
                 """
                 SELECT id FROM planning_cycles WHERE scope_id=? AND record_kind=?
                   AND department_id IS ? AND client_id IS ? AND period_start=?
-                  AND period_end=? AND lifecycle_state!='deleted'
+                  AND period_end=? AND title=? AND lifecycle_state!='deleted'
                 """,
                 (
                     identity.scope_id,
@@ -1662,6 +1657,7 @@ def create_planning_cycle(
                     client_id,
                     period_start,
                     period_end,
+                    normalized["title"],
                 ),
             ).fetchone()
             if duplicate is not None:
@@ -1680,11 +1676,11 @@ def create_planning_cycle(
                 """
                 INSERT INTO planning_cycles (
                     id, scope_id, event_line_id, period, plan_version, status,
-                    record_kind, client_id, parent_plan_id, department_id,
+                    record_kind, client_id, department_id,
                     owner_membership_id, period_kind, period_start, period_end,
                     timezone, title, summary, published_at, archived_at, version,
                     lifecycle_state, created_at, updated_at, deleted_at
-                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                           NULL, 1, 'active', ?, ?, NULL)
                 """,
                 (
@@ -1695,7 +1691,6 @@ def create_planning_cycle(
                     status,
                     record_kind,
                     client_id,
-                    normalized["parentPlanId"],
                     department_id,
                     normalized["ownerMembershipId"],
                     normalized["periodKind"],
@@ -1782,7 +1777,26 @@ def update_planning_cycle(
             )
             if int(row["version"] or 1) != expected:
                 raise RepositoryError(409, "planning_cycle_version_conflict", "计划已被其他成员更新")
+            if str(row["lifecycle_state"] or "active") == "archived":
+                raise RepositoryError(409, "archived_planning_cycle_cannot_be_deleted", "已归档计划不能再删除")
             status = normalized["status"] or str(row["status"])
+            if status == "archived" and str(row["status"]) != "archived":
+                linked_tasks = int(connection.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE scope_id=? AND planning_cycle_id=? "
+                    "AND lifecycle_state!='deleted'",
+                    (identity.scope_id, planning_cycle_id),
+                ).fetchone()[0])
+                linked_meetings = int(connection.execute(
+                    "SELECT COUNT(*) FROM meetings WHERE scope_id=? AND planning_cycle_id=? "
+                    "AND lifecycle_state!='deleted'",
+                    (identity.scope_id, planning_cycle_id),
+                ).fetchone()[0])
+                if linked_tasks + linked_meetings == 0:
+                    raise RepositoryError(
+                        409,
+                        "unused_planning_cycle_must_be_deleted",
+                        "尚未关联任务或会议的计划请直接删除，不需要归档",
+                    )
             lifecycle = "archived" if status == "archived" else "active"
             published_at = row["published_at"] or (now if status == "published" else None)
             archived_at = now if status == "archived" else None
@@ -1824,6 +1838,131 @@ def update_planning_cycle(
                 aggregate_type="planning_cycle",
                 aggregate_id=planning_cycle_id,
                 aggregate_version=int(updated["version"]),
+                payload_hash=payload_hash,
+                result=result,
+                target_resource_id=planning_cycle_id,
+                now=now,
+            )
+            connection.commit()
+            return settled
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def delete_planning_cycle(
+    repository: CloudRepository,
+    identity: SessionIdentity,
+    *,
+    planning_cycle_id: str,
+    expected_version: Any,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Tombstone an unused plan; plans with business dependants must be archived."""
+
+    expected = _positive_int(expected_version)
+    normalized = {"planningCycleId": planning_cycle_id, "expectedVersion": expected}
+    payload_hash = sha256_text(canonical_json(normalized))
+    now = utc_now()
+    with repository._connection() as connection:  # noqa: SLF001
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            command_id, operation_id, replay = _start_command(
+                repository,
+                connection,
+                identity,
+                command_type="gc06.planning_cycle.deleted",
+                idempotency_key=idempotency_key,
+                aggregate_type="planning_cycle",
+                aggregate_id=planning_cycle_id,
+                expected_version=expected,
+                payload_hash=payload_hash,
+                now=now,
+            )
+            if replay is not None:
+                connection.commit()
+                return replay
+            row = _planning_row(connection, identity, planning_cycle_id)
+            _require_plan_permission(
+                connection,
+                identity,
+                record_kind=str(row["record_kind"]),
+                department_id=row["department_id"],
+                write=True,
+            )
+            if int(row["version"] or 1) != expected:
+                raise RepositoryError(409, "planning_cycle_version_conflict", "计划已被其他成员更新")
+            linked_tasks = int(connection.execute(
+                "SELECT COUNT(*) FROM tasks WHERE scope_id=? AND planning_cycle_id=? "
+                "AND lifecycle_state!='deleted'",
+                (identity.scope_id, planning_cycle_id),
+            ).fetchone()[0])
+            linked_meetings = int(connection.execute(
+                "SELECT COUNT(*) FROM meetings WHERE scope_id=? AND planning_cycle_id=? "
+                "AND lifecycle_state!='deleted'",
+                (identity.scope_id, planning_cycle_id),
+            ).fetchone()[0])
+            if linked_tasks or linked_meetings:
+                raise RepositoryError(
+                    409,
+                    "planning_cycle_has_dependants",
+                    "已有任务或会议关联的计划不能删除，请改为归档",
+                )
+            next_version = expected + 1
+            connection.execute(
+                "UPDATE planning_cycles SET status='archived',lifecycle_state='deleted',"
+                "version=?,plan_version=plan_version+1,updated_at=?,deleted_at=? "
+                "WHERE id=? AND scope_id=? AND version=?",
+                (next_version, now, now, planning_cycle_id, identity.scope_id, expected),
+            )
+            connection.execute(
+                "UPDATE secured_resources SET lifecycle_state='deleted',version=version+1,"
+                "updated_at=?,deleted_at=? WHERE id=? AND scope_id=?",
+                (now, now, planning_cycle_id, identity.scope_id),
+            )
+            integrity_hash = sha256_text(
+                f"{identity.scope_id}|{planning_cycle_id}|active|deleted|{next_version}|{now}"
+            )
+            connection.execute(
+                "INSERT INTO lifecycle_events (id,scope_id,operation_id,secured_resource_id,"
+                "from_state,to_state,tombstone_version,actor_id,reason_code,occurred_at,"
+                "origin_instance_id,created_at,integrity_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    repository._record_id("life", operation_id, planning_cycle_id),  # noqa: SLF001
+                    identity.scope_id,
+                    operation_id,
+                    planning_cycle_id,
+                    str(row["lifecycle_state"] or "active"),
+                    "deleted",
+                    next_version,
+                    identity.principal_id,
+                    "user_deleted_unused_plan",
+                    now,
+                    repository.cloud_instance_id,
+                    now,
+                    integrity_hash,
+                ),
+            )
+            tombstone = {
+                **_planning_payload(row),
+                "status": "archived",
+                "lifecycleState": "deleted",
+                "version": next_version,
+                "deletedAt": now,
+                "updatedAt": now,
+            }
+            result = {"planningCycle": tombstone}
+            settled = _settle_command(
+                repository,
+                connection,
+                identity,
+                command_id=command_id,
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+                command_type="gc06.planning_cycle.deleted",
+                aggregate_type="planning_cycle",
+                aggregate_id=planning_cycle_id,
+                aggregate_version=next_version,
                 payload_hash=payload_hash,
                 result=result,
                 target_resource_id=planning_cycle_id,
@@ -2093,7 +2232,12 @@ def list_weekly_reviews(
     membership_id: str | None = None,
 ) -> list[dict[str, Any]]:
     with repository._connection() as connection:  # noqa: SLF001
-        clauses = ["scope_id=?", "lifecycle_state!='deleted'"]
+        clauses = [
+            "scope_id=?",
+            "lifecycle_state!='deleted'",
+            "EXISTS (SELECT 1 FROM planning_cycles pc WHERE pc.scope_id=weekly_reviews.scope_id "
+            "AND pc.id=weekly_reviews.planning_cycle_id AND pc.lifecycle_state!='deleted')",
+        ]
         params: list[Any] = [identity.scope_id]
         if planning_cycle_id:
             clauses.append("planning_cycle_id=?")
@@ -2488,7 +2632,7 @@ def _action_payload(row: sqlite3.Row) -> dict[str, Any]:
         "planningCycleId": row["planning_cycle_id"],
         "clientId": row["client_id"],
         "sourceSetId": row["source_set_id"],
-        "taskId": row["task_id"],
+        "taskId": None,
         "decisionState": str(row["decision_state"]),
         "title": str(row["title"]),
         "statement": str(row["statement"] or ""),
@@ -2547,7 +2691,13 @@ def list_decision_actions(
     planning_cycle_id: str | None = None,
 ) -> list[dict[str, Any]]:
     with repository._connection() as connection:  # noqa: SLF001
-        clauses = ["scope_id=?", "lifecycle_state!='deleted'"]
+        clauses = [
+            "scope_id=?",
+            "lifecycle_state!='deleted'",
+            "(planning_cycle_id IS NULL OR EXISTS (SELECT 1 FROM planning_cycles pc "
+            "WHERE pc.scope_id=decision_actions.scope_id AND pc.id=decision_actions.planning_cycle_id "
+            "AND pc.lifecycle_state!='deleted'))",
+        ]
         params: list[Any] = [identity.scope_id]
         if planning_cycle_id:
             clauses.append("planning_cycle_id=?")
@@ -2584,7 +2734,9 @@ def create_decision_action(
 ) -> dict[str, Any]:
     action_id = _text(payload.get("actionId") or payload.get("id"), limit=200) or new_id()
     planning_cycle_id = _required_text(payload.get("planningCycleId"), "planning_cycle_required", "决策行动必须属于计划周期", limit=200)
-    record_kind = _text(payload.get("recordKind"), limit=30) or "plan_action"
+    # 新产生的记录是待确认行动建议，不再是计划下面的“步骤”。
+    # 旧 plan_action 行只为历史兼容保留读取能力。
+    record_kind = _text(payload.get("recordKind"), limit=30) or "decision"
     state = _text(payload.get("decisionState"), limit=30) or "draft"
     if record_kind not in ACTION_KINDS or state not in {"draft", "confirmed"}:
         raise RepositoryError(422, "decision_action_state_invalid", "决策行动类型或状态无效")
@@ -2663,11 +2815,11 @@ def create_decision_action(
             connection.execute(
                 """
                 INSERT INTO decision_actions (
-                    id, scope_id, source_set_id, task_id, decision_state,
+                    id, scope_id, source_set_id, decision_state,
                     version, record_kind, planning_cycle_id, client_id, title,
                     statement, expected_output, owner_membership_id, confirmed_at,
                     lifecycle_state, created_at, updated_at, deleted_at
-                ) VALUES (?, ?, ?, NULL, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'active',
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'active',
                           ?, ?, NULL)
                 """,
                 (
@@ -2891,6 +3043,12 @@ def convert_action_to_primary_task(
     idempotency_key: str,
     task_command_port: FormalTaskCommandPort = UNAVAILABLE_FORMAL_TASK_COMMAND_PORT,
 ) -> dict[str, Any]:
+    """Compatibility command: convert one confirmed suggestion to a normal task.
+
+    v9 intentionally has no "primary task" slot.  The decision action remains
+    provenance; the returned task is independent unless the user explicitly
+    chooses a planning cycle in the task editor.
+    """
     expected = _positive_int(expected_version)
     with repository._connection() as connection:  # noqa: SLF001
         action = _action_row(connection, identity, action_id)
@@ -2902,16 +3060,6 @@ def convert_action_to_primary_task(
                 "decision_action_not_confirmed",
                 "只有已确认行动可以转为正式任务",
             )
-        if action["task_id"]:
-            task = connection.execute(
-                "SELECT * FROM tasks WHERE scope_id=? AND id=?",
-                (identity.scope_id, action["task_id"]),
-            ).fetchone()
-            return {
-                "decisionAction": _action_payload(action),
-                "task": dict(task) if task is not None else None,
-                "idempotentReplay": True,
-            }
         cycle = _planning_row(connection, identity, str(action["planning_cycle_id"]))
         _require_plan_permission(
             connection,
@@ -2936,94 +3084,19 @@ def convert_action_to_primary_task(
     )
     if not task_id:
         raise RepositoryError(502, "formal_task_receipt_invalid", "正式任务命令未返回任务 ID")
-    # GC-04 的正式创建命令在 sourceType=decision_action 时已经在同一事务
-    # 把任务挂回该行动。此处只兼容尚未具备原子绑定的旧命令端口，不能再写一次
-    # 导致行动版本冲突。
     with repository._connection() as connection:  # noqa: SLF001
-        attached_action = _action_row(connection, identity, action_id)
-        if str(attached_action["task_id"] or "") == task_id:
-            task = connection.execute(
-                "SELECT * FROM tasks WHERE scope_id=? AND id=? AND lifecycle_state!='deleted'",
-                (identity.scope_id, task_id),
-            ).fetchone()
-            return {
-                "decisionAction": _action_payload(attached_action),
-                "task": dict(task) if task is not None else dict(task_payload or {}),
-                "taskCommandReceipt": dict(receipt),
-                "idempotentReplay": bool(receipt.get("idempotentReplay")) if isinstance(receipt, Mapping) else False,
-            }
-    normalized = {"actionId": action_id, "expectedVersion": expected, "taskId": task_id}
-    payload_hash = sha256_text(canonical_json(normalized))
-    now = utc_now()
-    with repository._connection() as connection:  # noqa: SLF001
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            command_id, operation_id, replay = _start_command(
-                repository,
-                connection,
-                identity,
-                command_type="gc06.decision_action.primary_task_attached",
-                idempotency_key=idempotency_key,
-                aggregate_type="decision_action",
-                aggregate_id=action_id,
-                expected_version=expected,
-                payload_hash=payload_hash,
-                now=now,
-            )
-            if replay is not None:
-                connection.commit()
-                return replay
-            action = _action_row(connection, identity, action_id)
-            if int(action["version"]) != expected:
-                raise RepositoryError(409, "decision_action_version_conflict", "行动已被更新")
-            task = connection.execute(
-                "SELECT * FROM tasks WHERE scope_id=? AND id=? AND lifecycle_state!='deleted'",
-                (identity.scope_id, task_id),
-            ).fetchone()
-            if task is None:
-                raise RepositoryError(502, "formal_task_receipt_invalid", "正式任务命令未持久化任务")
-            action_client = str(action["client_id"] or "")
-            task_client = str(task["client_id"] or "")
-            if action_client != task_client:
-                raise RepositoryError(409, "decision_action_task_client_mismatch", "承接任务与行动客户项目不一致")
-            used = connection.execute(
-                "SELECT id FROM decision_actions WHERE scope_id=? AND task_id=? AND id!=?",
-                (identity.scope_id, task_id, action_id),
-            ).fetchone()
-            if used is not None:
-                raise RepositoryError(409, "task_already_primary_for_action", "该任务已承接另一项主要行动")
-            connection.execute(
-                "UPDATE decision_actions SET task_id=?, version=version+1, "
-                "updated_at=? WHERE id=? AND scope_id=? AND version=?",
-                (task_id, now, action_id, identity.scope_id, expected),
-            )
-            updated = _action_row(connection, identity, action_id)
-            result = {
-                "decisionAction": _action_payload(updated),
-                "task": dict(task),
-                "taskCommandReceipt": dict(receipt),
-            }
-            settled = _settle_command(
-                repository,
-                connection,
-                identity,
-                command_id=command_id,
-                operation_id=operation_id,
-                idempotency_key=idempotency_key,
-                command_type="gc06.decision_action.primary_task_attached",
-                aggregate_type="decision_action",
-                aggregate_id=action_id,
-                aggregate_version=int(updated["version"]),
-                payload_hash=payload_hash,
-                result=result,
-                target_resource_id=None,
-                now=now,
-            )
-            connection.commit()
-            return settled
-        except Exception:
-            connection.rollback()
-            raise
+        task = connection.execute(
+            "SELECT * FROM tasks WHERE scope_id=? AND id=? AND lifecycle_state!='deleted'",
+            (identity.scope_id, task_id),
+        ).fetchone()
+        if task is None:
+            raise RepositoryError(502, "formal_task_receipt_invalid", "正式任务命令未持久化任务")
+        return {
+            "decisionAction": _action_payload(_action_row(connection, identity, action_id)),
+            "task": dict(task),
+            "taskCommandReceipt": dict(receipt),
+            "idempotentReplay": bool(receipt.get("idempotentReplay")) if isinstance(receipt, Mapping) else False,
+        }
 
 
 def list_plan_item_tasks(
@@ -3032,7 +3105,7 @@ def list_plan_item_tasks(
     *,
     plan_item_id: str | None = None,
 ) -> dict[str, Any]:
-    """Read the strict action→task relation without reviving legacy task attributes."""
+    """Compatibility name: read the direct planning-cycle→tasks relation."""
 
     task_repository = GC04TaskRepository(repository)
     board = task_repository.board(identity)
@@ -3043,20 +3116,20 @@ def list_plan_item_tasks(
     }
     with repository._connection() as connection:  # noqa: SLF001
         rows = connection.execute(
-            "SELECT id, task_id FROM decision_actions WHERE scope_id=? "
-            "AND lifecycle_state='active' AND decision_state!='dropped' "
-            "AND task_id IS NOT NULL ORDER BY updated_at DESC, id",
+            "SELECT id, planning_cycle_id FROM tasks WHERE scope_id=? "
+            "AND lifecycle_state!='deleted' AND planning_cycle_id IS NOT NULL "
+            "ORDER BY updated_at DESC, id",
             (identity.scope_id,),
         ).fetchall()
     counts: dict[str, int] = {}
     matches: list[dict[str, Any]] = []
     for row in rows:
-        action_id = str(row["id"])
-        task = visible_tasks.get(str(row["task_id"] or ""))
+        cycle_id = str(row["planning_cycle_id"])
+        task = visible_tasks.get(str(row["id"] or ""))
         if task is None:
             continue
-        counts[action_id] = counts.get(action_id, 0) + 1
-        if plan_item_id and action_id == plan_item_id:
+        counts[cycle_id] = counts.get(cycle_id, 0) + 1
+        if plan_item_id and cycle_id == plan_item_id:
             matches.append(task)
     return {"tasks": matches, "counts": counts}
 
@@ -3070,22 +3143,21 @@ def get_task_plan_link(
     task_repository = GC04TaskRepository(repository)
     with repository._connection() as connection:  # noqa: SLF001
         task_repository._require_task_read(connection, identity, task_id)  # noqa: SLF001
-        action = connection.execute(
-            "SELECT * FROM decision_actions WHERE scope_id=? AND task_id=? "
-            "AND lifecycle_state='active' AND decision_state!='dropped' "
-            "ORDER BY updated_at DESC, id LIMIT 1",
+        task = connection.execute(
+            "SELECT planning_cycle_id,version,updated_at FROM tasks WHERE scope_id=? AND id=?",
             (identity.scope_id, task_id),
         ).fetchone()
-    if action is None:
+    if task is None or not task["planning_cycle_id"]:
         return None
     return {
         "taskId": task_id,
-        "departmentPlanItemId": str(action["id"]),
+        "planningCycleId": str(task["planning_cycle_id"]),
+        "departmentPlanItemId": str(task["planning_cycle_id"]),
         "focusItemId": None,
         "linkedBy": "manager",
         "confidence": 1.0,
-        "version": int(action["version"] or 1),
-        "updatedAt": str(action["updated_at"] or ""),
+        "version": int(task["version"] or 1),
+        "updatedAt": str(task["updated_at"] or ""),
     }
 
 
@@ -3097,7 +3169,7 @@ def set_task_plan_link(
     action_id: str | None,
     idempotency_key: str,
 ) -> dict[str, Any] | None:
-    """Attach one formal task to at most one primary decision action."""
+    """Attach one task directly to one independently selectable plan."""
 
     normalized = {"taskId": task_id, "actionId": action_id}
     payload_hash = sha256_text(canonical_json(normalized))
@@ -3109,18 +3181,9 @@ def set_task_plan_link(
             task = task_repository._require_task_write(  # noqa: SLF001
                 connection, identity, task_id
             )
-            current = connection.execute(
-                "SELECT * FROM decision_actions WHERE scope_id=? AND task_id=? "
-                "AND lifecycle_state='active' AND decision_state!='dropped' "
-                "ORDER BY updated_at DESC, id LIMIT 1",
-                (identity.scope_id, task_id),
-            ).fetchone()
             target = None
             if action_id:
-                target = _action_row(connection, identity, action_id)
-                cycle = _planning_row(
-                    connection, identity, str(target["planning_cycle_id"])
-                )
+                cycle = _planning_row(connection, identity, action_id)
                 _require_plan_permission(
                     connection,
                     identity,
@@ -3128,20 +3191,15 @@ def set_task_plan_link(
                     department_id=cycle["department_id"],
                     write=True,
                 )
-                action_client = str(target["client_id"] or "")
+                action_client = str(cycle["client_id"] or "")
                 task_client = str(task["client_id"] or "")
                 if action_client and action_client != task_client:
                     raise RepositoryError(
                         409,
                         "decision_action_task_client_mismatch",
-                        "任务与计划行动的客户项目不一致",
+                        "任务与关联计划的客户项目不一致",
                     )
-                if target["task_id"] and str(target["task_id"]) != task_id:
-                    raise RepositoryError(
-                        409,
-                        "decision_action_primary_task_exists",
-                        "该计划项已经关联另一条主要任务",
-                    )
+                target = cycle
             command_id, operation_id, replay = _start_command(
                 repository,
                 connection,
@@ -3157,31 +3215,26 @@ def set_task_plan_link(
             if replay is not None:
                 connection.commit()
                 return replay.get("planLink")
-            if current is not None and (target is None or str(current["id"]) != str(target["id"])):
-                connection.execute(
-                    "UPDATE decision_actions SET task_id=NULL, version=version+1, "
-                    "updated_at=? WHERE id=? AND scope_id=? AND version=?",
-                    (now, current["id"], identity.scope_id, int(current["version"])),
-                )
-            if target is not None and str(target["task_id"] or "") != task_id:
-                cursor = connection.execute(
-                    "UPDATE decision_actions SET task_id=?, version=version+1, "
-                    "updated_at=? WHERE id=? AND scope_id=? AND version=?",
-                    (task_id, now, target["id"], identity.scope_id, int(target["version"])),
-                )
-                if cursor.rowcount != 1:
-                    raise RepositoryError(409, "decision_action_version_conflict", "计划项已被更新")
-            updated = None
-            if target is not None:
-                updated = _action_row(connection, identity, str(target["id"]))
-            plan_link = None if updated is None else {
+            cursor = connection.execute(
+                "UPDATE tasks SET planning_cycle_id=?,version=version+1,updated_at=? "
+                "WHERE id=? AND scope_id=? AND version=?",
+                (str(target["id"]) if target is not None else None, now, task_id,
+                 identity.scope_id, int(task["version"] or 1)),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryError(409, "task_version_conflict", "任务已更新，请刷新后重试")
+            updated_task = connection.execute(
+                "SELECT * FROM tasks WHERE id=? AND scope_id=?", (task_id, identity.scope_id)
+            ).fetchone()
+            plan_link = None if target is None else {
                 "taskId": task_id,
-                "departmentPlanItemId": str(updated["id"]),
+                "planningCycleId": str(target["id"]),
+                "departmentPlanItemId": str(target["id"]),
                 "focusItemId": None,
                 "linkedBy": "manager",
                 "confidence": 1.0,
-                "version": int(updated["version"] or 1),
-                "updatedAt": str(updated["updated_at"] or now),
+                "version": int(updated_task["version"] or 1),
+                "updatedAt": str(updated_task["updated_at"] or now),
             }
             settled = _settle_command(
                 repository,
@@ -3193,7 +3246,7 @@ def set_task_plan_link(
                 command_type="gc06.task_plan_link.updated",
                 aggregate_type="task",
                 aggregate_id=task_id,
-                aggregate_version=int(task["version"] or 1),
+                aggregate_version=int(updated_task["version"] or 1),
                 payload_hash=payload_hash,
                 result={"planLink": plan_link},
                 target_resource_id=None,
@@ -3270,23 +3323,15 @@ def _meeting_plan_link_payload(
     scope_id: str,
     meeting_id: str,
 ) -> dict[str, Any] | None:
-    lineage = connection.execute(
-        "SELECT * FROM derivation_lineage WHERE scope_id=? AND derivative_kind=? "
-        "AND derivative_object_id=? AND invalidated_at IS NULL ORDER BY generated_at DESC,id DESC LIMIT 1",
-        (scope_id, MEETING_PLAN_LINK_PURPOSE, meeting_id),
+    meeting = connection.execute(
+        "SELECT planning_cycle_id FROM meetings WHERE scope_id=? AND id=?",
+        (scope_id, meeting_id),
     ).fetchone()
-    if lineage is None:
+    if meeting is None or not meeting["planning_cycle_id"]:
         return None
-    members = connection.execute(
-        "SELECT * FROM source_set_members WHERE scope_id=? AND source_set_id=? "
-        "AND lifecycle_state='active' AND removed_at IS NULL ORDER BY ordinal,id",
-        (scope_id, lineage["source_set_id"]),
-    ).fetchall()
-    by_kind = {str(item["source_object_kind"]): str(item["source_object_id"]) for item in members}
     return {
-        "sourceSetId": str(lineage["source_set_id"]),
-        "planningCycleId": by_kind.get("planning_cycle"),
-        "decisionActionId": by_kind.get("decision_action"),
+        "planningCycleId": str(meeting["planning_cycle_id"]),
+        "decisionActionId": None,
     }
 
 
@@ -3439,109 +3484,19 @@ def _sync_meeting_plan_link(
     decision_action_id: str | None,
     now: str,
 ) -> None:
-    source_set_id = repository._record_id("source_set", meeting_id, "meeting_plan")  # noqa: SLF001
-    lineage_id = repository._record_id("lineage", meeting_id, "meeting_plan")  # noqa: SLF001
-    connection.execute(
-        "UPDATE derivation_lineage SET invalidated_at=? WHERE scope_id=? "
-        "AND derivative_kind=? AND derivative_object_id=? AND invalidated_at IS NULL",
-        (now, identity.scope_id, MEETING_PLAN_LINK_PURPOSE, meeting_id),
-    )
-    connection.execute(
-        "UPDATE source_set_members SET lifecycle_state='deleted',removed_at=?,deleted_at=?,updated_at=?,version=version+1 "
-        "WHERE scope_id=? AND source_set_id=? AND lifecycle_state='active'",
-        (now, now, now, identity.scope_id, source_set_id),
-    )
-    if not planning_cycle_id:
-        connection.execute(
-            "UPDATE source_sets SET lifecycle_state='deleted',deleted_at=?,updated_at=?,version=version+1 "
-            "WHERE scope_id=? AND id=? AND lifecycle_state!='deleted'",
-            (now, now, identity.scope_id, source_set_id),
-        )
-        return
-    cycle = _planning_row(connection, identity, planning_cycle_id)
-    action = None
     if decision_action_id:
-        action = _decision_action_row(connection, identity, decision_action_id)
-        if str(action["planning_cycle_id"]) != planning_cycle_id:
-            raise RepositoryError(422, "meeting_plan_action_mismatch", "计划行动不属于所选计划周期")
-        if action["client_id"] and str(action["client_id"]) != client_id:
-            raise RepositoryError(422, "meeting_plan_client_mismatch", "计划行动与会议项目不一致")
-    members = [("planning_cycle", planning_cycle_id, int(cycle["version"] or 1))]
-    if action is not None:
-        members.append(("decision_action", decision_action_id, int(action["version"] or 1)))
-    connection.execute(
-        """
-        INSERT INTO source_sets (
-            id,scope_id,client_id,security_label_set_version,source_count,version,
-            purpose_kind,publication_state,created_by_principal_id,created_at,expires_at,
-            lifecycle_state,updated_at,deleted_at,authority_role,origin_instance_id
-        ) VALUES (?,?,?,NULL,?,1,?,'published',?,?,NULL,'active',?,NULL,'cloud',?)
-        ON CONFLICT(id) DO UPDATE SET client_id=excluded.client_id,
-            source_count=excluded.source_count,version=source_sets.version+1,
-            publication_state='published',lifecycle_state='active',updated_at=excluded.updated_at,
-            deleted_at=NULL
-        """,
-        (
-            source_set_id,
-            identity.scope_id,
-            client_id,
-            len(members),
-            MEETING_PLAN_LINK_PURPOSE,
-            identity.principal_id,
-            now,
-            now,
-            repository.cloud_instance_id,
-        ),
-    )
-    for ordinal, (kind, object_id, source_version) in enumerate(members):
-        member_id = repository._record_id("source_member", meeting_id, f"meeting_plan:{kind}")  # noqa: SLF001
-        connection.execute(
-            """
-            INSERT INTO source_set_members (
-                id,scope_id,source_set_id,source_object_id,source_version,policy_version,
-                source_object_kind,ordinal,added_at,removed_at,version,lifecycle_state,
-                created_at,updated_at,deleted_at,authority_role,origin_instance_id
-            ) VALUES (?,?,?,?,?,NULL,?,?,?,NULL,1,'active',?,?,NULL,'cloud',?)
-            ON CONFLICT(id) DO UPDATE SET source_object_id=excluded.source_object_id,
-                source_version=excluded.source_version,ordinal=excluded.ordinal,added_at=excluded.added_at,
-                removed_at=NULL,version=source_set_members.version+1,lifecycle_state='active',
-                updated_at=excluded.updated_at,deleted_at=NULL
-            """,
-            (
-                member_id,
-                identity.scope_id,
-                source_set_id,
-                object_id,
-                source_version,
-                kind,
-                ordinal,
-                now,
-                now,
-                now,
-                repository.cloud_instance_id,
-            ),
+        raise RepositoryError(422, "meeting_plan_action_removed", "会议只关联独立计划，不再关联计划步骤")
+    if planning_cycle_id:
+        cycle = _planning_row(connection, identity, planning_cycle_id)
+        _require_plan_permission(
+            connection, identity, record_kind=str(cycle["record_kind"]),
+            department_id=cycle["department_id"], write=False,
         )
+        if cycle["client_id"] and str(cycle["client_id"]) != client_id:
+            raise RepositoryError(409, "meeting_plan_client_mismatch", "会议项目必须与关联计划项目一致")
     connection.execute(
-        """
-        INSERT INTO derivation_lineage (
-            id,scope_id,source_set_id,policy_version_id,grant_generation,
-            derivative_kind,derivative_object_id,generator_version,generated_at,
-            invalidated_at,source_version,authority_role,origin_instance_id
-        ) VALUES (?,?,?,NULL,NULL,?,?,?, ?,NULL,1,'cloud',?)
-        ON CONFLICT(id) DO UPDATE SET source_set_id=excluded.source_set_id,
-            generator_version=excluded.generator_version,generated_at=excluded.generated_at,
-            invalidated_at=NULL,source_version=derivation_lineage.source_version+1
-        """,
-        (
-            lineage_id,
-            identity.scope_id,
-            source_set_id,
-            MEETING_PLAN_LINK_PURPOSE,
-            meeting_id,
-            MEETING_COLLABORATION_SCHEMA,
-            now,
-            repository.cloud_instance_id,
-        ),
+        "UPDATE meetings SET planning_cycle_id=?,updated_at=? WHERE id=? AND scope_id=?",
+        (planning_cycle_id, now, meeting_id, identity.scope_id),
     )
 
 
@@ -3860,17 +3815,18 @@ def create_meeting(
             connection.execute(
                 """
                 INSERT INTO meetings (
-                    id, scope_id, client_id, event_line_id, lifecycle_state,
+                    id, scope_id, client_id, event_line_id, planning_cycle_id, lifecycle_state,
                     title, agenda, starts_at, ends_at, timezone,
                     organizer_membership_id, visibility_scope, status, version,
                     created_at, updated_at, deleted_at
-                ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)
                 """,
                 (
                     meeting_id,
                     identity.scope_id,
                     client_id,
                     normalized["eventLineId"],
+                    normalized["planningCycleId"],
                     normalized["title"],
                     normalized["agenda"],
                     starts_at,
@@ -4065,13 +4021,14 @@ def update_meeting(
             status = normalized["status"] or str(row["status"])
             connection.execute(
                 """
-                UPDATE meetings SET client_id=?, event_line_id=?, title=?, agenda=?, starts_at=?,
+                UPDATE meetings SET client_id=?, event_line_id=?, planning_cycle_id=?, title=?, agenda=?, starts_at=?,
                     ends_at=?, organizer_membership_id=?, status=?, version=?, updated_at=?
                 WHERE id=? AND scope_id=? AND version=?
                 """,
                 (
                     binding.client_id,
                     event_line_id,
+                    normalized["planningCycleId"] if normalized["planLinkTouched"] else row["planning_cycle_id"],
                     normalized["title"] or row["title"],
                     normalized["agenda"] if "agenda" in payload else row["agenda"],
                     starts_at,

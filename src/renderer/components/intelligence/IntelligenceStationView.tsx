@@ -4,6 +4,11 @@
 // 避免 npx tsc --noEmit 在我们这条线被同事的代码挡掉。
 import React, { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  readRuntimeUiSessionValue,
+  useRuntimeUiSessionState,
+  writeRuntimeUiSessionValue,
+} from '../../lib/runtimeUiSessionStore';
+import {
   AlertTriangle,
   BellPlus,
   CheckCircle2,
@@ -87,6 +92,7 @@ import {
 } from '../../lib/api';
 
 type IntelligenceStationViewProps = {
+  uiSessionScopeKey?: string;
   activeTaskLists: TaskList[];
   effectiveTaskSettings: TaskSettings;
   currentSessionUser: SessionUser | null;
@@ -860,32 +866,17 @@ export function IntelligenceStationView({
   currentOperatorName,
   flash,
   onTasksReload,
+  uiSessionScopeKey = 'intelligence:local:anonymous',
 }: IntelligenceStationViewProps) {
   const [workObjects, setWorkObjects] = useState<IntelligenceWorkObject[]>([]);
   const [focusDirectives, setFocusDirectives] = useState<IntelligenceFocusDirective[]>([]);
-  // P12 · MRU（最近访问）持久化：上次看过的客户排在最上面，并默认回到上次的客户
-  const [selectedScopeKey, setSelectedScopeKey] = useState<WorkObjectSelection>(() => {
-    try {
-      const saved = localStorage.getItem('yiyu.intelligence.workobject.lastSelected');
-      if (saved) return saved as WorkObjectSelection;
-    } catch {/* SSR / 隐私模式 fallback */}
-    return 'all';
-  });
-  const [mruScopeKeys, setMruScopeKeys] = useState<string[]>(() => {
-    try {
-      const saved = localStorage.getItem('yiyu.intelligence.workobject.mru');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed.filter((x) => typeof x === 'string');
-      }
-    } catch {/* ignore */}
-    return [];
-  });
+  const [selectedScopeKey, setSelectedScopeKey] = useRuntimeUiSessionState<WorkObjectSelection>(`${uiSessionScopeKey}:scope`, 'all');
+  const [mruScopeKeys, setMruScopeKeys] = useRuntimeUiSessionState<string[]>(`${uiSessionScopeKey}:mru`, []);
   const [focusScopeKey, setFocusScopeKey] = useState<ScopeKey>('global');
   const [focusDraft, setFocusDraft] = useState<FocusDraft>(EMPTY_FOCUS_DRAFT);
-  const [activeTab, setActiveTab] = useState<IntelligenceContentKind>('public_opinion');
-  const [sort, setSort] = useState<SortMode>('captured_desc');
-  const [pages, setPages] = useState<Record<IntelligenceContentKind, number>>({
+  const [activeTab, setActiveTab] = useRuntimeUiSessionState<IntelligenceContentKind>(`${uiSessionScopeKey}:tab`, 'public_opinion');
+  const [sort, setSort] = useRuntimeUiSessionState<SortMode>(`${uiSessionScopeKey}:sort`, 'captured_desc');
+  const [pages, setPages] = useRuntimeUiSessionState<Record<IntelligenceContentKind, number>>(`${uiSessionScopeKey}:pages`, {
     brand_mirror: 1,
     timely_intelligence: 1,
     public_opinion: 1,
@@ -919,6 +910,17 @@ export function IntelligenceStationView({
   const autoRefreshDueCheckedRef = useRef(false);
   const refreshPollTimersRef = useRef<number[]>([]);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return undefined;
+    container.scrollTop = readRuntimeUiSessionValue(`${uiSessionScopeKey}:scroll-top`, 0);
+    const remember = () => writeRuntimeUiSessionValue(`${uiSessionScopeKey}:scroll-top`, container.scrollTop);
+    container.addEventListener('scroll', remember, { passive: true });
+    return () => {
+      remember();
+      container.removeEventListener('scroll', remember);
+    };
+  }, [uiSessionScopeKey]);
   const [refreshingKind, setRefreshingKind] = useState<IntelligenceContentKind | null>(null);
   const [refreshRuns, setRefreshRuns] = useState<IntelligenceRefreshRun[]>([]);
   const [refreshCycleSettings, setRefreshCycleSettings] = useState<IntelligenceRefreshCycleSettings>(DEFAULT_REFRESH_CYCLE_SETTINGS);
@@ -1139,20 +1141,9 @@ export function IntelligenceStationView({
   function changeScope(next: WorkObjectSelection) {
     setSelectedScopeKey(next);
     setPages({ brand_mirror: 1, timely_intelligence: 1, public_opinion: 1 });
-    // P12 · MRU 记录：把刚选的 scope 推到最前面，最多保留 20 条
-    try {
-      localStorage.setItem('yiyu.intelligence.workobject.lastSelected', next);
-      if (next !== 'all') {
-        setMruScopeKeys((prev) => {
-          const filtered = prev.filter((k) => k !== next);
-          const updated = [next, ...filtered].slice(0, 20);
-          try {
-            localStorage.setItem('yiyu.intelligence.workobject.mru', JSON.stringify(updated));
-          } catch { /* ignore */ }
-          return updated;
-        });
-      }
-    } catch { /* ignore */ }
+    if (next !== 'all') {
+      setMruScopeKeys((prev) => [next, ...prev.filter((key) => key !== next)].slice(0, 20));
+    }
   }
 
   function changeSort(next: SortMode) {

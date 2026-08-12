@@ -440,7 +440,7 @@ class LocalGC06PlanningProjection:
                 "recordKind": str(row["record_kind"]),
                 "planningCycleId": str(row["planning_cycle_id"] or ""),
                 "clientId": row["client_id"],
-                "taskId": row["task_id"],
+                "taskId": None,
                 "decisionState": str(row["decision_state"]),
                 "title": str(row["title"] or ""),
                 "statement": str(row["statement"] or ""),
@@ -501,24 +501,14 @@ class LocalGC06PlanningProjection:
                         "inboxStatus": "accepted" if str(grant["status"]) == "active" else str(grant["status"]),
                         "version": int(grant["version"] or 1),
                     })
-                lineage = connection.execute(
-                    "SELECT * FROM derivation_lineage WHERE scope_id=? AND derivative_kind='meeting_plan_link' "
-                    "AND derivative_object_id=? AND invalidated_at IS NULL ORDER BY generated_at DESC,id DESC LIMIT 1",
-                    (scope_id, row["id"]),
-                ).fetchone()
-                plan_link = None
-                if lineage is not None:
-                    members = connection.execute(
-                        "SELECT * FROM source_set_members WHERE scope_id=? AND source_set_id=? "
-                        "AND lifecycle_state='active' AND removed_at IS NULL",
-                        (scope_id, lineage["source_set_id"]),
-                    ).fetchall()
-                    by_kind = {str(item["source_object_kind"]): str(item["source_object_id"]) for item in members}
-                    plan_link = {
-                        "sourceSetId": str(lineage["source_set_id"]),
-                        "planningCycleId": by_kind.get("planning_cycle"),
-                        "decisionActionId": by_kind.get("decision_action"),
+                plan_link = (
+                    {
+                        "planningCycleId": str(row["planning_cycle_id"]),
+                        "decisionActionId": None,
                     }
+                    if row["planning_cycle_id"]
+                    else None
+                )
                 result.append({
                 "id": str(row["id"]),
                 "clientId": str(row["client_id"] or ""),
@@ -544,23 +534,14 @@ class LocalGC06PlanningProjection:
     def apply_planning_cycles(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         def apply(connection: Any, context: Any, scope_id: str, sandbox_id: str, now: str) -> int:
             count = 0
-            pending = list(rows)
-            while pending:
-                progressed = False
-                for row in list(pending):
-                    parent_id = row.get("parentPlanId")
-                    if parent_id and not connection.execute(
-                        "SELECT 1 FROM planning_cycles WHERE id=? AND scope_id=?",
-                        (parent_id, scope_id),
-                    ).fetchone():
-                        continue
-                    resource_id = str(row.get("id") or "")
-                    lifecycle = str(row.get("lifecycleState") or "active")
-                    version = max(1, int(row.get("version") or 1))
-                    created_at = str(row.get("createdAt") or now)
-                    updated_at = str(row.get("updatedAt") or now)
-                    deleted_at = row.get("deletedAt")
-                    self._ensure_resource(
+            for row in rows:
+                resource_id = str(row.get("id") or "")
+                lifecycle = str(row.get("lifecycleState") or "active")
+                version = max(1, int(row.get("version") or 1))
+                created_at = str(row.get("createdAt") or now)
+                updated_at = str(row.get("updatedAt") or now)
+                deleted_at = row.get("deletedAt")
+                self._ensure_resource(
                         connection,
                         scope_id=scope_id,
                         cloud_instance_id=context.cloud_instance_id,
@@ -572,8 +553,8 @@ class LocalGC06PlanningProjection:
                         created_at=created_at,
                         updated_at=updated_at,
                         deleted_at=deleted_at,
-                    )
-                    self._upsert(
+                )
+                self._upsert(
                         connection,
                         "planning_cycles",
                         {
@@ -584,7 +565,6 @@ class LocalGC06PlanningProjection:
                             "status": row.get("status") or "draft",
                             "record_kind": row.get("recordKind") or "organization_plan",
                             "client_id": row.get("clientId"),
-                            "parent_plan_id": parent_id,
                             "department_id": row.get("departmentId"),
                             "owner_membership_id": row.get("ownerMembershipId"),
                             "period_kind": row.get("periodKind"),
@@ -607,17 +587,36 @@ class LocalGC06PlanningProjection:
                                 now=now,
                             ),
                         },
-                    )
-                    pending.remove(row)
-                    progressed = True
-                    count += 1
-                if not progressed:
-                    raise LocalRuntimeError(
-                        409,
-                        "gc06_parent_plan_projection_missing",
-                        "部门计划缺少组织计划投影",
-                    )
+                )
+                count += 1
             return count
+
+        return self._transaction(apply)
+
+    def reconcile_planning_cycles(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Tombstone projected cycles absent from a successful cloud snapshot."""
+
+        active_ids = {str(row.get("id") or "") for row in rows if str(row.get("id") or "")}
+
+        def apply(connection: Any, _: Any, scope_id: str, sandbox_id: str, now: str) -> int:
+            projected = connection.execute(
+                "SELECT id FROM planning_cycles WHERE scope_id=? AND sandbox_id=? "
+                "AND projection_state='current' AND lifecycle_state!='deleted'",
+                (scope_id, sandbox_id),
+            ).fetchall()
+            stale_ids = [str(row["id"]) for row in projected if str(row["id"]) not in active_ids]
+            for resource_id in stale_ids:
+                connection.execute(
+                    "UPDATE planning_cycles SET lifecycle_state='deleted',projection_state='stale',"
+                    "deleted_at=?,updated_at=? WHERE id=? AND scope_id=? AND sandbox_id=?",
+                    (now, now, resource_id, scope_id, sandbox_id),
+                )
+                connection.execute(
+                    "UPDATE secured_resources SET lifecycle_state='deleted',deleted_at=?,updated_at=? "
+                    "WHERE id=? AND scope_id=?",
+                    (now, now, resource_id, scope_id),
+                )
+            return len(stale_ids)
 
         return self._transaction(apply)
 
@@ -706,7 +705,6 @@ class LocalGC06PlanningProjection:
                     {
                         "id": row.get("id"),
                         "source_set_id": None,
-                        "task_id": row.get("taskId"),
                         "decision_state": row.get("decisionState"),
                         "version": row.get("version") or 1,
                         "record_kind": row.get("recordKind"),
@@ -761,6 +759,11 @@ class LocalGC06PlanningProjection:
                         "id": meeting_id,
                         "client_id": row.get("clientId"),
                         "event_line_id": row.get("eventLineId"),
+                        "planning_cycle_id": (
+                            (row.get("planLink") or {}).get("planningCycleId")
+                            if isinstance(row.get("planLink"), Mapping)
+                            else row.get("planningCycleId")
+                        ),
                         "lifecycle_state": lifecycle,
                         "title": row.get("title"),
                         "agenda": row.get("agenda"),
@@ -843,85 +846,6 @@ class LocalGC06PlanningProjection:
                             ),
                         },
                     )
-                plan_link = row.get("planLink") if isinstance(row.get("planLink"), Mapping) else None
-                connection.execute(
-                    "UPDATE derivation_lineage SET invalidated_at=? WHERE scope_id=? "
-                    "AND derivative_kind='meeting_plan_link' AND derivative_object_id=? "
-                    "AND invalidated_at IS NULL",
-                    (now, scope_id, meeting_id),
-                )
-                if plan_link and plan_link.get("sourceSetId") and plan_link.get("planningCycleId"):
-                    source_set_id = str(plan_link["sourceSetId"])
-                    principal = connection.execute(
-                        "SELECT principal_id FROM sandboxes WHERE id=?",
-                        (sandbox_id,),
-                    ).fetchone()
-                    kinds = [("planning_cycle", str(plan_link["planningCycleId"]))]
-                    if plan_link.get("decisionActionId"):
-                        kinds.append(("decision_action", str(plan_link["decisionActionId"])))
-                    self._upsert(connection, "source_sets", {
-                        "id": source_set_id,
-                        "scope_id": scope_id,
-                        "client_id": row.get("clientId"),
-                        "security_label_set_version": None,
-                        "source_count": len(kinds),
-                        "version": version,
-                        "purpose_kind": "meeting_plan_link",
-                        "publication_state": "published",
-                        "created_by_principal_id": principal["principal_id"] if principal else None,
-                        "created_at": created_at,
-                        "expires_at": None,
-                        "lifecycle_state": "active",
-                        "updated_at": updated_at,
-                        "deleted_at": None,
-                        "authority_role": "cloud",
-                        "origin_instance_id": context.cloud_instance_id,
-                    })
-                    for ordinal, (kind, object_id) in enumerate(kinds):
-                        member_id = "source_member_" + hashlib.sha256(
-                            f"{meeting_id}\x1fmeeting_plan:{kind}".encode("utf-8")
-                        ).hexdigest()[:30]
-                        source_row = connection.execute(
-                            f"SELECT version FROM {'planning_cycles' if kind == 'planning_cycle' else 'decision_actions'} WHERE id=?",
-                            (object_id,),
-                        ).fetchone()
-                        self._upsert(connection, "source_set_members", {
-                            "id": member_id,
-                            "scope_id": scope_id,
-                            "source_set_id": source_set_id,
-                            "source_object_id": object_id,
-                            "source_version": int(source_row["version"] or 1) if source_row else 1,
-                            "policy_version": None,
-                            "source_object_kind": kind,
-                            "ordinal": ordinal,
-                            "added_at": updated_at,
-                            "removed_at": None,
-                            "version": version,
-                            "lifecycle_state": "active",
-                            "created_at": created_at,
-                            "updated_at": updated_at,
-                            "deleted_at": None,
-                            "authority_role": "cloud",
-                            "origin_instance_id": context.cloud_instance_id,
-                        })
-                    lineage_id = "lineage_" + hashlib.sha256(
-                        f"{meeting_id}\x1fmeeting_plan".encode("utf-8")
-                    ).hexdigest()[:30]
-                    self._upsert(connection, "derivation_lineage", {
-                        "id": lineage_id,
-                        "scope_id": scope_id,
-                        "source_set_id": source_set_id,
-                        "policy_version_id": None,
-                        "grant_generation": None,
-                        "derivative_kind": "meeting_plan_link",
-                        "derivative_object_id": meeting_id,
-                        "generator_version": "yiyu.meeting-collaboration.v1",
-                        "generated_at": updated_at,
-                        "invalidated_at": None,
-                        "source_version": version,
-                        "authority_role": "cloud",
-                        "origin_instance_id": context.cloud_instance_id,
-                    })
             return len(rows)
 
         return self._transaction(apply)

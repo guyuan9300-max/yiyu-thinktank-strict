@@ -719,6 +719,32 @@ class GC04TaskRepository:
             raise RepositoryError(403, "task_list_forbidden", "当前成员无权使用该任务清单")
         return str(row["id"])
 
+    @staticmethod
+    def _validate_planning_cycle(
+        connection: sqlite3.Connection,
+        identity: SessionIdentity,
+        planning_cycle_id: str | None,
+        client_id: str | None,
+    ) -> str | None:
+        if planning_cycle_id is None:
+            return None
+        row = connection.execute(
+            "SELECT * FROM planning_cycles WHERE id=? AND scope_id=? "
+            "AND lifecycle_state='active' AND status!='archived'",
+            (planning_cycle_id, identity.scope_id),
+        ).fetchone()
+        if row is None:
+            raise RepositoryError(422, "planning_cycle_invalid", "关联计划不存在或已归档")
+        plan_client = _text(row["client_id"])
+        if plan_client and plan_client != client_id:
+            raise RepositoryError(409, "planning_cycle_client_mismatch", "任务项目必须与关联计划项目一致")
+        from .gc06_planning import _require_plan_permission
+        _require_plan_permission(
+            connection, identity, record_kind=str(row["record_kind"]),
+            department_id=row["department_id"], write=False,
+        )
+        return str(row["id"])
+
     def _validate_tags(
         self,
         connection: sqlite3.Connection,
@@ -862,6 +888,9 @@ class GC04TaskRepository:
         )
         list_value = payload.get("taskListId") if "taskListId" in payload else payload.get("listId")
         task_list_id = self._validate_list(connection, identity, _text(list_value))
+        planning_cycle_id = self._validate_planning_cycle(
+            connection, identity, _text(payload.get("planningCycleId")), binding.client_id
+        )
         tag_ids = self._validate_tags(connection, identity, payload.get("tagIds") or [])
         owner_value = payload.get("ownerMembershipId") if "ownerMembershipId" in payload else payload.get("ownerId")
         owner_id = _text(owner_value) or identity.membership_id
@@ -887,6 +916,7 @@ class GC04TaskRepository:
             "tag_ids": tag_ids,
             "client_id": binding.client_id,
             "event_line_id": binding.event_line_id,
+            "planning_cycle_id": planning_cycle_id,
             "due_date": _text(payload.get("dueDate") or payload.get("deadlineAt") or payload.get("ddl")),
             "scheduled_start_at": scheduled_start,
             "scheduled_end_at": scheduled_end,
@@ -937,6 +967,13 @@ class GC04TaskRepository:
         if "taskListId" in payload or "listId" in payload:
             raw = payload.get("taskListId") if "taskListId" in payload else payload.get("listId")
             patch["task_list_id"] = self._validate_list(connection, identity, _text(raw))
+        if "planningCycleId" in payload:
+            patch["planning_cycle_id"] = self._validate_planning_cycle(
+                connection,
+                identity,
+                _text(payload.get("planningCycleId")),
+                _text(patch.get("client_id", row["client_id"])),
+            )
         if "tagIds" in payload:
             patch["tag_ids"] = self._validate_tags(
                 connection, identity, payload.get("tagIds") or []
@@ -1058,6 +1095,13 @@ class GC04TaskRepository:
         )
         if "task_list_id" in patch:
             self._validate_list(connection, identity, _text(patch["task_list_id"]))
+        if "planning_cycle_id" in patch:
+            self._validate_planning_cycle(
+                connection,
+                identity,
+                _text(patch["planning_cycle_id"]),
+                binding.client_id,
+            )
         self._validate_schedule(
             _text(patch.get("scheduled_start_at", row["scheduled_start_at"])),
             _text(patch.get("scheduled_end_at", row["scheduled_end_at"])),
@@ -1560,19 +1604,19 @@ class GC04TaskRepository:
                     """
                     INSERT INTO tasks (
                         id, scope_id, creator_principal_id, creator_membership_id,
-                        task_list_id, client_id, event_line_id, lifecycle_state,
+                        task_list_id, client_id, event_line_id, planning_cycle_id, lifecycle_state,
                         version, title, description, priority, task_kind,
                         visibility_scope, due_date, scheduled_start_at,
                         scheduled_end_at, duration_minutes, completion_note,
                         completed_at, source_type, source_id, archived_at,
                         created_at, updated_at, deleted_at
-                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, ?,
+                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, ?,
                               ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, NULL)
                     """,
                     (
                         task_id, identity.scope_id, identity.membership_id,
                         normalized["task_list_id"], normalized["client_id"],
-                        normalized["event_line_id"], normalized["title"],
+                        normalized["event_line_id"], normalized["planning_cycle_id"], normalized["title"],
                         normalized["description"], normalized["priority"],
                         normalized["task_kind"], normalized["visibility_scope"],
                         normalized["due_date"], normalized["scheduled_start_at"],
@@ -1580,87 +1624,6 @@ class GC04TaskRepository:
                         normalized["source_type"], normalized["source_id"], now, now,
                     ),
                 )
-                attached_action = None
-                if (
-                    normalized["source_type"] == "decision_action"
-                    and normalized["source_id"]
-                ):
-                    attached_action = connection.execute(
-                        "SELECT * FROM decision_actions WHERE id=? AND scope_id=? "
-                        "AND lifecycle_state='active' AND decision_state!='dropped'",
-                        (normalized["source_id"], identity.scope_id),
-                    ).fetchone()
-                    if attached_action is None:
-                        raise RepositoryError(404, "decision_action_missing", "计划步骤不存在")
-                    if attached_action["task_id"]:
-                        # 早期 release 删除任务后可能遗留 action.task_id。该任务已是
-                        # 墓碑时，它不再是“主要任务”，必须在本次正式创建事务内先
-                        # 解除陈旧关系；不能让界面显示 0 条任务却永久拒绝重建。
-                        linked_task = connection.execute(
-                            "SELECT lifecycle_state FROM tasks WHERE id=? AND scope_id=?",
-                            (str(attached_action["task_id"]), identity.scope_id),
-                        ).fetchone()
-                        if linked_task is None or str(linked_task["lifecycle_state"]) == "deleted":
-                            connection.execute(
-                                "UPDATE decision_actions SET task_id=NULL, version=version+1, "
-                                "updated_at=? WHERE id=? AND scope_id=? AND version=?",
-                                (
-                                    now,
-                                    attached_action["id"],
-                                    identity.scope_id,
-                                    int(attached_action["version"] or 1),
-                                ),
-                            )
-                            attached_action = connection.execute(
-                                "SELECT * FROM decision_actions WHERE id=? AND scope_id=?",
-                                (normalized["source_id"], identity.scope_id),
-                            ).fetchone()
-                        else:
-                            raise RepositoryError(
-                                409,
-                                "decision_action_primary_task_exists",
-                                "该计划步骤已经关联主要任务",
-                            )
-                    action_client_id = str(attached_action["client_id"] or "")
-                    task_client_id = str(normalized["client_id"] or "")
-                    if action_client_id != task_client_id:
-                        raise RepositoryError(
-                            409,
-                            "decision_action_task_client_mismatch",
-                            "任务项目必须与计划步骤项目一致",
-                        )
-                    from .gc06_planning import _planning_row, _require_plan_permission
-
-                    cycle = _planning_row(
-                        connection,
-                        identity,
-                        str(attached_action["planning_cycle_id"]),
-                    )
-                    _require_plan_permission(
-                        connection,
-                        identity,
-                        record_kind=str(cycle["record_kind"]),
-                        department_id=cycle["department_id"],
-                        write=True,
-                    )
-                    action_version = int(attached_action["version"] or 1)
-                    cursor = connection.execute(
-                        "UPDATE decision_actions SET task_id=?, version=version+1, "
-                        "updated_at=? WHERE id=? AND scope_id=? AND version=?",
-                        (
-                            task_id,
-                            now,
-                            attached_action["id"],
-                            identity.scope_id,
-                            action_version,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
-                        raise RepositoryError(
-                            409,
-                            "decision_action_version_conflict",
-                            "计划步骤已更新，请刷新后重试",
-                        )
                 self._replace_collaborators(
                     connection, identity, task_id=task_id,
                     owner_membership_id=normalized["owner_membership_id"],
@@ -1690,16 +1653,7 @@ class GC04TaskRepository:
                     "task": self._task_payload(connection, identity, row),
                     "notificationResult": notification,
                     "projection": self._projection_for_tasks(connection, identity, [task_id]),
-                    "planLink": (
-                        {
-                            "taskId": task_id,
-                            "departmentPlanItemId": str(attached_action["id"]),
-                            "linkedBy": "manager",
-                            "confidence": 1.0,
-                        }
-                        if attached_action is not None
-                        else None
-                    ),
+                    "planLink": None,
                 }
                 self._record_command(
                     connection, identity, idempotency_key=idempotency_key,
@@ -1894,25 +1848,13 @@ class GC04TaskRepository:
                         "WHERE id=? AND scope_id=? AND lifecycle_state!='deleted'",
                         (now, now, delivery_id, identity.scope_id),
                     )
-                affected_actions = connection.execute(
-                    "SELECT id FROM decision_actions WHERE scope_id=? AND task_id=? "
-                    "AND lifecycle_state='active'",
-                    (identity.scope_id, task_id),
-                ).fetchall()
-                connection.execute(
-                    "UPDATE decision_actions SET task_id=NULL, version=version+1, updated_at=? "
-                    "WHERE scope_id=? AND task_id=? AND lifecycle_state='active'",
-                    (now, identity.scope_id, task_id),
-                )
                 current = self._task_row(connection, identity, task_id, include_deleted=True)
                 self._rebuild_task_calendar(connection, identity, current, now=now)
                 result = {
                     "deleted": True,
                     "taskId": task_id,
                     "version": int(current["version"]),
-                    "affectedDecisionActionIds": [
-                        str(item["id"]) for item in affected_actions
-                    ],
+                    "affectedDecisionActionIds": [],
                     "projection": self._projection_for_tasks(connection, identity, [task_id]),
                 }
                 operation_id, _ = self._record_command(

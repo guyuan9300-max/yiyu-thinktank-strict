@@ -1,6 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import {
+  readRuntimeUiSessionValue,
+  useRuntimeUiSessionState,
+  writeRuntimeUiSessionValue,
+} from './lib/runtimeUiSessionStore';
+import {
   CheckSquare,
   Settings,
   Plus,
@@ -377,7 +382,6 @@ import {
   transferTaskOwner,
   retryEventLineSync,
   getTaskPlanLink,
-  patchTaskPlanLink,
   refreshTaskProjectKeywordProfile,
   predictPlanLinkFromText,
   draftTaskFromPlanStep,
@@ -8249,6 +8253,22 @@ export default function App() {
     workspacesState?.workspaces.find((item) => item.id === workspacesState.activeSandboxId) || null;
   const localDraftSummary = workspacesState?.localDraftSummary || null;
   const activeWorkspaceDisplayName = activeWorkspaceRecord?.name || '尚未选择组织';
+  const navigationScopeKey = `navigation:${workspacesState?.activeSandboxId || 'local'}:${authState.user?.id || 'anonymous'}`;
+  const navigationScopeRef = useRef(navigationScopeKey);
+  useEffect(() => {
+    if (navigationScopeRef.current === navigationScopeKey) return;
+    writeRuntimeUiSessionValue(`${navigationScopeRef.current}:active-tab`, activeTab);
+    writeRuntimeUiSessionValue(`${navigationScopeRef.current}:task-page`, taskViewMode);
+    navigationScopeRef.current = navigationScopeKey;
+    setActiveTab(readRuntimeUiSessionValue<NavKey>(`${navigationScopeKey}:active-tab`, 'tasks'));
+    setTaskViewMode(readRuntimeUiSessionValue<TaskViewMode>(`${navigationScopeKey}:task-page`, 'calendar'));
+  }, [navigationScopeKey]);
+  useEffect(() => {
+    writeRuntimeUiSessionValue(`${navigationScopeKey}:active-tab`, activeTab);
+  }, [activeTab, navigationScopeKey]);
+  useEffect(() => {
+    writeRuntimeUiSessionValue(`${navigationScopeKey}:task-page`, taskViewMode);
+  }, [navigationScopeKey, taskViewMode]);
   const activeSandboxIdRef = useRef('');
   useEffect(() => {
     activeSandboxIdRef.current = workspacesState?.activeSandboxId || '';
@@ -11762,7 +11782,7 @@ export default function App() {
         getDepartmentOptions({
           organizationId: requestedOrganizationId || null,
         }),
-        gc06Api.listPlanningCycles(),
+        gc06Api.listPlanningCycles(true),
         gc06Api.listDecisionActions(),
       ]);
     // 只接受最后一次组织计划请求。sandbox 激活/重启过程中 transition token 和
@@ -12836,16 +12856,6 @@ export default function App() {
   }, [taskViewMode]);
 
   useEffect(() => {
-    if (activeTab !== 'tasks') return;
-    const viewport = taskViewportRef.current;
-    if (!viewport) return;
-    const reset = () => viewport.scrollTo({ top: 0, behavior: 'auto' });
-    reset();
-    const raf = window.requestAnimationFrame(reset);
-    return () => window.cancelAnimationFrame(raf);
-  }, [activeTab, taskViewMode]);
-
-  useEffect(() => {
     if (activeTab !== 'tasks' || !hasAuthenticatedSession || currentSessionUser?.primaryRole !== 'admin') return;
     void loadAgentWorklogBlock(taskCalendarMonthLabel).catch(() => {
       setAgentWorklogs([]);
@@ -13426,7 +13436,6 @@ export default function App() {
         updatedAt: now,
       }));
       const plans: OrgDepartmentPlanSettings[] = strictPlanningCycles.map((cycle) => {
-        const cycleActions = strictDecisionActions.filter((action) => action.planningCycleId === cycle.id);
         const periodStart = cycle.periodStart || '';
         const periodEnd = cycle.periodEnd || '';
         let periodLabel = cycle.period?.trim() || periodStart.slice(0, 7);
@@ -13446,26 +13455,12 @@ export default function App() {
           clientId: cycle.clientId,
           weekLabel: periodLabel,
           ownerUserId: cycle.ownerMembershipId,
+          title: cycle.title,
           summary: cycle.summary,
           majorRisks: [],
           dependencies: [],
           status: cycle.status === 'archived' ? 'closed' : cycle.status === 'published' ? 'active' : 'draft',
-          items: cycleActions.map((action, index) => ({
-            id: action.id,
-            version: action.version,
-            focusItemId: null,
-            title: action.title,
-            statement: action.statement,
-            ownerUserId: action.ownerMembershipId,
-            status: action.decisionState === 'completed'
-              ? 'done'
-              : action.decisionState === 'dropped'
-                ? 'dropped'
-                : 'active',
-            expectedOutput: action.expectedOutput,
-            sortOrder: index,
-            updatedAt: now,
-          })),
+          items: [],
           updatedAt: now,
         };
       });
@@ -13541,56 +13536,14 @@ export default function App() {
           ownerMembershipId: plan.ownerUserId || viewerAuthorization?.membershipId || undefined,
           ...period,
           period: plan.weekLabel,
-          title: plan.summary.trim() || `${plan.departmentId ? '部门' : '组织'}计划 · ${plan.weekLabel}`,
+          title: plan.title?.trim() || plan.summary.trim() || `${plan.departmentId ? '部门' : '组织'}计划 · ${plan.weekLabel}`,
           summary: plan.summary,
           status: plan.status === 'closed' ? 'archived' : plan.status === 'active' ? 'published' : 'draft',
         };
         const savedCycle = existingCycle
           ? (await gc06Api.updatePlanningCycle(existingCycle, cyclePayload)).planningCycle
           : (await gc06Api.createPlanningCycle(cyclePayload)).planningCycle;
-        const existingActions = strictDecisionActions.filter((action) => action.planningCycleId === savedCycle.id);
-        const submittedIds = new Set(plan.items.map((item) => item.id));
-        for (const item of plan.items) {
-          const existingAction = existingActions.find((action) => action.id === item.id) || null;
-          const targetState = item.status === 'done' ? 'completed' : item.status === 'dropped' ? 'dropped' : null;
-          if (!existingAction) {
-            await gc06Api.createDecisionAction({
-              actionId: item.id,
-              planningCycleId: savedCycle.id,
-              recordKind: 'plan_action',
-              decisionState: 'draft',
-              title: item.title,
-              statement: item.statement,
-              expectedOutput: item.expectedOutput,
-              ownerMembershipId: item.ownerUserId || viewerAuthorization?.membershipId || undefined,
-            });
-            continue;
-          }
-          let currentAction = existingAction;
-          const basePayload = {
-            title: item.title,
-            statement: item.statement,
-            expectedOutput: item.expectedOutput,
-          };
-          if (targetState === 'completed' && currentAction.decisionState === 'draft') {
-            currentAction = (await gc06Api.updateDecisionAction(currentAction, {
-              ...basePayload,
-              decisionState: 'confirmed',
-              evidence: [{ sourceObjectKind: 'planning_cycle', sourceObjectId: savedCycle.id, sourceVersion: savedCycle.version }],
-            })).decisionAction;
-          }
-          await gc06Api.updateDecisionAction(currentAction, {
-            ...basePayload,
-            ...(targetState && targetState !== currentAction.decisionState ? {
-              decisionState: targetState,
-              evidence: [{ sourceObjectKind: 'planning_cycle', sourceObjectId: savedCycle.id, sourceVersion: savedCycle.version }],
-            } : {}),
-          });
-        }
-        for (const removed of existingActions.filter((action) => !submittedIds.has(action.id) && action.decisionState !== 'dropped')) {
-          await gc06Api.updateDecisionAction(removed, { decisionState: 'dropped' });
-        }
-        const [cycles, actions] = await Promise.all([gc06Api.listPlanningCycles(), gc06Api.listDecisionActions()]);
+        const [cycles, actions] = await Promise.all([gc06Api.listPlanningCycles(true), gc06Api.listDecisionActions()]);
         setStrictPlanningCycles(cycles);
         setStrictDecisionActions(actions);
 	      flash('success', '计划已保存');
@@ -13600,6 +13553,29 @@ export default function App() {
 	    } finally {
 	      setIsSavingOrgModel(false);
 	    }
+	  };
+
+	  const handleDeletePlanFromWorkshop = async (plan: OrgDepartmentPlanSettings) => {
+      setIsSavingOrgModel(true);
+      try {
+        const latestCycles = await gc06Api.listPlanningCycles(true);
+        const existingCycle = latestCycles.find((cycle) => cycle.id === plan.id);
+        // A missing ID in a successful authoritative snapshot means a previous
+        // delete already committed. Treat repeated confirmation as idempotent.
+        if (existingCycle) await gc06Api.deletePlanningCycle(existingCycle);
+        const [cycles, actions] = await Promise.all([
+          gc06Api.listPlanningCycles(true),
+          gc06Api.listDecisionActions(),
+        ]);
+        setStrictPlanningCycles(cycles);
+        setStrictDecisionActions(actions);
+        flash('success', '未关联任务的计划已删除');
+      } catch (error) {
+        flash('error', error instanceof Error ? error.message : '删除计划失败');
+        throw error;
+      } finally {
+        setIsSavingOrgModel(false);
+      }
 	  };
 
 	  const tasksViewBridgeRef = useRef<Record<string, unknown>>({});
@@ -13955,93 +13931,41 @@ export default function App() {
         isSelf: true,
       }];
     };
-    const [taskPriorityFilter, setTaskPriorityFilter] = useState<TaskPriorityFilter>('all');
-    const [taskListTimeRangeFilter, setTaskListTimeRangeFilter] = useState<TaskTimeRangeFilter>('all');
-    const [taskListCustomStartDate, setTaskListCustomStartDate] = useState('');
-    const [taskListCustomEndDate, setTaskListCustomEndDate] = useState('');
-    const [selectedListTaskIds, setSelectedListTaskIds] = useState<string[]>([]);
-    const [selectedListMeetingIds, setSelectedListMeetingIds] = useState<string[]>([]);
+    const taskUiSessionScope = [
+      'tasks',
+      workspacesState?.activeSandboxId || 'local',
+      currentTaskMembershipId || 'anonymous',
+    ].join(':');
+    const [taskPriorityFilter, setTaskPriorityFilter] = useRuntimeUiSessionState<TaskPriorityFilter>(`${taskUiSessionScope}:list:priority`, 'all');
+    const [taskListTimeRangeFilter, setTaskListTimeRangeFilter] = useRuntimeUiSessionState<TaskTimeRangeFilter>(`${taskUiSessionScope}:list:range`, 'all');
+    const [taskListCustomStartDate, setTaskListCustomStartDate] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:start`, '');
+    const [taskListCustomEndDate, setTaskListCustomEndDate] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:end`, '');
+    const [selectedListTaskIds, setSelectedListTaskIds] = useRuntimeUiSessionState<string[]>(`${taskUiSessionScope}:list:selected-tasks`, []);
+    const [selectedListMeetingIds, setSelectedListMeetingIds] = useRuntimeUiSessionState<string[]>(`${taskUiSessionScope}:list:selected-meetings`, []);
     // 多选模式：默认关，关闭时任务卡上的勾选方框不渲染，避免跟「完成」圆圈视觉打架
-    const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
+    const [isMultiSelectMode, setIsMultiSelectMode] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:multi-select`, false);
     const exitMultiSelectMode = () => {
       setIsMultiSelectMode(false);
       setSelectedListTaskIds([]);
       setSelectedListMeetingIds([]);
     };
-    const [collapsedTaskGroups, setCollapsedTaskGroups] = useState<Partial<Record<TaskExecutionGroupKey, boolean>>>({
+    const [collapsedTaskGroups, setCollapsedTaskGroups] = useRuntimeUiSessionState<Partial<Record<TaskExecutionGroupKey, boolean>>>(`${taskUiSessionScope}:list:collapsed`, {
       earlier: true,
       week: false,
       later: true,
       undated: true,
     });
     const [isBatchBusy, setIsBatchBusy] = useState(false);
-    const [hideCompletedInList, setHideCompletedInList] = useState(false);
-    const [hideOverdueInList, setHideOverdueInList] = useState(false);
-    const [hidePersonalScheduleInList, setHidePersonalScheduleInList] = useState(false);
+    const [hideCompletedInList, setHideCompletedInList] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:hide-completed`, false);
+    const [hideOverdueInList, setHideOverdueInList] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:hide-overdue`, false);
+    const [hidePersonalScheduleInList, setHidePersonalScheduleInList] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:hide-personal`, false);
     const [batchDueDate, setBatchDueDate] = useState('');
     const [batchEventLineId, setBatchEventLineId] = useState('');
-    const [inboxTimeSort, setInboxTimeSort] = useState<TaskTimeSort>('newest');
-    const [inboxTimeRangeFilter, setInboxTimeRangeFilter] = useState<TaskTimeRangeFilter>('all');
-    const [inboxCustomStartDate, setInboxCustomStartDate] = useState('');
-    const [inboxCustomEndDate, setInboxCustomEndDate] = useState('');
-    const [taskSearchQuery, setTaskSearchQuery] = useState('');
-    const taskListPreferenceKey = `yiyu:task-list-preferences:${workspacesState?.activeSandboxId || 'local'}:${currentTaskMembershipId || 'anonymous'}`;
-    const [taskListPreferencesHydrated, setTaskListPreferencesHydrated] = useState(false);
-    useEffect(() => {
-      setTaskListPreferencesHydrated(false);
-      try {
-        const stored = window.localStorage.getItem(taskListPreferenceKey);
-        if (stored) {
-          const parsed = JSON.parse(stored) as Record<string, unknown>;
-          if (['all', 'high', 'normal', 'low'].includes(String(parsed.priorityFilter))) setTaskPriorityFilter(parsed.priorityFilter as TaskPriorityFilter);
-          if (['all', 'last3days', 'lastMonth', 'lastHalfYear', 'custom'].includes(String(parsed.timeRangeFilter))) setTaskListTimeRangeFilter(parsed.timeRangeFilter as TaskTimeRangeFilter);
-          setTaskListCustomStartDate(typeof parsed.customStartDate === 'string' ? parsed.customStartDate : '');
-          setTaskListCustomEndDate(typeof parsed.customEndDate === 'string' ? parsed.customEndDate : '');
-          setTaskSearchQuery(typeof parsed.searchQuery === 'string' ? parsed.searchQuery : '');
-          setHideCompletedInList(parsed.hideCompleted === true);
-          setHideOverdueInList(parsed.hideOverdue === true);
-          setHidePersonalScheduleInList(parsed.hidePersonalSchedule === true);
-          if (parsed.collapsedGroups && typeof parsed.collapsedGroups === 'object') {
-            setCollapsedTaskGroups({
-              earlier: (parsed.collapsedGroups as Record<string, unknown>).earlier !== false,
-              week: (parsed.collapsedGroups as Record<string, unknown>).week === true,
-              later: (parsed.collapsedGroups as Record<string, unknown>).later !== false,
-              undated: (parsed.collapsedGroups as Record<string, unknown>).undated !== false,
-            });
-          }
-        }
-      } catch {
-        // Invalid local display preferences fall back to the product defaults.
-      }
-      const timer = window.setTimeout(() => setTaskListPreferencesHydrated(true), 0);
-      return () => window.clearTimeout(timer);
-    }, [taskListPreferenceKey]);
-    useEffect(() => {
-      if (!taskListPreferencesHydrated) return;
-      window.localStorage.setItem(taskListPreferenceKey, JSON.stringify({
-        priorityFilter: taskPriorityFilter,
-        timeRangeFilter: taskListTimeRangeFilter,
-        customStartDate: taskListCustomStartDate,
-        customEndDate: taskListCustomEndDate,
-        searchQuery: taskSearchQuery,
-        hideCompleted: hideCompletedInList,
-        hideOverdue: hideOverdueInList,
-        hidePersonalSchedule: hidePersonalScheduleInList,
-        collapsedGroups: collapsedTaskGroups,
-      }));
-    }, [
-      collapsedTaskGroups,
-      hideCompletedInList,
-      hideOverdueInList,
-      hidePersonalScheduleInList,
-      taskListCustomEndDate,
-      taskListCustomStartDate,
-      taskListPreferenceKey,
-      taskListPreferencesHydrated,
-      taskListTimeRangeFilter,
-      taskPriorityFilter,
-      taskSearchQuery,
-    ]);
+    const [inboxTimeSort, setInboxTimeSort] = useRuntimeUiSessionState<TaskTimeSort>(`${taskUiSessionScope}:inbox:sort`, 'newest');
+    const [inboxTimeRangeFilter, setInboxTimeRangeFilter] = useRuntimeUiSessionState<TaskTimeRangeFilter>(`${taskUiSessionScope}:inbox:range`, 'all');
+    const [inboxCustomStartDate, setInboxCustomStartDate] = useRuntimeUiSessionState(`${taskUiSessionScope}:inbox:start`, '');
+    const [inboxCustomEndDate, setInboxCustomEndDate] = useRuntimeUiSessionState(`${taskUiSessionScope}:inbox:end`, '');
+    const [taskSearchQuery, setTaskSearchQuery] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:search`, '');
     const [isTaskModalOpen, setIsTaskModalOpen] = useState(false);
     const [isSmartParseModalOpen, setIsSmartParseModalOpen] = useState(false);
     const [isDuePickerOpen, setIsDuePickerOpen] = useState(false);
@@ -14221,13 +14145,13 @@ export default function App() {
     const [meetingContextBriefs, setMeetingContextBriefs] = useState<Record<string, MeetingContextBrief>>({});
     const [loadingMeetingContextBriefIds, setLoadingMeetingContextBriefIds] = useState<string[]>([]);
     const [proposalBusyState, setProposalBusyState] = useState<Record<string, string>>({});
-    const [selectedInboxIds, setSelectedInboxIds] = useState<string[]>([]);
+    const [selectedInboxIds, setSelectedInboxIds] = useRuntimeUiSessionState<string[]>(`${taskUiSessionScope}:inbox:selected`, []);
     const [transitioningInboxTaskIds, setTransitioningInboxTaskIds] = useState<string[]>([]);
     const [isRejectModalOpen, setIsRejectModalOpen] = useState(false);
     const [rejectingTaskIds, setRejectingTaskIds] = useState<string[]>([]);
     const [rejectReason, setRejectReason] = useState('');
-    const [inboxSectionOpen, setInboxSectionOpen] = useState({ actionable: true, waiting: true });
-    const [expandedReviewGroupId, setExpandedReviewGroupId] = useState<string | null>(null);
+    const [inboxSectionOpen, setInboxSectionOpen] = useRuntimeUiSessionState(`${taskUiSessionScope}:inbox:sections`, { actionable: true, waiting: true });
+    const [expandedReviewGroupId, setExpandedReviewGroupId] = useRuntimeUiSessionState<string | null>(`${taskUiSessionScope}:review:expanded-group`, null);
     const [isGeneratingGlobal, setIsGeneratingGlobal] = useState(false);
     const [savingReviewGroupId, setSavingReviewGroupId] = useState<string | null>(null);
     const [savedReviewGroupId, setSavedReviewGroupId] = useState<string | null>(null);
@@ -14276,9 +14200,9 @@ export default function App() {
         details.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }, 180);
     };
-    const [hidePersonalTasks, setHidePersonalTasks] = useState(false);
-    const [reviewScope, setReviewScope] = useState<'work' | 'personal'>(effectiveTaskSettings.defaultReviewScope);
-    const [activeReviewTab, setActiveReviewTab] = useState<'overview' | 'events' | 'signals'>('events');
+    const [hidePersonalTasks, setHidePersonalTasks] = useRuntimeUiSessionState(`${taskUiSessionScope}:calendar:hide-personal`, false);
+    const [reviewScope, setReviewScope] = useRuntimeUiSessionState<'work' | 'personal'>(`${taskUiSessionScope}:review:scope`, effectiveTaskSettings.defaultReviewScope);
+    const [activeReviewTab, setActiveReviewTab] = useRuntimeUiSessionState<'overview' | 'events' | 'signals'>(`${taskUiSessionScope}:review:tab`, 'events');
     const defaultReviewPerspective = useMemo(
       () => resolveDefaultReviewPerspectiveForUser(currentSessionUser),
       [currentSessionUser?.departmentId, currentSessionUser?.id, currentSessionUser?.isDepartmentLead, currentSessionUser?.primaryRole],
@@ -14287,8 +14211,8 @@ export default function App() {
       () => resolveDefaultReviewDepartmentIdForUser(currentSessionUser, defaultReviewPerspective),
       [currentSessionUser?.departmentId, defaultReviewPerspective],
     );
-    const [reviewPerspective, setReviewPerspective] = useState<ReviewPerspectiveKey>(() => defaultReviewPerspective);
-    const [reviewDepartmentId, setReviewDepartmentId] = useState<string>(() => defaultReviewDepartmentId || '');
+    const [reviewPerspective, setReviewPerspective] = useRuntimeUiSessionState<ReviewPerspectiveKey>(`${taskUiSessionScope}:review:perspective`, () => defaultReviewPerspective);
+    const [reviewDepartmentId, setReviewDepartmentId] = useRuntimeUiSessionState<string>(`${taskUiSessionScope}:review:department`, () => defaultReviewDepartmentId || '');
     const [reviewDeptDropdownOpen, setReviewDeptDropdownOpen] = useState(false);
     const [reviewDeptDropdownAnchor, setReviewDeptDropdownAnchor] = useState<{ top: number; left: number } | null>(null);
     const reviewDeptDropdownRef = useRef<HTMLDivElement>(null);
@@ -14404,14 +14328,31 @@ export default function App() {
       return () => window.clearTimeout(timer);
     }, [reviewPerspective, reviewRequestDepartmentId]);
     useEffect(() => {
-      if (activeTab !== 'tasks' || taskViewMode !== 'review') return;
+      if (activeTab !== 'tasks') return undefined;
+      const viewport = taskViewportRef.current;
+      if (!viewport) return undefined;
+      const scrollKey = `${taskUiSessionScope}:${taskViewMode}:scroll-top`;
+      viewport.scrollTop = readRuntimeUiSessionValue(scrollKey, 0);
+      const remember = () => writeRuntimeUiSessionValue(scrollKey, viewport.scrollTop);
+      viewport.addEventListener('scroll', remember, { passive: true });
+      return () => {
+        remember();
+        viewport.removeEventListener('scroll', remember);
+      };
+    }, [activeTab, taskUiSessionScope, taskViewMode]);
+    useEffect(() => {
+      if (activeTab !== 'tasks' || taskViewMode !== 'review') return undefined;
       const viewport = reviewViewportRef.current;
-      if (!viewport) return;
-      const reset = () => viewport.scrollTo({ top: 0, behavior: 'auto' });
-      reset();
-      const raf = window.requestAnimationFrame(reset);
-      return () => window.cancelAnimationFrame(raf);
-    }, [activeTab, taskViewMode, activeReviewTab, reviewScope]);
+      if (!viewport) return undefined;
+      const scrollKey = `${taskUiSessionScope}:review:${activeReviewTab}:${reviewScope}:inner-scroll-top`;
+      viewport.scrollTop = readRuntimeUiSessionValue(scrollKey, 0);
+      const remember = () => writeRuntimeUiSessionValue(scrollKey, viewport.scrollTop);
+      viewport.addEventListener('scroll', remember, { passive: true });
+      return () => {
+        remember();
+        viewport.removeEventListener('scroll', remember);
+      };
+    }, [activeReviewTab, activeTab, reviewScope, taskUiSessionScope, taskViewMode]);
     useEffect(() => {
       if (activeTab !== 'tasks' || taskViewMode !== 'review') return;
       if (reviewPerspective === 'organization' || reviewPerspective === 'department') {
@@ -15201,30 +15142,8 @@ export default function App() {
       );
     }, [activeFormalTaskView, baseCalendarTasks]);
     const isAllSelected = actionableInboxTasks.length > 0 && selectedInboxIds.length === actionableInboxTasks.length;
-    const inboxSectionStorageKey = `yiyu:task-inbox-sections:${workspacesState?.activeSandboxId || 'local'}:${currentTaskMembershipId || 'anonymous'}`;
-    useEffect(() => {
-      try {
-        const stored = window.localStorage.getItem(inboxSectionStorageKey);
-        if (!stored) {
-          setInboxSectionOpen({ actionable: true, waiting: true });
-          return;
-        }
-        const parsed = JSON.parse(stored) as Partial<typeof inboxSectionOpen>;
-        setInboxSectionOpen({
-          actionable: parsed.actionable !== false,
-          waiting: parsed.waiting !== false,
-        });
-      } catch {
-        setInboxSectionOpen({ actionable: true, waiting: true });
-      }
-    }, [inboxSectionStorageKey]);
-
     const toggleInboxSection = (section: 'actionable' | 'waiting') => {
-      setInboxSectionOpen((prev) => {
-        const next = { ...prev, [section]: !prev[section] };
-        window.localStorage.setItem(inboxSectionStorageKey, JSON.stringify(next));
-        return next;
-      });
+      setInboxSectionOpen((prev) => ({ ...prev, [section]: !prev[section] }));
     };
 
     const tasksById = new Map(tasks.map((task) => [task.id, task]));
@@ -15455,6 +15374,10 @@ export default function App() {
     const archivedEventLineCount = useMemo(
       () => projectScopedEventLines.filter((item) => item.status === 'archived').length,
       [projectScopedEventLines],
+    );
+    const [hideArchivedEventLines, setHideArchivedEventLines] = useRuntimeUiSessionState(
+      `${taskUiSessionScope}:event-lines:hide-archived`,
+      false,
     );
     useEffect(() => {
       if (typeof window === 'undefined') return;
@@ -16865,15 +16788,9 @@ export default function App() {
         }
         setIsSavingTask(true);
         try {
-          const selectedMeetingPlan = strictPlanWorkshopState.departmentPlans.find((plan) => (
-            plan.items.some((item) => item.id === editingTask.planLinkPlanItemId)
-          )) || strictPlanWorkshopState.departmentPlans.find((plan) => (
-            editingTask.planLinkSource === 'manager'
-            && !editingTask.planLinkPlanItemId
-            && plan.departmentId === editingTask.planLinkDepartmentId
-            && (plan.weekLabel || '').trim() === editingTask.planLinkPeriodKey
-            && planningCycleTypeForKey(plan.weekLabel) === editingTask.planLinkCycleType
-          )) || null;
+          const selectedMeetingPlan = strictPlanWorkshopState.departmentPlans.find(
+            (plan) => plan.id === editingTask.planLinkPlanItemId,
+          ) || null;
           const payload = {
             clientId: editingTask.clientId,
             eventLineId: editingTask.eventLineId || null,
@@ -16887,9 +16804,7 @@ export default function App() {
             planningCycleId: editingTask.planLinkSource === 'manager'
               ? selectedMeetingPlan?.id || null
               : null,
-            decisionActionId: editingTask.planLinkSource === 'manager'
-              ? editingTask.planLinkPlanItemId || null
-              : null,
+            decisionActionId: null,
           };
           let saved: GC06Meeting;
           const existingMeeting = editingTask.id
@@ -16989,6 +16904,9 @@ export default function App() {
         durationMinutes: editingTask.durationMinutes,
         clientId: isEditingTaskPersonal ? null : (editingTask.clientId || null),
         eventLineId: isEditingTaskPersonal ? null : (editingTask.eventLineId || null),
+        planningCycleId: !isEditingTaskPersonal && editingTask.planLinkSource === 'manager'
+          ? editingTask.planLinkPlanItemId || null
+          : null,
         projectModuleId: isEditingTaskPersonal ? null : (editingTask.projectModuleId || null),
         projectFlowId: isEditingTaskPersonal ? null : (editingTask.projectFlowId || null),
         ddl: resolvedDdl,
@@ -16996,10 +16914,6 @@ export default function App() {
         ownerName,
         collaboratorIds: selectedTaskCollaborators.map((item) => item.id),
         tagIds: [...editingTask.tagIds],
-        ...(!editingTask.id && editingTask.planLinkSource === 'manager' && editingTask.planLinkPlanItemId ? {
-          sourceType: 'decision_action',
-          sourceId: editingTask.planLinkPlanItemId,
-        } : {}),
       };
       const draftSnapshot: TaskEditorState = {
         ...editingTask,
@@ -17054,7 +16968,6 @@ export default function App() {
 
       void (async () => {
         let transferredTaskSnapshot: Task | null = null;
-        let planLinkSyncError: string | null = null;
         try {
           let savedTask: Task;
           if (draftSnapshot.id && existingTaskSnapshot) {
@@ -17120,38 +17033,8 @@ export default function App() {
             }
           }
 
-          // Sync plan-link only if the user touched the plan-link section. Otherwise leave it to the
-          // backend's automatic AI matching (already runs on task create/update).
-          if (
-            draftSnapshot.planLinkTouched
-            && !isEditingTaskPersonal
-            && !(payload.sourceType === 'decision_action' && payload.sourceId)
-          ) {
-            const userExplicitlyLinked =
-              draftSnapshot.planLinkSource === 'manager' && draftSnapshot.planLinkPlanItemId;
-            try {
-              if (userExplicitlyLinked) {
-                await patchTaskPlanLink(savedTask.id, {
-                  departmentPlanItemId: draftSnapshot.planLinkPlanItemId,
-                  focusItemId: null,
-                });
-              } else if (draftSnapshot.planLinkSource === 'none') {
-                await patchTaskPlanLink(savedTask.id, {
-                  departmentPlanItemId: null,
-                  focusItemId: null,
-                });
-              }
-            } catch (error) {
-              // 之前是 console.warn 静默吞错——cloud_backend 挂了时用户看到任务成功保存，
-              // 但 plan-link 没写入，去「组织计划」看不到挂载，根本不知道为什么。
-              // 现在显式 flash 错误：任务已保存但挂载失败，用户能立即重试。
-              console.warn('[plan-link] failed to sync user choice', error);
-              if (userExplicitlyLinked) {
-                const msg = error instanceof Error ? error.message : '未知错误';
-                planLinkSyncError = msg;
-              }
-            }
-          }
+          // 计划关联随任务正式命令原子写入 tasks.planning_cycle_id。
+          // 不再保存任务后追加第二条“计划步骤挂接”命令，避免双版本和部分成功。
           window.dispatchEvent(new CustomEvent('yiyu:plan-relations-changed', {
             detail: { taskId: savedTask.id, actionId: draftSnapshot.planLinkPlanItemId || null },
           }));
@@ -17248,13 +17131,6 @@ export default function App() {
           }
           if ((savedTask?.eventLineId || draftSnapshot.eventLineId) && activeEventLine?.eventLine.id === (savedTask?.eventLineId || draftSnapshot.eventLineId)) {
             void openEventLineDetail(savedTask?.eventLineId || draftSnapshot.eventLineId);
-          }
-          if (planLinkSyncError) {
-            flash(
-              'error',
-              `任务内容已保存，但关联到计划项失败：${planLinkSyncError}。可在任务详情里重新挂接。`,
-            );
-            return;
           }
           flash(
             'success',
@@ -17786,8 +17662,8 @@ export default function App() {
       // should still work, and saveTask will skip plan-link sync while planLinkTouched=false.
       void getTaskPlanLink(task.id).then((link) => {
         if (!link) return;
-        const linkedPlan = strictPlanWorkshopState.departmentPlans.find((plan) =>
-          (plan.items || []).some((item) => item.id === link.departmentPlanItemId),
+        const linkedPlan = strictPlanWorkshopState.departmentPlans.find(
+        (plan) => plan.id === (link.planningCycleId || link.departmentPlanItemId),
         );
         setEditingTask((prev) => {
           if (prev.id !== task.id || prev.planLinkTouched) return prev;
@@ -17798,7 +17674,7 @@ export default function App() {
               ? planningCycleTypeForKey(linkedPlan.weekLabel)
               : prev.planLinkCycleType,
             planLinkPeriodKey: linkedPlan?.weekLabel || prev.planLinkPeriodKey,
-            planLinkPlanItemId: link.departmentPlanItemId || '',
+            planLinkPlanItemId: link.planningCycleId || link.departmentPlanItemId || '',
             planLinkSource: (link.linkedBy as 'ai' | 'manager') || 'ai',
             planLinkConfidence: link.confidence || 0,
             planLinkReason: link.linkedBy === 'manager'
@@ -17902,7 +17778,7 @@ export default function App() {
           ? planningCycleTypeForKey(linkedPlan.weekLabel)
           : 'month',
         planLinkPeriodKey: linkedPlan?.weekLabel || monthKeyFromDate(dueParts.date),
-        planLinkPlanItemId: meeting.planLink?.decisionActionId || '',
+        planLinkPlanItemId: meeting.planLink?.planningCycleId || '',
         planLinkSource: meeting.planLink?.planningCycleId ? 'manager' : 'unset',
         planLinkConfidence: 0,
         planLinkTouched: Boolean(meeting.planLink?.planningCycleId),
@@ -20776,6 +20652,7 @@ export default function App() {
           {taskViewMode === 'calendar' && (
             <div className="space-y-3">
               <TaskCalendarView
+                uiSessionScopeKey={`${taskUiSessionScope}:calendar`}
                 tasks={calendarTasks}
                 meetings={customerMeetings}
                 clientColorById={clientColorById}
@@ -20824,12 +20701,15 @@ export default function App() {
                 key={[workspacesState?.activeSandboxId || '', currentSessionUser?.id || ''].join('|')}
                 value={strictPlanWorkshopState}
                 currentUser={currentSessionUser}
+                tasks={tasks}
                 clients={dataCenterClients.map((client) => ({ id: client.id, name: client.name }))}
                 onSavePlan={handleSavePlanFromWorkshop}
+                onDeletePlan={handleDeletePlanFromWorkshop}
                 onOpenTask={(t) => openTaskEditor(t)}
                 onGenerateTaskFromPlanItem={handleGenerateTaskFromPlanItem}
                 isLoading={isOrganizationPlanningLoading}
                 loadError={organizationPlanningLoadError}
+                uiSessionScopeKey={`${taskUiSessionScope}:plans`}
               />
             </div>
           )}
@@ -20871,6 +20751,8 @@ export default function App() {
                       type="checkbox"
                       className="event-lines-hide-archived-toggle peer absolute inset-0 h-full w-full cursor-pointer opacity-0"
                       aria-label="隐藏已归档事件线"
+                      checked={hideArchivedEventLines}
+                      onChange={(event) => setHideArchivedEventLines(event.target.checked)}
                     />
                     <span>隐藏已归档</span>
                     <span className="tabular-nums text-[10px] text-gray-400">({archivedEventLineCount})</span>
@@ -24027,12 +23909,13 @@ export default function App() {
                     const visibleDepartments = (strictPlanWorkshopState.departments || []).filter((d) => d.active !== false);
                     const departmentChoices = isAdmin ? visibleDepartments : visibleDepartments.filter((d) => d.id === currentSessionUser?.departmentId);
                     const departmentPlans = (strictPlanWorkshopState.departmentPlans || []).filter(
-                      (plan) => plan.departmentId === deptId && planningCycleTypeForKey(plan.weekLabel) === cycleType,
+                      (plan) => plan.status !== 'closed'
+                        && plan.departmentId === deptId
+                        && planningCycleTypeForKey(plan.weekLabel) === cycleType,
                     );
                     const periodChoices = [...new Set(departmentPlans.map((plan) => (plan.weekLabel || '').trim()).filter(Boolean))]
                       .sort((left, right) => right.localeCompare(left));
                     const matchingPlans = departmentPlans.filter((plan) => (plan.weekLabel || '').trim() === periodKey);
-                    const planItems = matchingPlans.flatMap((p) => p.items || []);
                     const badgeMap: Record<string, { label: string; cls: string }> = {
                       ai: { label: 'AI 推荐', cls: 'bg-gray-100 text-gray-500' },
                       manager: { label: '已手动确认', cls: 'bg-[#5B7BFE]/10 text-[#5B7BFE]' },
@@ -24054,7 +23937,8 @@ export default function App() {
                               onChange={(event) => {
                                 const nextDepartmentId = event.target.value;
                                 const firstPeriod = strictPlanWorkshopState.departmentPlans.find(
-                                  (plan) => plan.departmentId === nextDepartmentId
+                                  (plan) => plan.status !== 'closed'
+                                    && plan.departmentId === nextDepartmentId
                                     && planningCycleTypeForKey(plan.weekLabel) === cycleType,
                                 )?.weekLabel || defaultPlanningPeriodKey(cycleType);
                                 setEditingTask((prev) => ({
@@ -24082,7 +23966,8 @@ export default function App() {
                               onChange={(event) => {
                                 const nextCycleType = event.target.value as PlanningCycleType;
                                 const firstPeriod = strictPlanWorkshopState.departmentPlans.find(
-                                  (plan) => plan.departmentId === deptId
+                                  (plan) => plan.status !== 'closed'
+                                    && plan.departmentId === deptId
                                     && planningCycleTypeForKey(plan.weekLabel) === nextCycleType,
                                 )?.weekLabel || defaultPlanningPeriodKey(nextCycleType);
                                 setEditingTask((prev) => ({
@@ -24123,10 +24008,9 @@ export default function App() {
                             </select>
                           </TaskPropertyRow>
 
-                          <TaskPropertyRow icon={<Target size={16} />} label={editingTask.recordMode === 'customer_meeting' ? '关联计划' : '关联计划项'}>
+                          <TaskPropertyRow icon={<Target size={16} />} label="关联计划">
                             <select
                               value={editingTask.planLinkPlanItemId
-                                || (editingTask.recordMode === 'customer_meeting' && editingTask.planLinkSource === 'manager' ? '__cycle__' : '')
                                 || (editingTask.planLinkSource === 'none' ? '__none__' : '')}
                               onChange={(event) => {
                                 const val = event.target.value;
@@ -24137,33 +24021,21 @@ export default function App() {
                                   if (!val) {
                                     return { ...prev, planLinkPlanItemId: '', planLinkSource: 'unset', planLinkTouched: true, planLinkReason: '' };
                                   }
-                                  if (val === '__cycle__') {
-                                    return {
-                                      ...prev,
-                                      planLinkPlanItemId: '',
-                                      planLinkSource: 'manager',
-                                      planLinkTouched: true,
-                                      planLinkReason: '已关联所选计划周期，不指定具体行动。',
-                                    };
-                                  }
-                                  const picked = planItems.find((it) => it.id === val);
+                                  const picked = matchingPlans.find((it) => it.id === val);
                                   return {
                                     ...prev,
                                     planLinkPlanItemId: val,
                                     planLinkSource: 'manager',
                                     planLinkTouched: true,
-                                    planLinkReason: picked ? `已手动关联到：${picked.title}。AI 不再覆盖此选择。` : '已手动关联。',
+                                    planLinkReason: picked ? `已手动关联到：${picked.title || picked.summary}。` : '已手动关联。',
                                   };
                                 });
                               }}
                               className="w-full rounded border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700"
                             >
-                              <option value="">{planItems.length === 0 ? '所选周期暂无计划项' : '请选择计划项'}</option>
-                              {editingTask.recordMode === 'customer_meeting' && matchingPlans.length > 0 && (
-                                <option value="__cycle__">关联所选计划（不指定具体行动）</option>
-                              )}
-                              {planItems.map((item) => (
-                                <option key={item.id} value={item.id}>{item.title}</option>
+                              <option value="">{matchingPlans.length === 0 ? '所选周期暂无计划' : '请选择计划'}</option>
+                              {matchingPlans.map((item) => (
+                                <option key={item.id} value={item.id}>{item.title || item.summary}</option>
                               ))}
                               <option value="__none__">— 不关联（计划外/支撑性任务）</option>
                             </select>
@@ -24702,9 +24574,14 @@ export default function App() {
     // back to the first project briefly paints the wrong workspace while a
     // project switch or authorization refresh is still settling.
     const currentClient = clients.find((client) => client.id === currentClientId) || null;
-    const [searchQuery, setSearchQuery] = useState('');
+    const workspaceUiSessionScope = [
+      'workspace',
+      workspacesState?.activeSandboxId || 'local',
+      viewerAuthorization?.membershipId || currentSessionUser?.id || 'anonymous',
+    ].join(':');
+    const [searchQuery, setSearchQuery] = useRuntimeUiSessionState(`${workspaceUiSessionScope}:project-search`, '');
     // P9：左侧项目列表可收起。文档编辑模式或屏幕窄时主区会更宽。
-    const [isClientListCollapsed, setIsClientListCollapsed] = useState(false);
+    const [isClientListCollapsed, setIsClientListCollapsed] = useRuntimeUiSessionState(`${workspaceUiSessionScope}:project-list-collapsed`, false);
     // 隐藏项目订阅已经提到主组件层(hiddenClientsVersion 闭包外层),这里不再重复订阅
     const workspaceClientUiKey = currentClientId || WORKSPACE_COMPOSER_NO_CLIENT_KEY;
     const workspaceRightTab = getWorkspaceRightTab(workspaceClientUiState, workspaceClientUiKey);
@@ -24776,8 +24653,15 @@ export default function App() {
       const messageId = typeof nextValue === 'function' ? nextValue(previous) : nextValue;
       dispatchWorkspaceClientUi({ type: 'setActiveMessageId', clientId: currentClientId, messageId });
     };
-    const [isEvidencePanelExpanded, setIsEvidencePanelExpanded] = useState(false);
-    const [expandedEvidenceIds, setExpandedEvidenceIds] = useState<Set<string>>(() => new Set());
+    const [isEvidencePanelExpanded, setIsEvidencePanelExpanded] = useRuntimeUiSessionState(`${workspaceUiSessionScope}:${workspaceClientUiKey}:evidence-panel`, false);
+    const [expandedEvidenceIdList, setExpandedEvidenceIdList] = useRuntimeUiSessionState<string[]>(`${workspaceUiSessionScope}:${workspaceClientUiKey}:evidence-items`, []);
+    const expandedEvidenceIds = useMemo(() => new Set(expandedEvidenceIdList), [expandedEvidenceIdList]);
+    const setExpandedEvidenceIds = (update: Set<string> | ((previous: Set<string>) => Set<string>)) => {
+      setExpandedEvidenceIdList((previousIds) => {
+        const previous = new Set(previousIds);
+        return Array.from(typeof update === 'function' ? update(previous) : update);
+      });
+    };
     // 智能文件导入模态框开关:工具页 Sparkles 按钮触发
     const [isSmartFileImportOpen, setIsSmartFileImportOpen] = useState(false);
     // 复制成功的内联反馈：哪条消息刚被复制，按钮原地显示对勾 1.5 秒
@@ -24909,7 +24793,7 @@ export default function App() {
         return [next, ...filtered].slice(0, RECENT_USED_DOCUMENTS_LIMIT);
       });
     };
-    const [filesTabSearchInput, setFilesTabSearchInput] = useState('');
+    const [filesTabSearchInput, setFilesTabSearchInput] = useRuntimeUiSessionState(`${workspaceUiSessionScope}:${workspaceClientUiKey}:file-search`, '');
     const [retryingProjectMaterialIds, setRetryingProjectMaterialIds] = useState<string[]>([]);
     const [feishuDocumentSyncStatusById, setFeishuDocumentSyncStatusById] = useState<Record<string, FeishuSyncStatusRecord | null>>({});
     const [feishuDocumentSyncingById, setFeishuDocumentSyncingById] = useState<Record<string, boolean>>({});
@@ -25460,6 +25344,18 @@ export default function App() {
       setClientWorkspaceSurfaceMode(clientWorkspaceSurfaceModeRequest.mode);
     }, [clientWorkspaceSurfaceModeRequest, currentClientId]);
 	  const chatContainerRef = useRef<HTMLDivElement | null>(null);
+    useEffect(() => {
+      const container = chatContainerRef.current;
+      if (!container) return undefined;
+      const scrollKey = `${workspaceUiSessionScope}:${workspaceClientUiKey}:chat-scroll-top`;
+      container.scrollTop = readRuntimeUiSessionValue(scrollKey, 0);
+      const remember = () => writeRuntimeUiSessionValue(scrollKey, container.scrollTop);
+      container.addEventListener('scroll', remember, { passive: true });
+      return () => {
+        remember();
+        container.removeEventListener('scroll', remember);
+      };
+    }, [workspaceClientUiKey, workspaceUiSessionScope]);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const analysisRunPollTimerRef = useRef<number | null>(null);
   const activePollingRunIdRef = useRef<string | null>(null);
@@ -36917,6 +36813,7 @@ export default function App() {
           window.setTimeout(() => promoteUnifiedTodoRef.current(todo), 0);
         }}
         flash={flash}
+        uiSessionScopeKey={`strategic:${workspacesState?.activeSandboxId || 'local'}:${viewerAuthorization?.membershipId || currentSessionUser?.id || 'anonymous'}`}
       />
     ),
     topics_management: (
@@ -36928,18 +36825,24 @@ export default function App() {
         currentOperatorName={currentOperatorName}
         flash={flash}
         onTasksReload={loadTaskBlock}
+        uiSessionScopeKey={`intelligence:${workspacesState?.activeSandboxId || 'local'}:${viewerAuthorization?.membershipId || currentSessionUser?.id || 'anonymous'}`}
       />
     ),
     growth_handbook: (
-      <GrowthCenterView key={`growth-${businessWorkspaceResetKey}`} />
+      <GrowthCenterView
+        key={`growth-${businessWorkspaceResetKey}`}
+        uiSessionScopeKey={`growth:${workspacesState?.activeSandboxId || 'local'}:${viewerAuthorization?.membershipId || currentSessionUser?.id || 'anonymous'}`}
+      />
     ),
     plan_workshop: (
       <PlanWorkshopView
         key={`plan-workshop-${businessWorkspaceResetKey}`}
         value={strictPlanWorkshopState}
         currentUser={currentSessionUser}
+        tasks={tasks}
         clients={dataCenterClients.map((client) => ({ id: client.id, name: client.name }))}
         onSavePlan={handleSavePlanFromWorkshop}
+        onDeletePlan={handleDeletePlanFromWorkshop}
         onOpenTask={(t) => {
           setActiveTab('tasks');
           setTaskViewMode('list');
@@ -36952,6 +36855,7 @@ export default function App() {
         }}
         isLoading={isOrganizationPlanningLoading}
         loadError={organizationPlanningLoadError}
+        uiSessionScopeKey={`plans:${workspacesState?.activeSandboxId || 'local'}:${viewerAuthorization?.membershipId || currentSessionUser?.id || 'anonymous'}`}
       />
     ),
     settings: (

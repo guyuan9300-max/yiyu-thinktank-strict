@@ -336,7 +336,7 @@ textarea {
   color: rgb(209 213 219) !important;
 }
 
-/* 事件线归档筛选使用浏览器原生 checkbox 状态，不依赖 React 异步状态或后端重载。 */
+/* 事件线归档筛选是 renderer-session 状态；跨页面保留，重启恢复默认。 */
 .event-lines-panel:has(.event-lines-hide-archived-toggle:checked)
   .event-line-card[data-event-line-status='archived'] {
   display: none;

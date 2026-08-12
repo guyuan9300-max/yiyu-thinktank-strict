@@ -197,6 +197,21 @@ def register_gc06_planning_routes(
             idempotency_key=idempotency_key,
         )
 
+    @app.delete("/api/v2/gc06/planning-cycles/{planning_cycle_id}")
+    def delete_planning_cycle(
+        planning_cycle_id: str,
+        payload: Annotated[dict[str, Any], Body()],
+        identity: Identity,
+        idempotency_key: Idempotency,
+    ) -> dict[str, Any]:
+        return gc06_planning.delete_planning_cycle(
+            repository,
+            identity,
+            planning_cycle_id=planning_cycle_id,
+            expected_version=payload.get("expectedVersion"),
+            idempotency_key=idempotency_key,
+        )
+
     @app.get("/api/v2/gc06/weekly-reviews")
     def list_weekly_reviews(
         identity: Identity,

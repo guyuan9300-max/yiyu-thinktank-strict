@@ -1,5 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
-import { readFile, writeFile } from 'node:fs/promises';
+import { access, readFile, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -124,6 +125,75 @@ async function runCommand(
       || detail.message
       || `${command} 执行失败`;
     throw new Error(message);
+  }
+}
+
+const STANDARD_EXECUTABLE_DIRS = [
+  '/usr/local/bin',
+  '/opt/homebrew/bin',
+  '/usr/bin',
+  '/bin',
+  '/usr/sbin',
+  '/sbin',
+];
+
+function maintenanceEnvironment(): NodeJS.ProcessEnv {
+  const existing = (process.env.PATH || '')
+    .split(path.delimiter)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const pathValue = [...new Set([...STANDARD_EXECUTABLE_DIRS, ...existing])]
+    .join(path.delimiter);
+  return {
+    ...process.env,
+    PATH: pathValue,
+    GIT_TERMINAL_PROMPT: '0',
+  };
+}
+
+export async function resolveMaintenanceNpm(): Promise<string> {
+  const candidates = [
+    '/usr/local/bin/npm',
+    '/opt/homebrew/bin/npm',
+    ...maintenanceEnvironment().PATH!.split(path.delimiter).map((directory) => (
+      path.join(directory, process.platform === 'win32' ? 'npm.cmd' : 'npm')
+    )),
+  ];
+  for (const candidate of [...new Set(candidates)]) {
+    try {
+      await access(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch {
+      // Continue to the next known executable directory.
+    }
+  }
+  throw new Error(
+    '本机没有找到 npm。请确认 Node.js 已安装；图形化安装版会自动检查 /usr/local/bin 与 /opt/homebrew/bin。',
+  );
+}
+
+async function runMaintenanceGate(repoPath: string): Promise<void> {
+  const npm = await resolveMaintenanceNpm();
+  try {
+    await execFileAsync(npm, ['run', 'verify:strict-maintenance'], {
+      cwd: repoPath,
+      encoding: 'utf8',
+      env: maintenanceEnvironment(),
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: 10 * 60_000,
+    });
+  } catch (error) {
+    const detail = error as {
+      stderr?: string;
+      stdout?: string;
+      message?: string;
+    };
+    throw new Error(
+      detail.stderr?.trim()
+      || detail.stdout?.trim()
+      || detail.message
+      || '严格发布门禁执行失败',
+    );
   }
 }
 
@@ -835,7 +905,7 @@ export async function pushStrictMain(
   }
   await fastForwardRemoteMainIfNeeded(repoPath);
   const remoteBefore = await run(repoPath, ['rev-parse', 'refs/remotes/origin/main']);
-  await runCommand(repoPath, 'npm', ['run', 'verify:strict-maintenance'], 10 * 60_000);
+  await runMaintenanceGate(repoPath);
   await run(repoPath, ['add', '--all']);
   const staged = await run(
     repoPath,
@@ -1041,7 +1111,7 @@ export async function publishStrictBranch(
   if (await hasUnmergedPaths(repoPath)) {
     throw new Error('当前存在未解决冲突，不能发布协作分支。');
   }
-  await runCommand(repoPath, 'npm', ['run', 'verify:strict-maintenance'], 10 * 60_000);
+  await runMaintenanceGate(repoPath);
   await run(repoPath, ['add', '--all']);
   const staged = await run(
     repoPath,
