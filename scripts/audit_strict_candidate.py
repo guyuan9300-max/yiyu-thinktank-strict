@@ -106,6 +106,7 @@ def audit_repository_identity() -> None:
 def audit_sql_boundaries() -> None:
     allowed_python = {
         ROOT / "strict_common" / "schema.py",
+        ROOT / "strict_common" / "offline_upgrade.py",
         ROOT / "strict_common" / "physical_schema.py",
         ROOT / "strict_common" / "project_scope.py",
         ROOT / "backend" / "app" / "runtime.py",

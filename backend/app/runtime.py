@@ -15,6 +15,7 @@ import httpx
 
 from strict_common.contracts import CLOUD_CONTRACT, capability_registry
 from strict_common.ids import canonical_json, new_id, sha256_text, utc_now
+from strict_common.offline_upgrade import ensure_local_database_current
 from strict_common.schema import initialize_database, runtime_connection
 from strict_common.security import decode_secret_bundle, encode_secret_bundle
 
@@ -73,6 +74,7 @@ class WorkspaceRuntime:
         cloud_factory: CloudFactory | None = None,
     ):
         self.database_path = database_path.resolve()
+        ensure_local_database_current(self.database_path)
         self.identity = initialize_database(self.database_path, "local")
         self.secret_store = secret_store
         self.cloud_factory = cloud_factory or CloudClientPool()
