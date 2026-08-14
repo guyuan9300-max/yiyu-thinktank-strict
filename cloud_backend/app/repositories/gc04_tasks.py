@@ -693,8 +693,15 @@ class GC04TaskRepository:
         scheduled_start_at: str | None,
         scheduled_end_at: str | None,
     ) -> None:
-        if scheduled_start_at and scheduled_end_at and scheduled_end_at < scheduled_start_at:
-            raise RepositoryError(422, "task_schedule_invalid", "任务结束时间不能早于开始时间")
+        if not scheduled_start_at or not scheduled_end_at:
+            return
+        try:
+            starts = datetime.fromisoformat(scheduled_start_at.replace("Z", "+00:00"))
+            ends = datetime.fromisoformat(scheduled_end_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise RepositoryError(422, "task_schedule_invalid", "任务时间格式无效") from exc
+        if ends <= starts:
+            raise RepositoryError(422, "task_schedule_invalid", "任务结束时间必须晚于开始时间")
 
     def _validate_list(
         self,

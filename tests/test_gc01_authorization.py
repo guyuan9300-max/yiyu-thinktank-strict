@@ -864,6 +864,47 @@ def test_gc01_session_login_refresh_and_logout_are_replayable_and_audited(
             connection,
             origin_instance_id=config.cloud_instance_id or "",
         )
+        # A disabled member must not leak an otherwise-active department
+        # assignment into a new device login snapshot.  The local 88-table
+        # projection cannot reference a membership that the same snapshot did
+        # not authorize as active.
+        now = utc_now()
+        connection.execute(
+            """
+            INSERT INTO principals (
+                id, status, identity_version, updated_at, principal_kind,
+                display_name, version, lifecycle_state, created_at, deleted_at
+            ) VALUES ('principal_disabled', 'disabled', 1, ?, 'person',
+                      '失效成员', 1, 'active', ?, NULL)
+            """,
+            (now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO organization_memberships (
+                id, scope_id, principal_id, role_key, status, version,
+                record_kind, visibility_scope, lifecycle_state, created_at,
+                updated_at, deleted_at
+            ) VALUES ('membership_disabled', 'scope_gc01_test',
+                      'principal_disabled', 'member', 'disabled', 1,
+                      'membership', 'self', 'active', ?, ?, NULL)
+            """,
+            (now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO organization_memberships (
+                id, scope_id, principal_id, role_key, status, version,
+                record_kind, parent_membership_id, department_id,
+                lifecycle_state, created_at, updated_at, deleted_at
+            ) VALUES ('assignment_disabled_department', 'scope_gc01_test',
+                      NULL, 'member', 'active', 1, 'department_assignment',
+                      'membership_disabled', 'department_gc01', 'active',
+                      ?, ?, NULL)
+            """,
+            (now, now),
+        )
+        connection.commit()
         structure_before = structure_sha256(normalized_structure(connection))
         counts_before = _table_counts(connection)
 
@@ -899,6 +940,17 @@ def test_gc01_session_login_refresh_and_logout_are_replayable_and_audited(
                 "isDepartmentLead": True,
                 "status": "active",
                 "version": 1,
+            }
+        ]
+        assert first.json()["sessionSnapshot"]["departmentAssignments"] == [
+            {
+                "assignmentId": "assignment_admin_department",
+                "membershipId": "membership_admin",
+                "departmentId": "department_gc01",
+                "assignmentRole": "department_lead",
+                "status": "active",
+                "version": 1,
+                "lifecycleState": "active",
             }
         ]
 

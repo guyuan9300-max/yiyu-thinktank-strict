@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  formatTaskCardScheduleLabel,
   getTaskCalendarPlacement,
   getTaskDeadline,
   getTaskDisplayTime,
@@ -120,4 +121,20 @@ test('task display time is hidden when task has no date', () => {
   const record = task({ dueDate: null, deadlineAt: null, scheduledStartAt: null });
 
   assert.equal(getTaskDisplayTime(record), null);
+});
+
+test('card label shows the default 09:00 start for a date-only task', () => {
+  const record = task({ dueDate: '2026-08-14', deadlineAt: '2026-08-14' });
+
+  assert.equal(formatTaskCardScheduleLabel(record), '09:00');
+  assert.equal(formatTaskCardScheduleLabel(record, true), '2026/08/14 09:00');
+});
+
+test('card label shows the full range for a cross-day task', () => {
+  const record = task({
+    scheduledStartAt: '2026-08-14T15:00',
+    scheduledEndAt: '2026-08-16T10:00',
+  });
+
+  assert.equal(formatTaskCardScheduleLabel(record), '2026/08/14 15:00 – 2026/08/16 10:00');
 });

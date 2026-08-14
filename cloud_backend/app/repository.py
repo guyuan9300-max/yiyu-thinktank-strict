@@ -963,15 +963,33 @@ class CloudRepository:
             ).fetchall()]
             department_assignments = [dict(row) for row in connection.execute(
                 """
-                SELECT id AS assignmentId,
-                       parent_membership_id AS membershipId,
-                       department_id AS departmentId,
-                       role_key AS assignmentRole,
-                       status, version, lifecycle_state AS lifecycleState
-                FROM organization_memberships
-                WHERE scope_id=? AND record_kind='department_assignment'
-                  AND lifecycle_state!='deleted'
-                ORDER BY department_id, parent_membership_id, id
+                SELECT assignment.id AS assignmentId,
+                       assignment.parent_membership_id AS membershipId,
+                       assignment.department_id AS departmentId,
+                       assignment.role_key AS assignmentRole,
+                       assignment.status, assignment.version,
+                       assignment.lifecycle_state AS lifecycleState
+                FROM organization_memberships AS assignment
+                JOIN organization_memberships AS membership
+                  ON membership.id=assignment.parent_membership_id
+                 AND membership.scope_id=assignment.scope_id
+                 AND membership.record_kind='membership'
+                 AND membership.status='active'
+                 AND membership.lifecycle_state='active'
+                JOIN principals AS principal
+                  ON principal.id=membership.principal_id
+                 AND principal.status='active'
+                 AND principal.lifecycle_state='active'
+                JOIN organizations AS department
+                  ON department.id=assignment.department_id
+                 AND department.record_kind='department'
+                 AND department.lifecycle_state='active'
+                WHERE assignment.scope_id=?
+                  AND assignment.record_kind='department_assignment'
+                  AND assignment.status='active'
+                  AND assignment.lifecycle_state='active'
+                ORDER BY assignment.department_id,
+                         assignment.parent_membership_id, assignment.id
                 """,
                 (identity.scope_id,),
             ).fetchall()]

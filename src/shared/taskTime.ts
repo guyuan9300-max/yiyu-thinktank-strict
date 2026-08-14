@@ -96,6 +96,10 @@ function formatTaskClockTime(date: Date) {
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
+function formatTaskNumericDateTime(date: Date) {
+  return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')} ${formatTaskClockTime(date)}`;
+}
+
 function formatTaskClockRange(start: Date, end: Date) {
   const startLabel = formatTaskClockTime(start);
   const endLabel = formatTaskClockTime(end);
@@ -275,6 +279,47 @@ export function getTaskDisplayTime(task: TaskTimeInput): TaskDisplayTime | null 
     dateLabel: formatDateInputValue(deadline),
     timeLabel: hasExplicitDeadlineTime ? formatTaskClockTime(deadline) : '',
   };
+}
+
+/**
+ * 卡片统一时间口径：单日只突出开始时间；跨天完整显示首尾时间点。
+ * 历史日期型任务没有显式钟点时，按产品默认 09:00 展示，不反写权威事实。
+ */
+export function formatTaskCardScheduleLabel(task: TaskTimeInput, includeSingleDate = false) {
+  const range = getTaskScheduleRange(task);
+  if (range) {
+    const hasExplicitStart = Boolean(
+      hasExplicitTaskTime(task.scheduledStartAt)
+        || hasExplicitTaskTime(task.startDate)
+        || (!task.scheduledStartAt && hasExplicitTaskTime(task.dueDate)),
+    );
+    const start = new Date(range.start);
+    if (!hasExplicitStart) start.setHours(9, 0, 0, 0);
+    const end = range.hasExplicitEnd
+      ? new Date(range.end)
+      : addMinutes(start, durationFromTask(task));
+    if (startOfTaskDay(start).getTime() !== startOfTaskDay(new Date(end.getTime() - 1)).getTime()) {
+      return `${formatTaskNumericDateTime(start)} – ${formatTaskNumericDateTime(end)}`;
+    }
+    return includeSingleDate ? formatTaskNumericDateTime(start) : formatTaskClockTime(start);
+  }
+
+  const deadline = getTaskDeadline(task);
+  if (!deadline) return '无日期';
+  const display = new Date(deadline);
+  if (!hasExplicitTaskTime(task.deadlineAt) && !hasExplicitTaskTime(task.dueDate)) {
+    display.setHours(9, 0, 0, 0);
+  }
+  return includeSingleDate ? formatTaskNumericDateTime(display) : formatTaskClockTime(display);
+}
+
+export function formatScheduleCardLabel(startValue: Date, endValue: Date, includeSingleDate = false) {
+  const start = new Date(startValue);
+  const end = endValue > start ? new Date(endValue) : addMinutes(start, DEFAULT_DURATION_MINUTES);
+  if (startOfTaskDay(start).getTime() !== startOfTaskDay(new Date(end.getTime() - 1)).getTime()) {
+    return `${formatTaskNumericDateTime(start)} – ${formatTaskNumericDateTime(end)}`;
+  }
+  return includeSingleDate ? formatTaskNumericDateTime(start) : formatTaskClockTime(start);
 }
 
 export function taskOverlapsDateWindow(task: TaskTimeInput, startDate: Date, endExclusive: Date) {

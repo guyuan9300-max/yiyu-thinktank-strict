@@ -636,6 +636,7 @@ import { StrategicBrainView, type ThoughtTaskPayload, DuplicateDocumentsSection 
 import { TopicsManagementView } from './components/topics/TopicsManagementView';
 import { IntelligenceStationView } from './components/intelligence/IntelligenceStationView';
 import { TaskCalendarView } from './components/tasks/TaskCalendarView';
+import { buildTaskScheduleFromStartEnd } from './lib/taskTimeline';
 import { DraggingTaskProvider, TaskRowLongPress } from './components/tasks/longPressDrag';
 import { AgentSimulationCalendarView } from './components/tasks/AgentSimulationCalendarView';
 import { AgentWeeklyPlanEditor } from './components/tasks/AgentWeeklyPlanEditor';
@@ -695,9 +696,10 @@ import { filterSharedTasks, isPersonalOnlyTask } from '../shared/taskVisibility'
 import {
   getTaskCalendarPlacement,
   getTaskDeadline,
-  getTaskDisplayTime,
   getTaskExecutionDate,
   getTaskScheduleRange,
+  formatScheduleCardLabel,
+  formatTaskCardScheduleLabel,
   formatDateInputValue,
   isTaskInCurrentReviewWeek,
   isTaskOverdue as isCanonicalTaskOverdue,
@@ -1475,6 +1477,9 @@ type TaskEditorState = {
   priorityReason: string;
   dueDate: string;
   dueTime: string;
+  endDate?: string;
+  endTime?: string;
+  crossDay?: boolean;
   durationMinutes: number;
   clientId: string;
   clientTouched: boolean;
@@ -13055,7 +13060,7 @@ export default function App() {
               <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-[#5B7BFE]">WORKSPACE · 工作空间</p>
               <h2 className="mt-2 text-[24px] font-bold text-gray-900">工作空间管理</h2>
               <p className="mt-2 text-[13px] leading-6 text-gray-500">
-                在已经加入的组织之间切换。登录、加入或创建组织请使用左下角的对应入口。
+                在已经登录的组织之间切换，也可以继续登录另一个组织。
               </p>
             </div>
             <button
@@ -13110,6 +13115,17 @@ export default function App() {
                 暂无已加入的组织。请关闭此窗口，并从左下角登录、加入或创建组织。
               </div>
             )}
+            <button
+              type="button"
+              onClick={() => {
+                setWorkspaceManagerOpen(false);
+                openCloudAuthModal('login');
+              }}
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-blue-200 bg-blue-50/40 px-4 py-3 text-[13px] font-semibold text-[#5B7BFE] transition hover:border-blue-300 hover:bg-blue-50"
+            >
+              <Plus size={15} />
+              登录其他组织
+            </button>
           </div>
         </div>
       </div>
@@ -15837,12 +15853,16 @@ export default function App() {
         : '--:--';
     })();
     const duePickerEndTime = (() => {
+      if (editingTask.endTime) return editingTask.endTime;
       if (!editingTask.dueTime) return '';
       const [hour, minute] = editingTask.dueTime.split(':').map(Number);
       if (!Number.isFinite(hour) || !Number.isFinite(minute)) return '';
       const end = hour * 60 + minute + Math.max(15, editingTask.durationMinutes || 60);
       return `${String(Math.floor((end % 1440) / 60)).padStart(2, '0')}:${String(end % 60).padStart(2, '0')}`;
     })();
+    const duePickerEndDate = editingTask.crossDay
+      ? (editingTask.endDate || editingTask.dueDate)
+      : editingTask.dueDate;
     const duePickerCalendarCells = useMemo(() => buildCalendarCells(duePickerMonth), [duePickerMonth]);
 
     useEffect(() => {
@@ -16821,14 +16841,17 @@ export default function App() {
           return;
         }
         const localStartsAt = combineTaskDueDateTime(editingTask.dueDate, editingTask.dueTime);
+        const localEndsAt = combineTaskDueDateTime(duePickerEndDate, duePickerEndTime);
         const startsAt = localStartsAt ? `${localStartsAt}:00+08:00` : '';
         if (!startsAt) {
           flash('error', '客户会议开始时间无效');
           return;
         }
-        const endsAt = new Date(
-          new Date(startsAt).getTime() + Math.max(15, editingTask.durationMinutes || 60) * 60_000,
-        ).toISOString();
+        const endsAt = localEndsAt ? `${localEndsAt}:00+08:00` : '';
+        if (editingTask.crossDay && duePickerEndDate <= editingTask.dueDate) {
+          flash('error', '跨天会议的结束日期必须晚于开始日期');
+          return;
+        }
         if (new Date(endsAt).getTime() <= new Date(startsAt).getTime()) {
           flash('error', '客户会议结束时间必须晚于开始时间');
           return;
@@ -16969,19 +16992,24 @@ export default function App() {
       const saveSandboxId = currentTaskSandboxId();
       pendingTaskSaveCountRef.current += 1;
       setPendingTaskSaveCount(pendingTaskSaveCountRef.current);
+      if (editingTask.crossDay && duePickerEndDate <= editingTask.dueDate) {
+        flash('error', '跨天任务的截止日期必须晚于开始日期');
+        setIsSavingTask(false);
+        pendingTaskSaveCountRef.current = Math.max(0, pendingTaskSaveCountRef.current - 1);
+        setPendingTaskSaveCount(pendingTaskSaveCountRef.current);
+        return;
+      }
+      const schedule = buildTaskScheduleFromStartEnd({
+        startDate: editingTask.dueDate || null,
+        startTime: editingTask.dueTime || null,
+        endDate: duePickerEndDate || null,
+        endTime: duePickerEndTime || null,
+      });
       const combinedDueDate = combineTaskDueDateTime(editingTask.dueDate, editingTask.dueTime);
       const hasScheduledTime = Boolean((editingTask.dueTime || '').trim());
-      const scheduledStartAt = hasScheduledTime ? combinedDueDate || null : null;
-      const scheduledEndAt = scheduledStartAt
-        ? (() => {
-            const endDate = new Date(new Date(scheduledStartAt).getTime() + Math.max(15, editingTask.durationMinutes || 60) * 60_000);
-            return combineTaskDueDateTime(
-              `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, '0')}-${String(endDate.getDate()).padStart(2, '0')}`,
-              `${String(endDate.getHours()).padStart(2, '0')}:${String(endDate.getMinutes()).padStart(2, '0')}`,
-            );
-          })()
-        : null;
-      const deadlineAt = hasScheduledTime ? null : (combinedDueDate || null);
+      const scheduledStartAt = hasScheduledTime ? schedule.scheduledStartAt : null;
+      const scheduledEndAt = hasScheduledTime ? schedule.scheduledEndAt : null;
+      const deadlineAt = hasScheduledTime ? null : (schedule.deadlineAt || combinedDueDate || null);
       const resolvedDdl = combinedDueDate
         ? duePickerSummaryLabel
         : (editingTask.ddl.trim() || '待确认');
@@ -17005,7 +17033,7 @@ export default function App() {
         scheduledEndAt,
         dueDate: deadlineAt || scheduledStartAt,
         startDate: scheduledStartAt,
-        durationMinutes: editingTask.durationMinutes,
+        durationMinutes: schedule.durationMinutes ?? editingTask.durationMinutes,
         clientId: isEditingTaskPersonal ? null : (editingTask.clientId || null),
         eventLineId: isEditingTaskPersonal ? null : (editingTask.eventLineId || null),
         planningCycleId: !isEditingTaskPersonal && editingTask.planLinkSource === 'manager'
@@ -17711,6 +17739,7 @@ export default function App() {
       }
       const resolvedDueDate = task.scheduledStartAt || task.deadlineAt || task.dueDate || dueDate || formatDateInputValue(new Date());
       const resolvedDueParts = splitTaskDueDateTime(resolvedDueDate);
+      const resolvedEndParts = splitTaskDueDateTime(task.scheduledEndAt || resolvedDueDate);
       resetTaskModalTransientState();
       const parsedDate = parseTaskDateValue(resolvedDueParts.date);
       setDuePickerMonth(parsedDate ? new Date(parsedDate.getFullYear(), parsedDate.getMonth(), 1) : getTodayCalendarState().calendarDate);
@@ -17728,6 +17757,9 @@ export default function App() {
         priorityReason: '保留当前优先级，你可以手动调整。',
         dueDate: resolvedDueParts.date,
         dueTime: resolvedDueParts.time || (resolvedDueParts.date ? '09:00' : ''),
+        endDate: resolvedEndParts.date || resolvedDueParts.date,
+        endTime: resolvedEndParts.time || '',
+        crossDay: Boolean(resolvedEndParts.date && resolvedDueParts.date && resolvedEndParts.date > resolvedDueParts.date),
         durationMinutes: Math.max(15, task.durationMinutes ?? options?.durationMinutes ?? 60),
         clientId: task.clientId || '',
         clientTouched: Boolean(task.clientId),
@@ -17822,6 +17854,7 @@ export default function App() {
 
     const openMeetingEditor = (meeting: GC06Meeting) => {
       const dueParts = splitTaskDueDateTime(meeting.startsAt);
+      const endParts = splitTaskDueDateTime(meeting.endsAt);
       const durationMinutes = Math.max(
         15,
         Math.round((new Date(meeting.endsAt).getTime() - new Date(meeting.startsAt).getTime()) / 60_000),
@@ -17858,6 +17891,9 @@ export default function App() {
         priorityReason: '客户会议不使用任务优先级。',
         dueDate: dueParts.date,
         dueTime: dueParts.time,
+        endDate: endParts.date || dueParts.date,
+        endTime: endParts.time || '',
+        crossDay: Boolean(endParts.date && dueParts.date && endParts.date > dueParts.date),
         durationMinutes,
         clientId: meeting.clientId,
         clientTouched: true,
@@ -17906,6 +17942,28 @@ export default function App() {
         flash('success', saved.status === 'completed' ? '会议已完成。' : '会议已重开。');
       } catch (error) {
         flash('error', error instanceof Error ? error.message : '会议状态更新失败');
+      }
+    };
+
+    const handleRescheduleMeeting = async (meeting: GC06Meeting, nextStartDate: string) => {
+      if (!guardWorkspaceWrite('调整会议时间')) return;
+      const currentStart = new Date(meeting.startsAt);
+      const currentEnd = new Date(meeting.endsAt);
+      const durationMs = Math.max(15 * 60_000, currentEnd.getTime() - currentStart.getTime());
+      const startTime = `${String(currentStart.getHours()).padStart(2, '0')}:${String(currentStart.getMinutes()).padStart(2, '0')}`;
+      const localStart = combineTaskDueDateTime(nextStartDate, startTime);
+      if (!localStart) throw new Error('会议开始时间无效');
+      const startsAt = `${localStart}:00+08:00`;
+      const nextEnd = new Date(new Date(startsAt).getTime() + durationMs);
+      const endsAt = `${nextEnd.getFullYear()}-${String(nextEnd.getMonth() + 1).padStart(2, '0')}-${String(nextEnd.getDate()).padStart(2, '0')}T${String(nextEnd.getHours()).padStart(2, '0')}:${String(nextEnd.getMinutes()).padStart(2, '0')}:00+08:00`;
+      try {
+        const saved = (await gc06Api.updateMeeting(meeting, { startsAt, endsAt })).meeting;
+        setCustomerMeetings((previous) => [saved, ...previous.filter((item) => item.id !== saved.id)]);
+        flash('success', '会议日期已调整，原有时间跨度保持不变。');
+      } catch (error) {
+        await gc06Api.listMeetings().then(setCustomerMeetings).catch(() => undefined);
+        flash('error', error instanceof Error ? error.message : '会议日期调整失败');
+        throw error;
       }
     };
 
@@ -18612,7 +18670,7 @@ export default function App() {
         flash('info', '任务正在保存，稍后再调整时间。');
         return;
       }
-      const safeDuration = Math.max(15, Math.min(12 * 60, Math.round(durationMinutes / 15) * 15));
+      const safeDuration = Math.max(15, Math.min(24 * 60, Math.round(durationMinutes / 15) * 15));
       const schedule = getTaskScheduleRange(task);
       const nextScheduledEndAt = schedule
         ? (() => {
@@ -18888,11 +18946,84 @@ export default function App() {
     const applyEditingTaskEndTime = (nextEndTime: string) => {
       setEditingTask((prev) => {
         if (!prev.dueTime || !nextEndTime) return prev;
-        const [startHour, startMinute] = prev.dueTime.split(':').map(Number);
-        const [endHour, endMinute] = nextEndTime.split(':').map(Number);
-        const duration = endHour * 60 + endMinute - (startHour * 60 + startMinute);
+        const startValue = combineTaskDueDateTime(prev.dueDate, prev.dueTime);
+        const endValue = combineTaskDueDateTime(prev.crossDay ? (prev.endDate || prev.dueDate) : prev.dueDate, nextEndTime);
+        const duration = startValue && endValue
+          ? Math.round((new Date(endValue).getTime() - new Date(startValue).getTime()) / 60_000)
+          : 0;
         if (!Number.isFinite(duration) || duration <= 0) return prev;
-        return { ...prev, durationMinutes: duration };
+        return { ...prev, endTime: nextEndTime, durationMinutes: duration };
+      });
+    };
+
+    const applyEditingTaskStartDateTime = (nextValue: string) => {
+      const nextParts = splitTaskDueDateTime(nextValue);
+      if (!nextParts.date || !nextParts.time) return;
+      setEditingTask((prev) => {
+        const nextEndDate = prev.crossDay
+          ? (prev.endDate && prev.endDate > nextParts.date
+              ? prev.endDate
+              : (() => {
+                  const start = parseTaskDateValue(nextParts.date);
+                  return start
+                    ? formatDateOnlyValue(new Date(start.getFullYear(), start.getMonth(), start.getDate() + 1))
+                    : nextParts.date;
+                })())
+          : nextParts.date;
+        const nextEndTime = prev.endTime || (() => {
+          const [hours, minutes] = nextParts.time.split(':').map(Number);
+          const end = hours * 60 + minutes + 60;
+          return `${String(Math.floor((end % 1440) / 60)).padStart(2, '0')}:${String(end % 60).padStart(2, '0')}`;
+        })();
+        const startValue = combineTaskDueDateTime(nextParts.date, nextParts.time);
+        const endValue = combineTaskDueDateTime(nextEndDate, nextEndTime);
+        const duration = startValue && endValue
+          ? Math.round((new Date(endValue).getTime() - new Date(startValue).getTime()) / 60_000)
+          : prev.durationMinutes;
+        return {
+          ...prev,
+          dueDate: nextParts.date,
+          dueTime: nextParts.time,
+          endDate: nextEndDate,
+          endTime: nextEndTime,
+          durationMinutes: Number.isFinite(duration) && duration > 0 ? duration : prev.durationMinutes,
+          ddl: formatTaskDueLabel(startValue),
+        };
+      });
+    };
+
+    const applyEditingTaskEndDateTime = (nextValue: string) => {
+      const nextParts = splitTaskDueDateTime(nextValue);
+      if (!nextParts.date || !nextParts.time) return;
+      setEditingTask((prev) => {
+        const nextEndDate = prev.crossDay ? nextParts.date : prev.dueDate;
+        const startValue = combineTaskDueDateTime(prev.dueDate, prev.dueTime || '09:00');
+        const endValue = combineTaskDueDateTime(nextEndDate, nextParts.time);
+        const duration = startValue && endValue
+          ? Math.round((new Date(endValue).getTime() - new Date(startValue).getTime()) / 60_000)
+          : prev.durationMinutes;
+        return {
+          ...prev,
+          endDate: nextEndDate,
+          endTime: nextParts.time,
+          durationMinutes: Number.isFinite(duration) && duration > 0 ? duration : prev.durationMinutes,
+        };
+      });
+    };
+
+    const applyEditingTaskCrossDay = (nextCrossDay: boolean) => {
+      setEditingTask((prev) => {
+        if (!nextCrossDay) {
+          return { ...prev, crossDay: false, endDate: prev.dueDate, endTime: prev.endTime || duePickerEndTime };
+        }
+        const start = parseTaskDateValue(prev.dueDate) || new Date();
+        const next = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 1);
+        return {
+          ...prev,
+          crossDay: true,
+          endDate: prev.endDate && prev.endDate > prev.dueDate ? prev.endDate : formatDateOnlyValue(next),
+          endTime: prev.endTime || duePickerEndTime || '10:00',
+        };
       });
     };
 
@@ -18904,6 +19035,12 @@ export default function App() {
           ...prev,
           dueDate: nextDueDate,
           dueTime: nextDueTime,
+          endDate: prev.crossDay
+            ? (prev.endDate && prev.endDate > nextDueDate ? prev.endDate : (() => {
+                const next = parseTaskDateValue(nextDueDate);
+                return next ? formatDateOnlyValue(new Date(next.getFullYear(), next.getMonth(), next.getDate() + 1)) : nextDueDate;
+              })())
+            : nextDueDate,
           ddl: nextDueValue ? formatTaskDueLabel(nextDueValue) : '待确认',
         };
       });
@@ -19906,7 +20043,7 @@ export default function App() {
                                     <div className="flex shrink-0 items-center gap-1.5">
                                       <span className="inline-flex items-center gap-1 rounded-full border border-slate-100 bg-slate-50 px-2 py-0.5 text-[10px] font-bold text-slate-600">
                                         <CalendarIcon size={10} />
-                                        {new Date(meeting.startsAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}
+                                        {formatScheduleCardLabel(new Date(meeting.startsAt), new Date(meeting.endsAt), true)}
                                       </span>
                                       <button type="button" onClick={(event) => { event.stopPropagation(); openMeetingEditor(meeting); }} className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-400 transition hover:border-[#C9D6FF] hover:text-[#5B7BFE]" aria-label={`编辑会议${meeting.title}`}><Pencil size={12} /></button>
                                       <button type="button" onClick={(event) => { event.stopPropagation(); void handleDeleteMeetingRecord(meeting); }} className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-400 transition hover:border-rose-200 hover:text-rose-500" aria-label={`删除会议${meeting.title}`}><Trash2 size={12} /></button>
@@ -19972,10 +20109,7 @@ export default function App() {
                             const hasDetailContent = Boolean(task.desc || task.eventLineId || task.projectContext?.clientName);
                             const isSelected = selectedListTaskIds.includes(task.id);
                             const isOverdue = isTaskOverdue(task);
-                            const displayTime = getTaskDisplayTime(task);
-                            const listTimeLabel = displayTime
-                              ? `${displayTime.dateLabel}${displayTime.timeLabel ? ` ${displayTime.timeLabel}` : ''}`
-                              : '无日期';
+                            const listTimeLabel = formatTaskCardScheduleLabel(task, true);
                             const listTimeClassName = isOverdue
                               ? 'border-rose-100 bg-rose-50 text-rose-700'
                               : isTaskDueToday(task)
@@ -20786,6 +20920,7 @@ export default function App() {
                 onOpenTaskEditor={openTaskEditor}
                 onOpenMeetingEditor={openMeetingEditor}
                 onToggleMeetingStatus={handleToggleMeetingCompletion}
+                onRescheduleMeeting={handleRescheduleMeeting}
                 onToggleTaskStatus={toggleTaskStatus}
                 onRescheduleTask={handleRescheduleTask}
                 onUpdateTaskDuration={handleUpdateTaskDuration}
@@ -23906,24 +24041,42 @@ export default function App() {
                       </div>
                     </TaskPropertyRow>
 
-                    <TaskPropertyRow icon={<CalendarIcon size={16} />} label="日期">
+                    <TaskPropertyRow icon={<CalendarIcon size={16} />} label="跨天">
                       <button
                         type="button"
-                        onClick={() => {
-                          setIsDuePickerOpen((prev) => !prev);
-                        }}
-                        className="rounded px-2 py-1 text-sm font-medium text-gray-700 hover:bg-gray-100"
+                        role="switch"
+                        aria-checked={Boolean(editingTask.crossDay)}
+                        onClick={() => applyEditingTaskCrossDay(!editingTask.crossDay)}
+                        className="flex w-full items-center justify-between rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700"
                       >
-                        {duePickerDateLabel}
+                        <span>跨天</span>
+                        <span className={`inline-flex h-6 min-w-11 items-center rounded-full px-1 transition-colors ${editingTask.crossDay ? 'justify-end bg-[#5B7BFE]' : 'justify-start bg-gray-300'}`}>
+                          <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-white px-1 text-[9px] font-bold text-gray-500 shadow-sm">
+                            {editingTask.crossDay ? '开' : '关'}
+                          </span>
+                        </span>
                       </button>
                     </TaskPropertyRow>
 
-                    <TaskPropertyRow icon={<Clock size={16} />} label="时间段">
-                      <div className="flex w-full items-center gap-2 px-2">
-                        <input type="time" value={editingTask.dueTime || ''} onChange={(event) => applyEditingTaskDueTime(event.target.value)} className="min-w-0 flex-1 rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700" />
-                        <span className="text-xs text-gray-400">至</span>
-                        <input type="time" value={duePickerEndTime} disabled={!editingTask.dueTime} onChange={(event) => applyEditingTaskEndTime(event.target.value)} className="min-w-0 flex-1 rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700 disabled:bg-gray-50 disabled:text-gray-300" />
-                      </div>
+                    <TaskPropertyRow icon={<Clock size={16} />} label="开始时间">
+                      <input
+                        type="datetime-local"
+                        lang="zh-CN"
+                        value={combineTaskDueDateTime(editingTask.dueDate, editingTask.dueTime || '09:00')}
+                        onChange={(event) => applyEditingTaskStartDateTime(event.target.value)}
+                        className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
+                      />
+                    </TaskPropertyRow>
+
+                    <TaskPropertyRow icon={<Clock size={16} />} label="结束时间">
+                      <input
+                        type="datetime-local"
+                        lang="zh-CN"
+                        value={combineTaskDueDateTime(duePickerEndDate, duePickerEndTime)}
+                        min={combineTaskDueDateTime(editingTask.dueDate, editingTask.dueTime || '09:00') || undefined}
+                        onChange={(event) => applyEditingTaskEndDateTime(event.target.value)}
+                        className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
+                      />
                     </TaskPropertyRow>
 
                     {editingTask.recordMode === 'task' && <TaskPropertyRow icon={<Flag size={16} className="text-red-500" />} label="优先级">
