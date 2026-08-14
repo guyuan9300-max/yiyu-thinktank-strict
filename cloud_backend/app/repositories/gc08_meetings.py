@@ -168,11 +168,11 @@ class GC08MeetingMinutesRepository:
             ),
         )
         connection.execute(
-            "INSERT INTO recordings (id,scope_id,meeting_id,object_manifest_id,"
+            "INSERT INTO recordings (id,scope_id,binding_kind,meeting_id,object_manifest_id,"
             "lifecycle_state,current_transcription_version_id,recording_state,"
             "duration_ms,captured_at,device_id,version,created_at,updated_at,"
             "deleted_at,source_version,projection_state,projected_at,stale_at) "
-            "VALUES (?,?,?,NULL,'active',NULL,'captured',?,?,?,1,?,?,NULL,?,"
+            "VALUES (?,?,'meeting',?,NULL,'active',NULL,'captured',?,?,?,1,?,?,NULL,?,"
             "'current',?,NULL) ON CONFLICT(id) DO UPDATE SET "
             "meeting_id=excluded.meeting_id,"
             "duration_ms=excluded.duration_ms,captured_at=excluded.captured_at,"

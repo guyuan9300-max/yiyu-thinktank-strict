@@ -695,6 +695,17 @@ def test_gc02_share_picker_reads_stable_local_membership_projection() -> None:
                 }
             }
 
+        @staticmethod
+        def cloud_query(path: str) -> dict[str, object]:
+            assert path == "/api/v2/organization-access/member-candidates"
+            return {
+                "items": [
+                    {"id": "membership_self", "fullName": "当前成员", "primaryRole": "employee", "membershipStatus": "active"},
+                    {"id": "membership_colleague", "fullName": "协作同事", "primaryRole": "employee", "membershipStatus": "active"},
+                    {"id": "membership_disabled", "fullName": "停用成员", "primaryRole": "employee", "membershipStatus": "disabled"},
+                ]
+            }
+
     candidates = organization_access_router.dispatch(
         SimpleNamespace(runtime=Runtime()),
         UiRequest(
@@ -1250,8 +1261,8 @@ def test_gc02_project_capability_gate_uses_current_cloud_decision(
             "SELECT projection_state FROM clients WHERE id='client_gc02_gate'"
         ).fetchone()["projection_state"] == "current"
 
-    # Even a syntactically valid cloud response cannot authorize past the
-    # bounded 24-hour project lease.
+    # A successful online project query has already validated the live
+    # membership and grants. The old timestamp is diagnostic only.
     expired_project = json.loads(json.dumps(project))
     expired_project["authorizationProjection"]["generatedAt"] = (
         datetime.now(timezone.utc) - timedelta(hours=26)
@@ -1260,14 +1271,12 @@ def test_gc02_project_capability_gate_uses_current_cloud_decision(
         datetime.now(timezone.utc) + timedelta(hours=2)
     ).isoformat(timespec="milliseconds")
     runtime.cloud_query = lambda path, query=None: {"project": expired_project}  # type: ignore[method-assign]
-    with pytest.raises(LocalRuntimeError) as expired:
-        runtime.require_project_capability("client_gc02_gate", "read")
-    assert expired.value.status_code == 403
-    assert expired.value.code == "project_authorization_lease_expired"
+    authorized = runtime.require_project_capability("client_gc02_gate", "read")
+    assert authorized["projectId"] == "client_gc02_gate"
     with runtime_connection(database, "local") as connection:
         assert connection.execute(
             "SELECT projection_state FROM clients WHERE id='client_gc02_gate'"
-        ).fetchone()["projection_state"] == "stale"
+        ).fetchone()["projection_state"] == "current"
 
 
 def test_gc02_workbench_answer_consumer_fails_closed_before_local_body_read() -> None:

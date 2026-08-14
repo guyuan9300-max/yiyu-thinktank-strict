@@ -59,6 +59,13 @@ def register_gc04_task_routes(
     def project_keyword_profiles(identity: Identity) -> list[dict[str, Any]]:
         return task_planning.list_profiles(identity)
 
+    @app.post("/api/v2/domain/task-planning/parse-draft")
+    def parse_task_draft(
+        payload: Annotated[dict[str, Any], Body()],
+        identity: Identity,
+    ) -> dict[str, Any]:
+        return task_planning.parse_draft(identity, payload=payload)
+
     @app.post("/api/v2/domain/task-planning/project-keyword-profiles/{client_id}/refresh")
     def refresh_project_keyword_profile(
         client_id: str,

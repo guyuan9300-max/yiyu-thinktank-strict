@@ -139,6 +139,66 @@ class GC07ProjectMaterialsRepository:
     def __init__(self, repository: CloudRepository):
         self.repository = repository
 
+    def publish_mobile_recording_summary(
+        self,
+        identity: SessionIdentity,
+        *,
+        project_id: str,
+        payload: Mapping[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Publish only an on-device AI summary; never accept transcript/path/audio."""
+        forbidden = {"transcript", "transcriptText", "audio", "audioPath", "localPath", "uri"}
+        if forbidden.intersection(payload):
+            raise RepositoryError(422, "mobile_recording_body_forbidden", "组织云不得接收录音、逐字稿或本机路径")
+        title = str(payload.get("title") or "现场录音知识摘要").strip()[:300]
+        summary = str(payload.get("safeSummaryMarkdown") or "").strip()
+        source_hash = str(payload.get("sourceContentHash") or "").strip().lower()
+        facts = [str(value).strip()[:500] for value in payload.get("facts") or [] if str(value).strip()][:20]
+        event_line_id = str(payload.get("eventLineId") or "").strip()
+        if not summary or len(summary) > 12_000 or len(source_hash) != 64 or any(c not in "0123456789abcdef" for c in source_hash):
+            raise RepositoryError(422, "mobile_recording_summary_invalid", "录音安全摘要回执无效")
+        normalized = {"projectId": project_id, "title": title, "safeSummaryMarkdown": summary, "facts": facts, "sourceContentHash": source_hash, "eventLineId": event_line_id or None}
+        payload_hash = self._payload_hash(normalized)
+        document_id = self.repository._record_id("knowledge_document", project_id, f"mobile-recording-{source_hash}")  # noqa: SLF001
+        with self.repository._connection() as connection:  # noqa: SLF001
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.repository._require_project_access(connection, identity, project_id=project_id, capability="knowledge_write")  # noqa: SLF001
+                replay = self._receipt(connection, identity, idempotency_key=idempotency_key, payload_hash=payload_hash)
+                if replay is not None:
+                    connection.rollback()
+                    return replay
+                if event_line_id:
+                    line = connection.execute("SELECT client_id,lifecycle_state FROM event_lines WHERE id=? AND scope_id=? AND record_kind='line'", (event_line_id, identity.scope_id)).fetchone()
+                    if line is None or str(line["client_id"]) != project_id or str(line["lifecycle_state"]) != "active":
+                        raise RepositoryError(422, "mobile_recording_event_line_invalid", "事件线不属于该项目或已归档")
+                current = connection.execute("SELECT current_version,version FROM knowledge_documents WHERE id=? AND scope_id=?", (document_id, identity.scope_id)).fetchone()
+                content = "\n".join([summary, "", "## 已提炼事实", *[f"- {fact}" for fact in facts]]).strip()
+                content_hash = sha256_text(content)
+                now = utc_now()
+                content_manifest_id = self.repository._record_id("manifest", document_id, content_hash)  # noqa: SLF001
+                receipt = canonical_json({"schema": "yiyu.mobile-recording-safe-summary.v1", "title": title, "safeSummaryMarkdown": summary, "facts": facts, "sourceContentHash": source_hash, "eventLineId": event_line_id or None, "localOriginalUploaded": False, "fullTranscriptUploaded": False})
+                receipt_hash = sha256_text(receipt)
+                connection.execute("INSERT OR IGNORE INTO object_manifests (id,scope_id,storage_key,content_hash,lifecycle_state,receipt,holder_role,holder_instance_id,storage_kind,byte_size,media_type,availability_state,receipt_hash,created_at,verified_at,deleted_at,authority_role,origin_instance_id) VALUES (?,?,NULL,?,'active',?,'organization_cloud',?,'safe_ai_summary',?,'application/vnd.yiyu.mobile-recording-summary+json','ready',?,?,?,NULL,'cloud',?)", (content_manifest_id, identity.scope_id, content_hash, receipt, identity.cloud_instance_id, len(receipt.encode("utf-8")), receipt_hash, now, now, identity.cloud_instance_id))
+                document_version = int(current["current_version"] or 0) + 1 if current else 1
+                aggregate_version = int(current["version"] or 0) + 1 if current else 1
+                if current is None:
+                    connection.execute("INSERT INTO secured_resources (id,scope_id,resource_kind,lifecycle_state,version,resource_type_key,created_at,updated_at,deleted_at,authority_role,origin_instance_id) VALUES (?,?,'knowledge_document','active',1,'mobile_recording_summary',?,?,NULL,'cloud',?)", (document_id, identity.scope_id, now, now, identity.cloud_instance_id))
+                    connection.execute("INSERT INTO knowledge_documents (id,scope_id,source_asset_id,client_id,current_version,owner_membership_id,title,document_kind,visibility_scope,parse_state,publication_state,published_at,version,lifecycle_state,created_at,updated_at,deleted_at) VALUES (?,?,NULL,?,?,? ,?,'shared_summary','organization','ready','published',?,1,'active',?,?,NULL)", (document_id, identity.scope_id, project_id, document_version, identity.membership_id, title, now, now, now))
+                else:
+                    connection.execute("UPDATE knowledge_documents SET current_version=?,title=?,publication_state='published',parse_state='ready',published_at=?,version=?,updated_at=? WHERE id=? AND scope_id=?", (document_version, title, now, aggregate_version, now, document_id, identity.scope_id))
+                    connection.execute("UPDATE secured_resources SET version=?,updated_at=? WHERE id=? AND scope_id=?", (aggregate_version, now, document_id, identity.scope_id))
+                version_id = self.repository._record_id("document_version", document_id, document_version)  # noqa: SLF001
+                connection.execute("INSERT INTO document_versions (id,scope_id,document_id,version,content_hash,created_at,object_manifest_id,source_asset_version,publication_state,created_by_membership_id,origin_instance_id,integrity_hash) VALUES (?,?,?,?,?,?,?,NULL,'published',?,?,?)", (version_id, identity.scope_id, document_id, document_version, content_hash, now, content_manifest_id, identity.membership_id, identity.cloud_instance_id, content_hash))
+                result = {"projectId": project_id, "documentId": document_id, "documentVersionId": version_id, "version": aggregate_version, "contentVersion": document_version, "publicationState": "published", "sourceContentHash": source_hash, "localOriginalUploaded": False, "fullTranscriptUploaded": False, "updatedAt": now}
+                self._record_command(connection, identity, idempotency_key=idempotency_key, payload_hash=payload_hash, command_type="project_knowledge.mobile_recording_summary_published", aggregate_type="knowledge_document", aggregate_id=document_id, aggregate_version=aggregate_version, expected_aggregate_version=(int(current["version"]) if current else None), result=result, target_resource_id=document_id)
+                connection.commit()
+                return result
+            except Exception:
+                connection.rollback()
+                raise
+
     @staticmethod
     def _payload_hash(payload: Mapping[str, Any]) -> str:
         return payload_fingerprint(dict(payload))
@@ -2053,6 +2113,8 @@ class GC07ProjectMaterialsRepository:
                     "sourceKind": (
                         "task_attachment_metadata"
                         if str(material.get("relationKind") or "") == "task"
+                        else "meeting_attachment_metadata"
+                        if str(material.get("relationKind") or "") == "meeting"
                         else "local_private_metadata"
                     ),
                     "relationKind": str(material.get("relationKind") or "").strip(),
@@ -2081,7 +2143,7 @@ class GC07ProjectMaterialsRepository:
                     project_id=project_id,
                 )
                 for material in normalized:
-                    if material["relationKind"] not in {"", "task"}:
+                    if material["relationKind"] not in {"", "task", "meeting"}:
                         raise RepositoryError(422, "material_relation_invalid", "资料关联对象无效")
                     if material["relationKind"] == "task":
                         task = connection.execute(
@@ -2091,6 +2153,14 @@ class GC07ProjectMaterialsRepository:
                         ).fetchone()
                         if task is None or str(task["client_id"] or "") != project_id:
                             raise RepositoryError(409, "task_material_project_mismatch", "任务附件与项目归属不一致")
+                    if material["relationKind"] == "meeting":
+                        meeting = connection.execute(
+                            "SELECT client_id FROM meetings WHERE id=? AND scope_id=? "
+                            "AND lifecycle_state!='deleted'",
+                            (material["relationId"], identity.scope_id),
+                        ).fetchone()
+                        if meeting is None or str(meeting["client_id"] or "") != project_id:
+                            raise RepositoryError(409, "meeting_material_project_mismatch", "会议附件与项目归属不一致")
                 now = utc_now()
                 documents: list[dict[str, Any]] = []
                 skipped = 0
@@ -2115,11 +2185,7 @@ class GC07ProjectMaterialsRepository:
                             project_id,
                             content_hash,
                             material["sourceKind"],
-                            (
-                                f"task:{material['relationId']}"
-                                if material["relationKind"] == "task"
-                                else ""
-                            ),
+                            (f"{material['relationKind']}:{material['relationId']}" if material["relationKind"] else ""),
                         ),
                     ).fetchone()
                     if existing is not None:
@@ -2205,11 +2271,7 @@ class GC07ProjectMaterialsRepository:
                                 material["fileName"],
                                 material["mediaType"],
                                 material["byteSize"],
-                                (
-                                    f"task:{material['relationId']}"
-                                    if material["relationKind"] == "task"
-                                    else None
-                                ),
+                                (f"{material['relationKind']}:{material['relationId']}" if material["relationKind"] else None),
                                 identity.membership_id,
                                 now,
                                 now,

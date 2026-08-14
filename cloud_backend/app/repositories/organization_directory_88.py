@@ -340,6 +340,41 @@ class StrictOrganizationDirectoryRepository:
             ]
             return [self._member(connection, identity, item) for item in ids]
 
+    def member_candidates(self, identity: SessionIdentity) -> list[dict[str, Any]]:
+        """Return the minimum coworker directory available to every active member.
+
+        The administrative directory deliberately remains admin-only. Task and
+        meeting assignment, however, is an ordinary collaboration capability and
+        must not depend on that administrative privilege.
+        """
+        with self.repository._connection() as connection:  # noqa: SLF001
+            self._assert_identity(connection, identity)
+            rows = connection.execute(
+                "SELECT m.id,m.role_key,m.status,p.display_name,p.contact_type,"
+                "p.normalized_contact FROM organization_memberships m "
+                "JOIN principals p ON p.id=m.principal_id "
+                "WHERE m.scope_id=? AND m.record_kind='membership' "
+                "AND m.lifecycle_state='active' AND m.status='active' "
+                "AND p.status='active' ORDER BY p.display_name,m.id",
+                (identity.scope_id,),
+            ).fetchall()
+        return [
+            {
+                "id": str(row["id"]),
+                "fullName": str(row["display_name"] or "未命名成员"),
+                "email": (
+                    str(row["normalized_contact"] or "")
+                    if str(row["contact_type"] or "") == "email"
+                    else ""
+                ),
+                "primaryRole": (
+                    "admin" if str(row["role_key"] or "") == "admin" else "employee"
+                ),
+                "membershipStatus": "active",
+            }
+            for row in rows
+        ]
+
     def departments(self, identity: SessionIdentity) -> list[dict[str, Any]]:
         with self.repository._connection() as connection:  # noqa: SLF001
             self._assert_identity(connection, identity)

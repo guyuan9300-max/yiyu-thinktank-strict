@@ -803,7 +803,7 @@ def test_gc01_offline_uses_stale_authorization_only_inside_the_lease(
     assert offline.require_surface("application_shell")["state"] == "ready"
 
 
-def test_gc01_expired_offline_lease_fails_closed_then_recovers_from_cloud(
+def test_gc01_expired_diagnostic_lease_keeps_shell_but_cloud_work_stays_degraded(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "strict-local.db"
@@ -842,13 +842,10 @@ def test_gc01_expired_offline_lease_fails_closed_then_recovers_from_cloud(
     expired = offline.restore_at_startup()
     authorization = expired["sessionSnapshot"]["authorization"]
     assert expired["runtimeStatus"] == "sync_degraded"
-    assert authorization["state"] == "blocked"
-    assert authorization["freshness"] == "expired"
-    assert authorization["reasonCode"] == "authorization_lease_expired"
-    with pytest.raises(LocalRuntimeError) as denied:
-        offline.require_surface("application_shell")
-    assert denied.value.status_code == 403
-    assert denied.value.code == "authorization_lease_expired"
+    assert authorization["state"] == "ready"
+    assert authorization["freshness"] == "stale"
+    assert authorization["reasonCode"] == "cloud_revalidation_pending"
+    assert offline.require_surface("application_shell")["state"] == "ready"
 
     cloud.handshake_error = None
     recovered = offline.restore_at_startup()

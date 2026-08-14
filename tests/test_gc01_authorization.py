@@ -918,6 +918,13 @@ def test_gc01_session_login_refresh_and_logout_are_replayable_and_audited(
             )
             connection.commit()
 
+        still_current = client.get(
+            "/api/v2/authorization/current",
+            headers=_auth(first.json()["accessToken"]),
+        )
+        assert still_current.status_code == 200, still_current.text
+        assert still_current.json()["state"] == "ready"
+
         reconnected = client.post(
             "/api/v2/auth/login",
             headers={"Idempotency-Key": "gc01-login-after-expired-lease"},

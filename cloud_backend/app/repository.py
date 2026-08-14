@@ -1099,6 +1099,7 @@ class CloudRepository:
             "previewSummary",
             "answer",
             "statement",
+            "excerpt",
         ):
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
@@ -1231,6 +1232,38 @@ class CloudRepository:
                 """,
                 (project_id, identity.scope_id),
             ).fetchall()
+            favorite_rows = connection.execute(
+                """
+                SELECT sets.id, sets.version, sets.updated_at,
+                       manifest.receipt, manifest.content_hash,
+                       (
+                         SELECT member.source_object_id
+                           FROM source_set_members AS member
+                          WHERE member.scope_id=sets.scope_id
+                            AND member.source_set_id=sets.id
+                            AND member.source_object_kind='ai_answer'
+                            AND member.lifecycle_state='active'
+                          ORDER BY member.ordinal, member.id
+                          LIMIT 1
+                       ) AS source_answer_id
+                  FROM source_sets AS sets
+                  JOIN source_set_members AS excerpt
+                    ON excerpt.scope_id=sets.scope_id
+                   AND excerpt.source_set_id=sets.id
+                   AND excerpt.source_object_kind='favorite_excerpt'
+                   AND excerpt.lifecycle_state='active'
+                  JOIN object_manifests AS manifest
+                    ON manifest.scope_id=excerpt.scope_id
+                   AND manifest.id=excerpt.source_object_id
+                   AND manifest.lifecycle_state='active'
+                 WHERE sets.scope_id=? AND sets.client_id=?
+                   AND sets.created_by_principal_id=?
+                   AND sets.purpose_kind='answer_favorite'
+                   AND sets.lifecycle_state='active'
+                 ORDER BY sets.updated_at DESC, sets.id
+                """,
+                (identity.scope_id, project_id, identity.principal_id),
+            ).fetchall()
             official_semantic_rows = connection.execute(
                 """
                 SELECT fact.id, fact.version, fact.updated_at, fact.fact_hash,
@@ -1336,6 +1369,10 @@ class CloudRepository:
             summary = self._knowledge_manifest_summary(row["receipt"])
             if not summary:
                 continue
+            try:
+                correction_receipt = json.loads(str(row["receipt"] or "{}"))
+            except json.JSONDecodeError:
+                correction_receipt = {}
             purpose_kind = str(row["purpose_kind"] or "")
             is_remember = purpose_kind == "answer_remember"
             is_profile_clarification = purpose_kind == "strategic_profile_clarification"
@@ -1354,6 +1391,31 @@ class CloudRepository:
                     "contentHash": str(row["content_hash"] or row["fact_hash"] or ""),
                     "sourceKind": purpose_kind or "answer_correction",
                     "memoryKind": "explicit_memory" if is_remember else "correction",
+                    "selectedTextHash": str(
+                        correction_receipt.get("selectedTextHash")
+                        if isinstance(correction_receipt, dict)
+                        else ""
+                    ) or None,
+                    "version": int(row["version"] or 1),
+                    "updatedAt": row["updated_at"],
+                    "availabilityState": "ready",
+                    "authority": "organization_cloud",
+                }
+            )
+
+        for row in favorite_rows:
+            summary = self._knowledge_manifest_summary(row["receipt"])
+            if not summary:
+                continue
+            saved_memories.append(
+                {
+                    "sourceId": str(row["id"]),
+                    "sourceAnswerId": str(row["source_answer_id"] or "") or None,
+                    "sourceDescription": "本人项目收藏",
+                    "summary": summary,
+                    "contentHash": str(row["content_hash"] or ""),
+                    "sourceKind": "answer_favorite",
+                    "memoryKind": "favorite",
                     "version": int(row["version"] or 1),
                     "updatedAt": row["updated_at"],
                     "availabilityState": "ready",

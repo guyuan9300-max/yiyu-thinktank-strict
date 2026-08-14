@@ -5,6 +5,8 @@
   "policySpecSchemaVersion": "gc01.organization-role-policy.v1",
   "viewerSurfacesSchemaVersion": "gc01.viewer-surfaces.v1",
   "viewerCapabilitiesSchemaVersion": "gc01.viewer-capabilities.v1",
+  "authorizationMode": "online_revalidation",
+  "leaseEnforcement": "diagnostic_only",
   "leaseHours": 24,
   "baselineProfile": "member",
   "unknownRolePolicy": "baseline_least_privilege",

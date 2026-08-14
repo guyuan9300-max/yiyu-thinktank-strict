@@ -8,6 +8,7 @@ from backend.app.ui_domains import task_attachments as local_task_attachments
 from backend.app.ui_domains.project_materials import register_and_process_local_materials
 from backend.app.ui_domains.routing import UiRequest
 from cloud_backend.app.repositories.gc04_tasks import GC04TaskRepository
+from cloud_backend.app.repositories.gc06_planning import create_meeting
 from cloud_backend.app.repositories.project_materials import GC07ProjectMaterialsRepository
 from strict_common.schema import runtime_connection, user_tables
 from tests.test_gc14_workbench_answer import _repository
@@ -172,6 +173,44 @@ def test_task_attachment_registers_only_safe_project_metadata(tmp_path: Path) ->
             (attachment["id"],),
         ).fetchone()[0]
         assert "/" not in str(receipt).replace("local_private_metadata_only", "")
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_meeting_attachment_registers_only_safe_project_metadata(tmp_path: Path) -> None:
+    repository, identity, payload = _repository(tmp_path)
+    meeting = create_meeting(
+        repository,
+        identity,
+        payload={
+            "title": "核对会议附件",
+            "clientId": payload["projectId"],
+            "startsAt": "2026-08-13T09:00:00+08:00",
+            "endsAt": "2026-08-13T10:00:00+08:00",
+        },
+        idempotency_key="meeting-attachment-create",
+    )["meeting"]
+    materials = GC07ProjectMaterialsRepository(repository)
+    registered = materials.register_local_material_metadata(
+        identity,
+        project_id=payload["projectId"],
+        materials=[{
+            "localSourceId": "local-meeting-file-1",
+            "fileName": "会议资料.txt",
+            "contentHash": "d" * 64,
+            "byteSize": 22,
+            "mediaType": "text/plain",
+            "relationKind": "meeting",
+            "relationId": meeting["id"],
+        }],
+        idempotency_key="meeting-attachment-metadata",
+    )
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        row = connection.execute(
+            "SELECT source_kind,source_locator_nonlocal FROM source_assets WHERE id=?",
+            (registered["documents"][0]["documentId"],),
+        ).fetchone()
+        assert tuple(row) == ("meeting_attachment_metadata", f"meeting:{meeting['id']}")
+        assert len(user_tables(connection)) == 88
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

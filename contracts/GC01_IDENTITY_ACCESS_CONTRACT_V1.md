@@ -15,7 +15,9 @@
 - `loading`：请求正在进行；不得先显示空结果。
 - `ready`：身份、会话和权限租约有效。
 - `empty`：查询成功且授权范围内确实没有对象。
-- `blocked`：身份存在但明确不能继续，例如 `permission_denied`、`schema_incompatible`、`authorization_lease_expired`。
+- `blocked`：身份存在但明确不能继续，例如 `permission_denied`、`schema_incompatible`。
+
+权限以组织云当前会话、成员关系、作用域和授权策略的在线校验结果为准。历史 `lease_expires_at` 字段仅用于兼容旧客户端和诊断投影新鲜度，不得单独阻止仍处于 active 状态的成员；断网时组织云业务操作准确返回连接失败，本机原件和未提交草稿仍可保留。
 - `failed_retryable`：超时、网络或临时服务失败。
 - `not_connected`：没有组织绑定、会话或已登记能力尚未接通。
 

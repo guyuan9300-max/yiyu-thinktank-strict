@@ -2,9 +2,9 @@
   "formatVersion": 1,
   "manifestId": "yiyu.strict.cloud.blueprint88.v1",
   "status": "FROZEN_FOR_IMPLEMENTATION",
-  "contractDate": "2026-08-12",
+  "contractDate": "2026-08-13",
   "schemaFamily": "yiyu-blueprint-88-v1",
-  "contractVersion": "9",
+  "contractVersion": "10",
   "databaseRole": "cloud_blueprint_88_authority_and_projection",
   "databaseEngine": "SQLite 3 STRICT tables",
   "requiredPragmas": {
@@ -24,7 +24,8 @@
     "deletionBoundary": "默认 CAS 墹碑；清除只经 purge_ledger 分层结算；外键统一 RESTRICT",
     "agentMemoryFoundation": "六个内置功能 Agent 以 bot_definitions 组织作用域权威行登记；项目问答显式绑定 client_id 与 bot_id。",
     "agentSkillFoundation": "Skill 以 automation_rules(record_kind=agent_skill) 为唯一权威；内置 Agent 核心岗位版本继续由 bot_definitions 权威登记。",
-    "flatPlanning": "计划是 planning_cycles 中可直接选择的独立对象；tasks/meetings 通过 planning_cycle_id 多对一关联。decision_actions 不再充当计划步骤或主要任务槽位。"
+    "flatPlanning": "计划是 planning_cycles 中可直接选择的独立对象；tasks/meetings 通过 planning_cycle_id 多对一关联。decision_actions 不再充当计划步骤或主要任务槽位。",
+    "classifiedMobileRecording": "待归类手机录音只留设备本地；正式归类后才进入 recordings，并沿 processing_attempts、transcription_versions、knowledge_documents 链路加工。"
   },
   "sourceOfTruthBoundary": "组织云裁决组织身份、权限与组织业务事实；本机原件和本机偏好只保留安全投影。",
   "forbiddenRuntime": {
@@ -4862,9 +4863,59 @@
           }
         },
         {
-          "name": "meeting_id",
+          "name": "binding_kind",
           "type": "TEXT",
           "nullable": false,
+          "default": null,
+          "primary_key": false,
+          "reference": null
+        },
+        {
+          "name": "task_id",
+          "type": "TEXT",
+          "nullable": true,
+          "default": null,
+          "primary_key": false,
+          "reference": {
+            "kind": "foreign_key",
+            "target_table": "tasks",
+            "target_field": "id",
+            "on_delete": "RESTRICT",
+            "source": "2026-08-13 产品裁决：手机速记录音归类到任务、会议或项目语料"
+          }
+        },
+        {
+          "name": "client_id",
+          "type": "TEXT",
+          "nullable": true,
+          "default": null,
+          "primary_key": false,
+          "reference": {
+            "kind": "foreign_key",
+            "target_table": "clients",
+            "target_field": "id",
+            "on_delete": "RESTRICT",
+            "source": "2026-08-13 产品裁决：手机速记录音归类到任务、会议或项目语料"
+          }
+        },
+        {
+          "name": "event_line_id",
+          "type": "TEXT",
+          "nullable": true,
+          "default": null,
+          "primary_key": false,
+          "reference": {
+            "kind": "foreign_key",
+            "target_table": "event_lines",
+            "target_field": "id",
+            "on_delete": "RESTRICT",
+            "source": "2026-08-13 产品裁决：手机速记录音归类到任务、会议或项目语料"
+          }
+        },
+        {
+          "name": "meeting_id",
+          "type": "TEXT",
+          "nullable": true,
           "default": null,
           "primary_key": false,
           "reference": {
@@ -5026,9 +5077,21 @@
         {
           "name": "ck_tombstone_time",
           "expression": "(lifecycle_state='deleted' AND deleted_at IS NOT NULL) OR (lifecycle_state!='deleted' AND deleted_at IS NULL)"
+        },
+        {
+          "name": "ck_recording_binding_kind",
+          "expression": "binding_kind IN ('task','meeting','project')"
+        },
+        {
+          "name": "ck_recording_binding_shape",
+          "expression": "(binding_kind='meeting' AND meeting_id IS NOT NULL AND task_id IS NULL AND client_id IS NULL AND event_line_id IS NULL) OR (binding_kind='task' AND task_id IS NOT NULL AND meeting_id IS NULL AND client_id IS NULL AND event_line_id IS NULL) OR (binding_kind='project' AND client_id IS NOT NULL AND meeting_id IS NULL AND task_id IS NULL)"
         }
       ],
-      "command_invariants": [],
+      "command_invariants": [
+        "手机录音停止后必须归类为已有任务/会议、新建任务/会议或项目共享语料；未归类原件只留本机草稿，不写组织事实。",
+        "recordings 每行只能有一个主绑定：task、meeting 或 project；project 绑定可选同项目 active event_line。",
+        "录音原件和完整转写默认本地权威；云端只保存安全元数据，发布摘要或纪要后由 knowledge_documents 形成新的云端权威事实。"
+      ],
       "deletion_policy": {
         "mode": "tombstone_then_purge",
         "rule": "CAS 写 lifecycle_state=deleted 与 deleted_at；影响预检后由 purge_ledger 分层清除。",

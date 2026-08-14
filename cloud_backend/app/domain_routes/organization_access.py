@@ -701,6 +701,12 @@ def register_routes(
     ) -> dict[str, Any]:
         return {"items": strict_directory.members(identity)}
 
+    @app.get("/api/v2/organization-access/member-candidates")
+    def member_candidates(
+        identity: SessionIdentity = Depends(identity_dependency),
+    ) -> dict[str, Any]:
+        return {"items": strict_directory.member_candidates(identity)}
+
     @app.get("/api/v2/organization-access/membership-applications/me")
     def current_membership_application(
         identity: SessionIdentity = Depends(identity_dependency),

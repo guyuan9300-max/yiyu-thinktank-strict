@@ -3341,6 +3341,13 @@ def _meeting_payload(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[s
         scope_id=str(row["scope_id"]),
         meeting_id=str(row["id"]),
     )
+    attachment_rows = connection.execute(
+        "SELECT id,display_name,media_type,byte_size,content_hash,availability_state,"
+        "version,created_at,updated_at FROM source_assets WHERE scope_id=? "
+        "AND source_kind='meeting_attachment_metadata' AND source_locator_nonlocal=? "
+        "AND lifecycle_state='active' ORDER BY created_at,id",
+        (str(row["scope_id"]), f"meeting:{row['id']}"),
+    ).fetchall()
     return {
         "id": str(row["id"]),
         "clientId": str(row["client_id"]),
@@ -3353,6 +3360,23 @@ def _meeting_payload(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[s
         "organizerMembershipId": row["organizer_membership_id"],
         "createdByMembershipId": creator_membership_id,
         "collaborators": collaborators,
+        "attachments": [
+            {
+                "id": str(item["id"]),
+                "title": str(item["display_name"] or "会议附件"),
+                "fileName": str(item["display_name"] or "会议附件"),
+                "mediaType": str(item["media_type"] or "application/octet-stream"),
+                "byteSize": int(item["byte_size"] or 0),
+                "contentHash": str(item["content_hash"] or ""),
+                "localAvailable": False,
+                "sourceScope": "member_local_metadata",
+                "availabilityState": str(item["availability_state"] or "local_only"),
+                "version": int(item["version"] or 1),
+                "createdAt": item["created_at"],
+                "updatedAt": item["updated_at"],
+            }
+            for item in attachment_rows
+        ],
         "planLink": _meeting_plan_link_payload(
             connection,
             scope_id=str(row["scope_id"]),

@@ -29,6 +29,8 @@ def _load_policy_contract() -> dict[str, Any]:
         raw.get("status") != "active"
         or not isinstance(profiles, dict)
         or baseline not in profiles
+        or raw.get("authorizationMode") != "online_revalidation"
+        or raw.get("leaseEnforcement") != "diagnostic_only"
         or int(raw.get("leaseHours") or 0) != 24
     ):
         raise RuntimeError("GC-01 authorization policy contract is invalid")
@@ -594,13 +596,12 @@ def read_authorization_projection(
             "authorization_projection_stale",
             "权限投影已过期，请重新同步",
         )
-    lease_expires_at = str(row["lease_expires_at"] or "")
-    if not lease_expires_at or _parse_time(lease_expires_at) <= datetime.now(timezone.utc):
-        raise AuthorizationProjectionError(
-            403,
-            "authorization_lease_expired",
-            "权限租约已过期，请重新连接组织云",
-        )
+    # The cloud request itself has already authenticated the live server
+    # session and joined the current principal/membership/scope rows above.
+    # `lease_expires_at` is retained for old-client compatibility and audit
+    # freshness only; it must not become a second, time-based authorization
+    # authority that can block an otherwise active organization member.
+    lease_expires_at = str(row["lease_expires_at"] or "") or None
     return {
         "state": "ready",
         "freshness": "current",

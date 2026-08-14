@@ -22,6 +22,9 @@ from .gc04_tasks import register_gc04_task_routes
 from .gc06_planning import register_gc06_planning_routes
 from .data_center_support_88 import register_data_center_support_routes
 from .organization_access import register_routes as register_organization_access_routes
+from .mobile_sync import register_mobile_sync_routes
+from .mobile_consult import register_mobile_consult_routes
+from .mobile_devices import register_mobile_device_routes
 from ..repositories.gc06_task_command_port import GC04_FORMAL_TASK_COMMAND_PORT
 
 
@@ -56,3 +59,6 @@ def register_domain_routes(
         task_command_port=GC04_FORMAL_TASK_COMMAND_PORT,
     )
     register_data_center_support_routes(app, repository, identity_dependency)
+    register_mobile_sync_routes(app, repository, identity_dependency)
+    register_mobile_consult_routes(app, repository, identity_dependency)
+    register_mobile_device_routes(app, repository, identity_dependency)

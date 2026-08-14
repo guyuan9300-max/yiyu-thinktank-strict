@@ -852,10 +852,11 @@ def _knowledge_presentation(
             "title": item.get("sourceDescription") or "已同步记忆",
             "summary": item.get("summary") or "",
             "memoryKind": item.get("memoryKind") or "explicit_memory",
+            "sourceAnswerId": item.get("sourceAnswerId"),
             "contentHash": item.get("contentHash") or "",
             "publicationState": "published",
             "updatedAt": item.get("updatedAt"),
-            "authority": "organization_cloud",
+            "authority": item.get("authority") or "organization_cloud",
         }
         for item in (cloud.get("savedMemories") or [])
     ]

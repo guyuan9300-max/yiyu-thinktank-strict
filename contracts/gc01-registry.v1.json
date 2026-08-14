@@ -118,7 +118,7 @@
       "queryId": "gc01.query.authorization.current",
       "authorityKind": "cloud_authority_local_projection",
       "projectionKind": "viewer_surfaces_and_capabilities",
-      "stalePolicy": "fail_closed_when_authorization_lease_expires",
+      "stalePolicy": "online_revalidation_required",
       "localRead": ["sandboxes", "authorization_scopes", "organizations", "organization_memberships", "principals", "policy_versions", "viewer_projections"],
       "cloudRead": ["sandboxes", "authorization_scopes", "organization_memberships", "principals", "policy_versions", "viewer_projections"]
     }

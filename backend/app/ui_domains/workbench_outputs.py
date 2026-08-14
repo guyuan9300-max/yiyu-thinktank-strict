@@ -1079,6 +1079,23 @@ def _workspace(compatibility: Any, project_id: str) -> dict[str, Any]:
         and hasattr(local_materials, "knowledge_presentation")
         else {"savedMemories": []}
     )
+    merged_saved_memories: dict[str, dict[str, Any]] = {}
+    for item in [
+        *(local_knowledge.get("savedMemories") or []),
+        *(knowledge_context.get("savedMemories") or []),
+    ]:
+        memory_id = _string(item.get("id") or item.get("sourceId"))
+        if not memory_id:
+            continue
+        merged_saved_memories[memory_id] = {
+            **item,
+            "id": memory_id,
+            "title": item.get("title") or item.get("sourceDescription") or "已存记忆",
+            "summary": item.get("summary") or item.get("statement") or "",
+            "authority": item.get("authority") or (
+                "organization_cloud" if item.get("sourceId") else "current_device"
+            ),
+        }
     memory_cards = [
         {
             "id": item.get("id"),
@@ -1112,7 +1129,11 @@ def _workspace(compatibility: Any, project_id: str) -> dict[str, Any]:
             "updatedAt": item.get("updatedAt"),
             "chatMessageId": item.get("sourceAnswerId"),
             "storageKind": (
-                "local_answer_memory"
+                (
+                    "organization_member_favorite"
+                    if item.get("authority") == "organization_cloud"
+                    else "local_answer_memory"
+                )
                 if item.get("memoryKind") == "favorite"
                 else "cloud_formal_fact"
             ),
@@ -1122,7 +1143,7 @@ def _workspace(compatibility: Any, project_id: str) -> dict[str, Any]:
             "version": item.get("version") or 1,
             "status": "active",
         }
-        for item in local_knowledge.get("savedMemories") or []
+        for item in merged_saved_memories.values()
     ]
     resource_states = {
         "documents": "ready" if documents else "empty",
@@ -1770,17 +1791,18 @@ def favorite_answer(
         message_id,
         expected_project_id=project_id,
     )
-    result = compatibility.runtime.workbench_save_answer_memory(
-        project_id=project_id,
-        answer_id=_string(answer.get("answerId")),
-        memory_kind="favorite",
-        idempotency_key=request.idempotency_key,
+    result = _cloud_command(
+        compatibility,
+        request,
+        "POST",
+        f"/api/v2/mobile-consult/answers/{_string(answer.get('answerId'))}/favorite",
+        {"projectId": project_id, "excerpt": _string(answer.get("answer") or answer.get("content"))},
     )
     return {
         **result,
-        "documentId": result.get("memoryId"),
-        "storageKind": "local_answer_memory",
-        "message": "已收藏为当前项目的本机记忆",
+        "documentId": result.get("favoriteId"),
+        "storageKind": "organization_member_favorite",
+        "message": "已收藏，并自动同步到本人其他设备",
     }
 
 
@@ -1796,17 +1818,11 @@ def unfavorite_answer(
         message_id,
         expected_project_id=project_id,
     )
-    return compatibility.runtime.workbench_revoke_answer_memory(
-        project_id=project_id,
-        answer_id=_string(answer.get("answerId")),
-        memory_kind="favorite",
-        expected_version=(
-            int(request.body.get("expectedVersion"))
-            if request.body.get("expectedVersion") is not None
-            else None
-        ),
-        idempotency_key=request.idempotency_key,
-    )
+    favorites = _cloud_query(compatibility, f"/api/v2/mobile-consult/projects/{project_id}/favorites")
+    favorite = next((item for item in favorites.get("favorites", []) if _string(item.get("answerId")) == _string(answer.get("answerId"))), None)
+    if not favorite:
+        return {"removed": True, "alreadyRemoved": True}
+    return _cloud_command(compatibility, request, "DELETE", f"/api/v2/mobile-consult/favorites/{_string(favorite.get('favoriteId'))}", {})
 
 
 @router.post(r"clients/([^/]+)/workspace/chat/messages/([^/]+)/facts/corrections")

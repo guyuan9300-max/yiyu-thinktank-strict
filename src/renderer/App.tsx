@@ -4520,9 +4520,15 @@ function splitTaskDueDateTime(value?: string | null) {
   if (/(?:Z|[+-]\d{2}:?\d{2})$/i.test(text)) {
     const zoned = new Date(text);
     if (!Number.isNaN(zoned.getTime())) {
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+      }).formatToParts(zoned);
+      const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value || '';
       return {
-        date: formatDateOnlyValue(zoned),
-        time: `${String(zoned.getHours()).padStart(2, '0')}:${String(zoned.getMinutes()).padStart(2, '0')}`,
+        date: `${get('year')}-${get('month')}-${get('day')}`,
+        time: `${get('hour')}:${get('minute')}`,
       };
     }
   }
@@ -4890,9 +4896,9 @@ function inferTaskDueDate(params: {
   title: string;
   desc: string;
   today: Date;
-}): { dueDate: string | null; dueTime: string | null; reason: string | null } {
+}): { dueDate: string | null; dueTime: string | null; durationMinutes: number | null; reason: string | null } {
   const text = `${params.title}\n${params.desc}`.trim();
-  if (!text) return { dueDate: null, dueTime: null, reason: null };
+  if (!text) return { dueDate: null, dueTime: null, durationMinutes: null, reason: null };
 
   const today = new Date(params.today.getFullYear(), params.today.getMonth(), params.today.getDate());
   const formatDate = (date: Date) => {
@@ -5014,6 +5020,7 @@ function inferTaskDueDate(params: {
 
   // ─── 时间识别 ───
   let dueTime: string | null = null;
+  let durationMinutes: number | null = null;
   let timeReason = '';
 
   // 1) HH:MM(优先,最明确)
@@ -5063,6 +5070,26 @@ function inferTaskDueDate(params: {
     }
   }
 
+  const toMinutes = (hour: number, minute: number, period = '') => {
+    let resolved = hour;
+    if (/下午|傍晚|晚上/.test(period) && resolved < 12) resolved += 12;
+    if (/上午|早上/.test(period) && resolved === 12) resolved = 0;
+    return resolved * 60 + minute;
+  };
+  const numericRange = text.match(/(\d{1,2})[:：](\d{2})\s*(?:到|至|[-–—~])\s*(\d{1,2})[:：](\d{2})/);
+  const chineseRange = text.match(/(上午|早上|中午|下午|傍晚|晚上)?\s*(\d{1,2})点(?:([0-5]?\d)分?)?\s*(?:到|至|[-–—~])\s*(上午|早上|中午|下午|傍晚|晚上)?\s*(\d{1,2})点(?:([0-5]?\d)分?)?/);
+  if (numericRange) {
+    const start = Number(numericRange[1]) * 60 + Number(numericRange[2]);
+    const end = Number(numericRange[3]) * 60 + Number(numericRange[4]);
+    if (end > start) durationMinutes = end - start;
+  } else if (chineseRange) {
+    const startPeriod = chineseRange[1] || '';
+    const endPeriod = chineseRange[4] || startPeriod;
+    const start = toMinutes(Number(chineseRange[2]), Number(chineseRange[3] || 0), startPeriod);
+    const end = toMinutes(Number(chineseRange[5]), Number(chineseRange[6] || 0), endPeriod);
+    if (end > start) durationMinutes = end - start;
+  }
+
   // 3) 纯"中午/早上"(没有具体小时)
   if (!dueTime) {
     if (/中午(?!\d|[一二两三四五六七八九十])/.test(text)) {
@@ -5073,7 +5100,7 @@ function inferTaskDueDate(params: {
   }
 
   if (!dueDate && !dueTime) {
-    return { dueDate: null, dueTime: null, reason: null };
+    return { dueDate: null, dueTime: null, durationMinutes: null, reason: null };
   }
   const reasonParts: string[] = [];
   if (dateReason) reasonParts.push(`日期"${dateReason}"`);
@@ -5081,6 +5108,7 @@ function inferTaskDueDate(params: {
   return {
     dueDate,
     dueTime,
+    durationMinutes,
     reason: `系统识别到${reasonParts.join(' + ')},已自动填入;改了会沿用你的修改。`,
   };
 }
@@ -8089,7 +8117,6 @@ export default function App() {
       // 真原 bug: 旧 key 真占 favorite slot 但 UI 真过滤掉 → 用户感觉"加 1 个占 2 位".
       const KNOWN_TOOL_KEYS = new Set([
         'import', 'fill_template', 'text_doc', 'link_material', 'smart_import',
-        'memory_sync',
       ]);
       const migrated: string[] = [];
       let hasLegacyImport = false;
@@ -8891,10 +8918,14 @@ export default function App() {
   const isCloudSession = authState.sessionMode === 'cloud';
   const isLocalSession = authState.sessionMode === 'local';
   const viewerAuthorization = authState.authorization || null;
+  const legacyLeaseOnlyBlock = Boolean(
+    viewerAuthorization?.state === 'blocked'
+    && viewerAuthorization?.reasonCode === 'authorization_lease_expired',
+  );
   const viewerSurfaces = viewerAuthorization?.surfaces || [];
   const viewerCapabilities = viewerAuthorization?.capabilities || [];
   const authorizationReady = Boolean(
-    !isCloudSession || viewerAuthorization?.state === 'ready',
+    !isCloudSession || viewerAuthorization?.state === 'ready' || legacyLeaseOnlyBlock,
   );
   const canUseApplicationShell = Boolean(
     !isCloudSession || (authorizationReady && viewerSurfaces.includes('application_shell')),
@@ -9369,6 +9400,11 @@ export default function App() {
     requested: false,
     titleFallback: '',
   });
+  const pendingMeetingMediaActionRef = useRef<
+    | { kind: 'import_recording'; paths: string[] }
+    | { kind: 'import_attachments'; paths: string[] }
+    | null
+  >(null);
 
   useEffect(() => {
     clientEditorModalStateRef.current = clientEditorModalState;
@@ -13984,7 +14020,7 @@ export default function App() {
       priorityTouched: false,
       priorityReason: '系统会根据任务内容自动识别优先级，你可以手动调整。',
       dueDate: defaultDueDateFromPreset(effectiveTaskSettings.defaultDueDatePreset),
-      dueTime: '',
+      dueTime: defaultDueDateFromPreset(effectiveTaskSettings.defaultDueDatePreset) ? '09:00' : '',
       durationMinutes: 60,
       clientId: '',
       clientTouched: false,
@@ -14162,6 +14198,8 @@ export default function App() {
     }, [isTaskModalOpen]);
 
     const resetTaskModalTransientState = () => {
+      pendingRecordingStartRef.current = { requested: false, titleFallback: '' };
+      pendingMeetingMediaActionRef.current = null;
       setIsDuePickerOpen(false);
       setDuePickerTab('date');
       setIsMentionMenuOpen(false);
@@ -14647,6 +14685,7 @@ export default function App() {
         er: nextEventLine?.reason ?? null,
         dd: nextDueDateInfo?.dueDate ?? null,
         dt: nextDueDateInfo?.dueTime ?? null,
+        dm: nextDueDateInfo?.durationMinutes ?? null,
       });
       if (fingerprint === taskInferFingerprintRef.current) return;
       taskInferFingerprintRef.current = fingerprint;
@@ -14670,6 +14709,7 @@ export default function App() {
           }
           if (!prev.dueTime && nextDueDateInfo.dueTime) {
             updates.dueTime = nextDueDateInfo.dueTime;
+            updates.durationMinutes = nextDueDateInfo.durationMinutes ?? 60;
           }
         }
         return Object.keys(updates).length > 0 ? { ...prev, ...updates } : prev;
@@ -15796,6 +15836,13 @@ export default function App() {
         ? `连续 ${taskCalendarSpanDays(editingTask.durationMinutes)} 天`
         : '--:--';
     })();
+    const duePickerEndTime = (() => {
+      if (!editingTask.dueTime) return '';
+      const [hour, minute] = editingTask.dueTime.split(':').map(Number);
+      if (!Number.isFinite(hour) || !Number.isFinite(minute)) return '';
+      const end = hour * 60 + minute + Math.max(15, editingTask.durationMinutes || 60);
+      return `${String(Math.floor((end % 1440) / 60)).padStart(2, '0')}:${String(end % 60).padStart(2, '0')}`;
+    })();
     const duePickerCalendarCells = useMemo(() => buildCalendarCells(duePickerMonth), [duePickerMonth]);
 
     useEffect(() => {
@@ -16830,9 +16877,66 @@ export default function App() {
               flash('error', recStart.reason || '录音启动失败');
             }
           }
+          const pendingMeetingMediaAction = pendingMeetingMediaActionRef.current;
+          pendingMeetingMediaActionRef.current = null;
+          let meetingMediaActionFailed = false;
+          if (pendingMeetingMediaAction) {
+            if (pendingMeetingMediaAction.kind === 'import_recording') {
+              setMeetingRecordingImporting(true);
+              try {
+                const recordingPath = pendingMeetingMediaAction.paths.find(gc08IsRecordingPath) || '';
+                if (!recordingPath) throw new Error('请选择受支持的音频或视频录音文件');
+                const registered = await gc08Api.registerRecording(saved.clientId, saved.id, {
+                  audioPath: recordingPath,
+                });
+                saveLastRecording(saved.clientId, saved.id, registered.recordingId);
+                setMeetingMediaRefreshKey((value) => value + 1);
+                flash('success', '客户会议已保存，录音已导入，可继续转写');
+              } catch (error) {
+                meetingMediaActionFailed = true;
+                flash(
+                  'error',
+                  `客户会议已保存，但录音导入失败：${error instanceof Error ? error.message : '可重新打开会议后重试'}`,
+                );
+              } finally {
+                setMeetingRecordingImporting(false);
+              }
+            } else {
+              setMeetingAttachmentImporting(true);
+              try {
+                const results = await importPaths(saved.clientId, 'file', pendingMeetingMediaAction.paths, {
+                  meetingId: saved.id,
+                });
+                const imported = results.reduce(
+                  (total, item) => total + Number(item.importedCount || 0),
+                  0,
+                );
+                if (currentClientId === saved.clientId) await refreshWorkspace(saved.clientId);
+                setMeetingMediaRefreshKey((value) => value + 1);
+                flash(
+                  'success',
+                  imported > 0
+                    ? `客户会议已保存，${imported} 份附件已加入项目工作台`
+                    : '客户会议已保存，所选附件已存在于项目工作台',
+                );
+              } catch (error) {
+                meetingMediaActionFailed = true;
+                flash(
+                  'error',
+                  `客户会议已保存，但附件导入失败：${error instanceof Error ? error.message : '可重新打开会议后重试'}`,
+                );
+              } finally {
+                setMeetingAttachmentImporting(false);
+              }
+            }
+          }
           closeTaskModal('meeting-saved');
           void loadTaskBlock();
-          flash('success', editingTask.id ? '客户会议已更新' : '客户会议已创建');
+          if (!pendingMeetingMediaAction || !meetingMediaActionFailed) {
+            if (!pendingMeetingMediaAction) {
+              flash('success', editingTask.id ? '客户会议已更新' : '客户会议已创建');
+            }
+          }
         } catch (error) {
           flash('error', error instanceof Error ? error.message : '客户会议保存失败');
         } finally {
@@ -17537,7 +17641,7 @@ export default function App() {
         priorityTouched: false,
         priorityReason: '系统会根据任务内容自动识别优先级，你可以手动调整。',
         dueDate: nextDueParts.date,
-        dueTime: nextDueParts.time,
+        dueTime: nextDueParts.time || (nextDueParts.date ? '09:00' : ''),
         durationMinutes: Math.max(15, options?.durationMinutes ?? 60),
         clientId: '',
         clientTouched: false,
@@ -17574,7 +17678,8 @@ export default function App() {
     const handleSmartParseResult = (result: TaskAiParseResult, originalText: string) => {
       const aiDueDate = result.dueDate || undefined;
       const aiDueTime = result.dueTime || '';
-      resetTaskDraft(aiDueDate);
+      const localTimeRange = inferTaskDueDate({ title: result.title || '', desc: originalText, today: new Date() });
+      resetTaskDraft(aiDueDate, { durationMinutes: localTimeRange.durationMinutes ?? 60 });
       setEditingTask((prev) => ({
         ...prev,
         title: result.title || prev.title,
@@ -17582,7 +17687,7 @@ export default function App() {
         priority: result.priority || prev.priority,
         priorityTouched: true,
         priorityReason: 'AI 从粘贴文本中识别',
-        dueTime: aiDueTime || prev.dueTime,
+        dueTime: aiDueTime || localTimeRange.dueTime || prev.dueTime,
         clientId: result.clientId || prev.clientId,
         clientTouched: Boolean(result.clientId),
         clientConfidence: result.clientId ? 'manual' : prev.clientConfidence,
@@ -17622,7 +17727,7 @@ export default function App() {
         priorityTouched: true,
         priorityReason: '保留当前优先级，你可以手动调整。',
         dueDate: resolvedDueParts.date,
-        dueTime: resolvedDueParts.time,
+        dueTime: resolvedDueParts.time || (resolvedDueParts.date ? '09:00' : ''),
         durationMinutes: Math.max(15, task.durationMinutes ?? options?.durationMinutes ?? 60),
         clientId: task.clientId || '',
         clientTouched: Boolean(task.clientId),
@@ -18780,12 +18885,25 @@ export default function App() {
       });
     };
 
+    const applyEditingTaskEndTime = (nextEndTime: string) => {
+      setEditingTask((prev) => {
+        if (!prev.dueTime || !nextEndTime) return prev;
+        const [startHour, startMinute] = prev.dueTime.split(':').map(Number);
+        const [endHour, endMinute] = nextEndTime.split(':').map(Number);
+        const duration = endHour * 60 + endMinute - (startHour * 60 + startMinute);
+        if (!Number.isFinite(duration) || duration <= 0) return prev;
+        return { ...prev, durationMinutes: duration };
+      });
+    };
+
     const applyEditingTaskDueDate = (nextDueDate: string) => {
       setEditingTask((prev) => {
-        const nextDueValue = combineTaskDueDateTime(nextDueDate, prev.dueTime);
+        const nextDueTime = nextDueDate ? (prev.dueTime || '09:00') : '';
+        const nextDueValue = combineTaskDueDateTime(nextDueDate, nextDueTime);
         return {
           ...prev,
           dueDate: nextDueDate,
+          dueTime: nextDueTime,
           ddl: nextDueValue ? formatTaskDueLabel(nextDueValue) : '待确认',
         };
       });
@@ -22830,8 +22948,8 @@ export default function App() {
                               ) : (
                                 <button
                                   type="button"
-                                  title={isEditingTaskPersonal ? '个人日程不支持录音转写' : !editingTask.clientId ? '先选择项目' : recordingSession.isActive ? '已有一个录音正在进行' : '开始录音（最长 4 小时）'}
-                                  disabled={isEditingTaskPersonal || !editingTask.clientId || recordingSession.isActive}
+                                  title={isEditingTaskPersonal ? '个人日程不支持录音转写' : recordingSession.isActive ? '已有一个录音正在进行' : '开始录音（最长 4 小时）'}
+                                  disabled={isEditingTaskPersonal || recordingSession.isActive}
                                   onClick={async () => {
                                     if (editingTask.id) {
                                       const result = await recordingSession.start({
@@ -23014,7 +23132,95 @@ export default function App() {
                           )}
                         />
                       ) : (
-                        <p className="text-xs text-slate-500">先保存会议，录音后即可在这里查看原件和转写文件位置。</p>
+                        <section
+                          aria-label="会议录音与转写文件"
+                          className="rounded-xl border border-slate-200 bg-slate-50/70 p-3"
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="flex items-center gap-2 text-xs font-bold text-slate-700">
+                              <Mic size={13} className="text-blue-500" />
+                              录音与转写
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                title={recordingSession.isActive ? '已有一个录音正在进行' : '保存会议后立即开始录音'}
+                                disabled={recordingSession.isActive || isSavingTask}
+                                onClick={() => {
+                                  pendingRecordingStartRef.current = {
+                                    requested: true,
+                                    titleFallback: '未命名会议录音',
+                                  };
+                                  if (!editingTask.title.trim()) {
+                                    flushSync(() => setEditingTask((previous) => ({
+                                      ...previous,
+                                      title: '未命名客户会议',
+                                    })));
+                                  }
+                                  void handleSaveTask();
+                                }}
+                                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-bold text-slate-500 hover:bg-rose-50 hover:text-rose-600 disabled:text-slate-300"
+                              >
+                                <Mic size={11} /> 录音
+                              </button>
+                              <button
+                                type="button"
+                                disabled={isSavingTask || meetingRecordingImporting || recordingSession.isActive}
+                                onClick={async () => {
+                                  const paths = await selectFilesBridge();
+                                  if (!paths.length) return;
+                                  if (!paths.some(gc08IsRecordingPath)) {
+                                    flash('error', '请选择受支持的音频或视频录音文件');
+                                    return;
+                                  }
+                                  pendingMeetingMediaActionRef.current = { kind: 'import_recording', paths };
+                                  if (!editingTask.title.trim()) {
+                                    flushSync(() => setEditingTask((previous) => ({
+                                      ...previous,
+                                      title: '未命名客户会议',
+                                    })));
+                                  }
+                                  void handleSaveTask();
+                                }}
+                                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-bold text-slate-500 hover:bg-blue-50 hover:text-blue-600 disabled:text-slate-300"
+                              >
+                                <UploadCloud size={11} /> 导入录音
+                              </button>
+                              <button
+                                type="button"
+                                disabled={isSavingTask || meetingAttachmentImporting}
+                                onClick={async () => {
+                                  const paths = await selectFilesBridge();
+                                  if (!paths.length) return;
+                                  pendingMeetingMediaActionRef.current = { kind: 'import_attachments', paths };
+                                  if (!editingTask.title.trim()) {
+                                    flushSync(() => setEditingTask((previous) => ({
+                                      ...previous,
+                                      title: '未命名客户会议',
+                                    })));
+                                  }
+                                  void handleSaveTask();
+                                }}
+                                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-bold text-slate-500 hover:bg-blue-50 hover:text-blue-600 disabled:text-slate-300"
+                              >
+                                <Paperclip size={11} /> 导入附件
+                              </button>
+                            </div>
+                          </div>
+                          <div className="mt-3 space-y-2 text-[11px] text-slate-500">
+                            <div className="flex items-center justify-between rounded-lg bg-white px-3 py-2">
+                              <span>录音原件</span>
+                              <span>文件不存在</span>
+                            </div>
+                            <div className="flex items-center justify-between rounded-lg bg-white px-3 py-2">
+                              <span>转写文件</span>
+                              <span>文件不存在</span>
+                            </div>
+                          </div>
+                          <p className="mt-2 text-[10px] leading-5 text-slate-400">
+                            首次操作会先正式保存客户会议，再继续录音或导入；如关联了项目，转写文件和附件会进入项目工作台。
+                          </p>
+                        </section>
                       )}
                       {/* 附件名称列表（显示在文本框内部） */}
                       {editingTask.recordMode === 'task' && visibleTaskAttachmentChips.length ? (
@@ -23199,12 +23405,9 @@ export default function App() {
                               );
                             }
                             const isAnyOtherRecording = recordingSession.isActive;
-                            const missingProject = !editingTask.clientId && !editingTask.eventLineId;
-                            const disabled = isEditingTaskPersonal || isAnyOtherRecording || missingProject;
+                            const disabled = isEditingTaskPersonal || isAnyOtherRecording;
                             const tooltip = isEditingTaskPersonal
                               ? '个人日程不支持录音转写'
-                              : missingProject
-                                ? '先选择项目'
                               : isAnyOtherRecording
                                 ? '已有一个录音正在进行'
                                 : editingTask.id
@@ -23703,17 +23906,24 @@ export default function App() {
                       </div>
                     </TaskPropertyRow>
 
-                    <TaskPropertyRow icon={<CalendarIcon size={16} />} label={editingTask.recordMode === 'customer_meeting' ? '会议时间' : '截止日期'}>
+                    <TaskPropertyRow icon={<CalendarIcon size={16} />} label="日期">
                       <button
                         type="button"
                         onClick={() => {
                           setIsDuePickerOpen((prev) => !prev);
-                          setDuePickerTab('date');
                         }}
                         className="rounded px-2 py-1 text-sm font-medium text-gray-700 hover:bg-gray-100"
                       >
-                        {duePickerSummaryLabel}
+                        {duePickerDateLabel}
                       </button>
+                    </TaskPropertyRow>
+
+                    <TaskPropertyRow icon={<Clock size={16} />} label="时间段">
+                      <div className="flex w-full items-center gap-2 px-2">
+                        <input type="time" value={editingTask.dueTime || ''} onChange={(event) => applyEditingTaskDueTime(event.target.value)} className="min-w-0 flex-1 rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700" />
+                        <span className="text-xs text-gray-400">至</span>
+                        <input type="time" value={duePickerEndTime} disabled={!editingTask.dueTime} onChange={(event) => applyEditingTaskEndTime(event.target.value)} className="min-w-0 flex-1 rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700 disabled:bg-gray-50 disabled:text-gray-300" />
+                      </div>
                     </TaskPropertyRow>
 
                     {editingTask.recordMode === 'task' && <TaskPropertyRow icon={<Flag size={16} className="text-red-500" />} label="优先级">
@@ -24280,29 +24490,6 @@ export default function App() {
                     className="w-[318px] max-w-full overflow-hidden rounded-[24px] border border-[#E7EAF3] bg-white shadow-[0_28px_70px_rgba(15,23,42,0.18)]"
                     onClick={(event) => event.stopPropagation()}
                   >
-                    <div className="border-b border-gray-100 p-3">
-                      <div className="grid grid-cols-2 rounded-2xl bg-[#F4F6FA] p-1">
-                        <button
-                          type="button"
-                          onClick={() => setDuePickerTab('date')}
-                          className={`rounded-xl px-3 py-2 text-[13px] font-bold transition-colors ${
-                            duePickerTab === 'date' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-800'
-                          }`}
-                        >
-                          日期
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setDuePickerTab('time')}
-                          className={`rounded-xl px-3 py-2 text-[13px] font-bold transition-colors ${
-                            duePickerTab === 'time' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-800'
-                          }`}
-                        >
-                          时间段
-                        </button>
-                      </div>
-                    </div>
-
                     {duePickerTab === 'date' ? (
                       <div className="p-4">
                         <div className="mb-4 flex items-center justify-between">
@@ -28231,7 +28418,7 @@ export default function App() {
           refreshWorkspace(currentClientId),
           refreshKnowledgePresentationForScope(currentClientId),
         ]);
-        flash('success', '已收藏为当前项目的本机记忆');
+        flash('success', '已收藏，并同步到本人其他设备');
       } catch (error) {
         flash('error', error instanceof Error ? error.message : '收藏失败');
       } finally {
@@ -31420,12 +31607,6 @@ export default function App() {
                           onClick: () => setIsSmartFileImportOpen(true),
                           disabled: isBackendBlocked || !currentClientId,
                         },
-                        memory_sync: {
-                          icon: <BrainCircuit size={18} />,
-                          title: '记忆同步 · 只生成安全摘要清单',
-                          onClick: () => void openMemorySyncDialog(),
-                          disabled: isBackendBlocked || !currentClientId,
-                        },
                       };
                       const validFavorites = favoriteWorkspaceTools.filter((key) => workspaceToolsRegistry[key]);
                       if (validFavorites.length === 0) {
@@ -31880,7 +32061,6 @@ export default function App() {
                           { key: 'repair_materials', icon: <Wand2 size={23} />, title: '整理资料 · 从本机正文生成并发布组织共享摘要', onClick: () => void handlePreviewDocumentAutoRepair(), disabled: isBackendBlocked || !currentClientId },
                           { key: 'feishu_import', icon: <Download size={23} />, title: '从飞书导入文档', onClick: () => void openFeishuDocImportModal(), disabled: isBackendBlocked || !currentClientId },
                           { key: 'smart_import', icon: <Sparkles size={23} />, title: '智能文件导入 · 讲故事 + 挂文件,自动分类归档', onClick: () => setIsSmartFileImportOpen(true), disabled: isBackendBlocked || !currentClientId },
-                          { key: 'memory_sync', icon: <BrainCircuit size={23} />, title: '记忆同步 · 只生成安全摘要清单', onClick: () => void openMemorySyncDialog(), disabled: isBackendBlocked || !currentClientId },
                         ] as const).map((tool) => {
                           const isFavorited = favoriteWorkspaceTools.includes(tool.key);
                           return (
@@ -32081,6 +32261,7 @@ export default function App() {
                   originalSourcePath?: string | null;
                   parseStatus?: string;
                   wikiStatus?: string;
+                  processingStage?: string | null;
                   processingErrorCode?: string | null;
                   processingMessage?: string | null;
                   processingRetryable?: boolean;
@@ -32095,6 +32276,7 @@ export default function App() {
                   originalSourcePath,
                   parseStatus,
                   wikiStatus,
+                  processingStage,
                   processingErrorCode,
                   processingMessage,
                   processingRetryable,
@@ -32230,7 +32412,9 @@ export default function App() {
                                       : processingErrorCode === 'local_document_preview_unsupported'
                                         ? '当前格式暂不支持解析'
                                         : processingMessage || '当前资料暂不能解析')
-                                  : '正在解析'}
+                                  : processingStage === 'audio_transcription' && processingMessage
+                                    ? `正在转写 · ${processingMessage}`
+                                    : '正在解析'}
                           </span>
                           {processingRetryable && (parseStatus === 'failed_retryable' || wikiStatus === 'failed_retryable') && (
                             <button
@@ -32512,6 +32696,7 @@ export default function App() {
                           originalSourcePath: doc.originalSourcePath,
                           parseStatus: doc.parseStatus,
                           wikiStatus: doc.wikiStatus,
+                          processingStage: doc.processingStage,
                           processingErrorCode: doc.processingErrorCode,
                           processingMessage: doc.processingMessage,
                           processingRetryable: doc.processingRetryable,
@@ -33008,13 +33193,6 @@ export default function App() {
                 <h3 className="flex items-center gap-2 text-[13px] font-bold text-gray-900">
                   <BrainCircuit size={16} className="text-purple-500" /> 已存记忆
                 </h3>
-                <button
-                  type="button"
-                  onClick={() => void openMemorySyncDialog()}
-                  className="rounded-lg border border-purple-100 bg-purple-50 px-2.5 py-1.5 text-[10px] font-bold text-purple-700 transition hover:bg-purple-100"
-                >
-                  记忆同步
-                </button>
               </div>
               <p className="mb-3 text-[11px] text-gray-400">显示当前项目的正式记住/纠错知识与本人的收藏；系统自动推断不在这里展示。</p>
               <div className="mb-4 grid grid-cols-3 gap-2">
@@ -33046,8 +33224,7 @@ export default function App() {
                       : card.memoryKind === 'correction'
                         ? '纠错/补充'
                         : '明确记忆';
-                    const canRevokeHere = card.authority === 'current_device'
-                      && Boolean(card.sourceAnswerId)
+                    const canRevokeHere = Boolean(card.sourceAnswerId)
                       && card.memoryKind === 'favorite';
                     return (
                       <div key={card.id} className="rounded-2xl border border-purple-100 bg-purple-50/40 p-3.5 shadow-[0_2px_8px_rgba(88,28,135,0.04)]">
@@ -36926,21 +37103,15 @@ export default function App() {
   };
 
   const AuthorizationGate = () => {
-    const leaseExpired = viewerAuthorization?.state === 'blocked'
-      && viewerAuthorization?.reasonCode === 'authorization_lease_expired';
     const retryable = viewerAuthorization?.retryable === true
       || viewerAuthorization?.state === 'failed_retryable';
     const missingShell = viewerAuthorization?.state === 'ready' && !canUseApplicationShell;
-    const title = leaseExpired
-      ? '权限租约已过期'
-      : retryable
+    const title = retryable
       ? '权限信息暂时无法确认'
       : missingShell
         ? '当前账号未获准进入桌面工作区'
         : '当前权限已被阻止';
-    const message = leaseExpired
-      ? '最后确认权限已超过 24 小时。重新连接组织云并验证成功后即可继续，不会使用过期权限绕过。'
-      : retryable
+    const message = retryable
       ? '软件保留本机已确认身份，但在权限重新确认前不会加载或写入组织业务数据。'
       : '这是组织云权限投影的明确结果，不会通过角色名称或本机缓存绕过。';
     return (

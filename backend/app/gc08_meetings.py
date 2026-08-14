@@ -498,10 +498,10 @@ class GC08LocalMeetingRepository:
                 ),
             )
             connection.execute(
-                "INSERT INTO recordings (id,scope_id,meeting_id,object_manifest_id,"
+                "INSERT INTO recordings (id,scope_id,binding_kind,meeting_id,object_manifest_id,"
                 "lifecycle_state,current_transcription_version_id,recording_state,"
                 "duration_ms,captured_at,device_id,version,created_at,updated_at,"
-                "deleted_at) VALUES (?,?,?,?,'active',NULL,'captured',?,?,?,1,?,?,NULL)",
+                "deleted_at) VALUES (?,?,'meeting',?,?,'active',NULL,'captured',?,?,?,1,?,?,NULL)",
                 (
                     normalized_recording_id,
                     context.scope_id,

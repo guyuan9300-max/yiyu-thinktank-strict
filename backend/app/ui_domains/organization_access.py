@@ -510,21 +510,28 @@ def mention_candidates(compatibility: Any, request: UiRequest, _: Any) -> list[d
     term = _text(request.query, "q").lower()
     snapshot = compatibility.runtime.current().get("sessionSnapshot") or {}
     current_id = _text(snapshot.get("membership") or {}, "membershipId")
+    # The login snapshot is an identity receipt, not the live organization
+    # directory.  It may legitimately omit peers and must never make the task
+    # editor look as if the organization has no other members.
+    result = compatibility.runtime.cloud_query(
+        "/api/v2/organization-access/member-candidates"
+    )
+    members = list(result.get("items") or [])
     return [
         {
-            "id": item["membershipId"],
-            "fullName": item.get("displayName") or "未命名成员",
-            "email": "",
+            "id": str(item.get("id") or item.get("membershipId") or ""),
+            "fullName": item.get("fullName") or item.get("displayName") or "未命名成员",
+            "email": item.get("email") or "",
             "primaryRole": (
                 "admin" if item.get("systemRole") == "admin" else "employee"
             ),
-            "isSelf": item["membershipId"] == current_id,
+            "isSelf": str(item.get("id") or item.get("membershipId") or "") == current_id,
         }
-        for item in snapshot.get("members") or []
-        if item.get("membershipId")
-        and item.get("status") == "active"
+        for item in members
+        if (item.get("id") or item.get("membershipId"))
+        and str(item.get("membershipStatus") or item.get("status") or "active") == "active"
         if not term
-        or term in _text(item, "displayName").lower()
+        or term in str(item.get("fullName") or item.get("displayName") or "").lower()
     ]
 
 

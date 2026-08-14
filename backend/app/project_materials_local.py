@@ -1740,6 +1740,72 @@ class LocalProjectMaterialsRepository:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def create_local_processing_attempt(
+        self,
+        *,
+        source_asset_id: str,
+        processor_kind: str,
+        status: str,
+        error_code: str | None,
+        error_message: str | None,
+        attempt_no: int,
+    ) -> str:
+        """Create one local derived-work receipt inside the SQL repository."""
+        context = self._context()
+        attempt_id = new_id()
+        with self.runtime._connection() as connection:
+            scope_id = self.runtime._local_object_scope_id(
+                connection, context.sandbox_id
+            )
+            connection.execute(
+                """
+                INSERT INTO processing_attempts (
+                    id,scope_id,operation_id,source_asset_id,recording_id,
+                    attempt_no,status,error_code,processor_kind,
+                    provider_resource_id,error_message_safe,next_retry_at,
+                    started_at,finished_at,authority_role,origin_instance_id
+                ) VALUES (?,?,NULL,?,NULL,?,?,?,?,NULL,?,NULL,?,NULL,'local',?)
+                """,
+                (
+                    attempt_id,
+                    scope_id,
+                    source_asset_id,
+                    attempt_no,
+                    status,
+                    error_code,
+                    processor_kind,
+                    error_message,
+                    utc_now(),
+                    context.sandbox_id,
+                ),
+            )
+            connection.commit()
+        return attempt_id
+
+    def update_local_processing_attempt(
+        self,
+        *,
+        attempt_id: str,
+        status: str,
+        error_code: str | None,
+        message: str | None,
+        finished: bool,
+    ) -> None:
+        with self.runtime._connection() as connection:
+            connection.execute(
+                "UPDATE processing_attempts SET status=?,error_code=?,"
+                "error_message_safe=?,finished_at=? "
+                "WHERE id=? AND authority_role='local'",
+                (
+                    status,
+                    error_code,
+                    str(message or "")[:300] or None,
+                    utc_now() if finished else None,
+                    attempt_id,
+                ),
+            )
+            connection.commit()
+
     def processing_state(self, entry: Mapping[str, Any]) -> dict[str, Any]:
         cloud_source_asset_id = str(
             entry.get("cloudDocumentId")

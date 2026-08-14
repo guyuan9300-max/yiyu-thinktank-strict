@@ -979,6 +979,7 @@ export interface DocumentRecord {
   wikiStatus?: 'not_requested' | 'queued' | 'processing' | 'ready' | 'blocked' | 'failed_retryable' | string;
   processingAttemptId?: string | null;
   processingAttemptNo?: number;
+  processingStage?: string | null;
   processingErrorCode?: string | null;
   processingMessage?: string | null;
   processingRetryable?: boolean;

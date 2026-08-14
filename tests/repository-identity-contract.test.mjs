@@ -34,8 +34,8 @@ test('repository marker pins the strict GitHub identity and main branch', () => 
     githubRepositoryNodeId: 'R_kgDOTnC5IQ',
     remoteUrl: 'https://github.com/guyuan9300-max/yiyu-thinktank-strict.git',
     targetBranch: 'main',
-    localManifestHash: '3b55180712dac2fac2e4257937aecc3afc583398fc61a8953ed390d82cf21d39',
-    cloudManifestHash: '02c3d8ffe1b0d15dea14e70ff4e2b0cf53e1a19196cb42c72f34f72f9a848594',
+    localManifestHash: '0ba62a13e9bd8e9935aaa3c88c7a685eef41deafce85bd83c11b0f7282a6654a',
+    cloudManifestHash: '51b0c60f5a50ffd5e48af2be06e1c659cfd081dccd0cdea5bb0a29d65da50fd5',
   });
 });
 

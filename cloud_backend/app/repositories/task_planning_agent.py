@@ -6,11 +6,14 @@ import json
 import re
 from typing import Any, Mapping
 
+import httpx
+
 from strict_common.agent_memory import AgentRunReceipt, builtin_agent_id
-from strict_common.ids import canonical_json, sha256_text, utc_now
+from strict_common.ids import canonical_json, new_id, sha256_text, utc_now
 
 from ..repository import CloudRepository, RepositoryError, SessionIdentity
 from .project_materials import GC07ProjectMaterialsRepository
+from . import gc06_planning
 
 
 PROFILE_SCHEMA = "yiyu.task-planning.project-keyword-profile.v2"
@@ -138,6 +141,235 @@ class TaskPlanningAgentRepository:
                     }
                 )
             return result
+
+    @staticmethod
+    def _json_object(value: str) -> dict[str, Any]:
+        raw = value.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RepositoryError(502, "task_draft_parse_invalid", "组织模型没有返回有效的任务草稿") from exc
+        if not isinstance(parsed, dict):
+            raise RepositoryError(502, "task_draft_parse_invalid", "组织模型没有返回有效的任务草稿")
+        return parsed
+
+    def parse_draft(
+        self,
+        identity: SessionIdentity,
+        *,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Parse, but never save, one task/meeting draft for desktop or mobile."""
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            raise RepositoryError(422, "task_draft_text_required", "请输入或说出要记录的事项")
+        current_date = str(payload.get("currentDate") or utc_now()[:10]).strip()
+        profiles = self.list_profiles(identity)
+        plans = gc06_planning.list_planning_cycles(
+            self.repository, identity, include_archived=False
+        )
+        event_lines = gc06_planning.list_event_lines(
+            self.repository, identity, include_archived=False
+        )
+        project_options = [
+            {
+                "clientId": row["clientId"],
+                "name": row["clientName"],
+                "keywords": list(row.get("keywords") or []),
+            }
+            for row in profiles
+        ]
+        plan_options = [
+            {
+                "planningCycleId": str(row.get("id") or row.get("planningCycleId") or ""),
+                "title": str(row.get("title") or ""),
+                "periodStart": row.get("periodStart"),
+                "periodEnd": row.get("periodEnd"),
+                "summary": str(row.get("summary") or "")[:500],
+            }
+            for row in plans
+            if str(row.get("id") or row.get("planningCycleId") or "")
+        ]
+        with self.repository._connection() as connection:  # noqa: SLF001
+            member_options = [
+                {"membershipId": str(row["membership_id"]), "displayName": str(row["display_name"] or "")}
+                for row in connection.execute(
+                    "SELECT membership.id AS membership_id,principal.display_name "
+                    "FROM organization_memberships AS membership "
+                    "JOIN principals AS principal ON principal.id=membership.principal_id "
+                    "WHERE membership.scope_id=? AND membership.record_kind='membership' "
+                    "AND membership.status='active' AND membership.lifecycle_state='active' "
+                    "AND principal.status='active' AND principal.lifecycle_state='active' "
+                    "ORDER BY principal.display_name,membership.id",
+                    (identity.scope_id,),
+                ).fetchall()
+            ]
+        event_line_options = [
+            {
+                "eventLineId": str(row.get("id") or row.get("eventLineId") or ""),
+                "clientId": str(row.get("clientId") or row.get("client_id") or row.get("primaryClientId") or ""),
+                "name": str(row.get("name") or row.get("title") or ""),
+            }
+            for row in event_lines
+            if str(row.get("id") or row.get("eventLineId") or "")
+        ]
+        provider = self.repository.ai_config(identity, include_secret=True)
+        if provider.get("status") != "ready" or not provider.get("apiKey"):
+            raise RepositoryError(409, "organization_ai_not_ready", "组织大模型尚未就绪")
+        system = (
+            "你是任务计划岗位的草稿解析器。只返回JSON对象，不保存或执行任何业务动作。"
+            "字段：recordMode(task|customer_meeting|personal_schedule)、title、description、date(YYYY-MM-DD或null)、"
+            "start(HH:MM或null)、end(HH:MM或null)、priority(low|normal|high)、clientId、eventLineId、planningCycleId、"
+            "ownerMembershipId、collaboratorMembershipIds、reasons。项目、事件线、计划和成员只能从候选ID原样选择；事件线必须属于已选项目；"
+            "任务中的‘负责/主责/牵头/交给’对应ownerMembershipId，‘协助/配合/参与’对应协作者；"
+            "会议中的‘组织/主持/召集’对应ownerMembershipId（组织者），‘参会/列席/参与’对应协作者。负责人不得同时出现在协作者数组。"
+            "今天/明天及上午/下午/晚上必须结合currentDate换算，下午未给时刻默认15:00。"
+            "无把握时必须为null或空数组。普通任务默认normal；只有明确紧急、严重阻塞、"
+            "法定或当天硬截止才high，明确可延后且影响小才low。会议须有明确会面/会议意图；个人日程只用于纯个人安排。"
+            "不得编造日期时间，不得自动保存。reasons为简短中文数组，说明项目、计划、优先级判断依据。"
+        )
+        prompt = canonical_json(
+            {
+                "currentDate": current_date,
+                "availableProjects": project_options,
+                "availablePlans": plan_options,
+                "availableMembers": member_options,
+                "availableEventLines": event_line_options,
+                "input": text,
+            }
+        )
+        base = str(provider.get("baseUrl") or "").rstrip("/")
+        endpoint = base if base.endswith("/chat/completions") else base + "/chat/completions"
+        try:
+            with httpx.Client(
+                timeout=httpx.Timeout(connect=5, read=75, write=15, pool=5),
+                trust_env=False,
+            ) as client:
+                response = client.post(
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {provider['apiKey']}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": provider["modelName"],
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.1,
+                        "thinking": {"type": "disabled"},
+                        "max_tokens": 1200,
+                        "stream": False,
+                    },
+                )
+        except httpx.HTTPError as exc:
+            raise RepositoryError(503, "task_draft_parse_failed_retryable", "任务草稿解析暂时失败，可以重试") from exc
+        if response.status_code >= 400:
+            raise RepositoryError(
+                503 if response.status_code >= 500 or response.status_code in {408, 425, 429} else 502,
+                "task_draft_parse_failed_retryable",
+                "任务草稿解析暂时失败，可以重试",
+            )
+        try:
+            content = str(response.json()["choices"][0]["message"]["content"])
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise RepositoryError(502, "task_draft_parse_invalid", "组织模型没有返回有效的任务草稿") from exc
+        parsed = self._json_object(content)
+        allowed_projects = {row["clientId"] for row in project_options}
+        allowed_plans = {row["planningCycleId"] for row in plan_options}
+        allowed_members = {row["membershipId"] for row in member_options}
+        owner_id = str(parsed.get("ownerMembershipId") or "") or None
+        if owner_id not in allowed_members:
+            owner_id = None
+        event_line_by_id = {row["eventLineId"]: row for row in event_line_options}
+        client_id = str(parsed.get("clientId") or "") or None
+        plan_id = str(parsed.get("planningCycleId") or "") or None
+        if client_id not in allowed_projects:
+            client_id = None
+        if plan_id not in allowed_plans:
+            plan_id = None
+        event_line_id = str(parsed.get("eventLineId") or "") or None
+        if event_line_id not in event_line_by_id or not client_id or event_line_by_id[event_line_id]["clientId"] != client_id:
+            event_line_id = None
+        collaborator_ids = [
+            str(value) for value in list(parsed.get("collaboratorMembershipIds") or [])
+            if str(value) in allowed_members and str(value) != identity.membership_id
+        ]
+        mode = str(parsed.get("recordMode") or "task")
+        if mode not in {"task", "customer_meeting", "personal_schedule"}:
+            mode = "task"
+        # The model is asked to classify member roles, but explicit Chinese
+        # role phrases are deterministic enough to correct before returning a
+        # draft.  This never saves the business object.
+        for member in sorted(member_options, key=lambda item: len(item["displayName"]), reverse=True):
+            member_id, name = member["membershipId"], re.escape(member["displayName"])
+            owner_pattern = (
+                rf"(?:由\s*)?{name}\s*(?:组织|主持|召集)"
+                if mode == "customer_meeting"
+                else rf"(?:由\s*)?{name}\s*(?:负责|主责|牵头|执行)|(?:负责人(?:是|为)?|交给)\s*{name}"
+            )
+            collaborator_pattern = (
+                rf"{name}\s*(?:参会|列席|参与)"
+                if mode == "customer_meeting"
+                else rf"{name}\s*(?:协助|配合|参与|协作|测试)"
+            )
+            if re.search(owner_pattern, text):
+                owner_id = member_id
+            elif re.search(collaborator_pattern, text) and member_id != identity.membership_id:
+                collaborator_ids.append(member_id)
+        collaborator_ids = sorted(set(collaborator_ids) - ({owner_id} if owner_id else set()))
+        priority = str(parsed.get("priority") or "normal")
+        if priority not in {"low", "normal", "high"}:
+            priority = "normal"
+        parsed_date = str(parsed.get("date") or "") or None
+        if not parsed_date and "今天" in text:
+            parsed_date = current_date
+        parsed_start = str(parsed.get("start") or "") or None
+        if "下午" in text and (not parsed_start or parsed_start < "12:00"):
+            parsed_start = "15:00"
+        parsed_end = str(parsed.get("end") or "") or None
+        if parsed_start and not parsed_end:
+            hour, minute = (int(value) for value in parsed_start.split(":", 1))
+            parsed_end = f"{min(23, hour + 1):02d}:{minute:02d}"
+        result = {
+            "recordMode": mode,
+            "title": str(parsed.get("title") or "").strip()[:300] or text[:300],
+            "description": str(parsed.get("description") or "").strip() or text,
+            "date": parsed_date,
+            "start": parsed_start,
+            "end": parsed_end,
+            "priority": priority,
+            "clientId": client_id,
+            "planningCycleId": plan_id,
+            "eventLineId": event_line_id,
+            "ownerMembershipId": owner_id,
+            "collaboratorMembershipIds": collaborator_ids,
+            "reasons": [str(item)[:200] for item in list(parsed.get("reasons") or [])[:5]],
+            "sourceText": text,
+        }
+        now, run_id = utc_now(), new_id()
+        bot_id = builtin_agent_id(identity.organization_id, "task_planning")
+        with self.repository._connection() as connection:  # noqa: SLF001
+            connection.execute(
+                "INSERT INTO execution_runs (id,scope_id,bot_id,rule_id,task_id,operation_id,status,"
+                "initiator_membership_id,proposal_id,run_kind,progress_object_manifest_id,"
+                "result_object_manifest_id,started_at,finished_at,version,lifecycle_state,created_at,updated_at,deleted_at) "
+                "VALUES (?,?,?,NULL,NULL,NULL,'completed',?,NULL,'task_draft_parse',NULL,NULL,?,?,1,'active',?,?,NULL)",
+                (run_id, identity.scope_id, bot_id, identity.membership_id, now, now, now, now),
+            )
+            connection.commit()
+        result["agentRun"] = AgentRunReceipt(
+            agent_kind="task_planning",
+            run_id=run_id,
+            state="completed",
+            stage="draft_ready",
+            message="草稿已解析，等待人工确认保存",
+            result_version=1,
+        ).as_dict()
+        return result
 
     def refresh_profile(
         self,

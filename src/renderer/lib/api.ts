@@ -2975,6 +2975,7 @@ export interface ProjectMaterialProcessingItem {
   wikiStatus: string;
   processingAttemptId?: string | null;
   processingAttemptNo?: number;
+  processingStage?: string | null;
   processingErrorCode?: string | null;
   processingMessage?: string | null;
   processingRetryable?: boolean;

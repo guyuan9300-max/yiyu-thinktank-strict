@@ -31,6 +31,7 @@ from cloud_backend.app.repositories.project_materials import (
 )
 from cloud_backend.app.repository import CloudRepository
 from strict_common.schema import runtime_connection
+from tests.test_gc01_authorization import _auth, _seed_gc01_cloud
 
 
 def _cloud_client(tmp_path: Path) -> tuple[TestClient, Path]:
@@ -287,6 +288,65 @@ def test_visible_member_can_register_own_local_material_without_project_edit_rig
     assert int(row["current_version"]) == 0
     assert row["storage_object_id"] is None
     assert row["source_locator"] == ""
+
+
+def test_mobile_recording_publishes_only_safe_summary_into_existing_88_tables(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "strict-cloud.db"
+    config, tokens = _seed_gc01_cloud(database)
+    with TestClient(create_app(config)) as client:
+        auth = _auth(tokens["admin"])
+        created = client.post(
+            "/api/v2/domain/project-materials/projects",
+            headers={**auth, "Idempotency-Key": "mobile-recording-project"},
+            json={"name": "移动录音测试项目"},
+        )
+        assert created.status_code == 201, created.text
+        project_id = created.json()["project"]["projectId"]
+        response = client.post(
+            f"/api/v2/domain/project-materials/projects/{project_id}/mobile-recording-summary",
+            headers={**auth, "Idempotency-Key": "mobile-recording-summary-once"},
+            json={
+                "title": "移动现场记录-知识摘要",
+                "safeSummaryMarkdown": "## 决定\n- 由项目组在下周完成教师培训方案。",
+                "facts": ["项目组将在下周完成教师培训方案"],
+                "sourceContentHash": "b" * 64,
+            },
+        )
+        assert response.status_code == 201, response.text
+        result = response.json()
+        assert result["localOriginalUploaded"] is False
+        assert result["fullTranscriptUploaded"] is False
+
+        rejected = client.post(
+            f"/api/v2/domain/project-materials/projects/{project_id}/mobile-recording-summary",
+            headers={**auth, "Idempotency-Key": "mobile-recording-body-rejected"},
+            json={
+                "title": "越界请求",
+                "safeSummaryMarkdown": "摘要",
+                "sourceContentHash": "c" * 64,
+                "transcriptText": "逐字稿不得进入组织云",
+            },
+        )
+        assert rejected.status_code == 422
+
+    with runtime_connection(database, "cloud", read_only=True) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchone()[0] == 88
+        document = connection.execute(
+            "SELECT document_kind,publication_state FROM knowledge_documents WHERE id=?",
+            (result["documentId"],),
+        ).fetchone()
+        manifest = connection.execute(
+            "SELECT receipt FROM object_manifests WHERE id=(SELECT object_manifest_id FROM document_versions WHERE id=?)",
+            (result["documentVersionId"],),
+        ).fetchone()
+        assert document["document_kind"] == "shared_summary"
+        assert document["publication_state"] == "published"
+        receipt = json.loads(manifest["receipt"])
+        assert receipt["localOriginalUploaded"] is False
+        assert receipt["fullTranscriptUploaded"] is False
+        assert "逐字稿不得进入组织云" not in manifest["receipt"]
 
 
 def test_project_crud_lifecycle_cas_idempotency_and_receipts(

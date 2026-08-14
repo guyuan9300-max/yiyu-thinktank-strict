@@ -366,6 +366,7 @@ class WorkspaceRuntime:
                 "/api/v2/organization-access/feishu/member-authorization",
                 "/api/v2/organization-access/feishu/delivery-profile",
                 "/api/v2/organization-access/members",
+                "/api/v2/organization-access/member-candidates",
                 "/api/v2/organization-access/management-titles",
                 "/api/v2/organization-access/bots",
                 "/api/v2/organization-access/activity-logs",
@@ -836,7 +837,11 @@ class WorkspaceRuntime:
         try:
             return execute(str(bundle["accessToken"]))
         except CloudClientError as exc:
-            if exc.status_code != 401:
+            if exc.status_code != 401 and exc.code not in {
+                "authorization_lease_expired",
+                "authorization_projection_missing",
+                "authorization_projection_stale",
+            }:
                 raise LocalRuntimeError(exc.status_code, exc.code, exc.message) from exc
         try:
             _, _, refreshed_bundle = self._refresh_local_session(
@@ -1441,34 +1446,9 @@ class WorkspaceRuntime:
                 "project_authorization_identity_mismatch",
                 "项目权限投影与当前登录身份不一致",
             )
-        try:
-            generated_time = datetime.fromisoformat(
-                str(authorization.get("generatedAt") or "").replace("Z", "+00:00")
-            )
-            lease_time = datetime.fromisoformat(
-                str(authorization.get("leaseExpiresAt") or "").replace("Z", "+00:00")
-            )
-            if generated_time.tzinfo is None:
-                generated_time = generated_time.replace(tzinfo=timezone.utc)
-            if lease_time.tzinfo is None:
-                lease_time = lease_time.replace(tzinfo=timezone.utc)
-            effective_lease = min(lease_time, generated_time + timedelta(hours=24))
-        except (TypeError, ValueError) as exc:
-            raise LocalRuntimeError(
-                502,
-                "project_authorization_lease_invalid",
-                "组织云返回的项目权限租约无效",
-            ) from exc
-        if effective_lease <= datetime.now(timezone.utc):
-            self._invalidate_project_access_projection(
-                normalized_project_id,
-                reason="project_authorization_lease_expired",
-            )
-            raise LocalRuntimeError(
-                403,
-                "project_authorization_lease_expired",
-                "项目权限租约已过期，请连接组织云后重试",
-            )
+        # This projection came from the successful online project query
+        # immediately above. The cloud membership/grant check is authoritative;
+        # the legacy lease timestamp remains diagnostic metadata only.
         capabilities = {
             str(value)
             for value in authorization.get("viewerCapabilities") or []
@@ -2098,34 +2078,11 @@ class WorkspaceRuntime:
             return None
         if not isinstance(surfaces, list) or not isinstance(capabilities, list):
             return None
-        generated_at = str(row["generated_at"] or "")
-        lease_expires_at = str(row["lease_expires_at"] or "")
-        effective_lease_expires_at = lease_expires_at
-        try:
-            generated_time = datetime.fromisoformat(
-                generated_at.replace("Z", "+00:00")
-            )
-            lease_time = datetime.fromisoformat(
-                lease_expires_at.replace("Z", "+00:00")
-            )
-            maximum_lease_time = generated_time + timedelta(hours=24)
-            if lease_time > maximum_lease_time:
-                lease_time = maximum_lease_time
-                effective_lease_expires_at = (
-                    lease_time.astimezone(timezone.utc)
-                    .isoformat(timespec="milliseconds")
-                    .replace("+00:00", "Z")
-                )
-            lease_expired = lease_time <= datetime.now(timezone.utc)
-        except (TypeError, ValueError):
-            lease_expired = True
-            effective_lease_expires_at = lease_expires_at or None
-        if lease_expired:
-            state = "blocked"
-            freshness = "expired"
-            reason_code = "authorization_lease_expired"
-            retryable = True
-        elif runtime_status == "sync_degraded":
+        lease_expires_at = str(row["lease_expires_at"] or "") or None
+        # Local viewer rows only drive presentation. Online cloud requests
+        # validate the live session/membership; offline operations fail with a
+        # retryable connectivity state instead of trusting this cached row.
+        if runtime_status == "sync_degraded":
             state = "ready"
             freshness = "stale"
             reason_code = "cloud_revalidation_pending"
@@ -2153,7 +2110,7 @@ class WorkspaceRuntime:
             "capabilities": capabilities,
             "generatedAt": row["generated_at"],
             "lastConfirmedAt": row["projected_at"] or row["generated_at"],
-            "leaseExpiresAt": effective_lease_expires_at,
+            "leaseExpiresAt": lease_expires_at,
             "sourceVersion": int(row["source_version"] or 1),
         }
 

@@ -259,6 +259,23 @@ def register_gc07_routes(
             idempotency_key=idempotency_key or new_id(),
         )
 
+    @app.post(
+        "/api/v2/domain/project-materials/projects/{project_id}/mobile-recording-summary",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def publish_mobile_recording_summary(
+        project_id: str,
+        payload: Annotated[dict[str, Any], Body()],
+        identity: Annotated[SessionIdentity, Depends(identity_dependency)],
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return domain.publish_mobile_recording_summary(
+            identity,
+            project_id=project_id,
+            payload=payload,
+            idempotency_key=idempotency_key or new_id(),
+        )
+
     @app.get(
         "/api/v2/domain/project-materials/projects/{project_id}"
         "/documents/{document_id}/reading-preview"
