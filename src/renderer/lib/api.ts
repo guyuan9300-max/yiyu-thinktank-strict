@@ -2965,8 +2965,25 @@ export async function deleteClientDocument(clientId: string, documentId: string)
   });
 }
 
+const inFlightClientWorkspaces = new Map<string, Promise<ClientWorkspace>>();
+
 export async function getClientWorkspace(id: string) {
-  return request<ClientWorkspace>(`/api/v2/ui/clients/${id}/workspace`);
+  const key = [
+    workspaceRequestContext.sandboxId,
+    workspaceRequestContext.requestSeq,
+    id,
+  ].join(':');
+  const existing = inFlightClientWorkspaces.get(key);
+  if (existing) return existing;
+  const pending = request<ClientWorkspace>(`/api/v2/ui/clients/${id}/workspace`);
+  inFlightClientWorkspaces.set(key, pending);
+  try {
+    return await pending;
+  } finally {
+    if (inFlightClientWorkspaces.get(key) === pending) {
+      inFlightClientWorkspaces.delete(key);
+    }
+  }
 }
 
 export interface ProjectMaterialProcessingItem {
@@ -3739,6 +3756,7 @@ export type NarrativeClarificationPayload = {
   question?: string;
   answer: string;
   basedOnRev?: number;
+  feedbackKind?: 'project_keyword_supplement' | string;
 };
 
 export type NarrativeClarificationSubmitResponse = NarrativeClarification & {
@@ -5664,6 +5682,20 @@ export interface TaskProjectKeywordProfile {
   clientId: string;
   clientName: string;
   keywords: string[];
+  categories: {
+    identityTerms: string[];
+    peopleAndOrganizations: string[];
+    productsAndPrograms: string[];
+    domainTerms: string[];
+    asrTerms: string[];
+  };
+  supplements: string[];
+  sourceSummary?: {
+    verifiedFactCount?: number;
+    sharedKnowledgeCount?: number;
+    localDocumentCount?: number;
+  };
+  generationState?: 'model_enriched' | 'rules_only' | string;
   state: 'ready' | 'not_built';
   version: number;
   updatedAt?: string | null;
@@ -7049,7 +7081,7 @@ export async function stopCollabPreview(payload: StopCollabPreviewPayload) {
 }
 
 export async function rebuildAndInstallFromRepo(repoPath: string) {
-  return window.yiyuWorkbench.rebuildAndInstallFromRepo(repoPath) as Promise<boolean>;
+  return window.yiyuWorkbench.rebuildAndInstallFromRepo(repoPath);
 }
 
 export async function setWorkspaceInteractionState(payload: { active: boolean; source: string; detail?: string | null }) {

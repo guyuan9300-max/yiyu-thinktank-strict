@@ -23,6 +23,7 @@ from ..project_materials_local import LocalProjectMaterialsRepository
 from ..local_asr.models import SENSE_VOICE_MODEL, model_ready
 from ..local_asr.subprocess_runner import run_local_asr_subprocess
 from ..runtime import LocalRuntimeError
+from ..transcript_semantic_correction import correct_project_transcript
 from .project_materials import register_and_process_local_materials
 from .routing import UiDomainRouter, UiRequest
 
@@ -364,7 +365,7 @@ def _context_provider(runtime: Any):
     return provide
 
 
-def _transcription_runner(runtime: Any):
+def _transcription_runner(runtime: Any, *, project_id: str = ""):
     model_root = runtime.database_path.parent / "models"
 
     def run(path: Path, language: str, progress_callback: Any = None) -> Any:
@@ -375,12 +376,32 @@ def _transcription_runner(runtime: Any):
                 "本机 ASR 模型未就绪；录音已保留，可下载模型后重试",
             )
         try:
-            return run_local_asr_subprocess(
+            output = run_local_asr_subprocess(
                 model_root=model_root,
                 audio_path=path,
                 language=language,
                 progress_callback=progress_callback,
             )
+            if project_id:
+                raw_text = str(
+                    output.get("dialogue_text")
+                    or output.get("dialogueText")
+                    or output.get("text")
+                    or ""
+                ).strip()
+                if raw_text:
+                    corrected = correct_project_transcript(
+                        runtime,
+                        project_id=project_id,
+                        title=path.name,
+                        transcript=raw_text,
+                        progress_callback=progress_callback,
+                    )
+                    output = dict(output)
+                    output["dialogue_text"] = corrected
+                    output["dialogueText"] = corrected
+                    output["text"] = corrected
+            return output
         except GC08DomainError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -621,7 +642,7 @@ def transcribe(
         runtime.database_path,
         runtime.database_path.parent / "recordings",
         lambda: pinned_context,
-        transcription_runner=_transcription_runner(runtime),
+        transcription_runner=_transcription_runner(runtime, project_id=client_id),
         minutes_runner=_minutes_runner(runtime),
     )
     if not current_job or str(current_job.get("status") or "") not in {

@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
-import { createWriteStream, mkdirSync } from 'node:fs';
+import { constants as fsConstants, createWriteStream, mkdirSync } from 'node:fs';
 import {
   access,
   chmod,
@@ -25,12 +25,21 @@ import {
   previewStrictPush,
   publishStrictBranch,
   pushStrictMain,
+  maintenanceEnvironment,
+  resolveMaintenanceNpm,
+  resolveMaintenanceUv,
   resolveStrictRepository,
 } from './strictCollabGit.js';
+import {
+  setOfficialUpdateIdentity,
+  setupOfficialUpdater,
+} from './officialUpdater.js';
 import type {
   FastForwardMainPayload,
   PublishCollabBranchPayload,
   PushMainPayload,
+  StrictRebuildInstallResult,
+  UpdateOrgIdentity,
 } from '../shared/types.js';
 
 const APP_NAME = '益语智库AI（新版）';
@@ -54,15 +63,21 @@ function runUpdateCommand(
   cwd: string,
   logPath: string,
   timeoutMs: number,
+  extraPathDirectories: string[] = [],
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const logStream = createWriteStream(logPath, { flags: 'a' });
+    const baseEnvironment = maintenanceEnvironment();
+    const commandEnvironment = {
+      ...baseEnvironment,
+      PATH: [...new Set([
+        ...extraPathDirectories,
+        ...(baseEnvironment.PATH || '').split(path.delimiter).filter(Boolean),
+      ])].join(path.delimiter),
+    };
     const child = spawn(command, args, {
       cwd,
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: '0',
-      },
+      env: commandEnvironment,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     child.stdout?.pipe(logStream, { end: false });
@@ -90,9 +105,13 @@ function runUpdateCommand(
   });
 }
 
-async function rebuildAndInstallStrictApp(repoPath: string): Promise<boolean> {
+async function rebuildAndInstallStrictApp(repoPath: string): Promise<StrictRebuildInstallResult> {
   if (!app.isPackaged) {
-    return false;
+    return {
+      state: 'not_packaged',
+      installed: false,
+      message: '当前是开发版，源码更新会由开发进程直接加载，无需覆盖安装。',
+    };
   }
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
     throw new Error('当前自动覆盖安装仅支持 Apple Silicon 版 macOS。');
@@ -133,15 +152,45 @@ async function rebuildAndInstallStrictApp(repoPath: string): Promise<boolean> {
     { encoding: 'utf8', mode: 0o600 },
   );
 
+  let npmPath: string;
+  let uvPath: string;
+  try {
+    [npmPath, uvPath] = await Promise.all([
+      resolveMaintenanceNpm(),
+      resolveMaintenanceUv(),
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '本机缺少源码构建环境。';
+    await writeFile(logPath, `${new Date().toISOString()} toolchain blocked: ${message}\n`, { flag: 'a' });
+    return {
+      state: 'blocked_missing_toolchain',
+      installed: false,
+      message: `源码已经接收，但不能在本机自动构建：${message}`,
+      logPath,
+    };
+  }
+
+  const toolDirectories = [path.dirname(npmPath), path.dirname(uvPath)];
+  try {
+    await access(path.join(resolution.repoPath, 'node_modules', '.bin', 'electron-builder'), fsConstants.X_OK);
+  } catch {
+    await runUpdateCommand(
+      npmPath,
+      ['ci'],
+      resolution.repoPath,
+      logPath,
+      20 * 60_000,
+      toolDirectories,
+    );
+  }
+
   await runUpdateCommand(
-    '/bin/zsh',
-    [
-      '-lc',
-      'if [ ! -x node_modules/.bin/electron-builder ]; then npm ci; fi; npm run dist:mac-local',
-    ],
+    npmPath,
+    ['run', 'dist:mac-local'],
     resolution.repoPath,
     logPath,
     30 * 60_000,
+    toolDirectories,
   );
 
   const candidatePath = path.join(
@@ -151,6 +200,19 @@ async function rebuildAndInstallStrictApp(repoPath: string): Promise<boolean> {
     `${APP_NAME}.app`,
   );
   await access(path.join(candidatePath, 'Contents', 'Info.plist'));
+
+  try {
+    await access('/Applications', fsConstants.W_OK);
+  } catch {
+    shell.showItemInFolder(candidatePath);
+    return {
+      state: 'built_admin_required',
+      installed: false,
+      message: '源码已更新并构建完成，但当前 macOS 账号无权覆盖 /Applications。已在 Finder 中显示构建产物，请由电脑管理员完成覆盖安装。',
+      artifactPath: candidatePath,
+      logPath,
+    };
+  }
 
   const stagedBundlePath = path.join('/Applications', `.${APP_NAME}.update-${updateId}.app`);
   await runUpdateCommand(
@@ -211,7 +273,13 @@ exit 71
   );
   updater.unref();
   setTimeout(() => app.quit(), 300);
-  return true;
+  return {
+    state: 'installing',
+    installed: true,
+    message: '构建完成，正在覆盖安装并重启软件。',
+    artifactPath: candidatePath,
+    logPath,
+  };
 }
 
 const singleInstance = app.requestSingleInstanceLock();
@@ -570,6 +638,7 @@ function createWindow(): void {
     void shell.openExternal(url);
     return { action: 'deny' };
   });
+  setupOfficialUpdater(mainWindow);
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
   });
@@ -616,6 +685,22 @@ ipcMain.handle('strict:set-mini-mode', (_event, enter: boolean) => {
   return { mini: enter };
 });
 
+ipcMain.handle(
+  'strict:set-update-org-identity',
+  async (_event, identity: UpdateOrgIdentity | null) => {
+    await setOfficialUpdateIdentity(identity);
+    return { ok: true };
+  },
+);
+
+ipcMain.handle(
+  'strict:set-update-org-code',
+  async (_event, organizationSlug: string | null) => {
+    await setOfficialUpdateIdentity(organizationSlug ? { organizationSlug } : null);
+    return { ok: true };
+  },
+);
+
 ipcMain.handle('strict:get-desktop-app-info', () => ({
   appVersion: app.getVersion(),
   isPackaged: app.isPackaged,
@@ -625,8 +710,8 @@ ipcMain.handle('strict:get-desktop-app-info', () => ({
   executablePath: process.execPath,
   releasePlanPath: '',
   releaseArtifactsPath: '',
-  updateChannel: 'strict',
-  updaterPhase: 'manual',
+  updateChannel: 'stable',
+  updaterPhase: 'ready_for_in_app_update',
   recommendedInstallPath: process.platform === 'darwin' ? '/Applications' : '',
   installStatus: 'ok',
   installWarning: null,

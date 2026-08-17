@@ -381,8 +381,11 @@ def client_workspace(
         and str(row.get("lifecycleState") or "active") != "deleted"
     ]
     pending_jobs = sum(
-        str(item.get("parseStatus") or "")
-        in {"not_requested", "queued", "processing"}
+        str(item.get("parseStatus") or "") in {"queued", "processing"}
+        or (
+            str(item.get("parseStatus") or "") == "ready"
+            and str(item.get("wikiStatus") or "") in {"queued", "processing"}
+        )
         for item in documents
     )
     failed_jobs = sum(
@@ -518,7 +521,10 @@ def client_workspace(
         "memoryCards": memory_cards,
         "threads": threads,
         "recentMessages": recent_messages,
-        "analysisRuns": [_analysis_run(project_id, answer) for answer in answers],
+        # Ready answers are already represented by recentMessages.  Returning
+        # the same full answer bodies again as completed analysis runs doubled
+        # large workspace payloads and was not used for active progress.
+        "analysisRuns": [],
         "meetings": meetings,
         "goals": [],
         "dnaModules": [],

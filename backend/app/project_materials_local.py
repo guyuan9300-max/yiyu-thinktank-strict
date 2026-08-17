@@ -1806,22 +1806,35 @@ class LocalProjectMaterialsRepository:
             )
             connection.commit()
 
-    def processing_state(self, entry: Mapping[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _source_asset_candidates(
+        entry: Mapping[str, Any],
+        *,
+        source_ids_by_hash: Mapping[str, list[str]],
+    ) -> list[str]:
         cloud_source_asset_id = str(
-            entry.get("cloudDocumentId")
-            or entry.get("documentId")
-            or ""
+            entry.get("cloudDocumentId") or entry.get("documentId") or ""
         ).strip()
-        local_source_asset_id = str(entry.get("localSourceId") or "").strip()
         if cloud_source_asset_id.startswith("local-pending:"):
             cloud_source_asset_id = ""
-        source_asset_ids = list(
+        content_hash = str(entry.get("contentHash") or "").strip()
+        return list(
             dict.fromkeys(
                 value
-                for value in (cloud_source_asset_id, local_source_asset_id)
+                for value in (
+                    cloud_source_asset_id,
+                    str(entry.get("localSourceId") or "").strip(),
+                    *(source_ids_by_hash.get(content_hash) or []),
+                )
                 if value
             )
         )
+
+    @staticmethod
+    def _processing_state_result(
+        source_asset_ids: list[str],
+        attempts: Mapping[tuple[str, str], Mapping[str, Any]],
+    ) -> dict[str, Any]:
         if not source_asset_ids:
             return {
                 "parseStatus": "blocked",
@@ -1833,16 +1846,10 @@ class LocalProjectMaterialsRepository:
         parsed = None
         wiki = None
         for source_asset_id in source_asset_ids:
-            candidate = self._latest_processing_attempt(
-                source_asset_id,
-                processor_kind="local_text_extraction",
-            )
+            candidate = attempts.get((source_asset_id, "local_text_extraction"))
             if candidate is not None:
                 parsed = candidate
-                wiki = self._latest_processing_attempt(
-                    source_asset_id,
-                    processor_kind="local_wiki_projection",
-                )
+                wiki = attempts.get((source_asset_id, "local_wiki_projection"))
                 break
         if parsed is None:
             return {
@@ -1882,6 +1889,82 @@ class LocalProjectMaterialsRepository:
                 or parsed.get("started_at")
             ),
         }
+
+    def processing_states(
+        self,
+        entries: Iterable[Mapping[str, Any]],
+        *,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve processing receipts for a whole file list in one DB read."""
+        normalized = [dict(entry) for entry in entries]
+        if not normalized:
+            return []
+        context = self._context()
+        hashes = list(
+            dict.fromkeys(
+                str(entry.get("contentHash") or "").strip()
+                for entry in normalized
+                if str(entry.get("contentHash") or "").strip()
+            )
+        )
+        source_ids_by_hash: dict[str, list[str]] = {}
+        attempts: dict[tuple[str, str], dict[str, Any]] = {}
+        with self.runtime._connection() as connection:
+            scope_id = self.runtime._local_object_scope_id(connection, context.sandbox_id)
+            if hashes:
+                placeholders = ",".join("?" for _ in hashes)
+                sql = (
+                    "SELECT id,content_hash FROM source_assets "
+                    f"WHERE scope_id=? AND content_hash IN ({placeholders}) "
+                    "AND lifecycle_state='active'"
+                )
+                parameters: list[Any] = [scope_id, *hashes]
+                if project_id:
+                    sql += " AND client_id=?"
+                    parameters.append(project_id)
+                for row in connection.execute(sql, tuple(parameters)).fetchall():
+                    source_ids_by_hash.setdefault(str(row["content_hash"]), []).append(str(row["id"]))
+            all_source_ids = list(
+                dict.fromkeys(
+                    source_id
+                    for entry in normalized
+                    for source_id in self._source_asset_candidates(
+                        entry,
+                        source_ids_by_hash=source_ids_by_hash,
+                    )
+                )
+            )
+            if all_source_ids:
+                placeholders = ",".join("?" for _ in all_source_ids)
+                rows = connection.execute(
+                    "SELECT * FROM processing_attempts "
+                    f"WHERE scope_id=? AND source_asset_id IN ({placeholders}) "
+                    "AND processor_kind IN ('local_text_extraction','local_wiki_projection') "
+                    "ORDER BY attempt_no DESC, started_at DESC, id DESC",
+                    (scope_id, *all_source_ids),
+                ).fetchall()
+                for row in rows:
+                    item = dict(row)
+                    attempts.setdefault(
+                        (str(row["source_asset_id"]), str(row["processor_kind"])),
+                        item,
+                    )
+        return [
+            self._processing_state_result(
+                self._source_asset_candidates(entry, source_ids_by_hash=source_ids_by_hash),
+                attempts,
+            )
+            for entry in normalized
+        ]
+
+    def processing_state(
+        self,
+        entry: Mapping[str, Any],
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.processing_states([entry], project_id=project_id)[0]
 
     def process_document(
         self,
@@ -5328,16 +5411,42 @@ class LocalProjectMaterialsRepository:
         state = self._load_project_state(project_id)
         sandbox_id = str(state.get("_localSandboxId") or "")
         result: list[dict[str, Any]] = []
-        for document_id, raw_entry in dict(state.get("documents") or {}).items():
-            if not isinstance(raw_entry, Mapping):
+        document_entries = [
+            (str(document_id), dict(raw_entry))
+            for document_id, raw_entry in dict(state.get("documents") or {}).items()
+            if isinstance(raw_entry, Mapping)
+        ]
+        source_manifests = self.runtime.local_storage_objects_get(
+            sandbox_id=sandbox_id,
+            object_ids=(
+                str(entry.get("localSourceId") or "")
+                for _, entry in document_entries
+            ),
+        )
+        processing_states = self.processing_states(
+            (entry for _, entry in document_entries),
+            project_id=project_id,
+        )
+        for (document_id, entry), processing in zip(
+            document_entries,
+            processing_states,
+            strict=True,
+        ):
+            source_id = str(entry.get("localSourceId") or "").strip()
+            source_manifest = source_manifests.get(source_id)
+            if (
+                source_manifest is None
+                or str(source_manifest.get("lifecycle_state") or "") != "active"
+            ):
                 continue
-            entry = dict(raw_entry)
-            try:
-                managed_path, _ = self._source_path(
-                    entry,
-                    sandbox_id=sandbox_id,
-                )
-            except LocalRuntimeError:
+            managed_path = self._managed_path(
+                str(source_manifest.get("storage_key") or "")
+            )
+            # A file-list refresh only establishes availability. Full byte-size
+            # and content-hash validation remains in _source_path when a user or
+            # processor actually reads the file. Reading and hashing every file
+            # on every project switch made large workspaces wait for minutes.
+            if not managed_path.is_file():
                 continue
             raw_original = str(entry.get("originalSourcePath") or "").strip()
             original_path = (
@@ -5351,7 +5460,6 @@ class LocalProjectMaterialsRepository:
                 else managed_path
             )
             suffix = managed_path.suffix.lower().lstrip(".")
-            processing = self.processing_state(entry)
             result.append(
                 {
                     "id": str(document_id),

@@ -91,6 +91,8 @@ import type {
   BadgeBoardOverview,
 } from '../../../shared/types';
 
+const GROWTH_RUNTIME_CACHE_TTL_MS = 5 * 60 * 1000;
+
 /* ══════════════════════════════════════════════════════════════════════
    CSS — injected once, matches growth-center-preview.html exactly
    ──────────────────────────────────────────────────────────────────── */
@@ -1320,9 +1322,10 @@ function AbilityRadar({ abilities, gaps }: { abilities: GrowthAbilityScore[]; ga
    Tab 1: Quote Wall
    ══════════════════════════════════════════════════════════════════ */
 function ExperienceWallTab({ uiSessionScopeKey }: { uiSessionScopeKey: string }) {
-  const [items, setItems] = useState<GrowthExperienceWallItem[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [cloudSyncError, setCloudSyncError] = useState<string | null>(null);
+  const [items, setItems] = useRuntimeUiSessionState<GrowthExperienceWallItem[]>(`${uiSessionScopeKey}:items`, []);
+  const [loadedAt, setLoadedAt] = useRuntimeUiSessionState<number>(`${uiSessionScopeKey}:loaded-at`, 0);
+  const [isLoading, setIsLoading] = useState(loadedAt <= 0);
+  const [cloudSyncError, setCloudSyncError] = useRuntimeUiSessionState<string | null>(`${uiSessionScopeKey}:cloud-error`, null);
   const [filter, setFilter] = useRuntimeUiSessionState<'all' | 'month' | 'quarter'>(`${uiSessionScopeKey}:filter`, 'all');
   const [likingIds, setLikingIds] = useState<Set<string>>(() => new Set());
 
@@ -1331,6 +1334,7 @@ function ExperienceWallTab({ uiSessionScopeKey }: { uiSessionScopeKey: string })
       const result = await getGrowthExperienceWall();
       setItems(result.items || []);
       setCloudSyncError(result.cloudSyncError || null);
+      setLoadedAt(Date.now());
     } catch {
       setItems([]);
       setCloudSyncError('成长金句暂时无法加载。');
@@ -1357,10 +1361,14 @@ function ExperienceWallTab({ uiSessionScopeKey }: { uiSessionScopeKey: string })
   }, [likingIds, reloadExperienceWall]);
 
   useEffect(() => {
-    setIsLoading(true);
+    if (loadedAt > 0 && Date.now() - loadedAt < GROWTH_RUNTIME_CACHE_TTL_MS) {
+      setIsLoading(false);
+      return;
+    }
+    setIsLoading(items.length === 0);
     reloadExperienceWall()
       .finally(() => setIsLoading(false));
-  }, [reloadExperienceWall]);
+  }, [items.length, loadedAt, reloadExperienceWall]);
 
   const sortedEntries = useMemo(() => {
     let filtered = [...items];
@@ -1826,19 +1834,21 @@ function AbilityGrowthTab({ overview }: { overview: GrowthOverview | null }) {
 /* ══════════════════════════════════════════════════════════════════════
    Tab 3: Badges & Rank
    ══════════════════════════════════════════════════════════════════ */
-function BadgesAndRankTab({ overview }: { overview: GrowthOverview | null }) {
-  const [badgeBoard, setBadgeBoard] = useState<BadgeBoard | null>(null);
+function BadgesAndRankTab({ overview, uiSessionScopeKey }: { overview: GrowthOverview | null; uiSessionScopeKey: string }) {
+  const [badgeBoard, setBadgeBoard] = useRuntimeUiSessionState<BadgeBoard | null>(`${uiSessionScopeKey}:board`, null);
+  const [loadedAt, setLoadedAt] = useRuntimeUiSessionState<number>(`${uiSessionScopeKey}:loaded-at`, 0);
   const [selectedBadge, setSelectedBadge] = useState<BadgeProgress | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(loadedAt <= 0);
+  const [loadError, setLoadError] = useRuntimeUiSessionState<string | null>(`${uiSessionScopeKey}:load-error`, null);
 
-  const loadBadges = useCallback(async () => {
+  const loadBadges = useCallback(async (options?: { keepVisible?: boolean }) => {
     setSelectedBadge(null);
-    setBadgeBoard(null);
+    if (!options?.keepVisible) setBadgeBoard(null);
     setLoadError(null);
-    setIsLoading(true);
+    setIsLoading(!options?.keepVisible);
     try {
       setBadgeBoard(await getGrowthBadges());
+      setLoadedAt(Date.now());
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : '成长徽章加载失败');
     } finally {
@@ -1847,8 +1857,12 @@ function BadgesAndRankTab({ overview }: { overview: GrowthOverview | null }) {
   }, []);
 
   useEffect(() => {
-    void loadBadges();
-  }, [loadBadges]);
+    if (loadedAt > 0 && Date.now() - loadedAt < GROWTH_RUNTIME_CACHE_TTL_MS) {
+      setIsLoading(false);
+      return;
+    }
+    void loadBadges({ keepVisible: Boolean(badgeBoard) });
+  }, [badgeBoard, loadedAt, loadBadges]);
 
   const rank = overview?.rank;
   const totalXp = overview?.totalXp ?? 0;
@@ -2110,7 +2124,6 @@ const TABS: { key: GrowthTab; label: string }[] = [
 export function GrowthCenterView({ uiSessionScopeKey = 'growth:local:anonymous' }: { uiSessionScopeKey?: string }) {
   const [activeTab, setActiveTab] = useRuntimeUiSessionState<GrowthTab>(`${uiSessionScopeKey}:tab`, 'experience');
   const growthState = useGrowthOverviewState();
-  const refreshGrowthOverview = growthState?.refreshGrowthOverview;
   const [headerOverview, setHeaderOverview] = useState<GrowthOverview | null>(null);
   const contentRef = React.useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -2134,13 +2147,6 @@ export function GrowthCenterView({ uiSessionScopeKey = 'growth:local:anonymous' 
     if (growthState?.growthOverview) return;
     getGrowthOverview().then(setHeaderOverview).catch(() => undefined);
   }, []);
-
-  // Opening Growth Center is an explicit request to see the latest derived
-  // state. Rebuild/read happens in the provider and remains idempotent; this
-  // avoids showing a startup snapshot after new tasks, meetings or reviews.
-  useEffect(() => {
-    if (refreshGrowthOverview) void refreshGrowthOverview();
-  }, [refreshGrowthOverview]);
 
   const overview = growthState?.growthOverview ?? headerOverview;
   const rankLabel = overview?.rank?.fullLabel || '加载中';
@@ -2188,7 +2194,7 @@ export function GrowthCenterView({ uiSessionScopeKey = 'growth:local:anonymous' 
         <div className="gc-content-inner">
           {activeTab === 'experience' && <ExperienceWallTab uiSessionScopeKey={`${uiSessionScopeKey}:experience`} />}
           {activeTab === 'ability' && <AbilityGrowthTab overview={overview} />}
-          {activeTab === 'badges' && <BadgesAndRankTab overview={overview} />}
+          {activeTab === 'badges' && <BadgesAndRankTab overview={overview} uiSessionScopeKey={`${uiSessionScopeKey}:badges`} />}
         </div>
       </div>
     </div>

@@ -12,6 +12,7 @@ from ..project_materials_local import LocalProjectMaterialsRepository
 from ..local_asr.models import SENSE_VOICE_MODEL, model_ready
 from ..local_asr.subprocess_runner import run_local_asr_subprocess
 from ..runtime import LocalRuntimeError
+from ..transcript_semantic_correction import correct_project_transcript
 from .gc04_tasks import _task_ui
 from .project_materials import register_and_process_local_materials
 from .routing import UiDomainRouter, UiRequest
@@ -289,6 +290,13 @@ def retry_task_transcription(compatibility: Any, request: UiRequest, match: Any)
                 text = str(output.get("dialogue_text") or output.get("dialogueText") or output.get("text") or "").strip()
                 if not text:
                     raise RuntimeError("TaskTranscriptionEmpty")
+                text = correct_project_transcript(
+                    runtime,
+                    project_id=project_id,
+                    title=str(attachment.get("title") or "任务录音"),
+                    transcript=text,
+                    progress_callback=report,
+                )
                 transcript = store.save_task_transcript(
                     task_id=task_id,
                     attachment_id=attachment_id,

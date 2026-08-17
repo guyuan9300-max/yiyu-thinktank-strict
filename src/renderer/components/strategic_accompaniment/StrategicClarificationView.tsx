@@ -31,6 +31,8 @@ import {
   getClientClarificationContext,
   getClientNarrative,
   getClientWorkspace,
+  getTaskProjectKeywordProfiles,
+  refreshTaskProjectKeywordProfile,
   listClientNarrativeClarifications,
   submitClientNarrativeClarification,
   regenerateClientNarrative,
@@ -70,15 +72,18 @@ import {
   type NarrativeDimensionKey,
   type NarrativeClarification,
   type OfficialWebsiteStatus,
+  type TaskProjectKeywordProfile,
 } from '../../lib/api';
 import { GlossaryAttributeReviewSection } from './GlossaryAttributeReviewSection';
 import { UnifiedTodoSection } from './UnifiedTodoSection';
+import { getClientKnowledgeRevision, markClientKnowledgeChanged } from '../../lib/clientKnowledgeEvents';
 // [DEPRECATED 2026-05-22 · 新计划阶段 0] V2.1 8 段组件已废弃, 跟产品手册 §03 钦定
 // 6 段 (essence/cooperation/business_intro/people/timeline/next_steps) 冲突.
 // 主仓库现有 NarrativePanel (走 narrative_generator) 才是真渲染入口.
 // import { FullNarrativeSection } from './FullNarrativeSection';
 
 interface StrategicClarificationViewProps {
+  uiSessionScopeKey?: string;
   clientOptions: Array<{ id: string; name: string }>;
   selectedClientId: string;
   onClientChange: (id: string) => void;
@@ -95,16 +100,25 @@ const CONFIDENCE_META: Record<Confidence, { label: string; bg: string; text: str
   low: { label: '待补充', bg: 'bg-slate-100', text: 'text-slate-500', icon: HelpCircle },
 };
 
-function isPrimaryOfficialWebsitePage(rawUrl: string): boolean {
-  try {
-    const url = new URL(rawUrl);
-    return !/^\/(?:seo|share)\//i.test(url.pathname);
-  } catch {
-    return false;
-  }
-}
+const STRATEGIC_PROFILE_CACHE_TTL_MS = 10 * 60 * 1000;
+
+type StrategicProfileCacheEntry = {
+  narrative: ClientNarrative | null;
+  clarifications: NarrativeClarification[];
+  context: ClarificationContext | null;
+  officialWebsite: OfficialWebsiteStatus | null;
+  recognitionProfile: TaskProjectKeywordProfile | null;
+  cachedAt: number;
+  knowledgeRevision: number;
+};
+
+// 只存在于当前 renderer 会话。它让切换模块后立即恢复客户档案，但不成为业务权威，
+// 软件重启后自然清空；云端版本化对象仍是唯一事实来源。
+const strategicProfileSessionCache = new Map<string, StrategicProfileCacheEntry>();
+const strategicStaleNoticeKeys = new Set<string>();
 
 export function StrategicClarificationView({
+  uiSessionScopeKey = 'strategic:local:anonymous',
   clientOptions,
   selectedClientId,
   onClientChange,
@@ -127,6 +141,10 @@ export function StrategicClarificationView({
   const [officialWebsiteError, setOfficialWebsiteError] = useState<string | null>(null);
   const [officialWebsiteElapsed, setOfficialWebsiteElapsed] = useState(0);
   const [officialWebsiteRefreshKey, setOfficialWebsiteRefreshKey] = useState(0);
+  const [recognitionProfile, setRecognitionProfile] = useState<TaskProjectKeywordProfile | null>(null);
+  const [recognitionRefreshing, setRecognitionRefreshing] = useState(false);
+  const recognitionAutoRefreshRef = useRef<string>('');
+  const recognitionRefreshInFlightRef = useRef<Promise<TaskProjectKeywordProfile | null> | null>(null);
 
   // 根因修复: 切客户竞态 — async 操作(submit clarification / regenerate narrative /
   // regenerate single dim)期间用户可能切到另一客户. await 返回时如果直接 setX(新数据),
@@ -141,48 +159,170 @@ export function StrategicClarificationView({
     selectedClientIdRef.current = selectedClientId;
   }, [selectedClientId]);
 
-  const loadAll = useCallback(async (clientId: string, isMounted: () => boolean) => {
-    if (!isMounted()) return;
-    setLoading(true);
+  const cacheKeyFor = useCallback(
+    (clientId: string) => `${uiSessionScopeKey}:client-profile:${clientId}`,
+    [uiSessionScopeKey],
+  );
+
+  const applyCachedEntry = useCallback((entry: StrategicProfileCacheEntry) => {
+    setNarrative(entry.narrative);
+    setClarifications(entry.clarifications);
+    setCtx(entry.context);
+    setOfficialWebsite(entry.officialWebsite);
+    setOfficialWebsiteUrl(String(entry.officialWebsite?.registeredUrl || ''));
+    setRecognitionProfile(entry.recognitionProfile);
     setError(null);
+  }, []);
+
+  const loadAll = useCallback(async (
+    clientId: string,
+    isMounted: () => boolean,
+    options?: { background?: boolean },
+  ) => {
+    if (!isMounted()) return;
+    const cacheKey = cacheKeyFor(clientId);
+    const cached = strategicProfileSessionCache.get(cacheKey);
+    if (!options?.background && !cached) setLoading(true);
+    if (!cached) setError(null);
     setDimensionRefreshErrors({});
     try {
-      // 本地优先(5/29): 叙事独立加载 — 后端 GET 本地优先读镜像, 断网也能返回上次版本。
-      // 澄清/上下文是云端协同, 断网失败降级为空, 不再连累叙事整页变空。
-      try {
-        const n = await getClientNarrative(clientId);
-        if (!isMounted()) return;  // 旧请求返回时新客户已切, 丢弃
-        setNarrative(n);
-      } catch (err) {
-        if (!isMounted()) return;
-        setError(err instanceof Error ? err.message : '加载失败');
-        setNarrative(null);
-      }
-      const c = await listClientNarrativeClarifications(clientId).catch(() => null);
-      const x = await getClientClarificationContext(clientId).catch(() => null);
-      const official = await getClientOfficialWebsite(clientId).catch(() => null);
+      // 五个消费者并行读取；缓存存在时始终保留旧版画面，后台刷新不会清空页面。
+      const [narrativeResult, clarificationResult, contextResult, officialResult, profilesResult] = await Promise.allSettled([
+        getClientNarrative(clientId),
+        listClientNarrativeClarifications(clientId),
+        getClientClarificationContext(clientId),
+        getClientOfficialWebsite(clientId),
+        getTaskProjectKeywordProfiles(),
+      ]);
       if (!isMounted()) return;
-      setClarifications(c?.clarifications ?? []);
-      setCtx(x);
-      setOfficialWebsite(official);
-      setOfficialWebsiteUrl(String(official?.registeredUrl || ''));
+      const next: StrategicProfileCacheEntry = {
+        narrative: narrativeResult.status === 'fulfilled'
+          ? narrativeResult.value
+          : (cached?.narrative || null),
+        clarifications: clarificationResult.status === 'fulfilled'
+          ? clarificationResult.value.clarifications
+          : (cached?.clarifications || []),
+        context: contextResult.status === 'fulfilled'
+          ? contextResult.value
+          : (cached?.context || null),
+        officialWebsite: officialResult.status === 'fulfilled'
+          ? officialResult.value
+          : (cached?.officialWebsite || null),
+        recognitionProfile: profilesResult.status === 'fulfilled'
+          ? (profilesResult.value.find((profile) => profile.clientId === clientId) || null)
+          : (cached?.recognitionProfile || null),
+        cachedAt: Date.now(),
+        knowledgeRevision: getClientKnowledgeRevision(clientId),
+      };
+      strategicProfileSessionCache.set(cacheKey, next);
+      applyCachedEntry(next);
+      if (narrativeResult.status === 'rejected' && !next.narrative) {
+        setError(narrativeResult.reason instanceof Error ? narrativeResult.reason.message : '加载失败');
+      }
     } finally {
       if (isMounted()) setLoading(false);
     }
-  }, []);
+  }, [applyCachedEntry, cacheKeyFor]);
 
   useEffect(() => {
     if (!selectedClientId) {
       setNarrative(null);
       setClarifications([]);
       setCtx(null);
+      setRecognitionProfile(null);
       return;
     }
     let mounted = true;
     const isMounted = () => mounted;
-    void loadAll(selectedClientId, isMounted);
+    const cached = strategicProfileSessionCache.get(cacheKeyFor(selectedClientId));
+    if (cached) {
+      applyCachedEntry(cached);
+      setLoading(false);
+    }
+    const knowledgeRevision = getClientKnowledgeRevision(selectedClientId);
+    const cacheIsFresh = Boolean(
+      cached
+      && Date.now() - cached.cachedAt < STRATEGIC_PROFILE_CACHE_TTL_MS
+      && cached.knowledgeRevision >= knowledgeRevision
+    );
+    if (!cacheIsFresh) {
+      void loadAll(selectedClientId, isMounted, { background: Boolean(cached) });
+    }
     return () => { mounted = false; };
-  }, [selectedClientId, loadAll]);
+  }, [applyCachedEntry, cacheKeyFor, selectedClientId, loadAll]);
+
+  // 页面内完成官网、澄清或叙事更新后，把已展示的新状态回写到本次会话缓存。
+  // 这里只缓存投影，不写数据库，也不会覆盖云端权威对象。
+  useEffect(() => {
+    if (!selectedClientId || loading || (!narrative && !officialWebsite && !recognitionProfile)) return;
+    strategicProfileSessionCache.set(cacheKeyFor(selectedClientId), {
+      narrative,
+      clarifications,
+      context: ctx,
+      officialWebsite,
+      recognitionProfile,
+      cachedAt: Date.now(),
+      knowledgeRevision: getClientKnowledgeRevision(selectedClientId),
+    });
+  }, [
+    cacheKeyFor,
+    clarifications,
+    ctx,
+    loading,
+    narrative,
+    officialWebsite,
+    recognitionProfile,
+    selectedClientId,
+  ]);
+
+  const refreshRecognitionProfile = async (
+    clientId: string,
+    options?: { silent?: boolean; afterCurrent?: boolean },
+  ): Promise<TaskProjectKeywordProfile | null> => {
+    if (!clientId) return null;
+    const current = recognitionRefreshInFlightRef.current;
+    if (current) {
+      if (!options?.afterCurrent) return current;
+      await current;
+    }
+    const request = (async () => {
+      setRecognitionRefreshing(true);
+      try {
+        const refreshed = await refreshTaskProjectKeywordProfile(clientId);
+        if (selectedClientIdRef.current !== clientId) return null;
+        setRecognitionProfile(refreshed);
+        if (!options?.silent) flash?.('success', '项目关键词已更新。');
+        return refreshed;
+      } catch (error) {
+        if (selectedClientIdRef.current === clientId && !options?.silent) {
+          flash?.('error', error instanceof Error ? error.message : '项目识别画像更新失败，可重试');
+        }
+        return null;
+      } finally {
+        if (selectedClientIdRef.current === clientId) setRecognitionRefreshing(false);
+      }
+    })();
+    recognitionRefreshInFlightRef.current = request;
+    try {
+      return await request;
+    } finally {
+      if (recognitionRefreshInFlightRef.current === request) {
+        recognitionRefreshInFlightRef.current = null;
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (
+      !selectedClientId
+      || loading
+      || recognitionRefreshing
+      || recognitionProfile?.state === 'ready'
+      || recognitionAutoRefreshRef.current === selectedClientId
+    ) return;
+    recognitionAutoRefreshRef.current = selectedClientId;
+    void refreshRecognitionProfile(selectedClientId, { silent: true });
+  }, [loading, recognitionProfile?.state, recognitionRefreshing, selectedClientId]);
 
   const handleOfficialWebsiteRefresh = async () => {
     const capturedClientId = selectedClientId;
@@ -196,6 +336,8 @@ export function StrategicClarificationView({
       if (selectedClientIdRef.current !== capturedClientId) return;
       setOfficialWebsite(refreshed);
       setOfficialWebsiteRefreshKey((value) => value + 1);
+      markClientKnowledgeChanged(capturedClientId, 'official_website_refreshed');
+      void refreshRecognitionProfile(capturedClientId, { silent: true });
       flash?.('success', `已读取 ${refreshed.pageCount} 个官网页面；权威事实已进入项目知识。`);
     } catch (err) {
       if (selectedClientIdRef.current !== capturedClientId) return;
@@ -214,14 +356,6 @@ export function StrategicClarificationView({
     return () => window.clearInterval(timer);
   }, [officialWebsiteRefreshing]);
 
-  const primaryOfficialPages = (officialWebsite?.pages || [])
-    .filter((page) => isPrimaryOfficialWebsitePage(page.url))
-    .slice(0, 12);
-  const supplementalOfficialPageCount = Math.max(
-    0,
-    Number(officialWebsite?.pageCount || 0) - primaryOfficialPages.length,
-  );
-
   // stale 信号检测 (只通知,不自动 regen).
   // 历史版本会自动 regenerate, 但多人协作场景下任意同事打开页面都会触发 → 覆盖别人校准的内容.
   // 改成"检测到 stale 仅 flash 提示", 由用户决定按板块单独刷新还是全局重生.
@@ -232,9 +366,15 @@ export function StrategicClarificationView({
       try {
         const stale = await getNarrativeStaleStatus(selectedClientId);
         if (cancelled || !stale.isStale) return;
+        const lastDocTitle = String(stale.lastDocTitle || '');
+        // 人工关键词补充已经直接进入识别画像，不需要再提示用户重生六卡。
+        if (/人工补充|关键词补充/.test(lastDocTitle)) return;
+        const noticeKey = `${selectedClientId}:${stale.markedAt}:${lastDocTitle}`;
+        if (strategicStaleNoticeKeys.has(noticeKey)) return;
+        strategicStaleNoticeKeys.add(noticeKey);
         flash?.(
           'info',
-          `检测到新材料 (${stale.lastDocTitle || '新文档'}). 点对应板块右上角刷新按钮单独更新, 或点"下一步要做什么"卡片标题旁的 ↻ 全部重生.`,
+          `检测到新材料 (${lastDocTitle || '新文档'}). 点对应板块右上角刷新按钮单独更新, 或点"下一步要做什么"卡片标题旁的 ↻ 全部重生.`,
         );
       } catch (err) {
         // eslint-disable-next-line no-console
@@ -257,6 +397,7 @@ export function StrategicClarificationView({
       // 切客户后, 旧客户的 success flash 不显示 (避免误导)
       if (selectedClientIdRef.current !== capturedClientId) return;
       if (submitted.narrative) setNarrative(submitted.narrative);
+      markClientKnowledgeChanged(capturedClientId, 'fact_corrected');
       flash?.('success', '补充已成为项目正式知识，客户档案已重新整理。');
       const c = await listClientNarrativeClarifications(capturedClientId);
       if (selectedClientIdRef.current !== capturedClientId) return;
@@ -264,6 +405,32 @@ export function StrategicClarificationView({
     } catch (err) {
       if (selectedClientIdRef.current !== capturedClientId) return;
       flash?.('error', err instanceof Error ? err.message : '提交失败');
+      throw err;
+    }
+  };
+
+  const handleKeywordSupplement = async (answer: string) => {
+    if (!selectedClientId || !answer.trim()) return;
+    const capturedClientId = selectedClientId;
+    try {
+      await submitClientNarrativeClarification(capturedClientId, {
+        dimension: 'essence',
+        answer: `项目识别关键词补充：${answer.trim()}`,
+        question: '补充项目关键词',
+        basedOnRev: narrative?.rev,
+        feedbackKind: 'project_keyword_supplement',
+      });
+      if (selectedClientIdRef.current !== capturedClientId) return;
+      markClientKnowledgeChanged(capturedClientId, 'fact_corrected');
+      await refreshRecognitionProfile(capturedClientId, { silent: true, afterCurrent: true });
+      if (selectedClientIdRef.current !== capturedClientId) return;
+      const c = await listClientNarrativeClarifications(capturedClientId);
+      if (selectedClientIdRef.current !== capturedClientId) return;
+      setClarifications(c.clarifications);
+      flash?.('success', '补充关键词已保存并更新项目识别画像。');
+    } catch (err) {
+      if (selectedClientIdRef.current !== capturedClientId) return;
+      flash?.('error', err instanceof Error ? err.message : '补充关键词提交失败');
       throw err;
     }
   };
@@ -287,6 +454,8 @@ export function StrategicClarificationView({
       // 切客户后, 旧客户的 narrative 不写入新客户 state
       if (selectedClientIdRef.current !== capturedClientId) return;
       setNarrative(fresh);
+      markClientKnowledgeChanged(capturedClientId, 'narrative_updated');
+      void refreshRecognitionProfile(capturedClientId, { silent: true });
       const c = await listClientNarrativeClarifications(capturedClientId);
       if (selectedClientIdRef.current !== capturedClientId) return;
       setClarifications(c.clarifications);
@@ -337,6 +506,8 @@ export function StrategicClarificationView({
       // 切客户后, 旧客户的全部重生结果不写入新客户 state
       if (selectedClientIdRef.current !== capturedClientId) return;
       setNarrative(fresh);
+      markClientKnowledgeChanged(capturedClientId, 'narrative_updated');
+      void refreshRecognitionProfile(capturedClientId, { silent: true });
       const c = await listClientNarrativeClarifications(capturedClientId);
       if (selectedClientIdRef.current !== capturedClientId) return;
       setClarifications(c.clarifications);
@@ -398,84 +569,18 @@ export function StrategicClarificationView({
       )}
 
       {selectedClientId && !loading && (
-        <section className="mb-5 rounded-2xl border border-emerald-100 bg-emerald-50/40 px-4 py-3.5">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="flex items-center gap-2">
-                <Database size={14} className="text-emerald-700" />
-                <h3 className="text-[13px] font-bold text-slate-900">官网权威信息源</h3>
-              </div>
-              <p className="mt-1 text-[10.5px] leading-5 text-slate-500">
-                同域页面会保存具体网址、版本和证据；无歧义事实进入项目知识，变化或冲突保留为待核实候选。
-              </p>
-            </div>
-            {officialWebsite?.updatedAt && (
-              <span className="text-[9.5px] text-slate-400">更新于 {officialWebsite.updatedAt.slice(0, 16).replace('T', ' ')}</span>
-            )}
-          </div>
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-100 bg-white px-3 py-2">
-            <span className="min-w-0 flex-1 truncate text-[10.5px] text-slate-600">
-              {officialWebsiteUrl || '尚未登记官网，请在“项目信息编辑”中填写并保存。'}
-            </span>
-            {officialWebsiteUrl && (
-              <button
-                type="button"
-                disabled={officialWebsiteRefreshing}
-                onClick={() => void handleOfficialWebsiteRefresh()}
-                className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-[10.5px] font-bold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <RefreshCw size={11} className={officialWebsiteRefreshing ? 'animate-spin' : ''} />
-                {officialWebsiteRefreshing
-                  ? officialWebsiteElapsed < 4
-                    ? '快速浏览官网…'
-                    : officialWebsiteElapsed < 10
-                    ? '制定权威信息目标…'
-                    : `逐项目抓取并核验 · ${officialWebsiteElapsed}s`
-                  : '重新抓取并比对'}
-              </button>
-            )}
-          </div>
-          {officialWebsiteError && (
-            <p className="mt-2 rounded-lg border border-rose-100 bg-rose-50 px-2.5 py-2 text-[10.5px] text-rose-700">{officialWebsiteError}</p>
-          )}
-          {officialWebsite?.researchProgress && (
-            <p className="mt-2 text-[10px] text-emerald-700">
-              本轮已结算 {officialWebsite.researchProgress.completedTargetCount}/{officialWebsite.researchProgress.targetCount} 个目标
-              {' · '}提炼 {officialWebsite.researchProgress.factCount} 条可核实事实
-              {officialWebsite.researchProgress.retryableFailureCount > 0
-                ? ` · ${officialWebsite.researchProgress.retryableFailureCount} 个批次可重试`
-                : ''}
-            </p>
-          )}
-          {officialWebsite && officialWebsite.pages.length > 0 && (
-            <div className="mt-3">
-              <p className="text-[10px] font-bold text-slate-600">
-                已读取 {officialWebsite.pageCount} 个页面 · 重点入口 {primaryOfficialPages.length} 个
-                {officialWebsite.candidateCount > 0 ? ` · ${officialWebsite.candidateCount} 项变化待核实` : ' · 当前无待核实冲突'}
-              </p>
-              <div className="mt-2 flex flex-wrap gap-1.5">
-                {primaryOfficialPages.map((page) => (
-                  <a
-                    key={`${page.url}:${page.version}`}
-                    href={page.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex max-w-full items-center gap-1 rounded-full border border-emerald-100 bg-white px-2.5 py-1 text-[9.5px] font-semibold text-emerald-700 hover:border-emerald-300"
-                    title={page.url}
-                  >
-                    <ExternalLink size={9} />
-                    <span className="max-w-[220px] truncate">{page.title}</span>
-                  </a>
-                ))}
-              </div>
-              {supplementalOfficialPageCount > 0 && (
-                <p className="mt-2 text-[9.5px] text-slate-400">
-                  另有 {supplementalOfficialPageCount} 个 SEO / 文章 / 报告证据页参与事实核验，不作为官网重点入口展示。
-                </p>
-              )}
-            </div>
-          )}
-        </section>
+        <OfficialWebsiteAndKeywordsCard
+          officialWebsite={officialWebsite}
+          officialWebsiteUrl={officialWebsiteUrl}
+          officialWebsiteRefreshing={officialWebsiteRefreshing}
+          officialWebsiteElapsed={officialWebsiteElapsed}
+          officialWebsiteError={officialWebsiteError}
+          onRefreshWebsite={() => void handleOfficialWebsiteRefresh()}
+          profile={recognitionProfile}
+          refreshing={recognitionRefreshing}
+          onRefreshKeywords={() => refreshRecognitionProfile(selectedClientId, { afterCurrent: true })}
+          onFeedback={handleKeywordSupplement}
+        />
       )}
 
       {/* [DEPRECATED 2026-05-22 · 新计划阶段 0] V2.1 8 段 FullNarrativeSection 已废弃,
@@ -1041,6 +1146,188 @@ function BusinessIntroSegmented({ text }: { text: string }) {
         </div>
       ))}
     </div>
+  );
+}
+
+const RECOGNITION_CATEGORY_META: Array<{
+  key: keyof TaskProjectKeywordProfile['categories'];
+  label: string;
+}> = [
+  { key: 'identityTerms', label: '名称与别称' },
+  { key: 'peopleAndOrganizations', label: '关键人物与组织' },
+  { key: 'productsAndPrograms', label: '重点项目与服务' },
+  { key: 'domainTerms', label: '服务领域' },
+];
+
+function OfficialWebsiteAndKeywordsCard({
+  officialWebsite,
+  officialWebsiteUrl,
+  officialWebsiteRefreshing,
+  officialWebsiteElapsed,
+  officialWebsiteError,
+  onRefreshWebsite,
+  profile,
+  refreshing,
+  onRefreshKeywords,
+  onFeedback,
+}: {
+  officialWebsite: OfficialWebsiteStatus | null;
+  officialWebsiteUrl: string;
+  officialWebsiteRefreshing: boolean;
+  officialWebsiteElapsed: number;
+  officialWebsiteError: string | null;
+  onRefreshWebsite: () => void;
+  profile: TaskProjectKeywordProfile | null;
+  refreshing: boolean;
+  onRefreshKeywords: () => Promise<TaskProjectKeywordProfile | null>;
+  onFeedback: (feedback: string) => Promise<void>;
+}) {
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedback, setFeedback] = useState('');
+  const [saving, setSaving] = useState(false);
+  const categories = profile?.categories;
+  const supplements = (profile?.supplements || []).slice(0, 20);
+  const categoryRows: Array<{ key: string; label: string; terms: string[] }> = [
+    ...RECOGNITION_CATEGORY_META.map((item) => ({
+      ...item,
+      terms: (categories?.[item.key] || []).slice(0, 8),
+    })),
+    { key: 'supplements', label: '补充', terms: supplements },
+  ].filter((item) => item.terms.length > 0);
+
+  const submit = async () => {
+    const value = feedback.trim();
+    if (!value || saving) return;
+    setSaving(true);
+    try {
+      await onFeedback(value);
+      setFeedback('');
+      setFeedbackOpen(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="mb-5 rounded-2xl border border-emerald-100 bg-emerald-50/35 px-4 py-3.5">
+      <div className="flex items-center gap-2">
+        <Database size={14} className="text-emerald-700" />
+        <h3 className="text-[13px] font-bold text-slate-900">官网抓取与项目关键词</h3>
+      </div>
+
+      <div className="mt-2.5 flex flex-wrap items-center gap-2 rounded-xl border border-emerald-100 bg-white px-3 py-2">
+        {officialWebsiteUrl ? (
+          <a
+            href={officialWebsiteUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="min-w-0 flex-1 truncate text-[10.5px] font-semibold text-emerald-700 hover:underline"
+            title={officialWebsiteUrl}
+          >
+            {officialWebsiteUrl}
+          </a>
+        ) : (
+          <span className="min-w-0 flex-1 text-[10.5px] text-slate-500">尚未登记官网</span>
+        )}
+        {officialWebsiteUrl && (
+          <button
+            type="button"
+            disabled={officialWebsiteRefreshing}
+            onClick={onRefreshWebsite}
+            className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-[10.5px] font-bold text-white hover:bg-emerald-700 disabled:opacity-50"
+          >
+            <RefreshCw size={11} className={officialWebsiteRefreshing ? 'animate-spin' : ''} />
+            {officialWebsiteRefreshing
+              ? officialWebsiteElapsed < 10
+                ? '正在抓取'
+                : `正在核验 · ${officialWebsiteElapsed}s`
+              : '重新抓取'}
+          </button>
+        )}
+      </div>
+
+      {officialWebsiteError ? (
+        <p className="mt-2 rounded-lg border border-rose-100 bg-rose-50 px-2.5 py-1.5 text-[10px] text-rose-700">{officialWebsiteError}</p>
+      ) : officialWebsite?.researchProgress ? (
+        <p className="mt-2 text-[10px] text-emerald-700">
+          本轮完成 {officialWebsite.researchProgress.completedTargetCount}/{officialWebsite.researchProgress.targetCount} 个目标
+          {' · '}形成 {officialWebsite.researchProgress.factCount} 条事实
+          {officialWebsite.researchProgress.retryableFailureCount > 0
+            ? ` · ${officialWebsite.researchProgress.retryableFailureCount} 项可重试`
+            : ''}
+          {refreshing ? ' · 正在整理关键词' : ''}
+        </p>
+      ) : null}
+
+      <div className="mt-3 flex items-center justify-between gap-2">
+        <div className="text-[10.5px] font-bold text-slate-700">项目关键词</div>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            disabled={refreshing}
+            onClick={() => void onRefreshKeywords()}
+            className="inline-flex items-center gap-1 rounded-lg border border-emerald-100 bg-white px-2.5 py-1 text-[10px] font-bold text-emerald-700 hover:border-emerald-300 disabled:opacity-50"
+          >
+            <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} />
+            更新
+          </button>
+          <button
+            type="button"
+            onClick={() => setFeedbackOpen((value) => !value)}
+            className="rounded-lg border border-emerald-100 bg-white px-2.5 py-1 text-[10px] font-bold text-emerald-700 hover:border-emerald-300"
+          >
+            补充关键词
+          </button>
+        </div>
+      </div>
+
+      {categoryRows.length > 0 ? (
+        <div className="mt-2 grid grid-cols-1 gap-x-4 gap-y-1.5 md:grid-cols-2 xl:grid-cols-3">
+          {categoryRows.map((row) => (
+            <div key={row.key} className="flex min-w-0 items-start gap-1.5">
+              <div className="w-[76px] shrink-0 pt-0.5 text-[9.5px] font-bold text-slate-500">{row.label}</div>
+              <div className="flex min-w-0 flex-wrap gap-1">
+                {row.terms.map((term) => (
+                  <span
+                    key={`${row.key}:${term}`}
+                    className="max-w-[130px] truncate rounded-full border border-white bg-white px-2 py-0.5 text-[9.5px] text-slate-600 shadow-sm"
+                    title={term}
+                  >
+                    {term}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="mt-2 rounded-xl border border-dashed border-emerald-100 bg-white/70 px-3 py-2 text-[10.5px] text-slate-500">
+          {refreshing ? '正在整理项目关键词…' : '当前还没有可用的项目关键词。'}
+        </p>
+      )}
+
+      {feedbackOpen && (
+        <div className="mt-2 rounded-xl border border-emerald-100 bg-white p-2.5">
+          <div className="flex items-start gap-2">
+            <textarea
+              value={feedback}
+              onChange={(event) => setFeedback(event.target.value)}
+              rows={2}
+              placeholder="补充项目特有的名称、人物、项目、服务或领域关键词"
+              className="min-h-[54px] flex-1 resize-none rounded-lg border border-slate-200 px-3 py-2 text-[11px] leading-5 text-slate-700 outline-none focus:border-emerald-300"
+            />
+            <button
+              type="button"
+              disabled={saving || !feedback.trim()}
+              onClick={() => void submit()}
+              className="rounded-lg bg-emerald-600 px-3 py-2 text-[10.5px] font-bold text-white hover:bg-emerald-700 disabled:opacity-50"
+            >
+              {saving ? '提交中' : '提交'}
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -1976,19 +2263,73 @@ function ClientPicker({
   selectedClientId: string;
   onClientChange: (id: string) => void;
 }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const selectedName = clientOptions.find((client) => client.id === selectedClientId)?.name || '选择...';
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeWhenOutside = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', closeWhenOutside);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('mousedown', closeWhenOutside);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [open]);
+
   return (
     <div className="flex items-center gap-2">
       <span className="text-[11px] font-bold text-slate-400">客户</span>
-      <select
-        value={selectedClientId}
-        onChange={(e) => onClientChange(e.target.value)}
-        className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-[13px] font-medium text-slate-700 focus:outline-none focus:border-blue-300"
-      >
-        <option value="">选择...</option>
-        {clientOptions.map((c) => (
-          <option key={c.id} value={c.id}>{c.name}</option>
-        ))}
-      </select>
+      <div ref={rootRef} className="relative">
+        <button
+          type="button"
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+          style={{ backgroundColor: '#ffffff' }}
+          className="flex min-w-[128px] items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white py-1.5 pl-3 pr-2.5 text-left text-[13px] font-medium text-slate-700 shadow-sm hover:border-slate-300 focus:border-blue-300 focus:outline-none"
+        >
+          <span className="truncate">{selectedName}</span>
+          <ChevronDown size={13} aria-hidden="true" className={`shrink-0 text-slate-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+        </button>
+        {open && (
+          <div
+            role="listbox"
+            aria-label="选择客户"
+            style={{ backgroundColor: '#ffffff' }}
+            className="absolute right-0 top-[calc(100%+6px)] z-50 min-w-full overflow-hidden rounded-xl border border-slate-200 bg-white p-1 shadow-xl"
+          >
+            {clientOptions.map((client) => {
+              const selected = client.id === selectedClientId;
+              return (
+                <button
+                  key={client.id}
+                  type="button"
+                  role="option"
+                  aria-selected={selected}
+                  onClick={() => {
+                    onClientChange(client.id);
+                    setOpen(false);
+                  }}
+                  className={`block w-full whitespace-nowrap rounded-lg px-3 py-1.5 text-left text-[12px] font-medium ${
+                    selected
+                      ? 'bg-blue-50 text-blue-700'
+                      : 'bg-white text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  {client.name}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

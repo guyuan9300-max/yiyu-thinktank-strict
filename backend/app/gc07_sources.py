@@ -22,6 +22,7 @@ from .local_asr.models import SENSE_VOICE_MODEL, model_ready
 from .local_asr.subprocess_runner import run_local_asr_subprocess
 from .project_materials_local import LocalProjectMaterialsRepository
 from .runtime import LocalRuntimeError
+from .transcript_semantic_correction import correct_project_transcript
 
 
 PPTX_MEDIA_TYPE = (
@@ -345,6 +346,13 @@ class GC07LocalProjectMaterialsRepository(LocalProjectMaterialsRepository):
                         entry.get("fileName")
                         or entry.get("title")
                         or path.name
+                    )
+                    text = correct_project_transcript(
+                        self.runtime,
+                        project_id=project_id,
+                        title=visible_source_name,
+                        transcript=text,
+                        progress_callback=report,
                     )
                     title = f"{Path(visible_source_name).stem}-录音转写"
                     material = pinned_store.import_text(

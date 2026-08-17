@@ -2263,6 +2263,7 @@ export function StrategicBrainView({
           )}
           {activeTab === 'contradictions' && (
             <StrategicClarificationView
+              uiSessionScopeKey={uiSessionScopeKey}
               clientOptions={thoughtClientOptions}
               selectedClientId={thoughtClientId}
               onClientChange={(id) => {

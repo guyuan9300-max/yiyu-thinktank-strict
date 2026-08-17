@@ -4857,6 +4857,18 @@ def submit_narrative_clarification(
         ),
         request.body,
     )
+    if str(request.body.get("feedbackKind") or "") == "project_keyword_supplement":
+        # Keyword supplements are already formal verified project facts in the
+        # cloud.  They refresh the versioned recognition profile directly and
+        # must not be reported as failed merely because this device cannot
+        # rebuild the larger strategic dossier at the same moment.
+        return {
+            **dict(clarification),
+            "profileUpdate": {
+                "state": "pending_refresh",
+                "retryable": False,
+            },
+        }
     # This input belongs to the client profile itself.  It is already a
     # verified project fact on the cloud, so the device holding the local Wiki
     # immediately rebuilds the safe client-profile version; no second click or

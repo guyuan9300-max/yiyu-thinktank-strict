@@ -1,7 +1,11 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type {
   DesktopRuntime,
+  OfficialPushUpdatePayload,
+  ReleaseVersionMetadata,
   RenderedOfficialWebsiteCapture,
+  UpdateEventPayload,
+  UpdateOrgIdentity,
 } from '../shared/types.js';
 
 const runtime = ipcRenderer.sendSync('strict:get-runtime-sync') as DesktopRuntime;
@@ -14,8 +18,10 @@ contextBridge.exposeInMainWorld('yiyuWorkbench', {
   backendBaseUrl: runtime.apiBaseUrl,
   desktopToken: runtime.desktopToken,
   setMiniMode: (enter: boolean) => ipcRenderer.invoke('strict:set-mini-mode', enter),
-  setUpdateOrgIdentity: () => Promise.resolve({ ok: true }),
-  setUpdateOrgCode: () => Promise.resolve({ ok: true }),
+  setUpdateOrgIdentity: (identity: UpdateOrgIdentity | null) =>
+    ipcRenderer.invoke('strict:set-update-org-identity', identity),
+  setUpdateOrgCode: (organizationSlug: string | null) =>
+    ipcRenderer.invoke('strict:set-update-org-code', organizationSlug),
   getDesktopAppInfo: () => ipcRenderer.invoke('strict:get-desktop-app-info'),
   resumeFromStartupGate: () => ipcRenderer.invoke('strict:resume-startup-gate'),
   selectFiles: () => ipcRenderer.invoke('strict:select-files'),
@@ -81,10 +87,23 @@ contextBridge.exposeInMainWorld('yiyuWorkbench', {
     Promise.resolve({ active: payload.active }),
   setBackgroundTasks: (payload: { tasks: unknown[] }) =>
     Promise.resolve({ ok: true, count: payload.tasks.length }),
-  checkForUpdates: () =>
-    Promise.resolve({ ok: false, reason: '严格新版暂未接入检查更新。' }),
-  getCurrentReleaseMetadata: () => Promise.resolve(null),
-  installOfficialPushUpdate: () =>
-    Promise.resolve({ ok: false, reason: '严格新版暂未接入检查更新。' }),
-  onUpdateEvent: () => () => undefined,
+  checkForUpdates: (): Promise<{
+    ok: boolean;
+    version?: string | null;
+    reason?: string;
+    officialPush?: OfficialPushUpdatePayload | null;
+  }> => ipcRenderer.invoke('yiyu-workbench:update.check'),
+  getCurrentReleaseMetadata: (): Promise<ReleaseVersionMetadata | null> =>
+    ipcRenderer.invoke('yiyu-workbench:update.currentReleaseMetadata'),
+  installOfficialPushUpdate: (): Promise<{
+    ok: boolean;
+    version?: string | null;
+    reason?: string;
+    fileName?: string | null;
+  }> => ipcRenderer.invoke('yiyu-workbench:update.installOfficialPush'),
+  onUpdateEvent: (callback: (payload: UpdateEventPayload) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, payload: UpdateEventPayload) => callback(payload);
+    ipcRenderer.on('yiyu-workbench:update-event', handler);
+    return () => ipcRenderer.removeListener('yiyu-workbench:update-event', handler);
+  },
 });

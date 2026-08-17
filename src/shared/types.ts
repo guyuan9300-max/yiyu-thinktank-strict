@@ -8101,6 +8101,20 @@ export interface CollabActionResult {
   stashRestoreWarning?: string | null;
 }
 
+export type StrictRebuildInstallState =
+  | 'installing'
+  | 'built_admin_required'
+  | 'blocked_missing_toolchain'
+  | 'not_packaged';
+
+export interface StrictRebuildInstallResult {
+  state: StrictRebuildInstallState;
+  message: string;
+  installed: boolean;
+  artifactPath?: string | null;
+  logPath?: string | null;
+}
+
 // === 输入广度线程：语音识别模型配置 ===
 
 export type SpeechProvider = 'volcano' | 'openai_whisper' | 'aliyun_tongyi' | 'xunfei';
@@ -8914,7 +8928,7 @@ declare global {
       fastForwardMain(payload: FastForwardMainPayload): Promise<CollabActionResult>;
       startCollabPreview(payload: StartCollabPreviewPayload): Promise<CollabActionResult>;
       stopCollabPreview(payload: StopCollabPreviewPayload): Promise<CollabActionResult>;
-      rebuildAndInstallFromRepo(repoPath: string): Promise<boolean>;
+      rebuildAndInstallFromRepo(repoPath: string): Promise<StrictRebuildInstallResult>;
       setWorkspaceInteractionState(payload: {
         active: boolean;
         source: string;

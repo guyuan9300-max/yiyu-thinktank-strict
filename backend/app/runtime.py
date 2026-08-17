@@ -182,6 +182,44 @@ class WorkspaceRuntime:
             row = connection.execute(sql, tuple(params)).fetchone()
         return self._local_object_result(row) if row is not None else None
 
+    def local_storage_objects_get(
+        self,
+        *,
+        sandbox_id: str,
+        object_ids: Iterable[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Read several sandbox manifests with one verified DB connection.
+
+        Workbench history used to open and fully verify the 88-table database
+        once per answer.  The objects still receive the exact same receipt and
+        scope checks here; only the redundant connections are removed.
+        """
+        context = self._current_context(require_ready=True)
+        if context.sandbox_id != sandbox_id:
+            raise LocalRuntimeError(409, "local_storage_sandbox_changed", "本机工作空间已切换，请重试")
+        normalized = list(dict.fromkeys(str(value).strip() for value in object_ids if str(value).strip()))
+        if not normalized:
+            return {}
+        manifest_to_object = {
+            self._local_object_manifest_id(sandbox_id, object_id): object_id
+            for object_id in normalized
+        }
+        placeholders = ",".join("?" for _ in manifest_to_object)
+        with self._connection() as connection:
+            scope_id = self._local_object_scope_id(connection, sandbox_id)
+            rows = connection.execute(
+                f"SELECT * FROM object_manifests WHERE id IN ({placeholders}) "
+                "AND scope_id=? AND holder_role='sandbox' AND holder_instance_id=?",
+                (*manifest_to_object.keys(), scope_id, sandbox_id),
+            ).fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            item = self._local_object_result(row)
+            object_id = manifest_to_object.get(str(row["id"])) or str(item.get("object_id") or "")
+            if object_id:
+                result[object_id] = item
+        return result
+
     def local_storage_object_put(
         self,
         *,
@@ -836,35 +874,69 @@ class WorkspaceRuntime:
                 allow_array=method == "GET",
             )
 
-        try:
-            return execute(str(bundle["accessToken"]))
-        except CloudClientError as exc:
-            if exc.status_code != 401 and exc.code not in {
+        def requires_session_refresh(exc: CloudClientError) -> bool:
+            return exc.status_code == 401 or exc.code in {
                 "authorization_lease_expired",
                 "authorization_projection_missing",
                 "authorization_projection_stale",
-            }:
-                raise LocalRuntimeError(exc.status_code, exc.code, exc.message) from exc
+            }
+
         try:
-            _, _, refreshed_bundle = self._refresh_local_session(
-                sandbox=sandbox,
-                session=session,
-                secret_reference=secret_reference,
-                bundle=bundle,
-                client=client,
-                # Refresh tokens rotate after every successful refresh.  The
-                # idempotency key therefore has to identify the token being
-                # consumed, not the long-lived sandbox/session.  Reusing one
-                # key for a later token is a different command and correctly
-                # conflicts on the cloud.
-                idempotency_key=(
-                    "gc01-connected-refresh-"
-                    + sha256_text(str(bundle.get("refreshToken") or ""))[:32]
-                ),
-            )
-            return execute(str(refreshed_bundle["accessToken"]))
+            return execute(str(bundle["accessToken"]))
         except CloudClientError as exc:
-            raise LocalRuntimeError(exc.status_code, exc.code, exc.message) from exc
+            if not requires_session_refresh(exc):
+                raise LocalRuntimeError(exc.status_code, exc.code, exc.message) from exc
+
+        # Several panels legitimately issue parallel cloud reads.  If their
+        # shared access token needs renewal, only one request may rotate the
+        # refresh token.  Requests waiting behind it must reload and reuse the
+        # new local session instead of attempting the same CAS with stale
+        # session data and surfacing a false module-level loading failure.
+        with self.local_storage_object_lock(
+            sandbox_id=str(sandbox["id"]),
+            object_id="gc01.local.session.refresh",
+        ):
+            current_session, current_reference, current_bundle = (
+                self._load_session_bundle(sandbox)
+            )
+            session_was_refreshed = (
+                current_reference != secret_reference
+                or int(current_session["version"] or 1)
+                != int(session["version"] or 1)
+            )
+            if session_was_refreshed:
+                try:
+                    return execute(str(current_bundle["accessToken"]))
+                except CloudClientError as exc:
+                    if not requires_session_refresh(exc):
+                        raise LocalRuntimeError(
+                            exc.status_code,
+                            exc.code,
+                            exc.message,
+                        ) from exc
+
+            try:
+                _, _, refreshed_bundle = self._refresh_local_session(
+                    sandbox=sandbox,
+                    session=current_session,
+                    secret_reference=current_reference,
+                    bundle=current_bundle,
+                    client=client,
+                    # Refresh tokens rotate after every successful refresh.  The
+                    # idempotency key therefore has to identify the token being
+                    # consumed, not the long-lived sandbox/session.  Reusing one
+                    # key for a later token is a different command and correctly
+                    # conflicts on the cloud.
+                    idempotency_key=(
+                        "gc01-connected-refresh-"
+                        + sha256_text(
+                            str(current_bundle.get("refreshToken") or "")
+                        )[:32]
+                    ),
+                )
+                return execute(str(refreshed_bundle["accessToken"]))
+            except CloudClientError as exc:
+                raise LocalRuntimeError(exc.status_code, exc.code, exc.message) from exc
 
     def cloud_query(
         self,
@@ -1584,6 +1656,7 @@ class WorkspaceRuntime:
         messages: list[dict[str, str]],
         temperature: float,
         read_timeout_seconds: float = 45.0,
+        max_output_tokens: int = 2_048,
     ) -> str:
         base_url = str(provider.get("baseUrl") or "").strip().rstrip("/")
         endpoint = (
@@ -1614,7 +1687,7 @@ class WorkspaceRuntime:
                         "temperature": temperature,
                         # 基础问答走低延迟通道；深度思考仍是明确的待接能力。
                         "thinking": {"type": "disabled"},
-                        "max_tokens": 2_048,
+                        "max_tokens": max(256, min(8_192, int(max_output_tokens))),
                         "stream": False,
                     },
                 )
@@ -1667,6 +1740,7 @@ class WorkspaceRuntime:
         messages: list[dict[str, str]],
         temperature: float,
         read_timeout_seconds: float = 45.0,
+        max_output_tokens: int = 2_048,
     ) -> dict[str, Any]:
         captured = self.capture_sandbox_context()
         provider = self._organization_ai_runtime_secret()
@@ -1675,6 +1749,7 @@ class WorkspaceRuntime:
             messages=messages,
             temperature=temperature,
             read_timeout_seconds=read_timeout_seconds,
+            max_output_tokens=max_output_tokens,
         )
         current = self.capture_sandbox_context()
         if (
@@ -1711,6 +1786,7 @@ class WorkspaceRuntime:
         creativity_mode: str = "balanced",
         capability: str = "deep_analysis",
         read_timeout_seconds: float = 45.0,
+        max_output_tokens: int = 2_048,
     ) -> dict[str, Any]:
         del capability
         normalized = prompt.strip()
@@ -1729,6 +1805,7 @@ class WorkspaceRuntime:
                 else 0.3
             ),
             read_timeout_seconds=read_timeout_seconds,
+            max_output_tokens=max_output_tokens,
         )
         provider = dict(completion["provider"])
         return {

@@ -152,9 +152,13 @@ function maintenanceEnvironment(): NodeJS.ProcessEnv {
 }
 
 export async function resolveMaintenanceNpm(): Promise<string> {
+  const home = os.homedir();
   const candidates = [
     '/usr/local/bin/npm',
     '/opt/homebrew/bin/npm',
+    path.join(home, '.volta', 'bin', 'npm'),
+    path.join(home, '.asdf', 'shims', 'npm'),
+    path.join(home, '.local', 'bin', 'npm'),
     ...maintenanceEnvironment().PATH!.split(path.delimiter).map((directory) => (
       path.join(directory, process.platform === 'win32' ? 'npm.cmd' : 'npm')
     )),
@@ -171,6 +175,32 @@ export async function resolveMaintenanceNpm(): Promise<string> {
     '本机没有找到 npm。请确认 Node.js 已安装；图形化安装版会自动检查 /usr/local/bin 与 /opt/homebrew/bin。',
   );
 }
+
+export async function resolveMaintenanceUv(): Promise<string> {
+  const home = os.homedir();
+  const candidates = [
+    '/usr/local/bin/uv',
+    '/opt/homebrew/bin/uv',
+    path.join(home, '.local', 'bin', 'uv'),
+    path.join(home, '.cargo', 'bin', 'uv'),
+    ...maintenanceEnvironment().PATH!.split(path.delimiter).map((directory) => (
+      path.join(directory, process.platform === 'win32' ? 'uv.exe' : 'uv')
+    )),
+  ];
+  for (const candidate of [...new Set(candidates)]) {
+    try {
+      await access(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch {
+      // Continue to the next known executable directory.
+    }
+  }
+  throw new Error(
+    '本机没有找到 uv。源码构建需要 Node.js/npm 和 uv；普通安装版运行本身不需要这些开发依赖。',
+  );
+}
+
+export { maintenanceEnvironment };
 
 async function runMaintenanceGate(repoPath: string): Promise<void> {
   const npm = await resolveMaintenanceNpm();

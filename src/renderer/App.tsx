@@ -5,6 +5,7 @@ import {
   useRuntimeUiSessionState,
   writeRuntimeUiSessionValue,
 } from './lib/runtimeUiSessionStore';
+import { markClientKnowledgeChanged } from './lib/clientKnowledgeEvents';
 import {
   CheckSquare,
   Settings,
@@ -6766,7 +6767,6 @@ type ClientEditorDraft = {
   isDataCenterIncluded: boolean;
   officialWebsiteUrl: string;
   captureOfficialWebsiteNow: boolean;
-  safeKeywords: string;
   strictVersion: number | null;
 };
 
@@ -6828,7 +6828,6 @@ function createEmptyClientEditorDraft(): ClientEditorDraft {
     isDataCenterIncluded: true,
     officialWebsiteUrl: '',
     captureOfficialWebsiteNow: true,
-    safeKeywords: '',
     strictVersion: null,
   };
 }
@@ -6851,7 +6850,6 @@ function buildClientEditorDraft(client: ClientSummary): ClientEditorDraft {
     isDataCenterIncluded: backendIncluded ?? fallbackExt?.isDataCenterIncluded ?? true,
     officialWebsiteUrl: client.officialWebsiteUrl || '',
     captureOfficialWebsiteNow: false,
-    safeKeywords: '',
     strictVersion: client._strictVersion ?? null,
   };
 }
@@ -7089,19 +7087,6 @@ function ClientEditorModal({
                   />
                   <span>保存后将抓取同域官网页面，形成可追溯的权威事实与候选变化。</span>
                 </label>
-              </div>
-              <div>
-                <p className="text-[10px] font-bold uppercase tracking-[0.12em] text-gray-500 mb-1.5">任务识别关键词 · 可选</p>
-                <input
-                  value={draft.safeKeywords}
-                  onKeyDown={handleKeyDown}
-                  onFocus={() => onInteractionState(true, 'client_safe_keywords_input', modalDetail)}
-                  onBlur={() => onInteractionState(state.open, 'client_modal', modalDetail)}
-                  onChange={(event) => updateDraft({ safeKeywords: event.target.value })}
-                  placeholder="例如：软件、官网、日慈（使用逗号分隔）"
-                  className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-[13px] text-gray-900 outline-none focus:border-[#5B7BFE] transition-colors"
-                />
-                <p className="mt-1.5 text-[11px] leading-5 text-gray-400">只用于任务编辑器的本地项目匹配，不会替你保存任务。</p>
               </div>
             </div>
 
@@ -8611,6 +8596,7 @@ export default function App() {
   const [isOrganizationPlanningLoading, setIsOrganizationPlanningLoading] = useState(false);
   const [organizationPlanningLoadError, setOrganizationPlanningLoadError] = useState('');
   const organizationPlanningRequestRef = useRef(0);
+  const organizationPlanningCacheRef = useRef({ scopeKey: '', loadedAt: 0 });
   const [taskProjectKeywordProfiles, setTaskProjectKeywordProfiles] = useState<TaskProjectKeywordProfile[]>([]);
   const taskProfileBackfillScopeRef = useRef('');
   const sharedTasks = useMemo(() => filterSharedTasks(tasks), [tasks]);
@@ -9513,6 +9499,7 @@ export default function App() {
     // 先作废组织计划的在途请求，再清理界面。新 sandbox 的加载会取得更大的
     // request id；旧空间迟到回包不能重新写回当前界面。
     organizationPlanningRequestRef.current += 1;
+    organizationPlanningCacheRef.current = { scopeKey: '', loadedAt: 0 };
     optimisticTasksRef.current.clear();
     taskMutationOverlaysRef.current.clear();
     reviewDirtyTaskIdsRef.current.clear();
@@ -10558,11 +10545,27 @@ export default function App() {
       setCollabDialogError(null);
       await refreshCollabStatus(repoPath);
       if (mode === 'pull') {
-        await loadSystemAdminSettingsBlock(currentSessionUser?.primaryRole === 'admin');
+        if (currentSessionUser?.primaryRole === 'admin') {
+          await loadSystemAdminSettingsBlock(true).catch((error) => {
+            console.warn('[strict-collab] admin settings refresh skipped after pull', error);
+          });
+        }
         if (desktopAppInfo?.isPackaged) {
           setCollabBusyAction('rebuild');
           flash('success', '源码已同步，正在构建并覆盖安装；完成后软件会自动重启。');
-          await rebuildAndInstallFromRepo(repoPath);
+          try {
+            const rebuild = await rebuildAndInstallFromRepo(repoPath);
+            if (rebuild.state === 'installing') {
+              flash('success', rebuild.message);
+            } else if (rebuild.state === 'not_packaged') {
+              flash('success', rebuild.message);
+            } else {
+              flash('info', rebuild.message);
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : '本机自动构建或覆盖安装失败';
+            flash('error', `源码已成功接收；${message}`);
+          }
         } else {
           flash('success', '源码已同步；当前开发版会直接读取最新界面。');
         }
@@ -11352,7 +11355,6 @@ export default function App() {
 
   const openEditClientModal = (client: ClientSummary) => {
     clientEditorOriginRef.current = 'default';
-    const keywordProfile = taskProjectKeywordProfiles.find((profile) => profile.clientId === client.id);
     setClientEditorModalState({
       open: true,
       origin: 'default',
@@ -11360,7 +11362,6 @@ export default function App() {
       requestId: createUiId('client-editor'),
       initialDraft: {
         ...buildClientEditorDraft(client),
-        safeKeywords: keywordProfile?.keywords.join('、') || '',
       },
     });
     logClientEditorModalLifecycle('open', { mode: 'edit', clientId: client.id });
@@ -11422,13 +11423,10 @@ export default function App() {
       // 保存成功后，清理旧 localStorage 迁移钥匙（如果有）
       if (savedClient?.id) {
         _clearClientDraftExtension(savedClient.id);
-        const safeKeywords = Array.from(new Set(
-          draft.safeKeywords
-            .split(/[，,、;；\n]/)
-            .map((keyword) => keyword.trim())
-            .filter(Boolean),
-        ));
-        void refreshTaskProjectKeywordProfile(savedClient.id, safeKeywords)
+        markClientKnowledgeChanged(savedClient.id, 'client_updated');
+        // 项目识别画像由官网权威事实、正式知识和客户档案持续生成。
+        // 项目编辑器只维护基础元数据，不再让用户直接编辑机器关键词。
+        void refreshTaskProjectKeywordProfile(savedClient.id)
           .then((profile) => {
             setTaskProjectKeywordProfiles((previous) => {
               const next = previous.filter((item) => item.clientId !== profile.clientId);
@@ -11443,10 +11441,19 @@ export default function App() {
         flash('info', '项目已保存，正在抓取官网权威信息…');
         void refreshClientOfficialWebsite(savedClient.id, draft.officialWebsiteUrl.trim())
           .then((result) => {
+            markClientKnowledgeChanged(savedClient.id, 'official_website_refreshed');
             flash(
               'success',
               `官网权威信息已更新：读取 ${result.pageCount} 个页面，${result.candidateCount || 0} 项变化待核实。`,
             );
+            void refreshTaskProjectKeywordProfile(savedClient.id)
+              .then((profile) => {
+                setTaskProjectKeywordProfiles((previous) => [
+                  ...previous.filter((item) => item.clientId !== profile.clientId),
+                  profile,
+                ]);
+              })
+              .catch((error) => console.warn('[project-recognition] refresh after website failed', error));
             void loadClientBlock(savedClient.id);
           })
           .catch((error) => {
@@ -11810,14 +11817,34 @@ export default function App() {
   async function loadOrganizationPlanningBlock(options?: {
     transition?: WorkspaceTransitionToken;
     organizationId?: string | null;
+    force?: boolean;
   }) {
-    const requestId = organizationPlanningRequestRef.current + 1;
-    organizationPlanningRequestRef.current = requestId;
-    setIsOrganizationPlanningLoading(true);
-    setOrganizationPlanningLoadError('');
     const requestedOrganizationId = (
       options?.organizationId ?? authState.user?.organizationId ?? ''
     ).trim();
+    const scopeKey = [
+      currentActiveSandboxId(),
+      viewerAuthorization?.membershipId || currentSessionUser?.id || '',
+      requestedOrganizationId,
+    ].join('|');
+    const cached = organizationPlanningCacheRef.current;
+    const hasCurrentScopeCache = cached.scopeKey === scopeKey && cached.loadedAt > 0;
+    const cacheIsFresh = hasCurrentScopeCache && Date.now() - cached.loadedAt < 5 * 60 * 1000;
+    if (!options?.force && cacheIsFresh) {
+      setOrganizationPlanningLoadError('');
+      setIsOrganizationPlanningLoading(false);
+      return {
+        departments: departmentOptions,
+        cycles: strictPlanningCycles,
+        actions: strictDecisionActions,
+      };
+    }
+    const requestId = organizationPlanningRequestRef.current + 1;
+    organizationPlanningRequestRef.current = requestId;
+    // 同一工作空间的旧快照已可用时，过期刷新只在后台进行，不先把页面
+    // 替换成加载态。首次进入或真正切换工作空间时才显示阻塞加载。
+    setIsOrganizationPlanningLoading(!hasCurrentScopeCache);
+    setOrganizationPlanningLoadError('');
     try {
       const [departments, cycles, actions] = await Promise.all([
         getDepartmentOptions({
@@ -11844,6 +11871,7 @@ export default function App() {
           setStrictPlanningCycles(cycles);
           setStrictDecisionActions(actions);
         });
+        organizationPlanningCacheRef.current = { scopeKey, loadedAt: Date.now() };
       }
       return { departments, cycles, actions };
     } catch (error) {
@@ -12454,13 +12482,6 @@ export default function App() {
     hasAuthenticatedSession,
     taskViewMode,
     workspacesState?.activeSandboxId,
-    workspaceRuntimeStatus,
-    // 冷启动的工作空间身份恢复可能在首个 200 回包之后再次清理业务瞬态状态。
-    // 计划页可见时必须观察这组三位一体快照；任何一部分被清空，都立即从
-    // 严格 GC-06 接口重新装载，不能回退到仅有“当前组织”的旧空壳。
-    departmentOptions.length,
-    strictPlanningCycles.length,
-    strictDecisionActions.length,
   ]);
 
   useEffect(() => {
@@ -12591,6 +12612,11 @@ export default function App() {
     if (prev.knowledgeStatus?.lastIndexedAt !== next.knowledgeStatus?.lastIndexedAt) return false;
     if (prev.knowledgeStatus?.totalDocs !== next.knowledgeStatus?.totalDocs) return false;
     if (prev.knowledgeStatus?.pendingDocs !== next.knowledgeStatus?.pendingDocs) return false;
+    if (prev.knowledgeStatus?.totalDocuments !== next.knowledgeStatus?.totalDocuments) return false;
+    if (prev.knowledgeStatus?.pendingJobs !== next.knowledgeStatus?.pendingJobs) return false;
+    if (prev.knowledgeStatus?.runningJobs !== next.knowledgeStatus?.runningJobs) return false;
+    if (prev.knowledgeStatus?.lastJobStatus !== next.knowledgeStatus?.lastJobStatus) return false;
+    if (prev.knowledgeStatus?.lastJobError !== next.knowledgeStatus?.lastJobError) return false;
     // 关键 nested ID 字段
     if (prev.notebookSummary?.updatedAt !== next.notebookSummary?.updatedAt) return false;
     if (prev.latestContextPack?.id !== next.latestContextPack?.id) return false;
@@ -12720,6 +12746,11 @@ export default function App() {
           (prevStatus as any).status === (nextStatus as any).status &&
           (prevStatus as any).totalDocs === (nextStatus as any).totalDocs &&
           (prevStatus as any).pendingDocs === (nextStatus as any).pendingDocs &&
+          (prevStatus as any).totalDocuments === (nextStatus as any).totalDocuments &&
+          (prevStatus as any).pendingJobs === (nextStatus as any).pendingJobs &&
+          (prevStatus as any).runningJobs === (nextStatus as any).runningJobs &&
+          (prevStatus as any).lastJobStatus === (nextStatus as any).lastJobStatus &&
+          (prevStatus as any).lastJobError === (nextStatus as any).lastJobError &&
           (prevStatus as any).lastIndexedAt === (nextStatus as any).lastIndexedAt
         ) ||
         (!prevStatus && !nextStatus);
@@ -12729,7 +12760,11 @@ export default function App() {
         (prevJobs.length === 0 ||
           ((prevJobs[0] as any)?.id === (nextJobs[0] as any)?.id &&
            (prevJobs[prevJobs.length - 1] as any)?.id === (nextJobs[nextJobs.length - 1] as any)?.id &&
-           (prevJobs[0] as any)?.status === (nextJobs[0] as any)?.status));
+           (prevJobs[0] as any)?.status === (nextJobs[0] as any)?.status &&
+           (prevJobs[0] as any)?.processedItems === (nextJobs[0] as any)?.processedItems &&
+           (prevJobs[0] as any)?.totalItems === (nextJobs[0] as any)?.totalItems &&
+           (prevJobs[0] as any)?.currentItemLabel === (nextJobs[0] as any)?.currentItemLabel &&
+           (prevJobs[0] as any)?.lastEventMessage === (nextJobs[0] as any)?.lastEventMessage));
       if (statusUnchanged && jobsUnchanged) return prev;
       return {
         ...prev,
@@ -13598,6 +13633,14 @@ export default function App() {
         const [cycles, actions] = await Promise.all([gc06Api.listPlanningCycles(true), gc06Api.listDecisionActions()]);
         setStrictPlanningCycles(cycles);
         setStrictDecisionActions(actions);
+	      organizationPlanningCacheRef.current = {
+	        scopeKey: [
+	          currentActiveSandboxId(),
+	          viewerAuthorization?.membershipId || currentSessionUser?.id || '',
+	          currentSessionUser?.organizationId || '',
+	        ].join('|'),
+	        loadedAt: Date.now(),
+	      };
 	      flash('success', '计划已保存');
 	    } catch (error) {
 	      flash('error', error instanceof Error ? error.message : '保存失败');
@@ -13621,6 +13664,14 @@ export default function App() {
         ]);
         setStrictPlanningCycles(cycles);
         setStrictDecisionActions(actions);
+        organizationPlanningCacheRef.current = {
+          scopeKey: [
+            currentActiveSandboxId(),
+            viewerAuthorization?.membershipId || currentSessionUser?.id || '',
+            currentSessionUser?.organizationId || '',
+          ].join('|'),
+          loadedAt: Date.now(),
+        };
         flash('success', '未关联任务的计划已删除');
       } catch (error) {
         flash('error', error instanceof Error ? error.message : '删除计划失败');
@@ -17178,6 +17229,7 @@ export default function App() {
             // 重读同一份严格快照，不能继续显示保存前的 0 条关系。
             void loadOrganizationPlanningBlock({
               organizationId: currentSessionUser?.organizationId ?? null,
+              force: true,
             }).catch((error) => {
               console.warn('[organization-planning] post-task-save refresh failed', error);
             });
@@ -17357,6 +17409,7 @@ export default function App() {
 	            loadTaskBlock(),
 	            loadOrganizationPlanningBlock({
 	              organizationId: currentSessionUser?.organizationId ?? null,
+	              force: true,
 	            }),
 	          ]);
 	          setTasks((prev) => prev.filter((t) => t.id !== deletedId));
@@ -19072,18 +19125,6 @@ export default function App() {
         setActiveReviewTab((current) => (current === 'overview' ? 'events' : current));
         setGrowthContextJump(null);
       }
-      if (mode === 'plan') {
-        // 组织计划是用户明确打开的严格 GC-06 消费面。不要只依赖启动期 effect：
-        // 冷启动的 sandbox/auth 清理顺序可能晚于首个回包，导致真实部门和计划
-        // 被清空后永久显示旧“当前组织”壳。点击入口时直接刷新三位一体快照。
-        window.setTimeout(() => {
-          void loadOrganizationPlanningBlock({
-            organizationId: currentSessionUser?.organizationId ?? null,
-          }).catch((error) => {
-            console.warn('[organization-planning] explicit refresh failed', error);
-          });
-        }, 0);
-      }
       if (mode !== 'list') {
         setDrillTaskViewOverride(null);
       }
@@ -20545,8 +20586,8 @@ export default function App() {
           )}
 
           {taskViewMode === 'inbox' && (
-            <div className="max-w-4xl">
-              <div className="bg-white border border-gray-100 rounded-2xl p-6">
+            <div className="h-full min-h-0 max-w-4xl">
+              <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-6">
                 <div className="flex flex-wrap items-start justify-between gap-3 mb-5">
                   <div>
                     <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-400">
@@ -20683,7 +20724,7 @@ export default function App() {
                     </div>
                   )}
                 </div>}
-                <div className="mb-4 flex flex-wrap items-center gap-2">
+                <div className="z-30 -mx-2 mb-4 flex shrink-0 flex-wrap items-center gap-2 border-b border-gray-100 bg-white px-2 py-2">
                   <label className="flex items-center gap-2 rounded-md bg-white px-3 py-1.5 text-[11.5px] font-medium text-gray-600 ring-1 ring-inset ring-gray-200">
                     <span className="text-[9px] font-semibold uppercase tracking-[0.16em] text-gray-400">排序</span>
                     <select
@@ -20730,7 +20771,8 @@ export default function App() {
                     </>
                   )}
                 </div>
-                <div className="space-y-3">
+                <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+                  <div className="space-y-3">
                   <section className="rounded-xl border border-blue-100 bg-blue-50/20">
                     <div
                       role="button"
@@ -20896,6 +20938,7 @@ export default function App() {
                       </p>
                     </div>
                   )}
+                  </div>
                 </div>
               </div>
             </div>
@@ -20949,7 +20992,7 @@ export default function App() {
           )}
 
           {taskViewMode === 'plan' && (
-            <div className="space-y-5">
+            <div className="h-full min-h-0">
               <PlanWorkshopView
                 key={[workspacesState?.activeSandboxId || '', currentSessionUser?.id || ''].join('|')}
                 value={strictPlanWorkshopState}
@@ -20980,9 +21023,9 @@ export default function App() {
                 ? `所有项目（${eventLineProjectOptions.length}）`
                 : (eventLineProjectOptions.find((o) => o.id === eventLineProjectFilterId)?.label ?? '未知项目');
             return (
-            <div className="event-lines-panel max-w-6xl mx-auto pb-20">
+            <div className="event-lines-panel mx-auto flex h-full min-h-0 max-w-6xl flex-col overflow-hidden">
               {/* 顶部标题区 */}
-              <header className="flex items-end justify-between gap-6 py-5 border-b border-gray-100">
+              <header className="z-30 flex shrink-0 items-end justify-between gap-6 border-b border-gray-100 bg-[#F9FAFB] py-5">
                 <div>
                   <h1 className="text-[26px] font-light tracking-tight text-gray-900">事件线</h1>
                   <p className="mt-1 text-[12px] text-gray-400">
@@ -21087,6 +21130,7 @@ export default function App() {
                 </div>
               </header>
 
+              <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto pb-20">
               {/* 空状态 */}
                 {projectScopedEventLines.length === 0 && (
                 <div className="py-24 text-center">
@@ -21311,6 +21355,7 @@ export default function App() {
                   );
                 })}
               </div>
+              </div>
               {/* 合并事件线 Modal：第一步选源，第二步确认 */}
               {eventLineMergeDialog && (() => {
                 const dialog = eventLineMergeDialog;
@@ -21514,7 +21559,7 @@ export default function App() {
           })()}
 
           {taskViewMode === 'review' && (
-            <div className="max-w-6xl mx-auto flex flex-col" style={{ height: 'calc(100vh - 80px)' }}>
+            <div className="mx-auto flex h-full min-h-0 max-w-6xl flex-col overflow-hidden">
 
               {/* ── 顶部控制栏 · 极简 typography ── */}
               <div className="flex items-end justify-between gap-6 py-5 shrink-0">
@@ -27186,13 +27231,11 @@ export default function App() {
         const total = latestKnowledgeJob?.totalItems || 0;
         const activeJob = latestKnowledgeJob?.status === 'queued' || latestKnowledgeJob?.status === 'running';
         const hasActivity =
-          isImportSubmitting ||
           isTemplateFilling ||
           isLinkImporting ||
-          activeJob ||
-          Boolean((knowledgeStatus?.pendingJobs || 0) + (knowledgeStatus?.runningJobs || 0));
-        const ratio = total > 0 ? Math.max(0, Math.min(1, processed / total)) : hasActivity ? 0.12 : 0;
-        const percent = total > 0 ? Math.round(ratio * 100) : hasActivity ? 12 : 0;
+          activeJob;
+        const ratio = total > 0 ? Math.max(0, Math.min(1, processed / total)) : 0;
+        const percent = total > 0 ? Math.round(ratio * 100) : 0;
         const currentItemLabel =
           latestKnowledgeJob?.currentItemLabel ||
           latestKnowledgeJob?.recentEvents?.find((event) => event.itemLabel)?.itemLabel ||
@@ -27206,7 +27249,7 @@ export default function App() {
           : !hasActivity
             ? ''
             : total <= 0
-              ? '正在准备资料队列'
+              ? ''
               : activeJob && completed
                 ? '正在收尾建库'
                 : activeJob
@@ -27214,7 +27257,7 @@ export default function App() {
                   : latestKnowledgeJob?.status === 'completed'
                     ? `已完成 ${processed}/${total || processed}`
                     : '正在同步资料状态';
-        const statusLabel = total > 0 ? `${processed}/${total}` : latestKnowledgeJob?.lastEventMessage || '准备中';
+        const statusLabel = total > 0 ? `${processed}/${total}` : latestKnowledgeJob?.lastEventMessage || '';
         return {
           hasActivity,
           processed,
@@ -27718,6 +27761,9 @@ export default function App() {
         const versionUpgradeCount = importResults.reduce((sum, item) => sum + (item.versionUpgradeCount || 0), 0);
         const unsupportedCount = importResults.reduce((sum, item) => sum + (item.unsupportedCount || 0), 0);
         const queuedImports = importResults.filter((item) => item.status === 'queued').length;
+        if (importedCount > 0) {
+          markClientKnowledgeChanged(currentClientId, 'material_imported');
+        }
         const partialImports = importResults.filter(
           (item) => item.overallState === 'partial' || item.status === 'partial',
         );
@@ -28341,6 +28387,7 @@ export default function App() {
         });
         workspaceStartMessageAbortControllerRef.current = null;
         if (started.memoryUpdate?.state === 'ready') {
+          markClientKnowledgeChanged(submittedClientId, 'memory_updated');
           void Promise.all([
             refreshWorkspace(submittedClientId),
             refreshKnowledgePresentationForScope(submittedClientId),
@@ -28537,6 +28584,7 @@ export default function App() {
           throw new Error('纠错尚未完整写入本机和组织云，请重试');
         }
         setAnswerCorrectionResult(result);
+        markClientKnowledgeChanged(targetClientId, 'fact_corrected');
         await Promise.all([
           refreshWorkspace(targetClientId),
           refreshKnowledgePresentationForScope(targetClientId),
@@ -28852,6 +28900,9 @@ export default function App() {
         clientId={currentClientId || undefined}
         onClose={() => setIsSmartFileImportOpen(false)}
         onImported={(stats) => {
+          if (currentClientId && stats.documents_created > 0) {
+            markClientKnowledgeChanged(currentClientId, 'material_imported');
+          }
           flash('success',
             `已导入数据中心: ${stats.documents_created} 个文件 · ${stats.entities_created} 个人物 · ` +
             `${stats.commitments_created} 个承诺 · ${stats.risk_signals_created} 个风险`,
@@ -32019,7 +32070,7 @@ export default function App() {
                         <div className="h-1.5 overflow-hidden rounded-full bg-[#E8EEFF]">
                           <div
                             className="h-full rounded-full bg-[#5B7BFE] transition-all duration-500"
-                            style={{ width: `${Math.min(Math.max(knowledgeJobProgressView.percent, knowledgeJobProgressView.hasActivity ? 8 : 0), 100)}%` }}
+                            style={{ width: `${Math.min(Math.max(knowledgeJobProgressView.percent, 0), 100)}%` }}
                           />
                         </div>
                         <p className="mt-1.5 truncate text-[10px] font-medium text-slate-500" title={knowledgeJobProgressView.currentItemLabel || knowledgeJobProgressView.lastEventMessage || ''}>

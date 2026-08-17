@@ -419,94 +419,97 @@ export function PlanWorkshopView({
   }
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="mx-auto max-w-7xl space-y-7 px-6 pb-20 pt-6 lg:px-8">
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <PageHeading subtitle={subtitle} error={loadError} />
-          {canCreatePlan && (
-            <div className="flex items-center gap-2">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      <div className="mx-auto flex h-full min-h-0 w-full max-w-7xl flex-col px-6 pt-6 lg:px-8">
+        <div className="z-30 -mx-2 shrink-0 border-b border-gray-100 bg-[#F9FAFB] px-2 pb-3 pt-1">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <PageHeading subtitle={subtitle} error={loadError} />
+            {canCreatePlan && (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowArchived((current) => !current)}
+                  className={`rounded-2xl border px-3 py-2 text-[12px] font-bold transition-colors ${
+                    showArchived
+                      ? 'border-gray-200 bg-white text-gray-500 hover:border-[#C9D6FF] hover:text-[#5B7BFE]'
+                      : 'border-amber-200 bg-amber-50 text-amber-700'
+                  }`}
+                >
+                  {showArchived ? '隐藏已归档' : '显示已归档'} ({archivedCount})
+                </button>
+                <button type="button" onClick={openAiSplit} className="inline-flex items-center gap-1.5 rounded-xl border border-[#5B7BFE]/30 bg-white px-3.5 py-2 text-[12px] font-bold text-[#4A66D8] hover:bg-[#5B7BFE]/5">
+                  <Sparkles size={14} /> AI 拆解多计划
+                </button>
+                <button type="button" onClick={() => openCreate()} className="inline-flex items-center gap-1.5 rounded-xl bg-[#5B7BFE] px-3.5 py-2 text-[12px] font-bold text-white hover:bg-[#4A6AE8]">
+                  <Plus size={14} /> 新增计划
+                </button>
+              </div>
+            )}
+          </div>
+
+          <section className="mt-3 flex flex-wrap items-center gap-2 border-y border-gray-100 py-2.5">
+            <label className="min-w-[260px] flex-1">
+              <input
+                value={taskSearchQuery}
+                onChange={(event) => setTaskSearchQuery(event.target.value)}
+                className="w-full rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] text-gray-800 outline-none focus:border-[#5B7BFE]"
+                placeholder="搜索任务名称或任务说明中的关键词"
+              />
+            </label>
+            <label className="w-[132px]">
+              <select
+                value={periodFilterType}
+                onChange={(event) => {
+                  const nextType = event.target.value as PeriodFilterType;
+                  setPeriodFilterType(nextType);
+                  setPeriodFilterValue(nextType === 'all' ? '' : defaultPlanningPeriodKey(nextType));
+                }}
+                className="w-full rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] font-bold text-gray-700 outline-none focus:border-[#5B7BFE]"
+              >
+                <option value="all">全部周期</option>
+                {CYCLE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+            </label>
+            <label className="w-[210px]">
+              {periodFilterType === 'all' ? (
+                <span className="block w-full cursor-not-allowed rounded-2xl border border-gray-200 bg-gray-100 px-3 py-2 text-[12px] font-bold text-gray-400">
+                  请先选择周期类型
+                </span>
+              ) : periodFilterType === 'week' ? (
+                <WeekPeriodInput value={periodFilterValue || defaultPlanningPeriodKey('week')} onChange={setPeriodFilterValue} compact />
+              ) : (
+                <input
+                  value={periodFilterValue}
+                  onChange={(event) => setPeriodFilterValue(event.target.value)}
+                  className="w-full rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] font-bold text-gray-700 outline-none focus:border-[#5B7BFE]"
+                  placeholder={periodFilterType === 'month' ? '例如 2026-08' : periodFilterType === 'quarter' ? '例如 2026-Q3' : periodFilterType === 'year' ? '例如 2026' : '输入目标周期'}
+                />
+              )}
+            </label>
+            {(taskSearchQuery || periodFilterType !== 'all') && (
               <button
                 type="button"
-                onClick={() => setShowArchived((current) => !current)}
-                className={`rounded-2xl border px-3 py-2 text-[12px] font-bold transition-colors ${
-                  showArchived
-                    ? 'border-gray-200 bg-white text-gray-500 hover:border-[#C9D6FF] hover:text-[#5B7BFE]'
-                    : 'border-amber-200 bg-amber-50 text-amber-700'
-                }`}
+                onClick={() => { setTaskSearchQuery(''); setPeriodFilterType('all'); setPeriodFilterValue(''); }}
+                className="rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] font-bold text-gray-500 hover:border-[#C9D6FF] hover:text-[#5B7BFE]"
               >
-                {showArchived ? '隐藏已归档' : '显示已归档'} ({archivedCount})
+                清除筛选
               </button>
-              <button type="button" onClick={openAiSplit} className="inline-flex items-center gap-1.5 rounded-xl border border-[#5B7BFE]/30 bg-white px-3.5 py-2 text-[12px] font-bold text-[#4A66D8] hover:bg-[#5B7BFE]/5">
-                <Sparkles size={14} /> AI 拆解多计划
-              </button>
-              <button type="button" onClick={() => openCreate()} className="inline-flex items-center gap-1.5 rounded-xl bg-[#5B7BFE] px-3.5 py-2 text-[12px] font-bold text-white hover:bg-[#4A6AE8]">
-                <Plus size={14} /> 新增计划
-              </button>
-            </div>
-          )}
+            )}
+          </section>
         </div>
 
-        <section className="flex flex-wrap items-center gap-2 border-y border-gray-100 py-2.5">
-          <label className="min-w-[260px] flex-1">
-            <input
-              value={taskSearchQuery}
-              onChange={(event) => setTaskSearchQuery(event.target.value)}
-              className="w-full rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] text-gray-800 outline-none focus:border-[#5B7BFE]"
-              placeholder="搜索任务名称或任务说明中的关键词"
-            />
-          </label>
-          <label className="w-[132px]">
-            <select
-              value={periodFilterType}
-              onChange={(event) => {
-                const nextType = event.target.value as PeriodFilterType;
-                setPeriodFilterType(nextType);
-                setPeriodFilterValue(nextType === 'all' ? '' : defaultPlanningPeriodKey(nextType));
-              }}
-              className="w-full rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] font-bold text-gray-700 outline-none focus:border-[#5B7BFE]"
-            >
-              <option value="all">全部周期</option>
-              {CYCLE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </select>
-          </label>
-          <label className="w-[210px]">
-            {periodFilterType === 'all' ? (
-              <span className="block w-full cursor-not-allowed rounded-2xl border border-gray-200 bg-gray-100 px-3 py-2 text-[12px] font-bold text-gray-400">
-                请先选择周期类型
-              </span>
-            ) : periodFilterType === 'week' ? (
-              <WeekPeriodInput value={periodFilterValue || defaultPlanningPeriodKey('week')} onChange={setPeriodFilterValue} compact />
-            ) : (
-              <input
-                value={periodFilterValue}
-                onChange={(event) => setPeriodFilterValue(event.target.value)}
-                className="w-full rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] font-bold text-gray-700 outline-none focus:border-[#5B7BFE]"
-                placeholder={periodFilterType === 'month' ? '例如 2026-08' : periodFilterType === 'quarter' ? '例如 2026-Q3' : periodFilterType === 'year' ? '例如 2026' : '输入目标周期'}
-              />
-            )}
-          </label>
-          {(taskSearchQuery || periodFilterType !== 'all') && (
-            <button
-              type="button"
-              onClick={() => { setTaskSearchQuery(''); setPeriodFilterType('all'); setPeriodFilterValue(''); }}
-              className="rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] font-bold text-gray-500 hover:border-[#C9D6FF] hover:text-[#5B7BFE]"
-            >
-              清除筛选
-            </button>
-          )}
-        </section>
+        <div className="min-h-0 flex-1 space-y-7 overflow-y-auto pb-20 pt-7">
+          {isAdmin && <section>
+            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">PLAN OVERVIEW</p>
+            <div className="mt-3 grid grid-cols-2 gap-x-8 gap-y-4 md:grid-cols-4">
+              <Metric label="部门覆盖" value={`${coveredDepartments} / ${departmentRows.length}`} hint="已制定计划的部门" />
+              <Metric label="待制定" value={String(departmentRows.length - coveredDepartments)} hint="尚无计划的部门" accent="amber" />
+              <Metric label="未启动计划" value={String(unlinkedPlans.length)} hint="尚无任务承接的有效计划" accent="amber" />
+              <Metric label="执行覆盖率" value={`${executionCoverage}%`} hint={`${linkedPlans} / ${filteredActivePlans.length} 条计划已有任务承接`} accent="blue" />
+            </div>
+          </section>}
 
-        {isAdmin && <section>
-          <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">PLAN OVERVIEW</p>
-          <div className="mt-3 grid grid-cols-2 gap-x-8 gap-y-4 md:grid-cols-4">
-            <Metric label="部门覆盖" value={`${coveredDepartments} / ${departmentRows.length}`} hint="已制定计划的部门" />
-            <Metric label="待制定" value={String(departmentRows.length - coveredDepartments)} hint="尚无计划的部门" accent="amber" />
-            <Metric label="未启动计划" value={String(unlinkedPlans.length)} hint="尚无任务承接的有效计划" accent="amber" />
-            <Metric label="执行覆盖率" value={`${executionCoverage}%`} hint={`${linkedPlans} / ${filteredActivePlans.length} 条计划已有任务承接`} accent="blue" />
-          </div>
-        </section>}
-
-        <section className="grid grid-cols-1 gap-x-8 gap-y-8 border-t border-gray-100 pt-6 lg:grid-cols-[1.1fr_1fr]">
+          <section className="grid grid-cols-1 gap-x-8 gap-y-8 border-t border-gray-100 pt-6 lg:grid-cols-[1.1fr_1fr]">
           <div>
             <p className="mb-4 text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">DEPARTMENTS · 部门 · 计划</p>
             <div className="-mx-2 max-h-[640px] overflow-y-auto">
@@ -632,7 +635,8 @@ export function PlanWorkshopView({
               )}
             </div>
           </div>
-        </section>
+          </section>
+        </div>
       </div>
 
       {editingPlan && (

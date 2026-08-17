@@ -256,12 +256,18 @@ class LocalWorkbenchChatRepository:
         )
         return str(stored["manifest_id"])
 
-    def _read_managed_payload(self, object_id: str) -> dict[str, Any]:
+    def _read_managed_payload(
+        self,
+        object_id: str,
+        *,
+        manifest: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         context = self._context()
-        manifest = self.runtime.local_storage_object_get(
-            sandbox_id=context.sandbox_id,
-            object_id=object_id,
-        )
+        if manifest is None:
+            manifest = self.runtime.local_storage_object_get(
+                sandbox_id=context.sandbox_id,
+                object_id=object_id,
+            )
         if manifest is None or str(manifest.get("lifecycle_state") or "") != "active":
             raise LocalRuntimeError(404, "workbench_answer_missing", "工作台回答不存在")
         path = self._managed_path(str(manifest.get("storage_key") or ""))
@@ -744,7 +750,15 @@ class LocalWorkbenchChatRepository:
                     thread_id,
                 ),
             ).fetchall()
-        answers = [self._read_managed_payload(f"ai-answer:{row['id']}") for row in rows]
+        object_ids = [f"ai-answer:{row['id']}" for row in rows]
+        manifests = self.runtime.local_storage_objects_get(
+            sandbox_id=context.sandbox_id,
+            object_ids=object_ids,
+        )
+        answers = [
+            self._read_managed_payload(object_id, manifest=manifests.get(object_id))
+            for object_id in object_ids
+        ]
         return [
             answer
             for answer in answers
@@ -753,6 +767,7 @@ class LocalWorkbenchChatRepository:
         ]
 
     def project_answers(self, client_id: str) -> list[dict[str, Any]]:
+        context = self._context()
         with self.runtime._connection() as connection:
             rows = connection.execute(
                 """
@@ -766,7 +781,15 @@ class LocalWorkbenchChatRepository:
                     client_id,
                 ),
             ).fetchall()
-        answers = [self._read_managed_payload(f"ai-answer:{row['id']}") for row in rows]
+        object_ids = [f"ai-answer:{row['id']}" for row in rows]
+        manifests = self.runtime.local_storage_objects_get(
+            sandbox_id=context.sandbox_id,
+            object_ids=object_ids,
+        )
+        answers = [
+            self._read_managed_payload(object_id, manifest=manifests.get(object_id))
+            for object_id in object_ids
+        ]
         return [
             answer
             for answer in answers

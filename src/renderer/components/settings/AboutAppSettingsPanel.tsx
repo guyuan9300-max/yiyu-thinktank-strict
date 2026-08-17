@@ -182,7 +182,7 @@ export function AboutAppSettingsPanel({ desktopAppInfo }: Props): React.ReactEle
         <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">UPDATES</p>
         <h3 className="mt-2 text-[18px] font-light tracking-tight text-gray-900">软件更新</h3>
         <p className="mt-1.5 text-[12px] leading-6 text-gray-500">
-          软件会每 24 小时检查一次官网发布的新版本。发现更新时会通知你；也可以点击“检查更新”查看更新内容并下载安装包。
+          软件启动后会检查官网发布的新版本，联网使用期间也会定期重试。发现更新时会通知你；也可以点击“检查更新”查看更新内容并下载安装包。
           安装前请关闭旧软件：Windows 请将新版安装到原目录；macOS 请将应用拖入“应用程序”并选择替换。
         </p>
 

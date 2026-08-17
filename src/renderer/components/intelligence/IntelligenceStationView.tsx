@@ -119,6 +119,8 @@ const PAGE_SIZE: Record<IntelligenceContentKind, number> = {
   public_opinion: 50,
 };
 
+const INTELLIGENCE_RUNTIME_CACHE_TTL_MS = 5 * 60 * 1000;
+
 // 顺序即 tab 显示顺序: 品牌监测 → 时效情报. brand_mirror 保留键以兼容 type/后端, 但 UI 过滤掉.
 const TAB_LABEL: Record<IntelligenceContentKind, string> = {
   public_opinion: '品牌监测',
@@ -868,8 +870,9 @@ export function IntelligenceStationView({
   onTasksReload,
   uiSessionScopeKey = 'intelligence:local:anonymous',
 }: IntelligenceStationViewProps) {
-  const [workObjects, setWorkObjects] = useState<IntelligenceWorkObject[]>([]);
-  const [focusDirectives, setFocusDirectives] = useState<IntelligenceFocusDirective[]>([]);
+  const [workObjects, setWorkObjects] = useRuntimeUiSessionState<IntelligenceWorkObject[]>(`${uiSessionScopeKey}:data:work-objects`, []);
+  const [focusDirectives, setFocusDirectives] = useRuntimeUiSessionState<IntelligenceFocusDirective[]>(`${uiSessionScopeKey}:data:focus-directives`, []);
+  const [shellLoadedAt, setShellLoadedAt] = useRuntimeUiSessionState<number>(`${uiSessionScopeKey}:data:shell-loaded-at`, 0);
   const [selectedScopeKey, setSelectedScopeKey] = useRuntimeUiSessionState<WorkObjectSelection>(`${uiSessionScopeKey}:scope`, 'all');
   const [mruScopeKeys, setMruScopeKeys] = useRuntimeUiSessionState<string[]>(`${uiSessionScopeKey}:mru`, []);
   const [focusScopeKey, setFocusScopeKey] = useState<ScopeKey>('global');
@@ -881,9 +884,11 @@ export function IntelligenceStationView({
     timely_intelligence: 1,
     public_opinion: 1,
   });
-  const [items, setItems] = useState<IntelligenceItem[]>([]);
-  const [candidateSamples, setCandidateSamples] = useState<IntelligenceCandidateSample[]>([]);
-  const [total, setTotal] = useState(0);
+  const itemRuntimeCacheKey = `${uiSessionScopeKey}:data:items:${selectedScopeKey}:${activeTab}:${sort}:${pages[activeTab]}`;
+  const [items, setItems] = useRuntimeUiSessionState<IntelligenceItem[]>(`${itemRuntimeCacheKey}:records`, []);
+  const [candidateSamples, setCandidateSamples] = useRuntimeUiSessionState<IntelligenceCandidateSample[]>(`${itemRuntimeCacheKey}:candidates`, []);
+  const [total, setTotal] = useRuntimeUiSessionState<number>(`${itemRuntimeCacheKey}:total`, 0);
+  const [itemsLoadedAt, setItemsLoadedAt] = useRuntimeUiSessionState<number>(`${itemRuntimeCacheKey}:loaded-at`, 0);
   const [loading, setLoading] = useState(false);
   const [focusModalOpen, setFocusModalOpen] = useState(false);
   const [savingFocus, setSavingFocus] = useState(false);
@@ -922,8 +927,9 @@ export function IntelligenceStationView({
     };
   }, [uiSessionScopeKey]);
   const [refreshingKind, setRefreshingKind] = useState<IntelligenceContentKind | null>(null);
-  const [refreshRuns, setRefreshRuns] = useState<IntelligenceRefreshRun[]>([]);
-  const [refreshCycleSettings, setRefreshCycleSettings] = useState<IntelligenceRefreshCycleSettings>(DEFAULT_REFRESH_CYCLE_SETTINGS);
+  const [refreshRuns, setRefreshRuns] = useRuntimeUiSessionState<IntelligenceRefreshRun[]>(`${uiSessionScopeKey}:data:refresh-runs`, []);
+  const [refreshCycleSettings, setRefreshCycleSettings] = useRuntimeUiSessionState<IntelligenceRefreshCycleSettings>(`${uiSessionScopeKey}:data:cycle-settings`, DEFAULT_REFRESH_CYCLE_SETTINGS);
+  const [refreshRunsLoadedAt, setRefreshRunsLoadedAt] = useRuntimeUiSessionState<number>(`${uiSessionScopeKey}:data:refresh-runs-loaded-at`, 0);
   const [cycleEditKind, setCycleEditKind] = useState<IntelligenceContentKind | null>(null);
   const [cycleEditValue, setCycleEditValue] = useState('');
   const [cycleSaving, setCycleSaving] = useState(false);
@@ -937,12 +943,24 @@ export function IntelligenceStationView({
   }, [selectedScopeKey, workObjects]);
   const selectedScopeKeyRef = useRef(selectedScopeKey);
   const activeTabRef = useRef(activeTab);
+  const shellLoadedAtRef = useRef(shellLoadedAt);
+  const itemsLoadedAtRef = useRef(itemsLoadedAt);
+  const refreshRunsLoadedAtRef = useRef(refreshRunsLoadedAt);
   useEffect(() => {
     selectedScopeKeyRef.current = selectedScopeKey;
   }, [selectedScopeKey]);
   useEffect(() => {
     activeTabRef.current = activeTab;
   }, [activeTab]);
+  useEffect(() => {
+    shellLoadedAtRef.current = shellLoadedAt;
+  }, [shellLoadedAt]);
+  useEffect(() => {
+    itemsLoadedAtRef.current = itemsLoadedAt;
+  }, [itemsLoadedAt]);
+  useEffect(() => {
+    refreshRunsLoadedAtRef.current = refreshRunsLoadedAt;
+  }, [refreshRunsLoadedAt]);
 
   // P12 · 按 MRU 排序的 workObjects — 最近看过的排前面，剩余按原顺序
   const sortedWorkObjects = useMemo(() => {
@@ -1015,7 +1033,12 @@ export function IntelligenceStationView({
     refreshPollTimersRef.current = [];
   }, []);
 
-  const loadShell = useCallback(async () => {
+  const loadShell = useCallback(async (options?: { preferCache?: boolean }) => {
+    if (
+      options?.preferCache
+      && shellLoadedAtRef.current > 0
+      && Date.now() - shellLoadedAtRef.current < INTELLIGENCE_RUNTIME_CACHE_TTL_MS
+    ) return;
     try {
       const [objects, directives, cycleSettings] = await Promise.all([
         getIntelligenceWorkObjects(),
@@ -1025,12 +1048,15 @@ export function IntelligenceStationView({
       setWorkObjects(objects);
       setFocusDirectives(directives);
       setRefreshCycleSettings(cycleSettings);
+      const loadedAt = Date.now();
+      shellLoadedAtRef.current = loadedAt;
+      setShellLoadedAt(loadedAt);
     } catch (error) {
       flashRef.current('error', error instanceof Error ? error.message : '情报站初始化失败');
     }
   }, []);
 
-  const loadItems = useCallback(async (options?: { silent?: boolean }) => {
+  const loadItems = useCallback(async (options?: { silent?: boolean; preferCache?: boolean }) => {
     // 品牌监测 tab 走 SentimentMonitorPanel 内部 items, 不调通用 items 端点
     if (activeTab === 'public_opinion') {
       setItems([]);
@@ -1038,10 +1064,15 @@ export function IntelligenceStationView({
       setTotal(0);
       return;
     }
+    if (
+      options?.preferCache
+      && itemsLoadedAtRef.current > 0
+      && Date.now() - itemsLoadedAtRef.current < INTELLIGENCE_RUNTIME_CACHE_TTL_MS
+    ) return;
     const capturedScopeKey = selectedScopeKey;
     const capturedTab = activeTab;
     const silent = Boolean(options?.silent);
-    if (!silent) setLoading(true);
+    if (!silent) setLoading(itemsLoadedAtRef.current <= 0);
     try {
       const response = await getIntelligenceItems({
         contentKind: activeTab,
@@ -1058,6 +1089,9 @@ export function IntelligenceStationView({
       setItems(response.items);
       setCandidateSamples(response.candidateSamples || []);
       setTotal(response.total);
+      const loadedAt = Date.now();
+      itemsLoadedAtRef.current = loadedAt;
+      setItemsLoadedAt(loadedAt);
     } catch (error) {
       if (selectedScopeKeyRef.current !== capturedScopeKey) return;
       flashRef.current('error', error instanceof Error ? error.message : '情报列表加载失败');
@@ -1080,21 +1114,29 @@ export function IntelligenceStationView({
     });
   }, []);
 
-  const loadRefreshRuns = useCallback(async () => {
+  const loadRefreshRuns = useCallback(async (options?: { preferCache?: boolean }) => {
+    if (
+      options?.preferCache
+      && refreshRunsLoadedAtRef.current > 0
+      && Date.now() - refreshRunsLoadedAtRef.current < INTELLIGENCE_RUNTIME_CACHE_TTL_MS
+    ) return refreshRuns;
     try {
       const runs = await getIntelligenceRefreshRuns({
         limit: 12,
       });
       setRefreshRuns(runs);
+      const loadedAt = Date.now();
+      refreshRunsLoadedAtRef.current = loadedAt;
+      setRefreshRunsLoadedAt(loadedAt);
       return runs;
     } catch (error) {
       flashRef.current('error', error instanceof Error ? error.message : '刷新状态读取失败');
       return [];
     }
-  }, []);
+  }, [refreshRuns, setRefreshRuns, setRefreshRunsLoadedAt]);
 
   useEffect(() => {
-    void loadShell();
+    void loadShell({ preferCache: true });
   }, [loadShell]);
 
   useEffect(() => {
@@ -1103,11 +1145,11 @@ export function IntelligenceStationView({
   }, [focusDirectives, focusScopeKey]);
 
   useEffect(() => {
-    void loadItems();
+    void loadItems({ preferCache: true });
   }, [loadItems]);
 
   useEffect(() => {
-    void loadRefreshRuns();
+    void loadRefreshRuns({ preferCache: true });
   }, [loadRefreshRuns]);
 
   // TODO: 半成品，autoRefreshIntelligenceDue 未在 api.ts 实现；后端 endpoint 也只是 stub。
@@ -1446,20 +1488,12 @@ export function IntelligenceStationView({
   })();
 
   return (
-    <div ref={scrollContainerRef} className="h-full overflow-y-auto bg-white font-sans text-gray-900">
-      <div className="mx-auto max-w-[1320px] px-6 lg:px-8 pt-8 pb-10">
-        {/* HERO · 标题 + 4 KPI + 主操作 ─────────────────────────── */}
-        <header>
-          <div className="flex flex-wrap items-start justify-between gap-4">
-            <div className="min-w-0">
-              <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">INTELLIGENCE · 资讯情报站</p>
-              <h1 className="mt-2 text-[22px] font-light tracking-tight text-gray-900">{TAB_LABEL[activeTab] || '客户 / 项目情报流'}</h1>
-              <p className="mt-1.5 text-[12px] text-gray-500 leading-relaxed">{selectedLabel}</p>
-            </div>
-          </div>
-
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-white font-sans text-gray-900">
+      <div className="mx-auto flex h-full min-h-0 w-full max-w-[1320px] flex-col px-6 pt-6 lg:px-8">
+        {/* 页面进入后直接展示指标；当前板块和项目由下方固定标签栏表达。 */}
+        <header className="shrink-0">
           {/* 4 KPI block — tab-aware: 品牌监测显示品牌健康 KPI, 时效情报显示信号流通 KPI */}
-          <div className="mt-7 grid grid-cols-2 md:grid-cols-4 gap-x-8 gap-y-6">
+          <div className="grid grid-cols-2 gap-x-8 gap-y-6 md:grid-cols-4">
             {activeTab === 'public_opinion' ? (
               <>
                 {/* 整体情感 0-100 (品牌监测 #1) */}
@@ -1558,9 +1592,9 @@ export function IntelligenceStationView({
           </div>
         </header>
 
-        <main className="mt-10">
+        <main className="mt-6 flex min-h-0 flex-1 flex-col">
           {/* Tab 切换:underline 风格,active 用 #5B7BFE 锚线,跟全局一致 */}
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-gray-100">
+          <div className="z-30 -mx-2 flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-gray-100 bg-white px-2 pt-2">
             <div className="flex gap-7">
               {(Object.keys(TAB_LABEL) as IntelligenceContentKind[]).filter((k) => !HIDDEN_TABS.has(k)).map((key) => (
                 <button
@@ -1618,6 +1652,7 @@ export function IntelligenceStationView({
             </div>
           </div>
 
+          <div ref={scrollContainerRef} className="min-h-0 flex-1 overflow-y-auto pb-10">
           {/* 时效情报的周期和主动作集中在标签页内，不占用全局标题区。 */}
           {activeTab === 'timely_intelligence' && (
             <div className="mt-4 mb-2 space-y-3">
@@ -1691,12 +1726,13 @@ export function IntelligenceStationView({
             {activeTab === 'public_opinion' ? (
               <SentimentMonitorPanel
                 workObject={selectedWorkObject}
+                uiSessionScopeKey={`${uiSessionScopeKey}:sentiment`}
                 onProfileChange={setBrandKpiProfile}
                 onNegativeCountChange={setBrandKpiNegativeCount}
               />
             ) : (
               <>
-            {loading ? (
+            {loading && itemsLoadedAt <= 0 ? (
               <div className="flex min-h-[260px] items-center justify-center text-[13px] font-bold text-gray-500">
                 <Loader2 size={18} className="mr-2 animate-spin" />
                 正在读取情报
@@ -1771,6 +1807,7 @@ export function IntelligenceStationView({
               </div>
             </>
           )}
+          </div>
         </main>
 
       </div>
@@ -2226,11 +2263,13 @@ export function IntelligenceStationView({
 
 function SentimentMonitorPanel({
   workObject,
+  uiSessionScopeKey,
   onProfileChange,
   onNegativeCountChange,
   onRegisterReload,
 }: {
   workObject: IntelligenceWorkObject | null;
+  uiSessionScopeKey: string;
   // H1+H2 修复: 上报 profile/负面数到顶层 KPI, 避免顶层独立调 API + 数据不一致
   onProfileChange?: (profile: SentimentProfile | null) => void;
   onNegativeCountChange?: (count: number) => void;
@@ -2242,21 +2281,27 @@ function SentimentMonitorPanel({
   const projectModuleId = workObject?.type === 'project_module' ? workObject.id : undefined;
   const hasScope = Boolean(clientId || projectModuleId);
   const scopeKey = `${clientId || ''}::${projectModuleId || ''}`;
+  const runtimeCacheKey = `${uiSessionScopeKey}:${scopeKey || 'none'}`;
   const scopeKeyRef = useRef(scopeKey);
   useEffect(() => {
     scopeKeyRef.current = scopeKey;
   }, [scopeKey]);
 
-  const [profile, setProfile] = useState<SentimentProfile | null>(null);
-  const [items, setItems] = useState<SentimentItem[]>([]);
-  const [audit, setAudit] = useState<BrandAudit | null>(null);
-  const [auditNote, setAuditNote] = useState<string | null>(null);
+  const [profile, setProfile] = useRuntimeUiSessionState<SentimentProfile | null>(`${runtimeCacheKey}:profile`, null);
+  const [items, setItems] = useRuntimeUiSessionState<SentimentItem[]>(`${runtimeCacheKey}:items`, []);
+  const [audit, setAudit] = useRuntimeUiSessionState<BrandAudit | null>(`${runtimeCacheKey}:audit`, null);
+  const [auditNote, setAuditNote] = useRuntimeUiSessionState<string | null>(`${runtimeCacheKey}:audit-note`, null);
+  const [sentimentLoadedAt, setSentimentLoadedAt] = useRuntimeUiSessionState<number>(`${runtimeCacheKey}:loaded-at`, 0);
+  const sentimentLoadedAtRef = useRef(sentimentLoadedAt);
+  useEffect(() => {
+    sentimentLoadedAtRef.current = sentimentLoadedAt;
+  }, [sentimentLoadedAt]);
   const [auditRecomputing, setAuditRecomputing] = useState(false);
   const [auditStep, setAuditStep] = useState<string>(''); // 显示当前级联步骤
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [lastRefresh, setLastRefresh] = useState<SentimentRefreshResult | null>(null);
+  const [lastRefresh, setLastRefresh] = useRuntimeUiSessionState<SentimentRefreshResult | null>(`${runtimeCacheKey}:last-refresh`, null);
   // 公开评价子区默认折叠 (放在监控对象卡底部, 点击展开看 SentimentItemCard 列表)
   const [publicReviewExpanded, setPublicReviewExpanded] = useState(false);
   // H6 修复: 切换客户时把折叠状态重置为默认 (折叠), 避免上一个客户的展开状态污染
@@ -2264,10 +2309,15 @@ function SentimentMonitorPanel({
     setPublicReviewExpanded(false);
   }, [clientId, projectModuleId]);
 
-  const reload = useCallback(async () => {
+  const reload = useCallback(async (options?: { preferCache?: boolean }) => {
     if (!hasScope) return;
+    if (
+      options?.preferCache
+      && sentimentLoadedAtRef.current > 0
+      && Date.now() - sentimentLoadedAtRef.current < INTELLIGENCE_RUNTIME_CACHE_TTL_MS
+    ) return;
     const capturedScopeKey = scopeKey;
-    setLoading(true);
+    setLoading(sentimentLoadedAtRef.current <= 0);
     setErrorMsg(null);
     try {
       const [p, it, au] = await Promise.all([
@@ -2280,6 +2330,9 @@ function SentimentMonitorPanel({
       setItems(it.items || []);
       setAudit(au.audit);
       setAuditNote(au.recomputeNote);
+      const loadedAt = Date.now();
+      sentimentLoadedAtRef.current = loadedAt;
+      setSentimentLoadedAt(loadedAt);
     } catch (err) {
       if (scopeKeyRef.current !== capturedScopeKey) return;
       setErrorMsg(err instanceof Error ? err.message : '舆情数据加载失败');
@@ -2357,7 +2410,7 @@ function SentimentMonitorPanel({
   };
 
   useEffect(() => {
-    void reload();
+    void reload({ preferCache: true });
   }, [reload]);
 
   const handleRefresh = async () => {
@@ -2431,6 +2484,7 @@ function SentimentMonitorPanel({
         audit={audit}
         targetName={targetName}
         clientId={clientId}
+        uiSessionScopeKey={runtimeCacheKey}
         recomputeNote={auditNote}
         recomputing={auditRecomputing}
         recomputeStep={auditStep}
@@ -2689,6 +2743,7 @@ function BrandAuditCard({
   audit,
   targetName,
   clientId,
+  uiSessionScopeKey,
   recomputeNote,
   recomputing,
   recomputeStep,
@@ -2697,6 +2752,7 @@ function BrandAuditCard({
   audit: BrandAudit | null;
   targetName: string;
   clientId: string | undefined;
+  uiSessionScopeKey: string;
   recomputeNote: string | null;
   recomputing: boolean;
   recomputeStep?: string;
@@ -2733,7 +2789,7 @@ function BrandAuditCard({
             </button>
           </div>
         </section>
-        <BrandStrategyTreeCard targetName={targetName} clientId={clientId} />
+        <BrandStrategyTreeCard targetName={targetName} clientId={clientId} uiSessionScopeKey={uiSessionScopeKey} />
       </>
     );
   }
@@ -2780,7 +2836,7 @@ function BrandAuditCard({
       {/* P14-D: 战略推演树 (从战略陪伴上传的 .md LLM 抽取)
           — 战略主张 + 方法学 + 利益相关方应然矩阵
           — 这是后续闭环卡的"应当如何"锚点 */}
-      <BrandStrategyTreeCard targetName={targetName} clientId={clientId} />
+      <BrandStrategyTreeCard targetName={targetName} clientId={clientId} uiSessionScopeKey={uiSessionScopeKey} />
 
       {/* 建议 recommendations — 紧接外立面感知度报告之后, 作为"行动指引" */}
       {audit.recommendations && audit.recommendations.length > 0 && (
@@ -2961,11 +3017,15 @@ function donutSectorPath(cx: number, cy: number, rIn: number, rOut: number, star
 function BrandStrategyTreeCard({
   targetName,
   clientId,
+  uiSessionScopeKey,
 }: {
   targetName: string;
   clientId: string | undefined;
+  uiSessionScopeKey: string;
 }) {
-  const [extract, setExtract] = useState<BrandStrategyExtract | null>(null);
+  const strategyCacheKey = `${uiSessionScopeKey}:strategy-tree:${clientId || 'none'}`;
+  const [extract, setExtract] = useRuntimeUiSessionState<BrandStrategyExtract | null>(`${strategyCacheKey}:extract`, null);
+  const [loadedAt, setLoadedAt] = useRuntimeUiSessionState<number>(`${strategyCacheKey}:loaded-at`, 0);
   const [loading, setLoading] = useState(false);
   const [extracting, setExtracting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2990,14 +3050,21 @@ function BrandStrategyTreeCard({
       setExtract(null);
       return;
     }
+    if (loadedAt > 0 && Date.now() - loadedAt < INTELLIGENCE_RUNTIME_CACHE_TTL_MS) {
+      setLoading(false);
+      return;
+    }
     let cancelled = false;
-    setLoading(true);
+    setLoading(loadedAt <= 0);
     setError(null);
     setEditing(false);
     setActionMessage(null);
     fetchBrandStrategyExtract(clientId)
       .then((res) => {
-        if (!cancelled) setExtract(res.extract);
+        if (!cancelled) {
+          setExtract(res.extract);
+          setLoadedAt(Date.now());
+        }
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : '加载失败');
@@ -3008,7 +3075,7 @@ function BrandStrategyTreeCard({
     return () => {
       cancelled = true;
     };
-  }, [clientId]);
+  }, [clientId, loadedAt, setExtract, setLoadedAt]);
 
   const handleExtract = async () => {
     if (!clientId || extracting) return;
@@ -3017,6 +3084,7 @@ function BrandStrategyTreeCard({
     try {
       const fresh = await triggerBrandStrategyExtraction(clientId);
       setExtract(fresh);
+      setLoadedAt(Date.now());
       if (fresh.error) setError(fresh.error);
     } catch (e) {
       setError(e instanceof Error ? e.message : '抽取失败');
@@ -3056,6 +3124,7 @@ function BrandStrategyTreeCard({
       });
       if (clientIdRef.current !== capturedClientId) return;
       setExtract(response.extract);
+      setLoadedAt(Date.now());
       setEditing(false);
       setActionMessage({
         tone: 'success',

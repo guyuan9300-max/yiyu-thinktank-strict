@@ -465,6 +465,8 @@ def create_strategic_profile_clarification(
     dimension = str(payload.get("dimension") or "").strip()
     statement = str(payload.get("answer") or "").strip()
     question = str(payload.get("question") or "").strip()
+    feedback_kind = str(payload.get("feedbackKind") or "").strip()
+    is_keyword_supplement = feedback_kind == "project_keyword_supplement"
     based_on_rev = int(payload.get("basedOnRev") or 0)
     if dimension not in {"essence", "business_intro", "cooperation", "people", "timeline", "next_steps"}:
         raise RepositoryError(422, "strategic_profile_dimension_invalid", "客户档案栏目无效")
@@ -485,6 +487,7 @@ def create_strategic_profile_clarification(
         "statement": statement,
         "statementHash": statement_hash,
         "basedOnRev": based_on_rev,
+        "feedbackKind": feedback_kind,
     }
     payload_hash = sha256_text(canonical_json(normalized))
     operation_id = repository._operation_id(identity.scope_id, command_type, idempotency_key)  # noqa: SLF001
@@ -504,10 +507,24 @@ def create_strategic_profile_clarification(
                 "AND lifecycle_state='active' ORDER BY updated_at DESC LIMIT 1",
                 (identity.scope_id, project_id),
             ).fetchone()
-            if narrative is None:
+            if narrative is None and not is_keyword_supplement:
                 raise RepositoryError(409, "strategic_profile_missing", "请先生成客户档案再补充")
-            if based_on_rev <= 0:
-                based_on_rev = int(narrative["current_version"] or 1)
+            # 人工补充关键词属于项目本身的正式协作知识，不依赖客户档案是否已经
+            # 生成。普通六卡纠错继续锚定 strategic_profile；关键词补充则锚定
+            # clients 的当前版本，避免为了写一个词制造第二权威或空档案前置条件。
+            source_object_id = (
+                project_id if is_keyword_supplement else str(narrative["id"])
+            )
+            source_object_kind = (
+                "client" if is_keyword_supplement else "narrative_output"
+            )
+            source_version = (
+                int(project["version"] or 1)
+                if is_keyword_supplement
+                else int(narrative["current_version"] or 1)
+            )
+            if based_on_rev <= 0 or is_keyword_supplement:
+                based_on_rev = source_version
                 normalized["basedOnRev"] = based_on_rev
                 payload_hash = sha256_text(canonical_json(normalized))
             replay = repository._existing_command(  # noqa: SLF001
@@ -640,17 +657,17 @@ def create_strategic_profile_clarification(
                 (source_set_id, identity.scope_id, project_id, identity.principal_id,
                  now, now, repository.cloud_instance_id),
             )
-            source_member_id = repository._record_id("source_member", source_set_id, str(narrative["id"]))  # noqa: SLF001
+            source_member_id = repository._record_id("source_member", source_set_id, source_object_id)  # noqa: SLF001
             connection.execute(
                 """INSERT INTO source_set_members (
                     id, scope_id, source_set_id, source_object_id, source_version,
                     policy_version, source_object_kind, ordinal, added_at, removed_at,
                     version, lifecycle_state, created_at, updated_at, deleted_at,
                     authority_role, origin_instance_id
-                ) VALUES (?, ?, ?, ?, ?, 1, 'narrative_output', 0, ?, NULL, 1,
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, 0, ?, NULL, 1,
                           'active', ?, ?, NULL, 'cloud', ?)""",
-                (source_member_id, identity.scope_id, source_set_id, str(narrative["id"]),
-                 int(narrative["current_version"] or 1), now, now, now,
+                (source_member_id, identity.scope_id, source_set_id, source_object_id,
+                 source_version, source_object_kind, now, now, now,
                  repository.cloud_instance_id),
             )
             connection.execute(
@@ -673,20 +690,27 @@ def create_strategic_profile_clarification(
                 (fact_id, identity.scope_id, statement_hash, source_set_id, manifest_id,
                  identity.membership_id, now, now, now, repository.cloud_instance_id),
             )
-            locator = canonical_json(
-                {"schema": "yiyu.strategic-profile-dimension.v1", "dimension": dimension,
-                 "basedOnRev": based_on_rev}
-            )
+            locator = canonical_json({
+                "schema": (
+                    "yiyu.project-keyword-supplement.v1"
+                    if is_keyword_supplement
+                    else "yiyu.strategic-profile-dimension.v1"
+                ),
+                "dimension": dimension,
+                "basedOnRev": based_on_rev,
+            })
             connection.execute(
                 """INSERT INTO evidence_links (
                     id, scope_id, fact_id, source_object_id, source_version, locator,
                     source_object_kind, locator_kind, page_no, paragraph_no, locator_hash,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'narrative_output', 'profile_dimension',
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?,
                           NULL, NULL, ?, ?)""",
                 (repository._record_id("evidence", fact_id, "version-1"),  # noqa: SLF001
-                 identity.scope_id, fact_id, str(narrative["id"]),
-                 int(narrative["current_version"] or 1), locator, sha256_text(locator), now),
+                 identity.scope_id, fact_id, source_object_id,
+                 source_version, locator, source_object_kind,
+                 ("project_keyword_supplement" if is_keyword_supplement else "profile_dimension"),
+                 sha256_text(locator), now),
             )
             result = {
                 "id": fact_id,

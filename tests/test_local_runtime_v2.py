@@ -724,6 +724,106 @@ def test_concurrent_requests_singleflight_session_refresh(tmp_path: Path) -> Non
         cloud.__exit__(None, None, None)
 
 
+def test_parallel_connected_queries_reuse_the_single_refreshed_session(
+    monkeypatch: Any,
+) -> None:
+    runtime = WorkspaceRuntime.__new__(WorkspaceRuntime)
+    runtime._workspace_context_local = threading.local()
+    runtime._local_object_locks_guard = threading.Lock()
+    runtime._local_object_locks = {}
+    context = WorkspaceContext(
+        sandbox_id="sandbox-a",
+        cloud_instance_id="cloud-a",
+        organization_id="organization-a",
+        cloud_api_url="https://cloud.invalid",
+        principal_id="principal-a",
+        membership_id="membership-a",
+        access_token="access-old",
+        refresh_token="refresh-old",
+        access_expires_at=None,
+        refresh_expires_at=None,
+    )
+    monkeypatch.setattr(runtime, "_current_context", lambda **_: context)
+    monkeypatch.setattr(runtime, "_connected_cloud_path_allowed", lambda *_: True)
+
+    class QueryResult:
+        @staticmethod
+        def fetchone() -> dict[str, str]:
+            return {"id": "sandbox-a"}
+
+    class Connection:
+        @staticmethod
+        def execute(*_: Any, **__: Any) -> QueryResult:
+            return QueryResult()
+
+    monkeypatch.setattr(runtime, "_connection", lambda: nullcontext(Connection()))
+    state_lock = threading.Lock()
+    state: dict[str, Any] = {
+        "version": 1,
+        "reference": "session-old",
+        "bundle": {"accessToken": "access-old", "refreshToken": "refresh-old"},
+    }
+
+    def load_session_bundle(_sandbox: Any) -> tuple[dict[str, int], str, dict[str, str]]:
+        with state_lock:
+            return (
+                {"version": int(state["version"])},
+                str(state["reference"]),
+                dict(state["bundle"]),
+            )
+
+    monkeypatch.setattr(runtime, "_load_session_bundle", load_session_bundle)
+    refresh_count = 0
+
+    def refresh_local_session(**_: Any) -> tuple[dict[str, int], str, dict[str, str]]:
+        nonlocal refresh_count
+        with state_lock:
+            refresh_count += 1
+            state.update(
+                version=2,
+                reference="session-new",
+                bundle={"accessToken": "access-new", "refreshToken": "refresh-new"},
+            )
+            return {"version": 2}, "session-new", dict(state["bundle"])
+
+    monkeypatch.setattr(runtime, "_refresh_local_session", refresh_local_session)
+    stale_request_barrier = threading.Barrier(2)
+
+    class Client:
+        @staticmethod
+        def request_v2(
+            _method: str,
+            _path: str,
+            *,
+            access_token: str,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            if access_token == "access-old":
+                stale_request_barrier.wait(timeout=2)
+                raise CloudClientError(
+                    401,
+                    "authorization_projection_stale",
+                    "权限投影需要刷新",
+                )
+            return {"attributes": []}
+
+    runtime.cloud_factory = lambda _: Client()
+    path = (
+        "/api/v2/domain/project-materials/projects/project-a/"
+        "glossary-attributes"
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda status: runtime.cloud_query(path, query={"status": status}),
+                ("pending", "verified"),
+            )
+        )
+
+    assert results == [{"attributes": []}, {"attributes": []}]
+    assert refresh_count == 1
+
+
 def test_transient_refresh_failure_is_retryable_and_recovers(tmp_path: Path) -> None:
     cloud, adapter, store, runtime, sandbox_id, _ = make_runtime_with_organization(
         tmp_path,
