@@ -29,7 +29,10 @@ from backend.app.runtime import (
 )
 from backend.app.secret_store import MemorySecretStore
 from backend.app.ui_compat import StrictUiCompatibility
-from backend.app.workbench_chat_local import LocalWorkbenchChatRepository
+from backend.app.workbench_chat_local import (
+    LocalWorkbenchChatRepository,
+    _normalize_answer_selection_text,
+)
 from cloud_backend.app.config import CloudConfig
 from cloud_backend.app.main import create_app
 from strict_common.agent_memory import builtin_agent_id
@@ -41,6 +44,14 @@ from strict_common.security import decode_secret_bundle, encode_secret_bundle
 def test_cloud_url_accepts_http_and_https() -> None:
     assert normalize_cloud_url("http://101.126.34.232/") == "http://101.126.34.232"
     assert normalize_cloud_url("https://example.invalid") == "https://example.invalid"
+
+
+def test_answer_selection_matches_rendered_markdown_text() -> None:
+    answer = "### 人物\n\n**张真**是[日慈基金会秘书长](https://example.invalid)。"
+    selected = "张真是日慈基金会秘书长"
+    normalized_answer = _normalize_answer_selection_text(answer).replace(" ", "")
+    normalized_selected = _normalize_answer_selection_text(selected).replace(" ", "")
+    assert normalized_selected in normalized_answer
 
 
 def test_cloud_client_v2_normalizes_one_leading_slash() -> None:

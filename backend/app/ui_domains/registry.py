@@ -99,6 +99,15 @@ def build_default_registry() -> UiDomainRegistry:
             r"(?P<document_id>[^/]+)",
         ),
         (
+            "GET",
+            r"clients/(?P<project_id>[^/]+)/document-recycle-bin",
+        ),
+        (
+            "POST",
+            r"clients/(?P<project_id>[^/]+)/document-recycle-bin/"
+            r"(?P<document_id>[^/]+)/restore",
+        ),
+        (
             "POST",
             r"clients/(?P<project_id>[^/]+)/documents/ai-action",
         ),
@@ -228,8 +237,6 @@ def build_default_registry() -> UiDomainRegistry:
         ("POST", r"smart-import/sessions/(?P<session_id>[^/]+)/commit"),
         ("DELETE", r"clients/(?P<project_id>[^/]+)"),
         ("GET", r"clients/(?P<project_id>[^/]+)/delete-preview"),
-        ("POST", r"clients/(?P<project_id>[^/]+)/freeze"),
-        ("POST", r"clients/(?P<project_id>[^/]+)/unfreeze"),
         ("POST", r"clients/(?P<project_id>[^/]+)/folders/recommend"),
         (
             "POST",
@@ -552,6 +559,8 @@ def build_default_registry() -> UiDomainRegistry:
         ("POST", r"agent-skills"),
         ("PATCH", r"agent-skills/([^/]+)"),
         ("PATCH", r"agent-skills/([^/]+)/enabled"),
+        ("DELETE", r"agent-skills/([^/]+)"),
+        ("POST", r"agent-skills/([^/]+)/delete"),
     }
     agent_skill_router = UiDomainRouter("gc11_agent_skill", pin_workspace=True)
     for route in workbench_outputs_router.routes:

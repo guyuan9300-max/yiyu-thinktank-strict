@@ -461,7 +461,7 @@ class WorkspaceRuntime:
             if re.fullmatch(r"/api/v2/gc06/tasks/[^/]+/plan-link", path):
                 return True
             if path == "/api/v2/agent-skills" or re.fullmatch(
-                r"/api/v2/agent-skills/[^/]+", path
+                r"/api/v2/agent-skills/[^/]+(?:/delete)?", path
             ):
                 return True
             if path == "/api/v2/settings/org-ai-config/runtime-secret":
@@ -539,6 +539,11 @@ class WorkspaceRuntime:
                 return True
             if re.fullmatch(
                 r"/api/v2/domain/project-materials/projects/[^/]+/documents/[^/]+/reading-preview",
+                path,
+            ):
+                return True
+            if re.fullmatch(
+                r"/api/v2/domain/project-materials/projects/[^/]+/delete-preview",
                 path,
             ):
                 return True
@@ -626,6 +631,9 @@ class WorkspaceRuntime:
                     re.fullmatch(r"/api/v2/agent-skills/[^/]+/runs", path)
                 )
                 or bool(
+                    re.fullmatch(r"/api/v2/agent-skills/[^/]+/delete", path)
+                )
+                or bool(
                     re.fullmatch(
                         r"/api/v2/mobile-link-transfers/[^/]+/(?:claim|settle)",
                         path,
@@ -682,7 +690,7 @@ class WorkspaceRuntime:
                 )
                 or bool(
                     re.fullmatch(
-                        r"/api/v2/gc06/(?:event-lines(?:/[^/]+/(?:activities|tasks/[^/]+|archive|reopen|delete))?|planning-cycles|weekly-reviews/draft|weekly-reviews/[^/]+/(?:submit|return|reopen)|decision-actions(?:/[^/]+/primary-task)?|meetings(?:/[^/]+/collaboration/(?:accept|reject))?)",
+                        r"/api/v2/gc06/(?:event-lines(?:/[^/]+/(?:activities|tasks/[^/]+|archive|reopen|delete))?|planning-cycles|weekly-reviews/draft|weekly-reviews/[^/]+/(?:submit|return|reopen)|decision-actions(?:/[^/]+/primary-task)?|meetings(?:/[^/]+/(?:migrate-to-task|collaboration/(?:accept|reject)))?)",
                         path,
                     )
                 )
@@ -760,6 +768,12 @@ class WorkspaceRuntime:
                 )
                 or bool(
                     re.fullmatch(
+                        r"/api/v2/domain/project-materials/projects/[^/]+/lifecycle",
+                        path,
+                    )
+                )
+                or bool(
+                    re.fullmatch(
                         r"/api/v2/workbench/projects/[^/]+/narrative-clarifications",
                         path,
                     )
@@ -829,7 +843,8 @@ class WorkspaceRuntime:
             )
         if method == "DELETE":
             return bool(
-                path == "/api/v2/organization-access/feishu/member-authorization"
+                re.fullmatch(r"/api/v2/agent-skills/[^/]+", path)
+                or path == "/api/v2/organization-access/feishu/member-authorization"
                 or
                 re.fullmatch(r"/api/v2/gc06/planning-cycles/[^/]+", path)
                 or
@@ -1668,7 +1683,7 @@ class WorkspaceRuntime:
     def _invoke_organization_ai(
         provider: Mapping[str, Any],
         *,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         temperature: float,
         read_timeout_seconds: float = 45.0,
         max_output_tokens: int = 2_048,
@@ -1752,7 +1767,7 @@ class WorkspaceRuntime:
     def organization_ai_completion(
         self,
         *,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         temperature: float,
         read_timeout_seconds: float = 45.0,
         max_output_tokens: int = 2_048,
@@ -1836,6 +1851,19 @@ class WorkspaceRuntime:
         from .workbench_chat_local import LocalWorkbenchChatRepository
 
         return LocalWorkbenchChatRepository(self).run(**kwargs)
+
+    def persist_workbench_chat_images(self, **kwargs: Any) -> list[dict[str, Any]]:
+        from .workbench_chat_local import LocalWorkbenchChatRepository
+
+        return LocalWorkbenchChatRepository(self).persist_chat_images(**kwargs)
+
+    def resolve_workbench_chat_images(
+        self,
+        receipts: Iterable[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        from .workbench_chat_local import LocalWorkbenchChatRepository
+
+        return LocalWorkbenchChatRepository(self).resolve_chat_images(receipts)
 
     def workbench_answer(self, answer_id: str) -> dict[str, Any]:
         from .workbench_chat_local import LocalWorkbenchChatRepository

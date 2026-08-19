@@ -17,7 +17,7 @@ contextBridge.exposeInMainWorld('strictDesktop', {
 contextBridge.exposeInMainWorld('yiyuWorkbench', {
   backendBaseUrl: runtime.apiBaseUrl,
   desktopToken: runtime.desktopToken,
-  setMiniMode: (enter: boolean) => ipcRenderer.invoke('strict:set-mini-mode', enter),
+  setMiniMode: (enter: boolean, height?: number) => ipcRenderer.invoke('strict:set-mini-mode', enter, height),
   setUpdateOrgIdentity: (identity: UpdateOrgIdentity | null) =>
     ipcRenderer.invoke('strict:set-update-org-identity', identity),
   setUpdateOrgCode: (organizationSlug: string | null) =>

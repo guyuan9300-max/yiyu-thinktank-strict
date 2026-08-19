@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -32,6 +35,78 @@ def _now() -> str:
 
 def _string(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _sanitize_answer_export_title(value: Any) -> str:
+    raw = _string(value)
+    if not raw:
+        return ""
+    raw = re.sub(r"```(?:text|markdown)?", "", raw, flags=re.I)
+    raw = next((line.strip() for line in raw.splitlines() if line.strip()), "")
+    raw = re.sub(r"^(?:标题|文档标题|建议标题)\s*[：:]\s*", "", raw)
+    raw = raw.strip("#*_`《》“”\"' ")
+    raw = re.sub(r"[\\/:*?\"<>|]+", "-", raw)
+    raw = re.sub(r"\s+", "", raw).strip("-_.，。！？；：")
+    raw = re.sub(r"\.(?:md|txt|docx?)$", "", raw, flags=re.I)
+    if raw in {"工作台回答", "工作台回答导出", "回答导出"}:
+        return ""
+    return raw[:28]
+
+
+def _fallback_answer_export_title(answers: Sequence[Mapping[str, Any]]) -> str:
+    first = answers[0] if answers else {}
+    question = _string(first.get("question"))
+    question = re.sub(
+        r"^(?:请帮我|请为我|麻烦你?|请你?|帮我)\s*",
+        "",
+        question,
+    )
+    question = re.sub(r"[？?。！!，,：:；;]+$", "", question)
+    title = _sanitize_answer_export_title(question)
+    if not title:
+        answer = _string(first.get("answerMarkdown"))
+        heading = re.search(r"^#{1,3}\s+(.+)$", answer, flags=re.M)
+        title = _sanitize_answer_export_title(
+            heading.group(1) if heading else answer[:80]
+        )
+    if not title:
+        title = "项目问答摘要"
+    if len(answers) > 1:
+        title = _sanitize_answer_export_title(f"{title}等{len(answers)}项") or title
+    return title
+
+
+def _answer_export_title(
+    compatibility: Any,
+    answers: Sequence[Mapping[str, Any]],
+) -> str:
+    fallback = _fallback_answer_export_title(answers)
+    samples = []
+    remaining = 4_500
+    for item in answers[:5]:
+        question = _string(item.get("question"))
+        answer = _string(item.get("answerMarkdown"))
+        excerpt = answer[: min(1_200, remaining)]
+        remaining -= len(excerpt)
+        samples.append(f"问题：{question}\n回答：{excerpt}")
+        if remaining <= 0:
+            break
+    try:
+        completion = compatibility.runtime.private_ai_completion(
+            system_prompt=(
+                "你是中文文档标题编辑。根据问题与回答提炼一个准确、具体、简短的标题；"
+                "优先写明主题，不写‘工作台回答’‘回答导出’等来源词。只输出标题本身，"
+                "不要引号、书名号、Markdown、解释或文件扩展名，建议8至20个汉字。"
+            ),
+            prompt="\n\n".join(samples),
+            creativity_mode="strict",
+            read_timeout_seconds=8.0,
+            max_output_tokens=48,
+        )
+        return _sanitize_answer_export_title(completion.get("content")) or fallback
+    except Exception:
+        # 导出不能因标题提炼服务短暂不可用而失败，问题文本仍能形成准确标题。
+        return fallback
 
 
 _OFFICIAL_RESEARCH_TARGETS: tuple[dict[str, Any], ...] = (
@@ -487,7 +562,10 @@ def _selected_style_or_agent_skill(
             rendered = "\n".join(f"{index + 1}. {value}" for index, value in enumerate(instructions))
             template = _string(item.get("outputTemplate"))
             if template:
-                rendered += "\n输出模板：\n" + template
+                rendered += (
+                    "\n风格代表性样本（只模仿表达方式，不照抄其中事实）：\n"
+                    + template
+                )
             return "", {**item, "renderedInstruction": rendered}
     skills = _cloud_query(
         compatibility,
@@ -532,7 +610,10 @@ def _project_summary(project: Mapping[str, Any], workspace: Mapping[str, Any]) -
     }
 
 
-def _chat_messages(answer: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _chat_messages(
+    answer: Mapping[str, Any],
+    runtime: Any | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     answer_id = _string(answer.get("answerId"))
     source_manifest = answer.get("sourceManifest") or {}
     thread_id = _string(source_manifest.get("threadId")) or answer_id
@@ -634,6 +715,23 @@ def _chat_messages(answer: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str,
         "evidence": [],
         "activeSkillIds": list(source_manifest.get("activeSkillIds") or []),
     }
+    local_chat_images = [
+        dict(item)
+        for item in source_manifest.get("localChatImageInputs") or []
+        if isinstance(item, Mapping)
+    ]
+    if (
+        local_chat_images
+        and runtime is not None
+        and hasattr(runtime, "resolve_workbench_chat_images")
+    ):
+        try:
+            user["imageAttachments"] = runtime.resolve_workbench_chat_images(
+                local_chat_images
+            )
+        except LocalRuntimeError:
+            # Missing local binary must not hide the verified text history.
+            user["imageAttachments"] = []
     assistant = {
         "id": answer_id,
         "threadId": thread_id,
@@ -1051,7 +1149,11 @@ def _workspace(compatibility: Any, project_id: str) -> dict[str, Any]:
         and _string(item.get("clientId")) == project_id
         and _string(item.get("lifecycleState") or "active") != "deleted"
     ]
-    messages = [message for answer in answers for message in _chat_messages(answer)]
+    messages = [
+        message
+        for answer in answers
+        for message in _chat_messages(answer, compatibility.runtime)
+    ]
     thread_by_id: dict[str, dict[str, Any]] = {}
     for answer in answers:
         thread_id = (
@@ -1367,6 +1469,49 @@ def start_chat(
     project_id = match.group(1)
     _require_project_read(compatibility, project_id)
     prompt = _string(request.body.get("prompt"))
+    raw_image_inputs = request.body.get("imageInputs") or []
+    if not isinstance(raw_image_inputs, list):
+        raise LocalRuntimeError(422, "chat_images_invalid", "图片输入格式无效")
+    if len(raw_image_inputs) > 4:
+        raise LocalRuntimeError(422, "chat_images_too_many", "一次最多附加4张图片")
+    image_context_items: list[dict[str, Any]] = []
+    image_source_receipts: list[dict[str, Any]] = []
+    local_image_objects: list[dict[str, Any]] = []
+    total_image_bytes = 0
+    supported_image_types = {"image/png", "image/jpeg", "image/webp"}
+    for index, raw_image in enumerate(raw_image_inputs):
+        if not isinstance(raw_image, Mapping):
+            raise LocalRuntimeError(422, "chat_image_invalid", "图片输入格式无效")
+        mime_type = _string(raw_image.get("mimeType")).lower()
+        data_url = _string(raw_image.get("dataUrl"))
+        name = _string(raw_image.get("name")) or f"图片{index + 1}"
+        prefix = f"data:{mime_type};base64,"
+        if mime_type not in supported_image_types or not data_url.startswith(prefix):
+            raise LocalRuntimeError(422, "chat_image_type_unsupported", "仅支持 PNG、JPG 和 WebP 图片")
+        try:
+            image_bytes = base64.b64decode(data_url[len(prefix):], validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise LocalRuntimeError(422, "chat_image_invalid", "图片内容无效") from exc
+        if not image_bytes or len(image_bytes) > 8 * 1024 * 1024:
+            raise LocalRuntimeError(422, "chat_image_too_large", "单张图片不能超过8MB")
+        total_image_bytes += len(image_bytes)
+        if total_image_bytes > 20 * 1024 * 1024:
+            raise LocalRuntimeError(422, "chat_images_too_large", "本轮图片总大小不能超过20MB")
+        content_hash = hashlib.sha256(image_bytes).hexdigest()
+        image_context_items.append({"name": name[:120], "mimeType": mime_type, "dataUrl": data_url})
+        local_image_objects.append(
+            {
+                "name": name[:120],
+                "mimeType": mime_type,
+                "bytes": image_bytes,
+                "contentHash": content_hash,
+            }
+        )
+        image_source_receipts.append(
+            {"name": name[:120], "mimeType": mime_type, "size": len(image_bytes), "contentHash": content_hash}
+        )
+    if not prompt and image_context_items:
+        prompt = "请理解这些图片，并结合当前项目上下文回答。"
     if not prompt:
         raise LocalRuntimeError(422, "prompt_required", "请输入问题")
     mode = _string(request.body.get("creativityMode")) or "balanced"
@@ -1374,6 +1519,19 @@ def start_chat(
         mode = "balanced"
     requested_thread_id = _string(request.body.get("threadId"))
     thread_id = requested_thread_id or new_id()
+    local_image_receipts: list[dict[str, Any]] = []
+    if local_image_objects:
+        if not hasattr(compatibility.runtime, "persist_workbench_chat_images"):
+            raise LocalRuntimeError(
+                503,
+                "chat_image_storage_unavailable",
+                "本机图片保存能力暂不可用，请稍后重试",
+            )
+        local_image_receipts = compatibility.runtime.persist_workbench_chat_images(
+            project_id=project_id,
+            thread_id=thread_id,
+            images=local_image_objects,
+        )
     selected_document_ids = [
         _string(value)
         for value in request.body.get("workingDocumentIds") or []
@@ -1513,7 +1671,7 @@ def start_chat(
         raise LocalRuntimeError(
             422,
             "agent_skill_selection_too_large",
-            "一次最多组合5个 Skill",
+            "一次最多组合5个写作模板",
         )
     writing_style = ""
     agent_skills: list[dict[str, Any]] = []
@@ -1533,7 +1691,7 @@ def start_chat(
             raise LocalRuntimeError(
                 422,
                 "agent_skill_id_invalid",
-                "Agent Skill 标识无效",
+                "写作模板标识无效",
             )
         agent_skills.append(agent_skill)
     history_messages: list[dict[str, str]] = []
@@ -1562,6 +1720,7 @@ def start_chat(
         history_messages=history_messages,
         writing_style=writing_style,
         agent_skills=agent_skills,
+        image_context_items=image_context_items,
         deep_thinking=bool(request.body.get("deepThinking")),
         source_manifest_extra={
             "operationKey": f"{request.idempotency_key}:chat-answer",
@@ -1581,11 +1740,13 @@ def start_chat(
             "retrievedDocuments": retrieved_sources,
             "localRetrievalState": local_retrieval_state,
             "localRetrievalMessage": local_retrieval_message,
+            "transientImageInputs": image_source_receipts,
+            "localChatImageInputs": local_image_receipts,
         },
         idempotency_key=f"{request.idempotency_key}:chat-answer",
     )
     answer = saved.get("answer") or {}
-    user, assistant = _chat_messages(answer)
+    user, assistant = _chat_messages(answer, compatibility.runtime)
     skill_runs: list[dict[str, Any]] = []
     for item in agent_skills:
         skill_id = _string(item.get("skillId"))
@@ -1710,7 +1871,7 @@ def get_chat_message(
         message_id,
         expected_project_id=project_id,
     )
-    user, assistant = _chat_messages(answer)
+    user, assistant = _chat_messages(answer, compatibility.runtime)
     return user if message_id.endswith(":question") else assistant
 
 
@@ -1735,7 +1896,7 @@ def get_chat_thread(
     messages = [
         message
         for answer in answers
-        for message in _chat_messages(answer)
+        for message in _chat_messages(answer, compatibility.runtime)
     ]
     return {
         "thread": {
@@ -4037,6 +4198,54 @@ def set_agent_skill_enabled(
     return saved
 
 
+@router.delete(r"agent-skills/([^/]+)")
+def delete_agent_skill(
+    compatibility: Any,
+    request: UiRequest,
+    match: re.Match[str],
+) -> Any:
+    saved = _cloud_command(
+        compatibility,
+        request,
+        "DELETE",
+        f"/api/v2/agent-skills/{match.group(1)}",
+        request.body,
+    )
+    current = _cloud_query(
+        compatibility,
+        "/api/v2/agent-skills",
+        query={"agentKind": "project_workspace", "enabledOnly": "false"},
+    )
+    compatibility.runtime.reconcile_agent_skill_projections(
+        [str(item.get("skillId") or "") for item in current.get("items") or []]
+    )
+    return saved
+
+
+@router.post(r"agent-skills/([^/]+)/delete")
+def delete_agent_skill_command(
+    compatibility: Any,
+    request: UiRequest,
+    match: re.Match[str],
+) -> Any:
+    saved = _cloud_command(
+        compatibility,
+        request,
+        "POST",
+        f"/api/v2/agent-skills/{match.group(1)}/delete",
+        request.body,
+    )
+    current = _cloud_query(
+        compatibility,
+        "/api/v2/agent-skills",
+        query={"agentKind": "project_workspace", "enabledOnly": "false"},
+    )
+    compatibility.runtime.reconcile_agent_skill_projections(
+        [str(item.get("skillId") or "") for item in current.get("items") or []]
+    )
+    return saved
+
+
 @router.put(r"writing-skills/([^/]+)")
 def update_writing_skill(
     compatibility: Any,
@@ -5704,10 +5913,11 @@ def export_answer(
         f"{item.get('answerMarkdown') or ''}"
         for item in answers
     )
+    export_title = _answer_export_title(compatibility, answers)
     store = LocalProjectMaterialsRepository(compatibility.runtime)
     local = store.import_text(
         project_id=project_id,
-        title="工作台回答导出",
+        title=export_title,
         content=content,
     )
     registered = _cloud_command(
@@ -6333,7 +6543,7 @@ def draft_report_sections(
                     f"【本机原件：{_string(local.get('title'))}】\n{excerpt}"
                 )
             skill_context = "\n\n".join(
-                f"【Skill：{_string(item.get('shortName'))}】\n"
+                f"【写作模板：{_string(item.get('shortName'))}】\n"
                 f"{_string(item.get('renderedInstruction'))}"
                 for item in agent_skills
                 if _string(item.get("renderedInstruction"))
@@ -6343,7 +6553,7 @@ def draft_report_sections(
                     "你是益语智库的项目工作台 Agent。只写指定章节；依据下方明确"
                     "提供的本机原件片段、组织共享知识与客户档案，明确区分事实、"
                     "判断和建议，不声称读取未提供的源文件。"
-                    + ("\n本次启用 Skill：\n" + skill_context if skill_context else "")
+                    + ("\n本次启用写作模板：\n" + skill_context if skill_context else "")
                 ),
                 prompt=(
                     "整份报告蓝图：\n"

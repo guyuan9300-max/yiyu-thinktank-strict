@@ -492,6 +492,37 @@ let workspaceRequestContext: { sandboxId: string; requestSeq: number } = {
   requestSeq: 0,
 };
 
+type MentionDirectoryCacheEntry = {
+  items: MentionCandidate[];
+  loadedAt: number;
+  inflight: Promise<MentionCandidate[]> | null;
+};
+
+const MENTION_DIRECTORY_CACHE_TTL_MS = 60_000;
+const mentionDirectoryCache = new Map<string, MentionDirectoryCacheEntry>();
+
+function currentMentionDirectoryScope(): string {
+  return workspaceRequestContext.sandboxId || '__local__';
+}
+
+function filterMentionCandidates(items: MentionCandidate[], query: string): MentionCandidate[] {
+  const normalized = query.trim().toLocaleLowerCase('zh-CN');
+  if (!normalized) return items;
+  return items.filter((item) => (
+    item.fullName.toLocaleLowerCase('zh-CN').includes(normalized)
+    || (item.email || '').toLocaleLowerCase('zh-CN').includes(normalized)
+  ));
+}
+
+export function clearMentionCandidatesCache(sandboxId?: string | null): void {
+  const normalized = String(sandboxId || '').trim();
+  if (normalized) {
+    mentionDirectoryCache.delete(normalized);
+    return;
+  }
+  mentionDirectoryCache.clear();
+}
+
 export function setWorkspaceRequestContext(sandboxId: string | null | undefined, requestSeq: number): void {
   workspaceRequestContext = {
     sandboxId: String(sandboxId || '').trim(),
@@ -2793,7 +2824,39 @@ export async function updateEmployeeManagementTitle(
 }
 
 export async function getMentionCandidates(query = '') {
-  return request<MentionCandidate[]>(`/api/v2/ui/employees/mention-candidates?q=${encodeURIComponent(query)}`);
+  const scope = currentMentionDirectoryScope();
+  const cached = mentionDirectoryCache.get(scope);
+  const now = Date.now();
+  if (cached?.items.length && now - cached.loadedAt < MENTION_DIRECTORY_CACHE_TTL_MS) {
+    return filterMentionCandidates(cached.items, query);
+  }
+  if (cached?.inflight) {
+    return filterMentionCandidates(await cached.inflight, query);
+  }
+
+  // The cloud endpoint already reads the complete active-member directory and
+  // applies q afterwards. Fetch it once per workspace so project sharing,
+  // task ownership and meeting collaboration reuse the same authority result.
+  const inflight = request<MentionCandidate[]>('/api/v2/ui/employees/mention-candidates?q=')
+    .then((items) => {
+      const normalized = Array.isArray(items) ? items : [];
+      mentionDirectoryCache.set(scope, {
+        items: normalized,
+        loadedAt: Date.now(),
+        inflight: null,
+      });
+      return normalized;
+    })
+    .catch((error) => {
+      mentionDirectoryCache.delete(scope);
+      throw error;
+    });
+  mentionDirectoryCache.set(scope, {
+    items: cached?.items || [],
+    loadedAt: cached?.loadedAt || 0,
+    inflight,
+  });
+  return filterMentionCandidates(await inflight, query);
 }
 
 export async function getClients() {
@@ -2919,28 +2982,16 @@ export async function fetchClientFactBundle(
 export type ClientDeletePreview = {
   clientId: string;
   name: string;
-  threadCount: number;
-  messageCount: number;
   documentCount: number;
-  dnaCount: number;
-  goalCount: number;
-  meetingCount: number;
   eventLineCount: number;
   taskCount: number;
-  isDemoClient: boolean;
+  narrativeCount: number;
+  isDemoClient?: boolean;
+  unavailableLegacyCounts?: string[];
 };
 
 export async function getClientDeletePreview(id: string) {
   return request<ClientDeletePreview>(`/api/v2/ui/clients/${id}/delete-preview`);
-}
-
-// 全局冷冻 / 解冻 — 把项目从所有自动计算/资讯/数据中心 job 里冻结
-export async function freezeClient(id: string) {
-  return request<ClientSummary>(`/api/v2/ui/clients/${id}/freeze`, { method: 'POST' });
-}
-
-export async function unfreezeClient(id: string) {
-  return request<ClientSummary>(`/api/v2/ui/clients/${id}/unfreeze`, { method: 'POST' });
 }
 
 export async function deleteClientFolder(clientId: string, folderId: string) {
@@ -2963,6 +3014,40 @@ export async function deleteClientDocument(clientId: string, documentId: string)
   }>(`/api/v2/ui/clients/${clientId}/documents/${documentId}`, {
     method: 'DELETE',
   });
+}
+
+export type RecycledClientDocument = {
+  documentId: string;
+  fileName: string;
+  deletedAt: string;
+  retentionUntil?: string | null;
+  recoverable: true;
+  originalAvailable?: boolean;
+};
+
+export async function getClientDocumentRecycleBin(clientId: string) {
+  return request<{
+    clientId: string;
+    items: RecycledClientDocument[];
+    count: number;
+    retentionDays: number;
+    recoverableOnly: true;
+  }>(`/api/v2/ui/clients/${encodeURIComponent(clientId)}/document-recycle-bin`);
+}
+
+export async function restoreClientDocument(clientId: string, documentId: string) {
+  return request<{
+    restored: boolean;
+    clientId: string;
+    previousDocumentId: string;
+    documentId: string;
+    fileName: string;
+    overallState: string;
+    cloudMetadataState: string;
+  }>(
+    `/api/v2/ui/clients/${encodeURIComponent(clientId)}/document-recycle-bin/${encodeURIComponent(documentId)}/restore`,
+    { method: 'POST' },
+  );
 }
 
 const inFlightClientWorkspaces = new Map<string, Promise<ClientWorkspace>>();
@@ -4865,6 +4950,7 @@ export async function startClientMessage(
   activeSkillId?: string | null,
   creativityMode?: import('../../shared/types').CreativityMode,
   activeSkillIds?: string[],
+  imageInputs?: Array<{ name: string; mimeType: string; dataUrl: string; size: number }>,
 ) {
   const workingDocumentIds = Array.isArray(workingDocumentIdsOrOptions) ? workingDocumentIdsOrOptions : [];
   const requestOptions = Array.isArray(workingDocumentIdsOrOptions) ? options : workingDocumentIdsOrOptions;
@@ -4878,6 +4964,7 @@ export async function startClientMessage(
       deepThinking: deepThinking === true,
       activeSkillId: activeSkillId || null,
       activeSkillIds: activeSkillIds || [],
+      imageInputs: imageInputs || [],
       creativityMode: creativityMode || 'balanced',
     }),
     ...requestOptions,
@@ -4962,6 +5049,16 @@ export async function setAgentSkillEnabled(
     {
       method: 'PATCH',
       body: JSON.stringify({ enabled, expectedVersion }),
+    },
+  );
+}
+
+export async function deleteAgentSkill(skillId: string, expectedVersion: number) {
+  return request<{ deleted: boolean; skillId: string; version: number }>(
+    `/api/v2/ui/agent-skills/${encodeURIComponent(skillId)}/delete`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ expectedVersion }),
     },
   );
 }
@@ -5076,7 +5173,15 @@ export async function correctWorkspaceAnswerFact(
 }
 
 export async function getDocumentText(documentId: string) {
-  return request<{ content: string; kind: string; title: string }>(
+  return request<{
+    content: string;
+    kind: string;
+    title: string;
+    fileName?: string;
+    path?: string;
+    mediaType?: string;
+    editableInPlace?: boolean;
+  }>(
     `/api/v2/ui/documents/${encodeURIComponent(documentId)}/text`,
   );
 }
@@ -5116,8 +5221,8 @@ export async function createClientTextDocument(clientId: string, payload: { titl
   });
 }
 
-// 覆盖式保存:把 markdown 渲染回原 docx 文件,documentId/path 不变。
-// 用于「智能编辑器 → 保存」按钮:用户从 docx 打开编辑后期望覆盖原文件。
+// 覆盖式保存：可写文本直接保存回原文件；docx 将 markdown 渲染回原 Word。
+// 标题变化会在保留 documentId 与扩展名的前提下同步重命名受管文件。
 export async function updateDocumentContent(documentId: string, payload: { title?: string | null; content: string }) {
   return request<{
     clientId: string;

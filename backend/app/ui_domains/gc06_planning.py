@@ -896,6 +896,30 @@ def update_meeting(compatibility: Any, request: UiRequest, match: Any) -> Any:
     return result
 
 
+@router.post(r"gc06/meetings/(?P<meeting_id>[^/]+)/migrate-to-task")
+def migrate_meeting_to_task(compatibility: Any, request: UiRequest, match: Any) -> Any:
+    result = _command(
+        compatibility,
+        request,
+        "POST",
+        f"meetings/{match.group('meeting_id')}/migrate-to-task",
+    )
+    task = result.get("task") if isinstance(result, Mapping) else None
+    if isinstance(task, Mapping):
+        _task_projector(compatibility).apply({"tasks": [task]})
+    meeting = result.get("meeting") if isinstance(result, Mapping) else None
+    if isinstance(meeting, Mapping):
+        _planning_projector(compatibility).apply_meetings([meeting])
+    if isinstance(task, Mapping):
+        task_id = str(task.get("id") or "")
+        if task_id:
+            _planning_projector(compatibility).apply_meeting_migration(
+                meeting_id=match.group("meeting_id"),
+                task_id=task_id,
+            )
+    return result
+
+
 @router.post(r"gc06/meetings/(?P<meeting_id>[^/]+)/collaboration/(?P<action>accept|reject)")
 def transition_meeting_collaboration(compatibility: Any, request: UiRequest, match: Any) -> Any:
     result = _command(

@@ -239,6 +239,35 @@ def register_gc07_routes(
         )
 
     @app.post(
+        "/api/v2/domain/project-materials/projects/{project_id}/lifecycle"
+    )
+    def transition_project(
+        project_id: str,
+        payload: Annotated[dict[str, Any], Body()],
+        identity: Annotated[SessionIdentity, Depends(identity_dependency)],
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key"),
+        ] = None,
+    ) -> dict[str, Any]:
+        return domain.transition_project(
+            identity,
+            project_id=project_id,
+            target_state=str(payload.get("targetState") or ""),
+            expected_version=int(payload.get("expectedVersion") or 0),
+            idempotency_key=idempotency_key or new_id(),
+        )
+
+    @app.get(
+        "/api/v2/domain/project-materials/projects/{project_id}/delete-preview"
+    )
+    def delete_preview(
+        project_id: str,
+        identity: Annotated[SessionIdentity, Depends(identity_dependency)],
+    ) -> dict[str, Any]:
+        return domain.delete_preview(identity, project_id=project_id)
+
+    @app.post(
         "/api/v2/domain/project-materials/projects/{project_id}"
         "/materials/register-metadata",
         status_code=status.HTTP_201_CREATED,

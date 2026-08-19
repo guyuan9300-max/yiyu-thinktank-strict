@@ -32,6 +32,7 @@ import {
 import { useRuntimeUiSessionState } from '../../lib/runtimeUiSessionStore';
 
 type CalendarDisplayMode = 'month' | 'week';
+type CalendarRoleFilter = 'creator' | 'owner' | 'collaborator';
 
 type TaskCalendarViewProps = {
   uiSessionScopeKey: string;
@@ -62,8 +63,8 @@ type TaskCalendarViewProps = {
   onApproveTaskReview: (taskId: string) => Promise<void>;
   onReturnTaskReview: (taskId: string) => Promise<void>;
   isTaskOverdue: (task: Task, today?: Date) => boolean;
-  showCollaborativeTasks: boolean;
-  onToggleCollaborativeTasks: () => void;
+  roleFilter: CalendarRoleFilter;
+  onRoleFilterChange: (role: CalendarRoleFilter) => void;
 };
 
 const sourceTypeLabels: Record<string, string> = {
@@ -79,7 +80,6 @@ const sourceTypeLabels: Record<string, string> = {
 const DAY_TIMELINE_SLOT_MINUTES = 15;
 const DAY_TIMELINE_SLOT_HEIGHT = 14;
 const DAY_TIMELINE_DEFAULT_DURATION_MINUTES = 60;
-const DAY_TIMELINE_DEFAULT_START_MINUTE = 8 * 60;
 const DAY_MINUTES = 24 * 60;
 const WEEK_MAX_VISIBLE_COLUMNS = 3; // 同时段最多可见 3 个任务卡,第 4 个起聚合 +N
 const WEEK_OVERLAP_INDENT_RATIO = 0.18; // indent 风格:每个后续重叠任务向右偏移 18%
@@ -443,8 +443,8 @@ export function TaskCalendarView({
   onApproveTaskReview: _onApproveTaskReview,
   onReturnTaskReview: _onReturnTaskReview,
   isTaskOverdue,
-  showCollaborativeTasks,
-  onToggleCollaborativeTasks,
+  roleFilter,
+  onRoleFilterChange,
 }: TaskCalendarViewProps) {
   const [isJumpPickerOpen, setIsJumpPickerOpen] = useState(false);
   const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null);
@@ -718,6 +718,7 @@ export function TaskCalendarView({
     continuesLeft: boolean;  // 左端是"上周接续"→ 显示左箭头
     continuesRight: boolean; // 右端是"下周接续"→ 显示右箭头
     showTitle: boolean;   // 只在起始格显示标题
+    titleSegment: string; // 标题按跨度分段，跨得越宽就能连续显示越多内容
   };
   const monthMultiDayBarsByDateKey = useMemo(() => {
     const result = new Map<string, Array<MonthDayBarSlot | null>>();
@@ -762,6 +763,9 @@ export function TaskCalendarView({
         const slots: Array<MonthDayBarSlot | null> = new Array(laneCount).fill(null);
         placed.forEach(({ bar, lane }) => {
           if (col < bar.firstCol || col > bar.lastCol) return;
+          const fullTitle = `${formatMonthTaskStartTime(bar.task)} ${bar.task.title}`;
+          const segmentWidth = 14;
+          const segmentIndex = col - bar.firstCol;
           slots[lane] = {
             task: bar.task,
             roundLeft: col === bar.firstCol && !bar.continuesLeft,
@@ -769,6 +773,7 @@ export function TaskCalendarView({
             continuesLeft: col === bar.firstCol && bar.continuesLeft,
             continuesRight: col === bar.lastCol && bar.continuesRight,
             showTitle: col === bar.firstCol,
+            titleSegment: fullTitle.slice(segmentIndex * segmentWidth, (segmentIndex + 1) * segmentWidth),
           };
         });
         result.set(formatDateInputValue(dayObj.date), slots);
@@ -949,16 +954,6 @@ export function TaskCalendarView({
     if (timedMatch) return timedMatch.durationMinutes;
     return Math.max(DAY_TIMELINE_SLOT_MINUTES, draggedTask.durationMinutes ?? DAY_TIMELINE_DEFAULT_DURATION_MINUTES);
   }, [draggedMeeting, draggedTask, weekTimedTasks]);
-
-  useEffect(() => {
-    if (calendarDisplayMode !== 'week') return;
-    const nextScrollTop = Math.max(0, (DAY_TIMELINE_DEFAULT_START_MINUTE / DAY_TIMELINE_SLOT_MINUTES) * DAY_TIMELINE_SLOT_HEIGHT - 12);
-    const pager = weekPagerRef.current;
-    if (!pager) return;
-    pager.querySelectorAll<HTMLElement>('[data-week-scroll="true"]').forEach((node) => {
-      node.scrollTop = nextScrollTop;
-    });
-  }, [calendarDisplayMode, selectedDate]);
 
   useEffect(() => {
     if (!resizingTaskId || !resizeDraftRef.current) return;
@@ -1556,29 +1551,24 @@ export function TaskCalendarView({
             </div>
 
             <div className="flex flex-wrap items-center justify-end gap-2 self-start lg:self-auto">
-              <button
-                type="button"
-                role="switch"
-                aria-checked={showCollaborativeTasks}
-                aria-label={showCollaborativeTasks ? '隐藏个人任务' : '显示全部任务'}
-                onClick={onToggleCollaborativeTasks}
-                className="group relative flex items-center overflow-visible"
-              >
-                <span className="pointer-events-none absolute left-0 top-1/2 -translate-x-[calc(100%+8px)] -translate-y-1/2 text-[11px] font-medium text-gray-400 whitespace-nowrap opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-visible:opacity-100 group-active:opacity-100">
-                  {showCollaborativeTasks ? '隐藏个人任务' : '显示全部任务'}
-                </span>
-                <span
-                  className={`relative inline-flex h-6 w-10 items-center rounded-full transition-colors duration-200 ${
-                    showCollaborativeTasks ? 'bg-[#5B7BFE]' : 'bg-gray-300'
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-                      showCollaborativeTasks ? 'translate-x-5' : 'translate-x-1'
+              <div className="inline-flex rounded-xl bg-gray-100 p-1" aria-label="按本人在事项中的身份筛选">
+                {([
+                  ['creator', '发起人'],
+                  ['owner', '负责人'],
+                  ['collaborator', '协作者'],
+                ] as Array<[CalendarRoleFilter, string]>).map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => onRoleFilterChange(value)}
+                    className={`rounded-lg px-3 py-1.5 text-[11px] font-bold transition-colors ${
+                      roleFilter === value ? 'bg-white text-[#4A66D8] shadow-sm' : 'text-gray-500 hover:text-gray-800'
                     }`}
-                  />
-                </span>
-              </button>
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
               <div className="relative flex items-center gap-1.5">
               <button
                 type="button"
@@ -1843,11 +1833,7 @@ export function TaskCalendarView({
                                   {slot.continuesLeft && (
                                     <ChevronLeft size={10} strokeWidth={2.5} className="shrink-0 opacity-70" aria-hidden="true" />
                                   )}
-                                  {slot.showTitle ? (
-                                    <span className="overflow-hidden text-ellipsis">{formatMonthTaskStartTime(slot.task)} {slot.task.title}</span>
-                                  ) : (
-                                    <span className="flex-1" aria-hidden="true" />
-                                  )}
+                                  <span className="min-w-0 flex-1 overflow-hidden text-ellipsis">{slot.titleSegment}</span>
                                   {slot.continuesRight && (
                                     <ChevronRight size={10} strokeWidth={2.5} className="ml-auto shrink-0 opacity-70" aria-hidden="true" />
                                   )}
@@ -2102,7 +2088,7 @@ export function TaskCalendarView({
             </div>
             <div
               ref={weekPagerRef}
-              className="overflow-x-auto overscroll-x-contain snap-x snap-proximity"
+              className="overflow-x-auto overscroll-x-contain snap-x snap-proximity scrollbar-hide"
               onScroll={handleWeekPagerScroll}
             >
               <div className="flex min-w-full">
@@ -2238,7 +2224,7 @@ export function TaskCalendarView({
                     )}
 
                     <div
-                      className="max-h-[860px] overflow-y-auto"
+                      className="overflow-visible"
                       data-week-scroll="true"
                       onScroll={handleWeekVerticalScroll}
                     >

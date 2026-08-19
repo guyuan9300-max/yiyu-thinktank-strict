@@ -13,6 +13,12 @@ import type {
 export type WorkspaceDisplayChatMessage = ChatMessage & {
   requestPrompt?: string;
   elapsedMs?: number;
+  imageAttachments?: Array<{
+    id: string;
+    name: string;
+    mimeType: string;
+    dataUrl?: string;
+  }>;
 };
 
 export type WorkspacePendingQuestionState = {

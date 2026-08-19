@@ -35,6 +35,7 @@ from cloud_backend.app.repositories.gc06_planning import (
     list_calendar_entries,
     list_event_lines,
     list_plan_item_tasks,
+    migrate_meeting_to_task,
     get_task_plan_link,
     merge_event_lines,
     reparent_event_line,
@@ -933,6 +934,50 @@ def test_meeting_requires_client_binds_event_line_and_rebuilds_calendar(
     assert list_calendar_entries(repository, identity) == []
 
 
+def test_meeting_migration_reuses_task_authority_and_is_replay_safe(tmp_path: Path) -> None:
+    repository, identity, payload = _repository(tmp_path)
+    meeting = create_meeting(
+        repository,
+        identity,
+        payload={
+            "meetingId": "meeting_to_task_gc06",
+            "clientId": payload["projectId"],
+            "title": "统一日程对象",
+            "agenda": "会议信息迁入任务",
+            "startsAt": "2026-08-08T09:00:00+08:00",
+            "endsAt": "2026-08-08T10:00:00+08:00",
+        },
+        idempotency_key="gc06-meeting-to-task-create",
+    )["meeting"]
+    first = migrate_meeting_to_task(
+        repository,
+        identity,
+        meeting_id=meeting["id"],
+        idempotency_key="gc06-meeting-to-task",
+    )
+    replay = migrate_meeting_to_task(
+        repository,
+        identity,
+        meeting_id=meeting["id"],
+        idempotency_key="gc06-meeting-to-task-replay",
+    )
+    assert first["task"]["id"] == replay["task"]["id"]
+    assert first["task"]["source_type"] == "meeting_migration"
+    assert first["meeting"]["status"] == "cancelled"
+    assert replay["meeting"]["status"] == "cancelled"
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        meeting_state = connection.execute(
+            "SELECT status FROM meetings WHERE id=?", (meeting["id"],)
+        ).fetchone()["status"]
+        task_count = connection.execute(
+            "SELECT COUNT(*) AS total FROM tasks WHERE source_type='meeting_migration' AND source_id=?",
+            (meeting["id"],),
+        ).fetchone()["total"]
+    assert meeting_state == "cancelled"
+    assert task_count == 1
+    assert [item["target_kind"] for item in list_calendar_entries(repository, identity)] == ["task"]
+
+
 def test_meeting_owner_invitation_and_plan_link_use_existing_88_tables(tmp_path: Path) -> None:
     repository, identity, payload = _repository(tmp_path)
     line = _create_line(repository, identity, payload["projectId"])
@@ -1445,6 +1490,19 @@ def test_gc06_local_projection_keeps_cloud_rows_in_the_matching_88_tables(
             "AND name NOT LIKE 'sqlite_%'"
         ).fetchone()[0] == 88
 
+    # A valid empty cloud snapshot means that the previous projection became
+    # stale.  It must reconcile cleanly instead of surfacing a false
+    # "dependency incomplete" error to the organization-plan page.
+    reconciled = projector.reconcile_planning_cycles([])
+    assert reconciled["count"] == 1
+    with runtime_connection(database, "local") as connection:
+        row = connection.execute(
+            "SELECT lifecycle_state,projection_state FROM planning_cycles WHERE id=?",
+            (plan_id,),
+        ).fetchone()
+        assert tuple(row) == ("deleted", "stale")
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
 
 def test_plan_item_tasks_use_strict_task_adapter_without_business_snapshot() -> None:
     class Runtime:
@@ -1500,7 +1558,7 @@ def test_gc06_detached_cloud_and_ui_registrars_are_complete(tmp_path: Path) -> N
         for route in app.routes
         if str(getattr(route, "path", "")).startswith("/api/v2/gc06/")
     ]
-    assert len(cloud_paths) == 29
+    assert len(cloud_paths) == 30
     assert "/api/v2/gc06/meetings/{meeting_id}/collaboration/{action}" in cloud_paths
     assert "/api/v2/gc06/plan-item-tasks" in cloud_paths
     assert "/api/v2/gc06/tasks/{task_id}/plan-link" in cloud_paths
@@ -1516,13 +1574,16 @@ def test_gc06_detached_cloud_and_ui_registrars_are_complete(tmp_path: Path) -> N
     assert WorkspaceRuntime._connected_cloud_path_allowed(
         "POST", "/api/v2/gc06/meetings/meeting_gc06/collaboration/accept"
     )
+    assert WorkspaceRuntime._connected_cloud_path_allowed(
+        "POST", "/api/v2/gc06/meetings/meeting_gc06/migrate-to-task"
+    )
     assert cloud_paths.index("/api/v2/gc06/event-lines/{event_line_id}/activities") < (
         cloud_paths.index("/api/v2/gc06/event-lines/{event_line_id}/{transition}")
     )
-    assert len(gc06_ui_router.routes) == 61
+    assert len(gc06_ui_router.routes) == 62
     assert sum(
         route.pattern.startswith("gc06/") for route in gc06_ui_router.routes
-    ) == 23
+    ) == 24
     assert {
         (route.method, route.pattern)
         for route in gc06_ui_router.routes

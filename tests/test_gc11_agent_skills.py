@@ -38,6 +38,10 @@ def test_skill_run_cloud_command_is_on_the_strict_allowlist() -> None:
         "POST",
         "/api/v2/agent-skills/skill_contract/arbitrary-action",
     )
+    assert WorkspaceRuntime._connected_cloud_path_allowed(
+        "POST",
+        "/api/v2/agent-skills/skill_contract/delete",
+    )
 
 
 def test_builtin_agent_contracts_are_complete_and_distinct() -> None:
@@ -198,6 +202,66 @@ def test_private_declarative_analysis_skill_uses_only_strict_88_authority(
         assert connection.execute("SELECT COUNT(*) FROM ai_proposals").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM ai_approvals").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_member_can_tombstone_owned_skill_without_erasing_run_history(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "strict-cloud.db"
+    config, tokens = _seed_gc01_cloud(database)
+    with TestClient(create_app(config)) as client:
+        created = client.post(
+            "/api/v2/agent-skills",
+            headers={**_auth(tokens["member"]), "Idempotency-Key": "delete-skill-create"},
+            json=ANALYSIS_SKILL,
+        )
+        assert created.status_code == 200, created.text
+        skill_id = created.json()["skillId"]
+
+        deleted = client.post(
+            f"/api/v2/agent-skills/{skill_id}/delete",
+            headers={**_auth(tokens["member"]), "Idempotency-Key": "delete-skill-command"},
+            json={"expectedVersion": 1},
+        )
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json() == {
+            "deleted": True,
+            "skillId": skill_id,
+            "version": 2,
+            "idempotentReplay": False,
+        }
+        replay = client.post(
+            f"/api/v2/agent-skills/{skill_id}/delete",
+            headers={**_auth(tokens["member"]), "Idempotency-Key": "delete-skill-command"},
+            json={"expectedVersion": 1},
+        )
+        assert replay.status_code == 200
+        assert replay.json()["idempotentReplay"] is True
+
+        visible = client.get(
+            "/api/v2/agent-skills?agentKind=project_workspace",
+            headers=_auth(tokens["member"]),
+        )
+        assert visible.status_code == 200
+        assert visible.json()["items"] == []
+
+    with runtime_connection(database, "cloud") as connection:
+        skill = connection.execute(
+            "SELECT lifecycle_state,enabled,version FROM automation_rules WHERE id=?",
+            (skill_id,),
+        ).fetchone()
+        assert tuple(skill) == ("deleted", 0, 2)
+        resource = connection.execute(
+            "SELECT lifecycle_state,version FROM secured_resources WHERE id=?",
+            (skill_id,),
+        ).fetchone()
+        assert tuple(resource) == ("deleted", 2)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lifecycle_events WHERE secured_resource_id=? AND to_state='deleted'",
+            (skill_id,),
+        ).fetchone()[0] == 1
         assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 

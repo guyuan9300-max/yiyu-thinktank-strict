@@ -15,7 +15,7 @@ from typing import Iterable
 
 
 TEXT_EXTENSIONS = {
-    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
+    ".txt", ".md", ".markdown", ".csv", ".tsv",
     ".xml", ".html", ".htm", ".mhtml", ".mht", ".yaml", ".yml",
 }
 OFFICE_EXTENSIONS = {

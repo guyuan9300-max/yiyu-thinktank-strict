@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -14,6 +15,20 @@ from strict_common.agent_memory import BUILTIN_AGENT_DEFINITIONS, builtin_agent_
 from strict_common.ids import canonical_json, sha256_text, utc_now
 
 from .runtime import LocalRuntimeError, WorkspaceRuntime
+
+
+def _normalize_answer_selection_text(value: str) -> str:
+    """Match browser-rendered answer text against its Markdown source."""
+
+    text = str(value or "")
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)
+    text = re.sub(r"(?m)^\s*(?:[-+*]|\d+[.)])\s+", "", text)
+    text = re.sub(r"[*_~`]", "", text)
+    text = re.sub(r"[>|]", " ", text)
+    return " ".join(text.split())
 
 
 def _load_optional_project_knowledge(
@@ -54,6 +69,11 @@ class LocalWorkbenchChatRepository:
     MEMORY_SYNC_MEDIA_TYPE = (
         "application/vnd.yiyu.member-memory-safe-summary+json"
     )
+    CHAT_IMAGE_MEDIA_TYPES = {
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/webp": "webp",
+    }
     GENERATOR_VERSION = "yiyu-gc14-workbench-p07-v1"
     MEMORY_GENERATOR_VERSION = "yiyu-gc15-answer-memory-p09-v1"
     MEMORY_SYNC_GENERATOR_VERSION = "yiyu-gc15-memory-sync-p10-v1"
@@ -304,6 +324,152 @@ class LocalWorkbenchChatRepository:
                 "本机回答正文格式无效",
             )
         return payload
+
+    def persist_chat_images(
+        self,
+        *,
+        project_id: str,
+        thread_id: str,
+        images: Iterable[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Store chat-only images locally without creating project files."""
+
+        context = self._context()
+        receipts: list[dict[str, Any]] = []
+        for index, image in enumerate(images):
+            mime_type = str(image.get("mimeType") or "").strip().lower()
+            extension = self.CHAT_IMAGE_MEDIA_TYPES.get(mime_type)
+            raw = image.get("bytes")
+            if extension is None or not isinstance(raw, bytes) or not raw:
+                raise LocalRuntimeError(422, "chat_image_invalid", "图片内容无效")
+            content_hash = hashlib.sha256(raw).hexdigest()
+            supplied_hash = str(image.get("contentHash") or "").strip()
+            if supplied_hash and supplied_hash != content_hash:
+                raise LocalRuntimeError(409, "chat_image_hash_mismatch", "图片内容校验失败")
+            object_id = self._stable_id(
+                "chat-image",
+                project_id,
+                thread_id,
+                str(index),
+                content_hash,
+            )
+            storage_key = (
+                f"managed/private/workbench/{context.sandbox_id}/"
+                f"chat-images/{object_id}.{extension}"
+            )
+            with self.runtime.local_storage_object_lock(
+                sandbox_id=context.sandbox_id,
+                object_id=object_id,
+            ):
+                current = self.runtime.local_storage_object_get(
+                    sandbox_id=context.sandbox_id,
+                    object_id=object_id,
+                )
+                path = self._managed_path(storage_key)
+                existing_valid = False
+                if (
+                    current is not None
+                    and str(current.get("content_hash") or "") == content_hash
+                    and str(current.get("storage_key") or "") == storage_key
+                    and str(current.get("lifecycle_state") or "") == "active"
+                ):
+                    try:
+                        existing = path.read_bytes()
+                        existing_valid = (
+                            len(existing) == len(raw)
+                            and hashlib.sha256(existing).hexdigest() == content_hash
+                        )
+                    except OSError:
+                        existing_valid = False
+                if not existing_valid:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    descriptor, temporary_name = tempfile.mkstemp(
+                        prefix=f".{path.name}.",
+                        suffix=".tmp",
+                        dir=path.parent,
+                    )
+                    try:
+                        with os.fdopen(descriptor, "wb") as temporary:
+                            temporary.write(raw)
+                            temporary.flush()
+                            os.fsync(temporary.fileno())
+                        os.replace(temporary_name, path)
+                    finally:
+                        try:
+                            os.unlink(temporary_name)
+                        except FileNotFoundError:
+                            pass
+                    if current is None or (
+                        str(current.get("content_hash") or "") != content_hash
+                        or str(current.get("storage_key") or "") != storage_key
+                        or str(current.get("lifecycle_state") or "") != "active"
+                    ):
+                        self.runtime.local_storage_object_put(
+                            sandbox_id=context.sandbox_id,
+                            object_id=object_id,
+                            storage_key=storage_key,
+                            content_hash=content_hash,
+                            media_type=mime_type,
+                            byte_size=len(raw),
+                            expected_version=int((current or {}).get("version") or 0),
+                        )
+            receipts.append(
+                {
+                    "objectId": object_id,
+                    "name": str(image.get("name") or f"图片{index + 1}")[:120],
+                    "mimeType": mime_type,
+                    "size": len(raw),
+                    "contentHash": content_hash,
+                }
+            )
+        return receipts
+
+    def resolve_chat_images(
+        self,
+        receipts: Iterable[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Resolve verified local image references for renderer history."""
+
+        context = self._context()
+        normalized = [dict(item) for item in receipts if isinstance(item, Mapping)]
+        object_ids = [str(item.get("objectId") or "").strip() for item in normalized]
+        manifests = self.runtime.local_storage_objects_get(
+            sandbox_id=context.sandbox_id,
+            object_ids=object_ids,
+        )
+        resolved: list[dict[str, Any]] = []
+        for item in normalized:
+            object_id = str(item.get("objectId") or "").strip()
+            manifest = manifests.get(object_id)
+            if not object_id or manifest is None:
+                continue
+            mime_type = str(manifest.get("media_type") or "").strip().lower()
+            if (
+                mime_type not in self.CHAT_IMAGE_MEDIA_TYPES
+                or str(manifest.get("lifecycle_state") or "") != "active"
+                or str(item.get("contentHash") or "")
+                != str(manifest.get("content_hash") or "")
+            ):
+                continue
+            try:
+                data = self._managed_path(str(manifest.get("storage_key") or "")).read_bytes()
+            except OSError:
+                continue
+            if (
+                len(data) != int(manifest.get("byte_size") or 0)
+                or hashlib.sha256(data).hexdigest()
+                != str(manifest.get("content_hash") or "")
+            ):
+                continue
+            resolved.append(
+                {
+                    "id": object_id,
+                    "name": str(item.get("name") or "图片")[:120],
+                    "mimeType": mime_type,
+                    "dataUrl": f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}",
+                }
+            )
+        return resolved
 
     @staticmethod
     def _temperature(mode: str) -> float:
@@ -1327,9 +1493,15 @@ class LocalWorkbenchChatRepository:
         if str(answer.get("projectId") or "") != project_id:
             raise LocalRuntimeError(409, "answer_project_mismatch", "回答不属于当前项目")
         answer_text = str(answer.get("answerMarkdown") or "")
-        collapsed_answer = " ".join(answer_text.split())
-        collapsed_selection = " ".join(normalized_selection.split())
-        if normalized_kind != "remember" and collapsed_selection not in collapsed_answer:
+        collapsed_answer = _normalize_answer_selection_text(answer_text)
+        collapsed_selection = _normalize_answer_selection_text(normalized_selection)
+        compact_answer = re.sub(r"\s+", "", collapsed_answer)
+        compact_selection = re.sub(r"\s+", "", collapsed_selection)
+        selection_matches = bool(collapsed_selection) and (
+            collapsed_selection in collapsed_answer
+            or compact_selection in compact_answer
+        )
+        if normalized_kind != "remember" and not selection_matches:
             raise LocalRuntimeError(
                 409,
                 "answer_selection_stale",
@@ -3409,6 +3581,7 @@ class LocalWorkbenchChatRepository:
         history_messages: list[Mapping[str, str]] | None = None,
         writing_style: str | None = None,
         agent_skills: list[Mapping[str, Any]] | None = None,
+        image_context_items: list[Mapping[str, Any]] | None = None,
         deep_thinking: bool = False,
         memory_policy: str = "member_private",
         source_manifest_extra: Mapping[str, Any] | None = None,
@@ -3755,7 +3928,7 @@ class LocalWorkbenchChatRepository:
             )
             if deep_thinking:
                 system_prompt += "\n先在内部核对事实边界、冲突和缺口，再输出结论；不要输出隐藏思维过程。"
-            messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+            messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
             messages.extend(
                 {
                     "role": "assistant" if str(item.get("role") or "") == "assistant" else "user",
@@ -3764,7 +3937,19 @@ class LocalWorkbenchChatRepository:
                 for item in (history_messages or [])[-8:]
                 if str(item.get("content") or "").strip()
             )
-            messages.append({"role": "user", "content": normalized_question})
+            image_items = [dict(item) for item in image_context_items or []]
+            if image_items:
+                user_content: list[dict[str, Any]] = [{"type": "text", "text": normalized_question}]
+                user_content.extend(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": str(item.get("dataUrl") or "")},
+                    }
+                    for item in image_items
+                )
+                messages.append({"role": "user", "content": user_content})
+            else:
+                messages.append({"role": "user", "content": normalized_question})
             completion = self.runtime.organization_ai_completion(
                 messages=messages,
                 temperature=self._temperature(mode),

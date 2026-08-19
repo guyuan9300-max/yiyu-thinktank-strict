@@ -3,6 +3,7 @@ import {
   getTaskCalendarPlacement,
   getTaskExecutionDate,
   getTaskScheduleRange,
+  splitTaskDateTime as splitCanonicalTaskDateTime,
   taskOverlapsDateWindow,
 } from '../../shared/taskTime';
 
@@ -20,22 +21,7 @@ function addDays(baseDate: Date, days: number) {
 }
 
 export function splitTaskDueDateTime(value?: string | null) {
-  if (!value) return { date: '', time: '' };
-  const text = value.trim();
-  if (!text) return { date: '', time: '' };
-  const match = text.match(/^(\d{4}-\d{2}-\d{2})(?:[T\s](\d{2}):(\d{2}))?/);
-  if (match) {
-    return {
-      date: match[1],
-      time: match[2] && match[3] ? `${match[2]}:${match[3]}` : '',
-    };
-  }
-  const parsed = new Date(text);
-  if (Number.isNaN(parsed.getTime())) return { date: '', time: '' };
-  return {
-    date: `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}-${String(parsed.getDate()).padStart(2, '0')}`,
-    time: `${String(parsed.getHours()).padStart(2, '0')}:${String(parsed.getMinutes()).padStart(2, '0')}`,
-  };
+  return splitCanonicalTaskDateTime(value);
 }
 
 export function normalizeTaskTimeInput(timePart?: string | null) {

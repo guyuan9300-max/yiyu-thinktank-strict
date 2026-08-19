@@ -385,6 +385,19 @@ def register_gc06_planning_routes(
             idempotency_key=idempotency_key,
         )
 
+    @app.post("/api/v2/gc06/meetings/{meeting_id}/migrate-to-task")
+    def migrate_meeting_to_task(
+        meeting_id: str,
+        identity: Identity,
+        idempotency_key: Idempotency,
+    ) -> dict[str, Any]:
+        return gc06_planning.migrate_meeting_to_task(
+            repository,
+            identity,
+            meeting_id=meeting_id,
+            idempotency_key=idempotency_key,
+        )
+
     @app.post("/api/v2/gc06/meetings/{meeting_id}/collaboration/{action}")
     def transition_meeting_collaboration(
         meeting_id: str,

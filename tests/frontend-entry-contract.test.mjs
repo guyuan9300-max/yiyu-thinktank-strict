@@ -245,6 +245,9 @@ test('workbench exposes project knowledge source counts and material boundary', 
 
 test('workbench explains text correction and clears a stale selection immediately', () => {
   assert.ok(appSource.includes('如需纠错或补充，请选中相关文本'));
+  assert.ok(appSource.includes('normalizeAnswerSelectionForMatch'));
+  assert.ok(appSource.includes('selectedText.length > 2_000'));
+  assert.equal(appSource.includes('selectedText.length > 20_000'), false);
   assert.ok(appSource.includes("document.addEventListener('selectionchange', clearStaleAnswerSelection)"));
   assert.match(
     appSource,

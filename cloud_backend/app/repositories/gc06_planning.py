@@ -1795,7 +1795,7 @@ def update_planning_cycle(
                     raise RepositoryError(
                         409,
                         "unused_planning_cycle_must_be_deleted",
-                        "尚未关联任务或会议的计划请直接删除，不需要归档",
+                        "尚未关联任务的计划请直接删除，不需要标记完成",
                     )
             lifecycle = "archived" if status == "archived" else "active"
             published_at = row["published_at"] or (now if status == "published" else None)
@@ -1906,7 +1906,7 @@ def delete_planning_cycle(
                 raise RepositoryError(
                     409,
                     "planning_cycle_has_dependants",
-                    "已有任务或会议关联的计划不能删除，请改为归档",
+                    "已有任务关联的计划不能删除，请改为标记完成",
                 )
             next_version = expected + 1
             connection.execute(
@@ -4153,6 +4153,139 @@ def update_meeting(
         except Exception:
             connection.rollback()
             raise
+
+
+def migrate_meeting_to_task(
+    repository: CloudRepository,
+    identity: SessionIdentity,
+    *,
+    meeting_id: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Move one legacy meeting authority row onto the canonical task chain.
+
+    Meetings used to be a second schedule authority.  The product now models
+    every scheduled item as a task; this command is deliberately resumable so
+    a network interruption cannot duplicate the task or orphan recordings.
+    """
+    with repository._connection() as connection:  # noqa: SLF001
+        meeting_row = _meeting_row(connection, identity, meeting_id)
+        repository._require_project_access(  # noqa: SLF001
+            connection,
+            identity,
+            project_id=str(meeting_row["client_id"]),
+            capability="project_write",
+        )
+        existing_task = connection.execute(
+            "SELECT id FROM tasks WHERE scope_id=? AND source_type='meeting_migration' "
+            "AND source_id=? AND lifecycle_state!='deleted' ORDER BY created_at LIMIT 1",
+            (identity.scope_id, meeting_id),
+        ).fetchone()
+        meeting = _meeting_payload(connection, meeting_row)
+
+    task_domain = GC04TaskRepository(repository)
+    if existing_task is None:
+        collaborators = list(meeting.get("collaborators") or [])
+        owner_id = (
+            next(
+                (
+                    str(item.get("membershipId") or "")
+                    for item in collaborators
+                    if str(item.get("roleKey") or "") == "owner"
+                ),
+                "",
+            )
+            or str(meeting.get("organizerMembershipId") or "")
+            or identity.membership_id
+        )
+        collaborator_ids = sorted(
+            {
+                str(item.get("membershipId") or "")
+                for item in collaborators
+                if str(item.get("roleKey") or "") == "collaborator"
+                and str(item.get("membershipId") or "")
+                and str(item.get("membershipId") or "") != owner_id
+            }
+        )
+        task_result = task_domain.create_task(
+            identity,
+            payload={
+                "title": str(meeting.get("title") or "未命名事项"),
+                "desc": str(meeting.get("agenda") or ""),
+                "priority": "normal",
+                "listId": "",
+                "scopeMode": "COLLAB_SHARED",
+                "clientId": str(meeting.get("clientId") or ""),
+                "eventLineId": meeting.get("eventLineId"),
+                "planningCycleId": (meeting.get("planLink") or {}).get("planningCycleId"),
+                "scheduledStartAt": str(meeting.get("startsAt") or ""),
+                "scheduledEndAt": str(meeting.get("endsAt") or ""),
+                "dueDate": str(meeting.get("startsAt") or ""),
+                "ddl": str(meeting.get("startsAt") or ""),
+                "ownerId": owner_id,
+                "collaboratorIds": collaborator_ids,
+                "tagIds": [],
+                "sourceType": "meeting_migration",
+                "sourceId": meeting_id,
+            },
+            idempotency_key=f"{idempotency_key}:task",
+        )
+        task_id = str((task_result.get("task") or {}).get("id") or "")
+    else:
+        task_id = str(existing_task["id"])
+        task_result = {"task": task_domain.task_detail(identity, task_id=task_id)["task"]}
+
+    if not task_id:
+        raise RepositoryError(500, "meeting_migration_task_missing", "会议迁移任务未生成")
+
+    # The task is already durable at this point.  The remaining updates are
+    # repeatable and therefore safe to resume after an interrupted request.
+    with repository._connection() as connection:  # noqa: SLF001
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            now = utc_now()
+            connection.execute(
+                "UPDATE recordings SET task_id=?, meeting_id=NULL, binding_kind='task', "
+                "updated_at=? WHERE scope_id=? AND meeting_id=?",
+                (task_id, now, identity.scope_id, meeting_id),
+            )
+            connection.execute(
+                "UPDATE source_assets SET source_kind='task_attachment_metadata', "
+                "source_locator_nonlocal=?, updated_at=? WHERE scope_id=? "
+                "AND source_kind='meeting_attachment_metadata' "
+                "AND source_locator_nonlocal=?",
+                (f"task:{task_id}", now, identity.scope_id, f"meeting:{meeting_id}"),
+            )
+            connection.execute(
+                "UPDATE calendar_entries SET invalidated_at=? "
+                "WHERE scope_id=? AND target_kind='meeting' AND meeting_id=? "
+                "AND invalidated_at IS NULL",
+                (now, identity.scope_id, meeting_id),
+            )
+            connection.execute(
+                "UPDATE meetings SET status='cancelled', version=version+1, updated_at=? "
+                "WHERE scope_id=? AND id=? AND status!='cancelled'",
+                (now, identity.scope_id, meeting_id),
+            )
+            updated_meeting_row = connection.execute(
+                "SELECT * FROM meetings WHERE scope_id=? AND id=?",
+                (identity.scope_id, meeting_id),
+            ).fetchone()
+            updated_meeting = (
+                _meeting_payload(connection, updated_meeting_row)
+                if updated_meeting_row is not None
+                else {"id": meeting_id, "status": "cancelled"}
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return {
+        "task": task_result["task"],
+        "meeting": updated_meeting,
+        "meetingId": meeting_id,
+        "migrated": True,
+    }
 
 
 def transition_meeting_collaboration(

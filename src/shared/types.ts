@@ -830,6 +830,10 @@ export interface ClientSummary {
   //   relatedUserIds：勾选的相关同事 user.id（批 3 接通 cloud sync 后驱动跨用户可见）
   //   isDataCenterIncluded：是否进入数据中心计算（false = 仅工作台可见）
   relatedUserIds?: string[];
+  /** Names already resolved while the project authority row is loaded. */
+  relatedUsers?: MentionCandidate[];
+  /** Stable membership that created and owns the project. */
+  ownerMembershipId?: string | null;
   /** Project creator plus explicitly shared organization administrators. */
   managerNames?: string[];
   /** Explicitly shared ordinary members, excluding project managers. */
@@ -7105,7 +7109,7 @@ export interface KnowledgeJob {
   id: string;
   clientId: string;
   jobType: string;
-  status: 'queued' | 'running' | 'completed' | 'failed';
+  status: 'queued' | 'running' | 'interrupted' | 'completed' | 'failed';
   totalItems: number;
   processedItems: number;
   lastError?: string | null;
@@ -7113,6 +7117,7 @@ export interface KnowledgeJob {
   lastEventMessage?: string | null;
   recentEvents?: KnowledgeJobEvent[];
   queuedItemLabels?: string[];
+  resumeDocumentIds?: string[];
   createdAt: string;
   startedAt?: string | null;
   finishedAt?: string | null;
@@ -8923,7 +8928,7 @@ declare global {
     yiyuWorkbench: {
       backendBaseUrl: string;
       desktopToken: string;
-      setMiniMode(enter: boolean): Promise<{ mini: boolean }>;
+      setMiniMode(enter: boolean, height?: number): Promise<{ mini: boolean }>;
       setUpdateOrgIdentity(identity: UpdateOrgIdentity | null): Promise<{ ok: boolean; reason?: string }>;
       setUpdateOrgCode(orgCode: string | null): Promise<{ ok: boolean; reason?: string }>;
       getDesktopAppInfo(): Promise<DesktopAppInfo>;

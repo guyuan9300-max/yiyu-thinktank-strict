@@ -126,6 +126,12 @@ export const gc06Api = {
       body: JSON.stringify({ ...payload, expectedVersion: meeting.version }),
     });
   },
+  migrateMeetingToTask(meeting: GC06Meeting) {
+    return request<{ task: import('../../../shared/types').Task; meetingId: string; migrated: boolean }>(
+      `${ROOT}/meetings/${meeting.id}/migrate-to-task`,
+      { method: 'POST', body: JSON.stringify({ expectedVersion: meeting.version }) },
+    );
+  },
   transitionMeetingCollaboration(
     meeting: GC06Meeting,
     action: 'accept' | 'reject',

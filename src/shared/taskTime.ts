@@ -46,6 +46,29 @@ export function splitTaskDateTime(value?: string | null) {
   if (!value) return { date: '', time: '' };
   const text = value.trim();
   if (!text) return { date: '', time: '' };
+  // 组织云旧会议以及部分外部日历会返回带时区的 ISO 时间。
+  // 这类值必须先换算为产品统一的 Asia/Shanghai 墙上时间，再交给
+  // 任务/月历/周历使用；直接截取字符串会把 UTC 07:00 错画成 07:00，
+  // 而不是正确的 15:00。
+  if (/(?:Z|[+-]\d{2}:?\d{2})$/i.test(text)) {
+    const zoned = new Date(text);
+    if (!Number.isNaN(zoned.getTime())) {
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23',
+      }).formatToParts(zoned);
+      const part = (type: string) => parts.find((item) => item.type === type)?.value || '';
+      return {
+        date: `${part('year')}-${part('month')}-${part('day')}`,
+        time: `${part('hour')}:${part('minute')}`,
+      };
+    }
+  }
   const match = text.match(/^(\d{4}-\d{2}-\d{2})(?:[T\s](\d{1,2}):(\d{2}))?/);
   if (match) {
     return {

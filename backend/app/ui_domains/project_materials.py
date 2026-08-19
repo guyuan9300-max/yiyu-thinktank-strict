@@ -182,6 +182,7 @@ def register_and_process_local_materials(
     relation_kind: str,
     relation_id: str,
     idempotency_key: str,
+    force_processing: bool = False,
 ) -> dict[str, Any]:
     """Finish the same material lifecycle used by direct workbench imports.
 
@@ -255,6 +256,7 @@ def register_and_process_local_materials(
     processing = store.process_pending_documents(
         project_id=project_id,
         document_ids=document_ids,
+        force=force_processing,
     )
     shared_summaries = _publish_ready_material_summaries(
         runtime=runtime,
@@ -265,6 +267,7 @@ def register_and_process_local_materials(
             for item in processing.get("items") or []
             if str(item.get("documentId") or "")
         ],
+        force=force_processing,
     )
     return {
         "documentIds": document_ids,
@@ -314,6 +317,18 @@ def _client(project: Mapping[str, Any]) -> dict[str, Any]:
             if str(membership_id)
             != str(project.get("ownerMembershipId") or "")
         ],
+        "relatedUsers": [
+            {
+                "id": str(member.get("id") or ""),
+                "fullName": str(member.get("fullName") or "未命名成员"),
+                "email": str(member.get("email") or ""),
+                "primaryRole": str(member.get("primaryRole") or "employee"),
+                "isSelf": bool(member.get("isSelf")),
+            }
+            for member in project.get("participantMembers") or []
+            if str(member.get("id") or "")
+        ],
+        "ownerMembershipId": project.get("ownerMembershipId"),
         "managerNames": [
             str(name)
             for name in project.get("managerNames") or []
@@ -778,34 +793,99 @@ def local_knowledge_progress(
         if str(item.get("parseStatus") or "") == "ready"
         and str(item.get("wikiStatus") or "") == "ready"
     ]
-    jobs = [
-        {
-            "id": item.get("processingAttemptId"),
-            "clientId": project_id,
-            "jobType": (
-                "local_wiki_projection"
-                if str(item.get("parseStatus") or "") == "ready"
-                else "local_text_extraction"
-            ),
-            "status": (
-                item.get("wikiStatus")
-                if str(item.get("parseStatus") or "") == "ready"
-                else item.get("parseStatus")
-            ),
-            "totalItems": 1,
-            "processedItems": 0,
-            "lastError": item.get("processingMessage"),
-            "currentItemLabel": item.get("title"),
-            "lastEventMessage": item.get("processingMessage"),
-            "recentEvents": [],
-            "queuedItemLabels": [item.get("title")],
-            "createdAt": item.get("processedAt"),
-            "startedAt": item.get("processedAt"),
-            "finishedAt": None,
-            "updatedAt": item.get("processedAt"),
-        }
-        for item in pending
+    # Every forced batch is queued with the same authoritative attempt
+    # started_at.  Group by that receipt field so the renderer sees one real
+    # X/N job instead of N unrelated 0/1 jobs (or a shrinking denominator).
+    active_batch_started_at = max(
+        (
+            str(item.get("processingBatchStartedAt") or "")
+            for item in pending
+            if item.get("processingBatchStartedAt")
+        ),
+        default="",
+    )
+    batch_documents = (
+        [
+            item
+            for item in documents
+            if str(item.get("processingBatchStartedAt") or "")
+            == active_batch_started_at
+        ]
+        if active_batch_started_at
+        else []
+    )
+    batch_active = [
+        item
+        for item in batch_documents
+        if str(item.get("parseStatus") or "") in {"queued", "processing"}
+        or (
+            str(item.get("parseStatus") or "") == "ready"
+            and str(item.get("wikiStatus") or "")
+            in {"queued", "processing"}
+        )
     ]
+    batch_running = [
+        item
+        for item in batch_active
+        if str(item.get("parseStatus") or "") == "processing"
+        or str(item.get("wikiStatus") or "") == "processing"
+    ]
+    batch_current = (
+        batch_running[0]
+        if batch_running
+        else batch_active[0]
+        if batch_active
+        else None
+    )
+    batch_processed = max(0, len(batch_documents) - len(batch_active))
+    batch_is_active = bool(
+        active_batch_started_at
+        and store.is_processing_batch_active(
+            project_id=project_id,
+            batch_started_at=active_batch_started_at,
+        )
+    )
+    jobs = (
+        [
+            {
+                "id": f"local-material-batch:{active_batch_started_at}",
+                "clientId": project_id,
+                "jobType": "local_material_reprocessing",
+                "status": (
+                    "running"
+                    if batch_is_active and batch_running
+                    else "queued"
+                    if batch_is_active
+                    else "interrupted"
+                ),
+                "totalItems": len(batch_documents),
+                "processedItems": batch_processed,
+                "lastError": None,
+                "currentItemLabel": (batch_current or {}).get("title"),
+                "lastEventMessage": (
+                    f"正在重新解析 {batch_processed + 1}/{len(batch_documents)}"
+                    if batch_current
+                    else None
+                ),
+                "recentEvents": [],
+                "queuedItemLabels": [
+                    item.get("title") for item in batch_active if item.get("title")
+                ],
+                "resumeDocumentIds": [
+                    str(item.get("id") or "")
+                    for item in batch_active
+                    if item.get("id")
+                ],
+                "createdAt": active_batch_started_at,
+                "startedAt": active_batch_started_at,
+                "finishedAt": None,
+                "updatedAt": (batch_current or {}).get("processedAt")
+                or active_batch_started_at,
+            }
+        ]
+        if batch_documents and batch_active
+        else []
+    )
     return {
         "knowledgeStatus": {
             "totalDocuments": len(documents),
@@ -829,6 +909,8 @@ def local_knowledge_progress(
             "lastJobStatus": (
                 "failed"
                 if failed
+                else "interrupted"
+                if jobs and jobs[0].get("status") == "interrupted"
                 else "running"
                 if pending
                 else "completed"
@@ -1273,11 +1355,23 @@ def archive_client(
     match: Any,
 ) -> dict[str, Any]:
     project_id = match.group("project_id")
+    project = _project_detail(compatibility, project_id)
+    authorization = project.get("authorizationProjection")
+    if not isinstance(authorization, Mapping):
+        authorization = {}
+    if str(project.get("ownerMembershipId") or "") != str(
+        authorization.get("viewerMembershipId") or ""
+    ):
+        raise LocalRuntimeError(
+            403,
+            "project_delete_creator_required",
+            "只有项目创建者可以删除项目",
+        )
     project = _transition(
         compatibility,
         request,
         project_id,
-        "archived",
+        "deleted",
     )
     return {
         "deleted": True,
@@ -1314,34 +1408,6 @@ def client_delete_preview(
         ),
         "_strictVersion": int(result.get("version") or 1),
     }
-
-
-@router.post(r"clients/(?P<project_id>[^/]+)/freeze")
-def freeze_client(
-    compatibility: Any,
-    request: UiRequest,
-    match: Any,
-) -> dict[str, Any]:
-    return _transition(
-        compatibility,
-        request,
-        match.group("project_id"),
-        "frozen",
-    )
-
-
-@router.post(r"clients/(?P<project_id>[^/]+)/unfreeze")
-def unfreeze_client(
-    compatibility: Any,
-    request: UiRequest,
-    match: Any,
-) -> dict[str, Any]:
-    return _transition(
-        compatibility,
-        request,
-        match.group("project_id"),
-        "active",
-    )
 
 
 @router.get(r"clients/(?P<project_id>[^/]+)/knowledge-context")
@@ -2183,6 +2249,8 @@ def create_document_from_text(
             "materialBoundary": registered.get("materialBoundary") or {},
         }
     except LocalRuntimeError as exc:
+        duplicate = exc.code == "material_content_duplicate"
+        version_conflict = exc.code == "material_metadata_version_conflict"
         return {
             "clientId": project_id,
             "documentId": f"local-pending:{local['localSourceId']}",
@@ -2370,6 +2438,72 @@ def delete_document(
             "errorCode": exc.code,
             "message": "本机资料已删除；组织云元数据尚待同步",
         }
+
+
+@router.get(r"clients/(?P<project_id>[^/]+)/document-recycle-bin")
+def document_recycle_bin(
+    compatibility: Any,
+    _: UiRequest,
+    match: Any,
+) -> dict[str, Any]:
+    project_id = match.group("project_id")
+    _require_project_read(compatibility, project_id)
+    items = _local_call(
+        lambda: _local_store(compatibility).recycled_documents(project_id)
+    )
+    return {
+        "clientId": project_id,
+        "items": items,
+        "count": len(items),
+        "retentionDays": 30,
+        "recoverableOnly": True,
+    }
+
+
+@router.post(
+    r"clients/(?P<project_id>[^/]+)/document-recycle-bin/"
+    r"(?P<document_id>[^/]+)/restore"
+)
+def restore_recycled_document(
+    compatibility: Any,
+    request: UiRequest,
+    match: Any,
+) -> dict[str, Any]:
+    project_id = match.group("project_id")
+    document_id = match.group("document_id")
+    _require_project_read(compatibility, project_id)
+    store = _local_store(compatibility)
+    local = _local_call(
+        lambda: store.restore_recycled_document(project_id, document_id)
+    )
+    settled = _local_call(
+        lambda: register_and_process_local_materials(
+            runtime=compatibility.runtime,
+            store=store,
+            project_id=project_id,
+            local_materials=[local],
+            relation_kind="",
+            relation_id="",
+            idempotency_key=request.idempotency_key,
+            force_processing=True,
+        )
+    )
+    restored_ids = [
+        str(value)
+        for value in settled.get("documentIds") or []
+        if str(value)
+    ]
+    return {
+        "restored": True,
+        "clientId": project_id,
+        "previousDocumentId": document_id,
+        "documentId": restored_ids[0] if restored_ids else document_id,
+        "fileName": local.get("fileName"),
+        "overallState": settled.get("overallState") or "ready",
+        "cloudMetadataState": settled.get("cloudMetadataState") or "ready",
+        "processing": settled.get("processing") or {},
+        "sharedSummaries": settled.get("sharedSummaries") or {},
+    }
 
 
 @router.get(r"documents/(?P<document_id>[^/]+)/text")
@@ -3410,16 +3544,20 @@ def update_document_content(
             ),
             "cloudMetadataErrorCode": exc.code,
             "cloudMetadataMessage": (
-                "本机正文已保存；组织云元数据尚未更新，请重试"
+                "本机正文已保存；当前项目已存在内容相同的资料，组织云未重复登记"
+                if duplicate
+                else "本机正文已保存；组织云资料版本已变化，请刷新后再保存一次"
+                if version_conflict
+                else "本机正文已保存；组织云元数据尚未更新，请重试"
             ),
-            "retryable": exc.status_code >= 500,
+            "retryable": exc.status_code >= 500 or version_conflict,
             "materialBoundary": {},
         }
     return {
         **local,
         "localState": "ready",
         "overallState": "ready",
-        "cloudVersion": cloud.get("version"),
+        "cloudVersion": cloud.get("aggregateVersion") or cloud.get("version"),
         "cloudMetadataState": "ready",
         "retryable": False,
         "materialBoundary": cloud.get("materialBoundary") or {},

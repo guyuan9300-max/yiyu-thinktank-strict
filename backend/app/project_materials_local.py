@@ -12,9 +12,11 @@ import json
 import math
 import mimetypes
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import zipfile
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -38,6 +40,10 @@ from .material_ingestion import (
     discover_import_paths,
 )
 from .runtime import LocalRuntimeError, WorkspaceRuntime
+
+
+_ACTIVE_MATERIAL_BATCHES: set[tuple[str, str, str]] = set()
+_ACTIVE_MATERIAL_BATCHES_LOCK = threading.Lock()
 
 
 def _bounded_project_lease(value: Any) -> str:
@@ -89,6 +95,17 @@ class LocalProjectMaterialsRepository:
     _DOCX_PLACEHOLDER_PATTERN = re.compile(
         r"\{\{\s*([^{}]{1,120}?)\s*\}\}"
     )
+
+    def is_processing_batch_active(
+        self,
+        *,
+        project_id: str,
+        batch_started_at: str,
+    ) -> bool:
+        context = self._context()
+        key = (context.sandbox_id, project_id, batch_started_at)
+        with _ACTIVE_MATERIAL_BATCHES_LOCK:
+            return key in _ACTIVE_MATERIAL_BATCHES
     _DOCX_EMPTY_MARKERS = {
         "",
         "____",
@@ -97,6 +114,20 @@ class LocalProjectMaterialsRepository:
         "待完善",
         "tbd",
         "todo",
+    }
+    _TEXT_EDITABLE_SUFFIXES = {
+        ".md",
+        ".markdown",
+        ".txt",
+        ".csv",
+        ".tsv",
+        ".xml",
+        ".html",
+        ".htm",
+        ".mhtml",
+        ".mht",
+        ".yaml",
+        ".yml",
     }
 
     def __init__(self, runtime: WorkspaceRuntime, context_provider: Any = None):
@@ -112,6 +143,46 @@ class LocalProjectMaterialsRepository:
     def _safe_name(value: str) -> str:
         normalized = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", value)
         return normalized.strip("._")[:160] or "material"
+
+    @classmethod
+    def _renamed_document_identity(
+        cls,
+        *,
+        source_id: str,
+        storage_key: str,
+        current_file_name: str,
+        title: str,
+    ) -> tuple[str, str]:
+        """Keep one source object while making its managed filename follow the title."""
+
+        current_path = Path(storage_key)
+        suffix = Path(current_file_name).suffix or current_path.suffix
+        raw_stem = title.strip()
+        if suffix and raw_stem.casefold().endswith(suffix.casefold()):
+            raw_stem = raw_stem[: -len(suffix)]
+        safe_stem = cls._safe_name(raw_stem)
+        file_name = f"{safe_stem}{suffix}"
+        managed_name = (
+            f"{source_id}-{file_name}"
+            if current_path.name.startswith(f"{source_id}-")
+            else file_name
+        )
+        return file_name, current_path.with_name(managed_name).as_posix()
+
+    @classmethod
+    def _document_editable_in_place(
+        cls,
+        *,
+        path: Path,
+        media_type: str,
+    ) -> bool:
+        """Report whether smart-editor saves can safely replace this source."""
+
+        return (
+            path.suffix.casefold() == ".docx"
+            or media_type.casefold().startswith("text/")
+            or path.suffix.casefold() in cls._TEXT_EDITABLE_SUFFIXES
+        )
 
     @staticmethod
     def select_relevant_excerpt(
@@ -1894,6 +1965,10 @@ class LocalProjectMaterialsRepository:
             "wikiStatus": wiki_status,
             "processingAttemptId": str(parsed.get("id") or ""),
             "processingAttemptNo": int(parsed.get("attempt_no") or 0),
+            # Batch progress is a read-model concern.  The authoritative
+            # attempt already carries the common batch start timestamp, so we
+            # expose it instead of inventing a second queue table or payload.
+            "processingBatchStartedAt": parsed.get("started_at") or None,
             "processingStage": (
                 "wiki" if active_error is wiki else "text_extraction"
             ),
@@ -2018,34 +2093,59 @@ class LocalProjectMaterialsRepository:
             "blocked",
         }:
             return {"documentId": document_id, **self.processing_state(entry)}
-        attempt_no = int((current or {}).get("attempt_no") or 0) + 1
-        attempt_id = new_id()
+        queued_attempt = (
+            current
+            if current is not None and str(current.get("status") or "") == "queued"
+            else None
+        )
+        attempt_no = (
+            int(queued_attempt.get("attempt_no") or 0)
+            if queued_attempt is not None
+            else int((current or {}).get("attempt_no") or 0) + 1
+        )
+        attempt_id = (
+            str(queued_attempt.get("id") or "")
+            if queued_attempt is not None
+            else new_id()
+        )
         now = utc_now()
         with self.runtime._connection() as connection:
             scope_id = self.runtime._local_object_scope_id(
                 connection,
                 context.sandbox_id,
             )
-            connection.execute(
-                """
-                INSERT INTO processing_attempts (
-                    id, scope_id, operation_id, source_asset_id, recording_id,
-                    attempt_no, status, error_code, processor_kind,
-                    provider_resource_id, error_message_safe, next_retry_at,
-                    started_at, finished_at, authority_role, origin_instance_id
-                ) VALUES (?, ?, NULL, ?, NULL, ?, 'processing', NULL,
-                          'local_text_extraction', NULL, NULL, NULL, ?, NULL,
-                          'local', ?)
-                """,
-                (
-                    attempt_id,
-                    scope_id,
-                    source_id,
-                    attempt_no,
-                    now,
-                    context.sandbox_id,
-                ),
-            )
+            if queued_attempt is not None:
+                connection.execute(
+                    """
+                    UPDATE processing_attempts
+                    SET status='processing', error_code=NULL,
+                        error_message_safe=NULL, next_retry_at=NULL,
+                        finished_at=NULL
+                    WHERE id=? AND scope_id=? AND authority_role='local'
+                    """,
+                    (attempt_id, scope_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO processing_attempts (
+                        id, scope_id, operation_id, source_asset_id, recording_id,
+                        attempt_no, status, error_code, processor_kind,
+                        provider_resource_id, error_message_safe, next_retry_at,
+                        started_at, finished_at, authority_role, origin_instance_id
+                    ) VALUES (?, ?, NULL, ?, NULL, ?, 'processing', NULL,
+                              'local_text_extraction', NULL, NULL, NULL, ?, NULL,
+                              'local', ?)
+                    """,
+                    (
+                        attempt_id,
+                        scope_id,
+                        source_id,
+                        attempt_no,
+                        now,
+                        context.sandbox_id,
+                    ),
+                )
             connection.commit()
         try:
             local = self.document_text(document_id)
@@ -3195,34 +3295,99 @@ class LocalProjectMaterialsRepository:
             for document_id in dict(state.get("documents") or {})
             if not requested or str(document_id) in requested
         ]
-        parsed_items = [
-            self.process_document(
+        # Queue the whole batch first.  This makes every waiting file visible
+        # to the UI before the first OCR/Office extraction starts and gives the
+        # progress endpoint a truthful denominator for the complete run.
+        batch_started_at = utc_now()
+        context = self._context()
+        queued: list[tuple[str, str, int]] = []
+        for document_id in selected:
+            _, document_state, entry = self._document_entry(document_id)
+            if str(document_state.get("projectId") or "") != project_id:
+                continue
+            source_id = self._ensure_local_source_asset(
                 project_id=project_id,
-                document_id=document_id,
-                force=force,
+                entry=entry,
             )
-            for document_id in selected
-        ]
-        wiki_items = [
-            self.build_local_wiki_document(
-                project_id=project_id,
-                document_id=document_id,
-                force=force,
+            current = self._latest_processing_attempt(
+                source_id,
+                processor_kind="local_text_extraction",
             )
-            if str(parsed.get("parseStatus") or "") == "ready"
-            else parsed
-            for document_id, parsed in zip(selected, parsed_items, strict=True)
-        ]
-        items = [
-            self.build_local_wiki_retrieval(
-                project_id=project_id,
-                document_id=document_id,
-                force=force,
+            queued.append(
+                (
+                    document_id,
+                    source_id,
+                    int((current or {}).get("attempt_no") or 0) + 1,
+                )
             )
-            if str(wiki.get("wikiStatus") or "") == "ready"
-            else wiki
-            for document_id, wiki in zip(selected, wiki_items, strict=True)
-        ]
+        if queued:
+            with self.runtime._connection() as connection:
+                scope_id = self.runtime._local_object_scope_id(
+                    connection,
+                    context.sandbox_id,
+                )
+                connection.execute("BEGIN IMMEDIATE")
+                for _, source_id, attempt_no in queued:
+                    connection.execute(
+                        """
+                        INSERT INTO processing_attempts (
+                            id, scope_id, operation_id, source_asset_id,
+                            recording_id, attempt_no, status, error_code,
+                            processor_kind, provider_resource_id,
+                            error_message_safe, next_retry_at, started_at,
+                            finished_at, authority_role, origin_instance_id
+                        ) VALUES (?, ?, NULL, ?, NULL, ?, 'queued', NULL,
+                                  'local_text_extraction', NULL, NULL, NULL, ?,
+                                  NULL, 'local', ?)
+                        """,
+                        (
+                            new_id(),
+                            scope_id,
+                            source_id,
+                            attempt_no,
+                            batch_started_at,
+                            context.sandbox_id,
+                        ),
+                    )
+                connection.commit()
+
+        # Finish one file end-to-end before moving to the next.  A file only
+        # counts as processed after its local Wiki/retrieval terminal state is
+        # known, so 7/21 really means seven files are done rather than merely
+        # extracted.  The in-memory key is only a liveness signal; durable
+        # queue state remains in processing_attempts.
+        batch_key = (context.sandbox_id, project_id, batch_started_at)
+        with _ACTIVE_MATERIAL_BATCHES_LOCK:
+            _ACTIVE_MATERIAL_BATCHES.add(batch_key)
+        items: list[dict[str, Any]] = []
+        try:
+            for document_id, _, _ in queued:
+                parsed = self.process_document(
+                    project_id=project_id,
+                    document_id=document_id,
+                    force=force,
+                )
+                if str(parsed.get("parseStatus") or "") != "ready":
+                    items.append(parsed)
+                    continue
+                wiki = self.build_local_wiki_document(
+                    project_id=project_id,
+                    document_id=document_id,
+                    force=force,
+                )
+                if str(wiki.get("wikiStatus") or "") != "ready":
+                    items.append(wiki)
+                    continue
+                items.append(
+                    self.build_local_wiki_retrieval(
+                        project_id=project_id,
+                        document_id=document_id,
+                        force=force,
+                    )
+                )
+        finally:
+            with _ACTIVE_MATERIAL_BATCHES_LOCK:
+                _ACTIVE_MATERIAL_BATCHES.discard(batch_key)
         counts = {
             status: sum(item.get("parseStatus") == status for item in items)
             for status in (
@@ -4133,11 +4298,57 @@ class LocalProjectMaterialsRepository:
                 connection,
                 context.sandbox_id,
             )
+            local_source_id = str(normalized.get("localSourceId") or "").strip()
+            source_manifest_id = (
+                self.runtime._local_object_manifest_id(
+                    context.sandbox_id,
+                    local_source_id,
+                )
+                if local_source_id
+                else ""
+            )
+            content_hash = str(normalized.get("contentHash") or "").strip()
+            # The renderer key becomes the cloud metadata id after upload,
+            # while the one strict local source_asset can retain its original
+            # id when the same content hash is reused.  Resolve the authority
+            # row first so delete/recycle never targets a second identity.
+            source_row = connection.execute(
+                """
+                SELECT id, object_manifest_id, version
+                FROM source_assets
+                WHERE scope_id=? AND client_id=? AND record_kind='asset'
+                  AND (
+                    id=? OR object_manifest_id=?
+                    OR (? != '' AND content_hash=?)
+                  )
+                ORDER BY CASE
+                    WHEN id=? THEN 0
+                    WHEN object_manifest_id=? THEN 1
+                    ELSE 2
+                END, updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (
+                    scope_id,
+                    project_id,
+                    document_id,
+                    source_manifest_id,
+                    content_hash,
+                    content_hash,
+                    document_id,
+                    source_manifest_id,
+                ),
+            ).fetchone()
+            source_asset_id = (
+                str(source_row["id"])
+                if source_row is not None
+                else document_id
+            )
             knowledge_rows = connection.execute(
                 "SELECT id FROM knowledge_documents "
                 "WHERE scope_id=? AND client_id=? AND source_asset_id=? "
                 "AND lifecycle_state='active'",
-                (scope_id, project_id, document_id),
+                (scope_id, project_id, source_asset_id),
             ).fetchall()
             knowledge_ids = [str(row["id"]) for row in knowledge_rows]
             version_ids: list[str] = []
@@ -4186,26 +4397,23 @@ class LocalProjectMaterialsRepository:
                     }
                 )
             connection.execute("BEGIN IMMEDIATE")
-            source_row = connection.execute(
-                "SELECT object_manifest_id, version FROM source_assets "
-                "WHERE id=? AND scope_id=? AND client_id=?",
-                (document_id, scope_id, project_id),
-            ).fetchone()
             if source_row is not None:
-                source_manifest_id = str(source_row["object_manifest_id"] or "")
-                if source_manifest_id:
-                    manifest_ids.append(source_manifest_id)
+                authority_manifest_id = str(
+                    source_row["object_manifest_id"] or ""
+                )
+                if authority_manifest_id:
+                    manifest_ids.append(authority_manifest_id)
                 connection.execute(
                     "UPDATE source_assets SET lifecycle_state='deleted', "
                     "availability_state='deleted', deleted_at=?, updated_at=?, "
                     "version=version+1 WHERE id=? AND scope_id=?",
-                    (now, now, document_id, scope_id),
+                    (now, now, source_asset_id, scope_id),
                 )
                 connection.execute(
                     "UPDATE secured_resources SET lifecycle_state='deleted', "
                     "deleted_at=?, updated_at=?, version=version+1 "
                     "WHERE id=? AND scope_id=?",
-                    (now, now, document_id, scope_id),
+                    (now, now, source_asset_id, scope_id),
                 )
             if knowledge_ids:
                 placeholders = ",".join("?" for _ in knowledge_ids)
@@ -4276,41 +4484,51 @@ class LocalProjectMaterialsRepository:
                     f"WHERE scope_id=? AND id IN ({placeholders})",
                     (now, scope_id, *unique_manifest_ids),
                 )
-            lifecycle_id = new_id()
-            lifecycle_integrity = hashlib.sha256(
-                canonical_json(
-                    {
-                        "id": lifecycle_id,
-                        "scopeId": scope_id,
-                        "resourceId": document_id,
-                        "from": "active",
-                        "to": "deleted",
-                        "reason": "member_local_source_deleted",
-                        "occurredAt": now,
-                    }
-                ).encode("utf-8")
-            ).hexdigest()
-            connection.execute(
-                "INSERT INTO lifecycle_events ("
-                "id,scope_id,operation_id,secured_resource_id,from_state,"
-                "to_state,tombstone_version,actor_id,reason_code,occurred_at,"
-                "origin_instance_id,created_at,integrity_hash"
-                ") VALUES (?,?,NULL,?,'active','deleted',?,?,?, ?,?,?,?)",
-                (
-                    lifecycle_id,
-                    scope_id,
-                    document_id,
-                    int((source_row or {"version": 0})["version"] or 0) + 1,
-                    context.principal_id,
-                    "member_local_source_deleted",
-                    now,
-                    context.sandbox_id,
-                    now,
-                    lifecycle_integrity,
-                ),
-            )
+            if source_row is not None:
+                lifecycle_id = new_id()
+                lifecycle_integrity = hashlib.sha256(
+                    canonical_json(
+                        {
+                            "id": lifecycle_id,
+                            "scopeId": scope_id,
+                            "resourceId": source_asset_id,
+                            "from": "active",
+                            "to": "deleted",
+                            "reason": "member_local_source_deleted",
+                            "occurredAt": now,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                connection.execute(
+                    "INSERT INTO lifecycle_events ("
+                    "id,scope_id,operation_id,secured_resource_id,from_state,"
+                    "to_state,tombstone_version,actor_id,reason_code,occurred_at,"
+                    "origin_instance_id,created_at,integrity_hash"
+                    ") VALUES (?,?,NULL,?,'active','deleted',?,?,?, ?,?,?,?)",
+                    (
+                        lifecycle_id,
+                        scope_id,
+                        source_asset_id,
+                        int(source_row["version"] or 0) + 1,
+                        context.principal_id,
+                        "member_local_source_deleted",
+                        now,
+                        context.sandbox_id,
+                        now,
+                        lifecycle_integrity,
+                    ),
+                )
             connection.commit()
         documents.pop(document_id, None)
+        recycled_documents = dict(state.get("recycledDocuments") or {})
+        recycled_documents[document_id] = {
+            **normalized,
+            "documentId": document_id,
+            "deletedAt": now,
+            "retentionUntil": (
+                datetime.now(timezone.utc) + timedelta(days=30)
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        }
         cloud_document_id = str(normalized.get("cloudDocumentId") or "")
         pending_deletes = dict(state.get("pendingCloudDeletes") or {})
         if cloud_document_id:
@@ -4320,6 +4538,7 @@ class LocalProjectMaterialsRepository:
                 "updatedAt": now,
             }
         state["documents"] = documents
+        state["recycledDocuments"] = recycled_documents
         state["pendingCloudDeletes"] = pending_deletes
         self._write_project_state(project_id, state)
         return {
@@ -4330,6 +4549,248 @@ class LocalProjectMaterialsRepository:
             "cloudMetadataState": (
                 "pending" if cloud_document_id else "not_applicable"
             ),
+        }
+
+    @staticmethod
+    def _recycle_timestamp(value: Any) -> datetime | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _deleted_source_entries(self, project_id: str) -> dict[str, dict[str, Any]]:
+        """Reconstruct pre-feature recycle rows from the strict tombstones."""
+
+        context = self._context()
+        with self.runtime._connection() as connection:
+            scope_id = self.runtime._local_object_scope_id(
+                connection,
+                context.sandbox_id,
+            )
+            rows = connection.execute(
+                """
+                SELECT sa.id AS document_id, sa.display_name, sa.media_type,
+                       sa.byte_size, sa.content_hash, sa.deleted_at,
+                       om.storage_key, om.local_original_path, om.receipt,
+                       om.verified_at
+                FROM source_assets sa
+                JOIN object_manifests om
+                  ON om.id=sa.object_manifest_id AND om.scope_id=sa.scope_id
+                WHERE sa.scope_id=? AND sa.client_id=?
+                  AND sa.record_kind='asset' AND sa.lifecycle_state='deleted'
+                  AND om.holder_role='sandbox' AND om.holder_instance_id=?
+                ORDER BY COALESCE(sa.deleted_at, om.deleted_at, om.verified_at) DESC
+                """,
+                (scope_id, project_id, context.sandbox_id),
+            ).fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                receipt = json.loads(str(row["receipt"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                receipt = {}
+            source_id = str(receipt.get("objectId") or "").strip()
+            document_id = str(row["document_id"] or "").strip()
+            if not source_id or not document_id:
+                continue
+            result[document_id] = {
+                "documentId": document_id,
+                "cloudDocumentId": document_id,
+                "localSourceId": source_id,
+                "localSummaryId": None,
+                "fileName": str(row["display_name"] or "未命名资料"),
+                "title": str(row["display_name"] or "未命名资料"),
+                "mediaType": str(row["media_type"] or "application/octet-stream"),
+                "byteSize": int(row["byte_size"] or 0),
+                "contentHash": str(row["content_hash"] or ""),
+                "managedPath": str(self._managed_path(str(row["storage_key"] or ""))),
+                "originalSourcePath": str(row["local_original_path"] or "") or None,
+                "deletedAt": str(row["deleted_at"] or row["verified_at"] or ""),
+            }
+        return result
+
+    def recycled_documents(self, project_id: str) -> list[dict[str, Any]]:
+        """List only tombstones that this device can actually restore.
+
+        The audit tombstone remains even if a user has removed the original.
+        Such a row is deliberately omitted even when an internal managed copy
+        remains: the product recycle bin promises restoration only when the
+        user-visible original can still be identified on this device.
+        """
+
+        state = self._load_project_state(project_id)
+        sandbox_id = str(state.get("_localSandboxId") or "")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        recycled = self._deleted_source_entries(project_id)
+        recycled.update(
+            {
+                str(document_id): dict(raw)
+                for document_id, raw in dict(state.get("recycledDocuments") or {}).items()
+                if isinstance(raw, Mapping)
+            }
+        )
+        result: list[dict[str, Any]] = []
+        for document_id, raw in recycled.items():
+            if not isinstance(raw, Mapping):
+                continue
+            entry = dict(raw)
+            deleted_at = self._recycle_timestamp(entry.get("deletedAt"))
+            if deleted_at is None or deleted_at < cutoff:
+                continue
+            display_name = str(entry.get("fileName") or entry.get("title") or "").strip()
+            if display_name and not classify_import_path(Path(display_name)).accepted:
+                continue
+            source_id = str(entry.get("localSourceId") or "").strip()
+            manifest = (
+                self.runtime.local_storage_object_get(
+                    sandbox_id=sandbox_id,
+                    object_id=source_id,
+                )
+                if sandbox_id and source_id
+                else None
+            )
+            managed_path = (
+                self._managed_path(str(manifest.get("storage_key") or ""))
+                if manifest is not None
+                else Path(str(entry.get("managedPath") or ""))
+            )
+            raw_original = str(entry.get("originalSourcePath") or "").strip()
+            original_path = Path(raw_original).expanduser() if raw_original else None
+            if original_path is None or not original_path.is_file():
+                continue
+            result.append(
+                {
+                    "documentId": str(document_id),
+                    "fileName": display_name or managed_path.name or "未命名资料",
+                    "deletedAt": entry.get("deletedAt"),
+                    "retentionUntil": entry.get("retentionUntil"),
+                    "recoverable": True,
+                    "originalAvailable": True,
+                }
+            )
+        return sorted(
+            result,
+            key=lambda item: str(item.get("deletedAt") or ""),
+            reverse=True,
+        )
+
+    def restore_recycled_document(
+        self,
+        project_id: str,
+        document_id: str,
+    ) -> dict[str, Any]:
+        state = self._load_project_state(project_id)
+        recycled = dict(state.get("recycledDocuments") or {})
+        raw = recycled.get(document_id)
+        if not isinstance(raw, Mapping):
+            raw = self._deleted_source_entries(project_id).get(document_id)
+        if not isinstance(raw, Mapping):
+            raise LocalRuntimeError(404, "recycled_document_missing", "回收站中没有该资料")
+        entry = dict(raw)
+        deleted_at = self._recycle_timestamp(entry.get("deletedAt"))
+        if (
+            deleted_at is None
+            or deleted_at < datetime.now(timezone.utc) - timedelta(days=30)
+        ):
+            raise LocalRuntimeError(410, "recycled_document_expired", "该资料已超过可恢复期限")
+        display_name = str(entry.get("fileName") or entry.get("title") or "").strip()
+        if display_name and not classify_import_path(Path(display_name)).accepted:
+            raise LocalRuntimeError(415, "recycled_document_format_excluded", "该格式已不再允许作为项目资料")
+        sandbox_id = str(state.get("_localSandboxId") or "")
+        source_id = str(entry.get("localSourceId") or "").strip()
+        if not sandbox_id or not source_id:
+            raise LocalRuntimeError(409, "recycled_document_identity_missing", "回收资料缺少本机来源身份")
+        manifest = self.runtime.local_storage_object_get(
+            sandbox_id=sandbox_id,
+            object_id=source_id,
+        )
+        if manifest is None:
+            raise LocalRuntimeError(409, "recycled_document_manifest_missing", "回收资料缺少本机文件登记")
+        managed_path = self._managed_path(str(manifest.get("storage_key") or ""))
+        raw_original = str(entry.get("originalSourcePath") or "").strip()
+        original_path = Path(raw_original).expanduser() if raw_original else None
+        if original_path is None or not original_path.is_file():
+            raise LocalRuntimeError(
+                410,
+                "recycled_document_original_missing",
+                "原文件已不存在，无法从资料回收站恢复",
+            )
+        if not managed_path.is_file():
+            managed_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = managed_path.with_name(f".{managed_path.name}.{new_id()}.restore")
+            shutil.copy2(original_path, temporary)
+            temporary.replace(managed_path)
+            digest = hashlib.sha256()
+            byte_size = 0
+            with managed_path.open("rb") as input_stream:
+                while chunk := input_stream.read(1024 * 1024):
+                    digest.update(chunk)
+                    byte_size += len(chunk)
+            restored_manifest = self.runtime.local_storage_object_put(
+                sandbox_id=sandbox_id,
+                object_id=source_id,
+                storage_key=str(manifest.get("storage_key") or ""),
+                content_hash=digest.hexdigest(),
+                media_type=str(entry.get("mediaType") or manifest.get("media_type") or "application/octet-stream"),
+                byte_size=byte_size,
+                expected_version=int(manifest.get("version") or 0),
+                original_path=str(original_path),
+            )
+            entry["contentHash"] = digest.hexdigest()
+            entry["byteSize"] = byte_size
+            entry["managedPath"] = str(managed_path)
+            entry["updatedAt"] = restored_manifest.get("updatedAt") or utc_now()
+        else:
+            self.runtime.local_storage_object_set_lifecycle(
+                object_id=source_id,
+                lifecycle_state="active",
+            )
+        summary_id = str(entry.get("localSummaryId") or "").strip()
+        if summary_id:
+            try:
+                self.runtime.local_storage_object_set_lifecycle(
+                    object_id=summary_id,
+                    lifecycle_state="active",
+                )
+            except LocalRuntimeError as exc:
+                if exc.code != "local_storage_object_missing":
+                    raise
+                entry["localSummaryId"] = None
+        entry.pop("deletedAt", None)
+        entry.pop("retentionUntil", None)
+        entry["cloudDocumentId"] = None
+        entry["cloudMetadataState"] = "pending"
+        entry["sharedSummaryState"] = "not_requested"
+        entry["sharedSummaryMessage"] = ""
+        entry["updatedAt"] = utc_now()
+        documents = dict(state.get("documents") or {})
+        documents[document_id] = {**entry, "documentId": document_id}
+        recycled.pop(document_id, None)
+        state["documents"] = documents
+        state["recycledDocuments"] = recycled
+        self._write_project_state(project_id, state)
+        source_asset_id = self._ensure_local_source_asset(
+            project_id=project_id,
+            entry={**entry, "documentId": document_id},
+        )
+        return {
+            "documentId": document_id,
+            "localSourceId": source_id,
+            "sourceAssetId": source_asset_id,
+            "fileName": display_name or managed_path.name,
+            "title": str(entry.get("title") or display_name or managed_path.name),
+            "managedPath": str(managed_path),
+            "originalSourcePath": str(original_path) if original_path is not None else None,
+            "mediaType": str(entry.get("mediaType") or manifest.get("media_type") or "application/octet-stream"),
+            "byteSize": int(entry.get("byteSize") or manifest.get("byte_size") or 0),
+            "contentHash": str(entry.get("contentHash") or manifest.get("content_hash") or ""),
+            "updatedAt": entry.get("updatedAt") or utc_now(),
         }
 
     def pending_cloud_deletes(self, project_id: str) -> list[dict[str, Any]]:
@@ -4871,6 +5332,48 @@ class LocalProjectMaterialsRepository:
             ) from exc
 
     @staticmethod
+    def _pptx_ooxml_text(path: Path) -> str:
+        """Read visible slide text without loading embedded fonts.
+
+        PowerPoint/Keynote may warn that a restricted embedded font cannot be
+        loaded.  That is a rendering restriction, not a text-access
+        restriction: the strings remain in ``ppt/slides/*.xml``.  This narrow
+        OOXML fallback keeps the original file untouched and avoids treating a
+        font warning as a corrupt or encrypted document.
+        """
+        try:
+            with zipfile.ZipFile(path) as package:
+                slide_names = [
+                    name
+                    for name in package.namelist()
+                    if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+                ]
+                slide_names.sort(
+                    key=lambda value: int(
+                        re.search(r"slide(\d+)\.xml$", value).group(1)  # type: ignore[union-attr]
+                    )
+                )
+                sections: list[str] = []
+                for index, name in enumerate(slide_names, start=1):
+                    try:
+                        root = ElementTree.fromstring(package.read(name))
+                    except ElementTree.ParseError:
+                        continue
+                    values = [
+                        str(node.text or "").strip()
+                        for node in root.iter()
+                        if str(node.tag).endswith("}t")
+                        and str(node.text or "").strip()
+                    ]
+                    if values:
+                        sections.append(
+                            f"[幻灯片 {index}]\n" + "\n".join(values)
+                        )
+                return "\n\n".join(sections).strip()
+        except (OSError, zipfile.BadZipFile):
+            return ""
+
+    @staticmethod
     def _decoded_text(path: Path) -> str:
         data = path.read_bytes()
         try:
@@ -5039,6 +5542,10 @@ class LocalProjectMaterialsRepository:
             source_id=source_id,
             content_hash=content_hash,
         )
+        editable_in_place = self._document_editable_in_place(
+            path=path,
+            media_type=media_type,
+        )
         if cached is not None and str(cached.get("content") or "").strip():
             return {
                 "documentId": document_id,
@@ -5053,6 +5560,7 @@ class LocalProjectMaterialsRepository:
                 "byteSize": int(row["byte_size"]),
                 "mediaType": media_type,
                 "storageVersion": int(row["version"]),
+                "editableInPlace": editable_in_place,
             }
         suffix = path.suffix.lower()
         if suffix == ".docx":
@@ -5132,7 +5640,14 @@ class LocalProjectMaterialsRepository:
             content = self._apple_office_text(path)
             kind = suffix.lstrip(".")
         elif suffix in OFFICE_EXTENSIONS:
-            content = self._sharepoint_document_text(path)
+            try:
+                content = self._sharepoint_document_text(path)
+            except LocalRuntimeError as exc:
+                if suffix not in {".pptx", ".pptm"}:
+                    raise
+                content = self._pptx_ooxml_text(path)
+                if not content and exc.code != "office_document_invalid":
+                    raise
             if not content and suffix in {".pptx", ".pptm"}:
                 try:
                     content = extract_ocr_text(path)
@@ -5147,8 +5662,6 @@ class LocalProjectMaterialsRepository:
             ".md",
             ".markdown",
             ".txt",
-            ".json",
-            ".jsonl",
             ".csv",
             ".tsv",
             ".xml",
@@ -5187,6 +5700,7 @@ class LocalProjectMaterialsRepository:
             "byteSize": int(row["byte_size"]),
             "mediaType": media_type,
             "storageVersion": int(row["version"]),
+            "editableInPlace": editable_in_place,
         }
 
     def _update_docx_document_text(
@@ -5277,6 +5791,16 @@ class LocalProjectMaterialsRepository:
                     or str(entry.get("title") or "").strip()
                     or path.stem
                 )
+                renamed_file_name, renamed_storage_key = (
+                    self._renamed_document_identity(
+                        source_id=source_id,
+                        storage_key=storage_key,
+                        current_file_name=str(
+                            entry.get("fileName") or path.name
+                        ),
+                        title=normalized_title,
+                    )
+                )
                 request_fingerprint = hashlib.sha256(
                     canonical_json(
                         {
@@ -5347,7 +5871,7 @@ class LocalProjectMaterialsRepository:
                     stored = self._upsert_object(
                         sandbox_id=context.sandbox_id,
                         object_id=source_id,
-                        storage_key=storage_key,
+                        storage_key=renamed_storage_key,
                         media_type=self.DOCX_MEDIA_TYPE,
                         data=output_data,
                         expected_version=current_version,
@@ -5385,7 +5909,7 @@ class LocalProjectMaterialsRepository:
                                 "当前设备受管的本机私有项目 Word 资料"
                             ),
                             "updatedAt": stored["updatedAt"],
-                            "fileName": entry.get("fileName") or path.name,
+                            "fileName": renamed_file_name,
                         }
                         self._upsert_object(
                             sandbox_id=context.sandbox_id,
@@ -5400,6 +5924,8 @@ class LocalProjectMaterialsRepository:
                 entry.update(
                     {
                         "title": normalized_title,
+                        "fileName": renamed_file_name,
+                        "managedPath": stored["path"],
                         "contentHash": stored["contentHash"],
                         "byteSize": stored["byteSize"],
                         "mediaType": self.DOCX_MEDIA_TYPE,
@@ -5412,12 +5938,14 @@ class LocalProjectMaterialsRepository:
                 )
                 state["documents"][document_id] = entry
                 self._write_project_state(project_id, state)
+                if renamed_storage_key != storage_key:
+                    path.unlink(missing_ok=True)
                 return {
                     "clientId": project_id,
                     "documentId": document_id,
                     "title": normalized_title,
-                    "fileName": entry.get("fileName") or path.name,
-                    "path": str(path),
+                    "fileName": renamed_file_name,
+                    "path": stored["path"],
                     "sourceScope": "local_private",
                     "contentHash": stored["contentHash"],
                     "byteSize": stored["byteSize"],
@@ -5466,21 +5994,27 @@ class LocalProjectMaterialsRepository:
                 "本机文档版本已变化，请刷新后重试",
             )
         media_type = str(entry.get("mediaType") or row["media_type"] or "")
-        if not (
-            media_type.startswith("text/")
-            or path.suffix.lower()
-            in {".md", ".txt", ".json", ".csv", ".tsv", ".xml", ".html"}
+        if not self._document_editable_in_place(
+            path=path,
+            media_type=media_type,
         ):
             raise LocalRuntimeError(
                 415,
                 "local_document_update_unsupported",
                 "该文件格式不能在文本编辑器中覆盖保存",
             )
+        normalized_title = title.strip() or entry.get("title") or path.stem
+        renamed_file_name, renamed_storage_key = self._renamed_document_identity(
+            source_id=str(entry["localSourceId"]),
+            storage_key=str(row["storage_key"]),
+            current_file_name=str(entry.get("fileName") or path.name),
+            title=str(normalized_title),
+        )
         data = content.encode("utf-8")
         stored = self._upsert_object(
             sandbox_id=context.sandbox_id,
             object_id=str(entry["localSourceId"]),
-            storage_key=str(row["storage_key"]),
+            storage_key=renamed_storage_key,
             media_type=media_type or "text/plain",
             data=data,
             expected_version=int(row["version"]),
@@ -5502,7 +6036,7 @@ class LocalProjectMaterialsRepository:
                     "summaryKind": "text_excerpt",
                     "sourceDescription": "当前设备受管的本机私有项目文本资料",
                     "updatedAt": stored["updatedAt"],
-                    "fileName": entry.get("fileName") or path.name,
+                    "fileName": renamed_file_name,
                 }
                 self._upsert_object(
                     sandbox_id=context.sandbox_id,
@@ -5514,7 +6048,9 @@ class LocalProjectMaterialsRepository:
                 )
         entry.update(
             {
-                "title": title.strip() or entry.get("title") or path.stem,
+                "title": normalized_title,
+                "fileName": renamed_file_name,
+                "managedPath": stored["path"],
                 "contentHash": stored["contentHash"],
                 "byteSize": stored["byteSize"],
                 "updatedAt": stored["updatedAt"],
@@ -5522,12 +6058,14 @@ class LocalProjectMaterialsRepository:
         )
         state["documents"][document_id] = entry
         self._write_project_state(project_id, state)
+        if renamed_storage_key != str(row["storage_key"]):
+            path.unlink(missing_ok=True)
         return {
             "clientId": project_id,
             "documentId": document_id,
             "title": entry["title"],
-            "fileName": entry.get("fileName") or path.name,
-            "path": str(path),
+            "fileName": renamed_file_name,
+            "path": stored["path"],
             "sourceScope": "local_private",
             "contentHash": stored["contentHash"],
             "byteSize": stored["byteSize"],
@@ -7084,7 +7622,6 @@ class LocalProjectMaterialsRepository:
         )
         if media_type.startswith("text/") or source.suffix.lower() in {
             ".md",
-            ".json",
             ".csv",
             ".tsv",
         }:
@@ -7794,8 +8331,6 @@ class LocalProjectMaterialsRepository:
             ".md",
             ".markdown",
             ".txt",
-            ".json",
-            ".jsonl",
             ".csv",
             ".tsv",
             ".xml",

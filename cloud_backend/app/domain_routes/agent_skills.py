@@ -73,6 +73,37 @@ def register_agent_skill_routes(
             idempotency_key=idempotency_key or new_id(),
         )
 
+    @app.delete("/api/v2/agent-skills/{skill_id}")
+    def delete_skill(
+        skill_id: str,
+        identity: Identity,
+        payload: Annotated[dict[str, Any] | None, Body()] = None,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return agent_skills.delete_agent_skill(
+            repository,
+            identity,
+            skill_id=skill_id,
+            expected_version=int((payload or {}).get("expectedVersion") or 0),
+            idempotency_key=idempotency_key or new_id(),
+        )
+
+    @app.post("/api/v2/agent-skills/{skill_id}/delete")
+    def delete_skill_command(
+        skill_id: str,
+        payload: Annotated[dict[str, Any], Body()],
+        identity: Identity,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        """Command-style alias for clients/proxies that do not forward DELETE bodies."""
+        return agent_skills.delete_agent_skill(
+            repository,
+            identity,
+            skill_id=skill_id,
+            expected_version=int((payload or {}).get("expectedVersion") or 0),
+            idempotency_key=idempotency_key or new_id(),
+        )
+
     @app.post("/api/v2/agent-skills/{skill_id}/runs")
     def record_skill_run(
         skill_id: str,

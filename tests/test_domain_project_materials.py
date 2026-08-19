@@ -1370,6 +1370,7 @@ def test_local_import_and_smart_import_use_strict_storage_objects(
     )
     local_text = store.document_text("cloud-text-document")
     assert local_text["sourceScope"] == "local_private"
+    assert local_text["editableInPlace"] is True
     assert "任务交接背景" in local_text["content"]
     updated_text = store.update_document_text(
         "cloud-text-document",
@@ -1377,6 +1378,10 @@ def test_local_import_and_smart_import_use_strict_storage_objects(
         content="这是更新后仍只保存在当前设备上的背景。",
     )
     assert updated_text["title"] == "更新后的背景"
+    assert updated_text["fileName"] == "更新后的背景.md"
+    assert Path(updated_text["path"]).name.endswith("-更新后的背景.md")
+    assert Path(updated_text["path"]).is_file()
+    assert not Path(text_material["managedPath"]).exists()
     assert store.document_text("cloud-text-document")["content"].startswith(
         "这是更新后"
     )
@@ -1928,6 +1933,74 @@ def test_member_local_edit_updates_only_cloud_metadata(
     assert row["source_locator"] == ""
     assert command is not None
     assert "当前设备" not in str(command["payload_json"])
+
+
+def test_local_metadata_edit_releases_legacy_deleted_content_hash(
+    tmp_path: Path,
+) -> None:
+    client, database = _cloud_client(tmp_path)
+    with client:
+        _, headers = _bootstrap(client)
+        project = _default_project(client, headers)
+        created = client.post(
+            f"/api/v2/domain/project-materials/projects/{project['projectId']}"
+            "/materials/register-metadata",
+            headers={**headers, "Idempotency-Key": "local-meta-collision-create"},
+            json={
+                "materials": [
+                    {
+                        "localSourceId": "legacy-deleted-source",
+                        "fileName": "旧文件.md",
+                        "contentHash": "c" * 64,
+                        "byteSize": 12,
+                        "mediaType": "text/markdown",
+                    },
+                    {
+                        "localSourceId": "current-source",
+                        "fileName": "新文件.md",
+                        "contentHash": "d" * 64,
+                        "byteSize": 16,
+                        "mediaType": "text/markdown",
+                    },
+                ]
+            },
+        )
+        assert created.status_code == 201, created.text
+        first, current = created.json()["documents"]
+        # Reproduce tombstones created by releases before deletion began
+        # releasing the nullable deduplication key.
+        with runtime_connection(database, "cloud") as connection:
+            connection.execute(
+                "UPDATE source_assets SET lifecycle_state='deleted', "
+                "availability_state='deleted', deleted_at=updated_at "
+                "WHERE id=?",
+                (first["documentId"],),
+            )
+            connection.commit()
+        updated = client.patch(
+            f"/api/v2/domain/project-materials/projects/{project['projectId']}"
+            f"/documents/{current['documentId']}/local-metadata",
+            headers={**headers, "Idempotency-Key": "local-meta-collision-update"},
+            json={
+                "expectedVersion": 1,
+                "title": "新文件（改名）",
+                "contentHash": "c" * 64,
+                "byteSize": 12,
+                "mediaType": "text/markdown",
+            },
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["releasedTombstoneId"] == first["documentId"]
+    with runtime_connection(database, "cloud", read_only=True) as connection:
+        rows = connection.execute(
+            "SELECT id,content_hash,lifecycle_state FROM source_assets "
+            "WHERE id IN (?,?) ORDER BY id",
+            (first["documentId"], current["documentId"]),
+        ).fetchall()
+    by_id = {str(row["id"]): row for row in rows}
+    assert by_id[first["documentId"]]["content_hash"] is None
+    assert by_id[first["documentId"]]["lifecycle_state"] == "deleted"
+    assert by_id[current["documentId"]]["content_hash"] == "c" * 64
     assert "这是" not in str(command["payload_json"])
     assert summary_version is not None
     assert "允许组织共享" in summary_version["markdown_content"]

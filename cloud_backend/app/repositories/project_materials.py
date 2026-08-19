@@ -862,6 +862,20 @@ class GC07ProjectMaterialsRepository:
             for membership_id in manager_membership_ids
             if participant_directory.get(membership_id, {}).get("displayName")
         ]
+        participant_members = [
+            {
+                "id": membership_id,
+                "fullName": participant_directory[membership_id]["displayName"],
+                "primaryRole": (
+                    "admin"
+                    if participant_directory[membership_id]["roleKey"] == "admin"
+                    else "employee"
+                ),
+                "isSelf": membership_id == identity.membership_id,
+            }
+            for membership_id in sorted(participants)
+            if participant_directory.get(membership_id, {}).get("displayName")
+        ]
         shared_member_count = len(participants - set(manager_membership_ids))
         document_count = connection.execute(
             """
@@ -920,6 +934,7 @@ class GC07ProjectMaterialsRepository:
             "createdAt": str(row["created_at"]),
             "updatedAt": str(row["updated_at"]),
             "participantMembershipIds": sorted(participants),
+            "participantMembers": participant_members,
             "managerMembershipIds": manager_membership_ids,
             "managerNames": manager_names,
             "sharedMemberCount": shared_member_count,
@@ -2080,6 +2095,170 @@ class GC07ProjectMaterialsRepository:
                 connection.rollback()
                 raise
 
+    def transition_project(
+        self,
+        identity: SessionIdentity,
+        *,
+        project_id: str,
+        target_state: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        if target_state != "deleted":
+            raise RepositoryError(422, "project_state_invalid", "项目状态无效")
+        normalized = {
+            "projectId": project_id,
+            "targetState": target_state,
+            "expectedVersion": expected_version,
+        }
+        payload_hash = self._payload_hash(normalized)
+        with self.repository._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                replay = self._receipt(
+                    connection,
+                    identity,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                )
+                if replay is not None:
+                    connection.rollback()
+                    return replay
+                row = self.repository._require_project_access(
+                    connection,
+                    identity,
+                    project_id=project_id,
+                )
+                is_creator = str(row["owner_membership_id"] or "") == identity.membership_id
+                if not is_creator:
+                    raise RepositoryError(
+                        403,
+                        "project_delete_creator_required",
+                        "只有项目创建者可以删除项目",
+                    )
+                current_version = int(row["version"] or 1)
+                if expected_version != current_version:
+                    raise RepositoryError(
+                        409,
+                        "project_version_conflict",
+                        "项目已更新，请刷新后重试",
+                    )
+                if bool(row["is_default_internal"]):
+                    raise RepositoryError(
+                        409,
+                        "default_project_protected",
+                        "组织默认内部项目不能删除",
+                    )
+                now = utc_now()
+                deleted_at = now
+                archived_at = None
+                updated = connection.execute(
+                    "UPDATE clients SET lifecycle_state=?,version=version+1,"
+                    "archived_at=?,deleted_at=?,updated_at=? "
+                    "WHERE id=? AND scope_id=? AND version=?",
+                    (
+                        target_state,
+                        archived_at,
+                        deleted_at,
+                        now,
+                        project_id,
+                        identity.scope_id,
+                        current_version,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RepositoryError(409, "project_version_conflict", "项目已更新，请刷新后重试")
+                updated_row = connection.execute(
+                    "SELECT * FROM clients WHERE id=? AND scope_id=?",
+                    (project_id, identity.scope_id),
+                ).fetchone()
+                result = {"project": self._project_payload(connection, identity, updated_row)}
+                self._record_command(
+                    connection,
+                    identity,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                    command_type=f"client.{target_state}",
+                    aggregate_type="client",
+                    aggregate_id=project_id,
+                    aggregate_version=current_version + 1,
+                    expected_aggregate_version=expected_version,
+                    result=result,
+                    target_resource_id=project_id,
+                )
+                connection.execute(
+                    "UPDATE secured_resources SET lifecycle_state='deleted',"
+                    "version=version+1,updated_at=?,deleted_at=? "
+                    "WHERE id=? AND scope_id=?",
+                    (now, now, project_id, identity.scope_id),
+                )
+                connection.execute(
+                    "UPDATE object_grants SET status='revoked',version=version+1,"
+                    "updated_at=?,revoked_at=? WHERE scope_id=? "
+                    "AND secured_resource_id=? AND status='active'",
+                    (now, now, identity.scope_id, project_id),
+                )
+                connection.execute(
+                    "UPDATE policy_versions SET lifecycle_state='archived',updated_at=? "
+                    "WHERE scope_id=? AND secured_resource_id=? AND lifecycle_state='active'",
+                    (now, identity.scope_id, project_id),
+                )
+                connection.commit()
+                return result
+            except Exception:
+                connection.rollback()
+                raise
+
+    def delete_preview(
+        self,
+        identity: SessionIdentity,
+        *,
+        project_id: str,
+    ) -> dict[str, Any]:
+        with self.repository._connection() as connection:
+            row = self.repository._require_project_access(
+                connection,
+                identity,
+                project_id=project_id,
+            )
+            if str(row["owner_membership_id"] or "") != identity.membership_id:
+                raise RepositoryError(
+                    403,
+                    "project_delete_creator_required",
+                    "只有项目创建者可以删除项目",
+                )
+            document_count = int(connection.execute(
+                "SELECT COUNT(*) FROM knowledge_documents WHERE scope_id=? "
+                "AND client_id=? AND lifecycle_state!='deleted'",
+                (identity.scope_id, project_id),
+            ).fetchone()[0])
+            task_count = int(connection.execute(
+                "SELECT COUNT(*) FROM tasks WHERE scope_id=? AND client_id=? "
+                "AND lifecycle_state!='deleted'",
+                (identity.scope_id, project_id),
+            ).fetchone()[0])
+            event_line_count = int(connection.execute(
+                "SELECT COUNT(*) FROM event_lines WHERE scope_id=? AND client_id=? "
+                "AND lifecycle_state!='deleted'",
+                (identity.scope_id, project_id),
+            ).fetchone()[0])
+            narrative_count = int(connection.execute(
+                "SELECT COUNT(*) FROM narrative_outputs WHERE scope_id=? AND client_id=? "
+                "AND lifecycle_state!='deleted'",
+                (identity.scope_id, project_id),
+            ).fetchone()[0])
+            return {
+                "projectId": project_id,
+                "name": str(row["name"] or ""),
+                "version": int(row["version"] or 1),
+                "isDefaultInternalProject": bool(row["is_default_internal"]),
+                "documentCount": document_count,
+                "taskCount": task_count,
+                "eventLineCount": event_line_count,
+                "narrativeCount": narrative_count,
+                "unavailableLegacyCounts": ["threads", "messages", "folders", "dna", "goals", "meetings"],
+            }
+
     def register_local_material_metadata(
         self,
         identity: SessionIdentity,
@@ -2685,6 +2864,7 @@ class GC07ProjectMaterialsRepository:
     ) -> dict[str, Any]:
         expected_version = int(payload.get("expectedVersion") or 0)
         title = str(payload.get("title") or payload.get("fileName") or "").strip()
+        file_name = str(payload.get("fileName") or title).strip()
         content_hash = str(payload.get("contentHash") or "").strip().lower()
         media_type = str(payload.get("mediaType") or "application/octet-stream").strip()
         try:
@@ -2693,6 +2873,7 @@ class GC07ProjectMaterialsRepository:
             raise RepositoryError(422, "material_metadata_invalid", "资料大小无效") from exc
         if (
             not title
+            or not file_name
             or len(content_hash) != 64
             or any(value not in "0123456789abcdef" for value in content_hash)
             or byte_size < 0
@@ -2703,6 +2884,7 @@ class GC07ProjectMaterialsRepository:
             "documentId": document_id,
             "expectedVersion": expected_version,
             "title": title,
+            "fileName": file_name,
             "contentHash": content_hash,
             "byteSize": byte_size,
             "mediaType": media_type,
@@ -2740,22 +2922,60 @@ class GC07ProjectMaterialsRepository:
                 if expected_version != current_version:
                     raise RepositoryError(409, "material_metadata_version_conflict", "资料元数据已更新，请刷新后重试")
                 now = utc_now()
-                updated = connection.execute(
-                    "UPDATE source_assets SET display_name=?, content_hash=?, "
-                    "byte_size=?, media_type=?, version=version+1, updated_at=? "
-                    "WHERE id=? AND scope_id=? AND version=? "
-                    "AND lifecycle_state='active'",
+                duplicate = connection.execute(
+                    "SELECT id,lifecycle_state FROM source_assets "
+                    "WHERE scope_id=? AND client_id=? AND record_kind='asset' "
+                    "AND content_hash=? AND id!=? LIMIT 1",
                     (
-                        title,
-                        content_hash,
-                        byte_size,
-                        media_type,
-                        now,
-                        document_id,
                         identity.scope_id,
-                        current_version,
+                        project_id,
+                        content_hash,
+                        document_id,
                     ),
-                )
+                ).fetchone()
+                released_tombstone_id: str | None = None
+                if duplicate is not None:
+                    if str(duplicate["lifecycle_state"] or "") != "deleted":
+                        raise RepositoryError(
+                            409,
+                            "material_content_duplicate",
+                            "当前项目已存在内容相同的资料",
+                        )
+                    # A tombstone keeps its stable object id and audit trail, but
+                    # must not retain the live deduplication key forever.  The
+                    # original hash remains in its deleted object manifest and
+                    # lifecycle/command receipts, so clearing this nullable
+                    # projection field does not erase audit evidence.
+                    released_tombstone_id = str(duplicate["id"])
+                    connection.execute(
+                        "UPDATE source_assets SET content_hash=NULL, "
+                        "version=version+1, updated_at=? "
+                        "WHERE id=? AND scope_id=? AND lifecycle_state='deleted'",
+                        (now, released_tombstone_id, identity.scope_id),
+                    )
+                try:
+                    updated = connection.execute(
+                        "UPDATE source_assets SET display_name=?, content_hash=?, "
+                        "byte_size=?, media_type=?, version=version+1, updated_at=? "
+                        "WHERE id=? AND scope_id=? AND version=? "
+                        "AND lifecycle_state='active'",
+                        (
+                            file_name,
+                            content_hash,
+                            byte_size,
+                            media_type,
+                            now,
+                            document_id,
+                            identity.scope_id,
+                            current_version,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise RepositoryError(
+                        409,
+                        "material_content_duplicate",
+                        "当前项目已存在内容相同的资料",
+                    ) from exc
                 if updated.rowcount != 1:
                     raise RepositoryError(409, "material_metadata_version_conflict", "资料元数据已更新，请刷新后重试")
                 manifest_id = str(row["object_manifest_id"] or "")
@@ -2786,12 +3006,13 @@ class GC07ProjectMaterialsRepository:
                     "documentId": document_id,
                     "projectId": project_id,
                     "title": title,
-                    "fileName": title,
+                    "fileName": file_name,
                     "contentHash": content_hash,
                     "byteSize": byte_size,
                     "mediaType": media_type,
                     "aggregateVersion": current_version + 1,
                     "lifecycleState": "active",
+                    "releasedTombstoneId": released_tombstone_id,
                     "materialBoundary": {
                         "sourceFileContentUploaded": False,
                         "sourceFilePathUploaded": False,
@@ -2865,7 +3086,7 @@ class GC07ProjectMaterialsRepository:
                     raise RepositoryError(409, "material_metadata_version_conflict", "资料元数据已更新，请刷新后重试")
                 now = utc_now()
                 connection.execute(
-                    "UPDATE source_assets SET lifecycle_state='deleted', "
+                    "UPDATE source_assets SET lifecycle_state='deleted', content_hash=NULL, "
                     "availability_state='deleted', deleted_at=?, updated_at=?, "
                     "version=version+1 WHERE id=? AND scope_id=? AND version=?",
                     (now, now, document_id, identity.scope_id, current_version),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -19,10 +20,14 @@ from backend.app.ui_domains import UiRequest, build_default_registry
 from backend.app.ui_domains import project_materials as project_materials_ui
 from backend.app.ui_domains import workbench_outputs
 from backend.app.ui_domains.workbench_outputs import (
+    _answer_export_title,
     _explicit_project_memory_statement,
     _published_meeting_payload,
 )
-from backend.app.workbench_chat_local import _load_optional_project_knowledge
+from backend.app.workbench_chat_local import (
+    LocalWorkbenchChatRepository,
+    _load_optional_project_knowledge,
+)
 from cloud_backend.app.config import CloudConfig
 from cloud_backend.app.main import create_app
 from cloud_backend.app.repositories.workbench_outputs import (
@@ -44,6 +49,30 @@ from strict_common.schema import initialize_database, runtime_connection
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_answer_export_title_uses_fast_ai_and_has_question_fallback() -> None:
+    class Runtime:
+        def private_ai_completion(self, **_: object) -> dict[str, str]:
+            return {"content": "《日慈基金会定位与发展》"}
+
+    answers = [
+        {
+            "question": "请为我提炼这份文件的核心内容？",
+            "answerMarkdown": "# 日慈是谁\n\n日慈基金会关注儿童心理健康。",
+        }
+    ]
+    assert _answer_export_title(
+        SimpleNamespace(runtime=Runtime()), answers
+    ) == "日慈基金会定位与发展"
+
+    class FailedRuntime:
+        def private_ai_completion(self, **_: object) -> dict[str, str]:
+            raise RuntimeError("model unavailable")
+
+    assert _answer_export_title(
+        SimpleNamespace(runtime=FailedRuntime()), answers
+    ) == "提炼这份文件的核心内容"
 
 
 def _grant_project_access(connection, identity: SessionIdentity, project_id: str, now: str) -> None:
@@ -2304,6 +2333,182 @@ def test_workspace_chat_consumes_thread_attachment_deep_mode_and_style(
     assert manifest["threadId"] == "thread-a"
     assert manifest["selectedDocuments"][0]["contentHash"] == "sentinel-hash"
     assert "ATTACHMENT_SENTINEL_BODY" not in json.dumps(manifest)
+
+
+def test_workspace_chat_persists_local_image_reference_without_archiving_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Runtime:
+        database_path = Path("/tmp/strict-local.db")
+
+        def __init__(self) -> None:
+            self.chat_call: dict[str, object] = {}
+
+        @staticmethod
+        def require_project_capability(project_id: str, capability: str) -> dict:
+            assert (project_id, capability) == ("project-a", "read")
+            return {"allowed": True}
+
+        def workbench_chat(self, **kwargs: object) -> dict:
+            self.chat_call = dict(kwargs)
+            return {
+                "answer": {
+                    "answerId": "answer-image",
+                    "projectId": "project-a",
+                    "question": str(kwargs["question"]),
+                    "answerMarkdown": "图片已理解",
+                    "sourceManifest": dict(kwargs["source_manifest_extra"]),
+                    "createdAt": utc_now(),
+                }
+            }
+
+        @staticmethod
+        def persist_workbench_chat_images(**kwargs: object) -> list[dict]:
+            images = list(kwargs["images"])
+            assert kwargs["project_id"] == "project-a"
+            assert kwargs["thread_id"]
+            return [
+                {
+                    "objectId": "chat-image-local-1",
+                    "name": images[0]["name"],
+                    "mimeType": images[0]["mimeType"],
+                    "size": len(images[0]["bytes"]),
+                    "contentHash": images[0]["contentHash"],
+                }
+            ]
+
+        @staticmethod
+        def resolve_workbench_chat_images(receipts: object) -> list[dict]:
+            receipt = list(receipts)[0]
+            return [
+                {
+                    "id": receipt["objectId"],
+                    "name": receipt["name"],
+                    "mimeType": receipt["mimeType"],
+                    "dataUrl": "data:image/png;base64,iVBORw0KGgo=",
+                }
+            ]
+
+    runtime = Runtime()
+    monkeypatch.setattr(
+        workbench_outputs,
+        "LocalProjectMaterialsRepository",
+        lambda _runtime: SimpleNamespace(
+            search_local_wiki=lambda **_kwargs: {"hits": []},
+        ),
+    )
+    data_url = "data:image/png;base64,iVBORw0KGgo="
+    result = build_default_registry().dispatch(
+        SimpleNamespace(runtime=runtime),
+        UiRequest(
+            method="POST",
+            path="clients/project-a/workspace/chat/start",
+            query={},
+            body={
+                "prompt": "请看图说明问题",
+                "imageInputs": [
+                    {
+                        "name": "截图.png",
+                        "mimeType": "image/png",
+                        "dataUrl": data_url,
+                    }
+                ],
+            },
+            idempotency_key="chat-image-transient",
+        ),
+    )
+    assert result["assistantMessage"]["content"] == "图片已理解"
+    assert runtime.chat_call["image_context_items"] == [
+        {"name": "截图.png", "mimeType": "image/png", "dataUrl": data_url}
+    ]
+    manifest = runtime.chat_call["source_manifest_extra"]
+    assert manifest["transientImageInputs"][0]["name"] == "截图.png"
+    assert manifest["transientImageInputs"][0]["size"] > 0
+    assert manifest["localChatImageInputs"] == [
+        {
+            "objectId": "chat-image-local-1",
+            "name": "截图.png",
+            "mimeType": "image/png",
+            "size": 8,
+            "contentHash": manifest["transientImageInputs"][0]["contentHash"],
+        }
+    ]
+    assert result["userMessage"]["imageAttachments"][0]["id"] == "chat-image-local-1"
+    assert data_url not in json.dumps(manifest)
+
+
+def test_local_chat_image_survives_runtime_restart_without_source_asset(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "local" / "strict-local.db"
+    runtime = WorkspaceRuntime(database, MemorySecretStore())
+    sandbox_id = "sandbox-chat-image"
+    scope_id = "scope-chat-image"
+    principal_id = "principal-chat-image"
+    membership_id = "membership-chat-image"
+    organization_id = "organization-chat-image"
+    now = utc_now()
+    with runtime._connection() as connection:
+        connection.execute(
+            "INSERT INTO organizations (id,lifecycle_state,version,updated_at,record_kind,name,created_at,deleted_at,projection_state,projected_at) "
+            "VALUES (?,'active',1,?,'organization','图片测试组织',?,NULL,'current',?)",
+            (organization_id, now, now, now),
+        )
+        connection.execute(
+            "INSERT INTO principals (id,status,identity_version,updated_at,principal_kind,display_name,version,lifecycle_state,created_at,deleted_at,projection_state,projected_at) "
+            "VALUES (?,'active',1,?,'person','图片测试成员',1,'active',?,NULL,'current',?)",
+            (principal_id, now, now, now),
+        )
+        connection.execute(
+            "INSERT INTO authorization_scopes (id,scope_kind,organization_id,policy_version,created_at,updated_at,status,version,lifecycle_state,deleted_at,projection_state,projected_at) "
+            "VALUES (?,'organization',?,1,?,?,'active',1,'active',NULL,'current',?)",
+            (scope_id, organization_id, now, now, now),
+        )
+        connection.execute(
+            "INSERT INTO organization_memberships (id,scope_id,principal_id,role_key,status,version,record_kind,visibility_scope,lifecycle_state,created_at,updated_at,deleted_at,projection_state,projected_at) "
+            "VALUES (?,?,?,'member','active',1,'membership','organization','active',?,?,NULL,'current',?)",
+            (membership_id, scope_id, principal_id, now, now, now),
+        )
+        connection.execute(
+            "INSERT INTO sandboxes (id,scope_id,principal_id,membership_id,record_kind,cloud_instance_id,database_generation_id,sandbox_kind,display_name,runtime_status,manifest_hash,version,lifecycle_state,created_at,updated_at,deleted_at,authority_role,origin_instance_id) "
+            "VALUES (?,?,?,?,'sandbox','cloud-chat-image',?,'organization','图片工作空间','ready',?,1,'active',?,?,NULL,'local',?)",
+            (
+                sandbox_id,
+                scope_id,
+                principal_id,
+                membership_id,
+                runtime.identity.database_generation_id,
+                runtime.identity.manifest_hash,
+                now,
+                now,
+                runtime.identity.database_generation_id,
+            ),
+        )
+        connection.commit()
+    context = SimpleNamespace(sandbox_id=sandbox_id)
+    runtime._current_context = lambda require_ready=True: context  # type: ignore[method-assign]
+    raw = b"\x89PNG\r\n\x1a\nchat-image-sentinel"
+    receipt = LocalWorkbenchChatRepository(runtime).persist_chat_images(
+        project_id="project-a",
+        thread_id="thread-a",
+        images=[
+            {
+                "name": "现场截图.png",
+                "mimeType": "image/png",
+                "bytes": raw,
+                "contentHash": hashlib.sha256(raw).hexdigest(),
+            }
+        ],
+    )[0]
+
+    restarted = WorkspaceRuntime(database, MemorySecretStore())
+    restarted._current_context = lambda require_ready=True: context  # type: ignore[method-assign]
+    restored = LocalWorkbenchChatRepository(restarted).resolve_chat_images([receipt])
+    assert restored[0]["name"] == "现场截图.png"
+    assert restored[0]["dataUrl"].startswith("data:image/png;base64,")
+    with runtime._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM object_manifests").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM source_assets").fetchone()[0] == 0
 
 
 def test_workspace_chat_automatically_recalls_current_project_local_wiki(

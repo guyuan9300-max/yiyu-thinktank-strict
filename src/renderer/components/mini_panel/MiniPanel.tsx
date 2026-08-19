@@ -30,6 +30,7 @@ export interface MiniPanelProps {
   onRestore?: () => void;
   /** 日历视图:把任务拖到某个日期格子→改期到那天(5/29) */
   onRescheduleTask?: (taskId: string, dateIso: string) => void;
+  onViewChange?: (view: MiniView) => void;
 }
 
 type MiniView = 'today' | 'calendar';
@@ -310,9 +311,13 @@ function CalendarCard({
 
 export function MiniPanel(props: MiniPanelProps) {
   const [view, setView] = useState<MiniView>('today');
+  const selectView = (nextView: MiniView) => {
+    setView(nextView);
+    props.onViewChange?.(nextView);
+  };
   return (
-    <div className="animate-fade-in flex h-full w-full flex-col overflow-hidden rounded-[20px] border border-slate-200/70 bg-white/95 shadow-[0_10px_40px_rgba(15,23,42,0.10)] backdrop-blur-xl">
-      <MiniHeader view={view} onView={setView} onRestore={props.onRestore} />
+    <div className="animate-fade-in flex h-screen w-screen flex-col overflow-hidden rounded-[20px] border border-slate-200/70 bg-white/95 shadow-[0_10px_40px_rgba(15,23,42,0.10)] backdrop-blur-xl">
+      <MiniHeader view={view} onView={selectView} onRestore={props.onRestore} />
       <div className="min-h-0 flex-1">
         {view === 'today' ? (
           <TodayCard today={props.today} onToggleTask={props.onToggleTask} onOpenTask={props.onOpenTask} onOpenEvent={props.onOpenEvent} onQuickAdd={props.onQuickAdd} />

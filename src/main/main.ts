@@ -46,6 +46,11 @@ const APP_NAME = '益语智库AI（新版）';
 const DATA_DIR_NAME = 'YiyuThinkTankStrictV1';
 
 let mainWindow: BrowserWindow | null = null;
+let preMiniWindowState: {
+  bounds: { x: number; y: number; width: number; height: number };
+  maximized: boolean;
+  fullScreen: boolean;
+} | null = null;
 let backendProcess: ChildProcess | null = null;
 let backendPort = 0;
 let desktopToken = '';
@@ -673,16 +678,70 @@ ipcMain.on('strict:get-runtime-sync', (event) => {
   };
 });
 
-ipcMain.handle('strict:set-mini-mode', (_event, enter: boolean) => {
+ipcMain.handle('strict:set-mini-mode', async (_event, enter: boolean, requestedHeight?: number) => {
   if (!mainWindow) {
     return { mini: false };
   }
+  const window = mainWindow;
   if (enter) {
-    mainWindow.setMinimumSize(360, 560);
-    mainWindow.setSize(420, 720, true);
+    const miniHeight = Math.max(340, Math.min(680, Math.round(requestedHeight || 360)));
+    // 已经处于精简模式时只是“今天/日历”切页，调整高度即可；不能覆盖
+    // preMiniWindowState，否则退出精简模式时无法回到原窗口。
+    if (preMiniWindowState) {
+      window.setMinimumSize(360, 320);
+      window.setSize(420, miniHeight, true);
+      return { mini: true };
+    }
+    preMiniWindowState = {
+      bounds: window.getBounds(),
+      maximized: window.isMaximized(),
+      fullScreen: window.isFullScreen(),
+    };
+    // macOS 离开原生全屏是异步的。过去在 setFullScreen(false) 后立即
+    // setSize，尺寸请求会被系统吞掉，于是迷你内容被拉伸在整块全屏里。
+    // 等窗口真正退出全屏/最大化后再设置固定窄窗尺寸。
+    if (preMiniWindowState.fullScreen) {
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          window.removeListener('leave-full-screen', finish);
+          resolve();
+        };
+        window.once('leave-full-screen', finish);
+        window.setFullScreen(false);
+        setTimeout(finish, 1500);
+      });
+    }
+    if (window.isMaximized()) {
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          window.removeListener('unmaximize', finish);
+          resolve();
+        };
+        window.once('unmaximize', finish);
+        window.unmaximize();
+        setTimeout(finish, 500);
+      });
+    }
+    window.setMinimumSize(360, 320);
+    window.setSize(420, miniHeight, true);
+    window.center();
   } else {
-    mainWindow.setMinimumSize(1080, 700);
-    mainWindow.setSize(1440, 900, true);
+    window.setMinimumSize(1080, 700);
+    const previous = preMiniWindowState;
+    preMiniWindowState = null;
+    if (previous) {
+      window.setBounds(previous.bounds, true);
+      if (previous.maximized) window.maximize();
+      if (previous.fullScreen) window.setFullScreen(true);
+    } else {
+      window.setSize(1440, 900, true);
+    }
   }
   return { mini: enter };
 });

@@ -991,6 +991,116 @@ def set_agent_skill_enabled(
             raise
 
 
+def delete_agent_skill(
+    repository: CloudRepository,
+    identity: SessionIdentity,
+    *,
+    skill_id: str,
+    expected_version: int,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Tombstone a member-managed Skill while preserving historical runs."""
+
+    command_type = "agent_skill.delete"
+    normalized = {"skillId": skill_id, "expectedVersion": int(expected_version)}
+    payload_hash = payload_fingerprint(normalized)
+    operation_id = _operation_id(identity.scope_id, command_type, idempotency_key)
+    with repository._connection() as connection:  # noqa: SLF001
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = connection.execute(
+                "SELECT aggregate_id,payload_hash,expected_aggregate_version FROM commands "
+                "WHERE scope_id=? AND idempotency_key=? AND command_type=?",
+                (identity.scope_id, idempotency_key, command_type),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload_hash"] or "") != payload_hash:
+                    raise RepositoryError(409, "idempotency_payload_conflict", "相同操作键对应了不同 Skill 删除请求")
+                connection.commit()
+                return {
+                    "deleted": True,
+                    "skillId": str(existing["aggregate_id"]),
+                    "version": int(existing["expected_aggregate_version"] or 0) + 1,
+                    "idempotentReplay": True,
+                }
+            row = connection.execute(
+                "SELECT * FROM automation_rules WHERE id=? AND scope_id=? "
+                "AND record_kind='agent_skill' AND lifecycle_state='active'",
+                (skill_id, identity.scope_id),
+            ).fetchone()
+            authorization = _authorization_for(connection, row, identity) if row is not None else None
+            if row is None or authorization is None or not authorization.get("canManage"):
+                raise RepositoryError(404, "agent_skill_missing", "Skill 不存在或当前成员不可管理")
+            if int(row["version"] or 1) != expected_version:
+                raise RepositoryError(409, "agent_skill_version_conflict", "Skill 已变化，请刷新后重试")
+            now = utc_now()
+            next_version = expected_version + 1
+            connection.execute(
+                "UPDATE automation_rules SET enabled=0,lifecycle_state='deleted',deleted_at=?,"
+                "updated_at=?,version=?,rule_version=? WHERE id=? AND scope_id=?",
+                (now, now, next_version, next_version, skill_id, identity.scope_id),
+            )
+            connection.execute(
+                "UPDATE secured_resources SET lifecycle_state='deleted',deleted_at=?,updated_at=?,"
+                "version=? WHERE id=? AND scope_id=?",
+                (now, now, next_version, skill_id, identity.scope_id),
+            )
+            connection.execute(
+                "UPDATE object_grants SET status='revoked',revoked_at=?,updated_at=?,version=version+1 "
+                "WHERE scope_id=? AND secured_resource_id=? AND status='active' AND lifecycle_state='active'",
+                (now, now, identity.scope_id, skill_id),
+            )
+            event_hash = sha256_text(f"{skill_id}|{next_version}|deleted|{payload_hash}")
+            connection.execute(
+                "INSERT INTO idempotency_records (id,scope_id,idempotency_key,payload_hash,result_hash,"
+                "expires_at,result_object_manifest_id,status,created_at,authority_role,origin_instance_id) "
+                "VALUES (?,?,?,?,?,NULL,NULL,'completed',?,'cloud',?)",
+                (_record_id("idempotency", operation_id), identity.scope_id, idempotency_key,
+                 payload_hash, event_hash, now, identity.cloud_instance_id),
+            )
+            # lifecycle_events.operation_id is a strict FK to commands.operation_id.
+            # Establish the authoritative command before appending its lifecycle event.
+            connection.execute(
+                "INSERT INTO commands (id,scope_id,operation_id,idempotency_key,aggregate_type,aggregate_id,"
+                "command_type,actor_principal_id,expected_aggregate_version,status,actor_membership_id,"
+                "payload_hash,submitted_at,settled_at,authority_role,origin_instance_id) "
+                "VALUES (?,?,?,?, 'agent_skill',?,?,?,?, 'completed',?,?,?,?, 'cloud',?)",
+                (_record_id("cmd", operation_id), identity.scope_id, operation_id, idempotency_key,
+                 skill_id, command_type, identity.principal_id, expected_version,
+                 identity.membership_id, payload_hash, now, now, identity.cloud_instance_id),
+            )
+            connection.execute(
+                "INSERT INTO lifecycle_events (id,scope_id,operation_id,secured_resource_id,from_state,to_state,"
+                "tombstone_version,actor_id,reason_code,occurred_at,origin_instance_id,created_at,integrity_hash) "
+                "VALUES (?,?,?,?, 'active','deleted',?,?,?,?,?,?,?)",
+                (
+                    _record_id("life", operation_id, skill_id), identity.scope_id, operation_id, skill_id,
+                    next_version, identity.principal_id, "user_deleted_agent_skill", now,
+                    identity.cloud_instance_id, now, sha256_text(f"{event_hash}|{now}"),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO outbox_events (id,scope_id,operation_id,aggregate_version,event_type,status,"
+                "aggregate_type,aggregate_id,event_hash,available_at,published_at,authority_role,origin_instance_id) "
+                "VALUES (?,?,?,?,'agent_skill.deleted','pending','agent_skill',?,?,?,NULL,'cloud',?)",
+                (_record_id("outbox", operation_id, "deleted"), identity.scope_id, operation_id,
+                 next_version, skill_id, event_hash, now, identity.cloud_instance_id),
+            )
+            connection.execute(
+                "INSERT INTO audit_events (id,scope_id,operation_id,actor_id,action,event_hash,"
+                "actor_membership_id,target_resource_id,occurred_at,origin_instance_id,created_at,"
+                "integrity_hash,authority_role) VALUES (?,?,?,?, 'agent_skill.delete',?,?,?,?,?,?,?,'cloud')",
+                (_record_id("audit", operation_id), identity.scope_id, operation_id,
+                 identity.principal_id, event_hash, identity.membership_id, skill_id, now,
+                 identity.cloud_instance_id, now, sha256_text(f"{operation_id}|{event_hash}|{now}")),
+            )
+            connection.commit()
+            return {"deleted": True, "skillId": skill_id, "version": next_version, "idempotentReplay": False}
+        except Exception:
+            connection.rollback()
+            raise
+
+
 def record_agent_skill_run(
     repository: CloudRepository,
     identity: SessionIdentity,

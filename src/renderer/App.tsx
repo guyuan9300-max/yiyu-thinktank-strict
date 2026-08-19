@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { flushSync } from 'react-dom';
+import { createPortal, flushSync } from 'react-dom';
 import {
   readRuntimeUiSessionValue,
   useRuntimeUiSessionState,
@@ -21,7 +21,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Sparkles,
-  Snowflake,
   UploadCloud,
   Briefcase,
   FolderOpen,
@@ -366,9 +365,10 @@ import {
   deleteClient,
   getClientDeletePreview,
   type ClientDeletePreview,
-  freezeClient,
-  unfreezeClient,
   deleteClientDocument,
+  getClientDocumentRecycleBin,
+  restoreClientDocument,
+  type RecycledClientDocument,
   createGoal,
   launchFeishuMeeting,
   createHandbook,
@@ -534,6 +534,7 @@ import {
   createAgentSkill,
   updateAgentSkill,
   setAgentSkillEnabled,
+  deleteAgentSkill,
   listWritingSkills,
   createWritingSkill,
   updateWritingSkill,
@@ -791,6 +792,14 @@ type InlineEditorDraft = {
   updatedAt: number;
 };
 
+type PendingChatImage = {
+  id: string;
+  name: string;
+  mimeType: string;
+  dataUrl: string;
+  size: number;
+};
+
 function readInlineEditorDraft(clientId: string): InlineEditorDraft | null {
   if (!clientId) return null;
   try {
@@ -938,64 +947,6 @@ function setWorkspaceExportBag(clientId: string, next: string[]): void {
   else workspaceExportBagByClient.set(clientId, next);
   _persistMapToLocalStorage(_EXPORT_LS_KEY, workspaceExportBagByClient);
   notifyWorkspaceExportBagListeners();
-}
-
-// ─── 全局冷冻项目 ─────────────────────────────────────────────
-// SOT(单一真实源)是后端 clients.frozen_at;前端通过主组件 useEffect 把 client.isFrozen
-// 同步进这个 Set,所有非工作台 view 的下拉/计算都过滤 Set 里的 id。
-// localStorage 缓存只是乐观更新的暂存:用户点开关后立刻 UI 响应,后端 API 完成后会 refetch 校正。
-// 冷冻后:
-//   - 工作台左栏「近期项目」严格不显示(只在搜索结果可临时找回)
-//   - 战略陪伴 / 资讯情报站 / 任务编辑器客户下拉全部过滤
-//   - 后端自动 job(资讯抓取/embedding 重建/notebook 刷新等)跳过冷冻项目
-const _HIDDEN_CLIENTS_LS_KEY = 'yiyu.workspace.hiddenClientIds.v1';
-interface _HiddenClientsState {
-  hiddenSet?: Set<string>;
-  listeners?: Set<WorkspaceQueueListener>;
-}
-const _hiddenClientsState: _HiddenClientsState =
-  ((globalThis as unknown as { __yiyuHiddenClients?: _HiddenClientsState }).__yiyuHiddenClients ||=
-    {} as _HiddenClientsState);
-
-function _hydrateHiddenSet(): Set<string> {
-  if (typeof window === 'undefined') return new Set();
-  try {
-    const raw = window.localStorage.getItem(_HIDDEN_CLIENTS_LS_KEY);
-    if (!raw) return new Set();
-    const parsed = JSON.parse(raw) as unknown;
-    if (Array.isArray(parsed)) {
-      return new Set(parsed.filter((value): value is string => typeof value === 'string'));
-    }
-    return new Set();
-  } catch {
-    return new Set();
-  }
-}
-function _persistHiddenSet(set: Set<string>): void {
-  if (typeof window === 'undefined') return;
-  try {
-    if (set.size === 0) {
-      window.localStorage.removeItem(_HIDDEN_CLIENTS_LS_KEY);
-    } else {
-      window.localStorage.setItem(_HIDDEN_CLIENTS_LS_KEY, JSON.stringify([...set]));
-    }
-  } catch {
-    // localStorage 满或被禁:静默,本次会话内仍按 in-memory Set 工作
-  }
-}
-const hiddenClientIds: Set<string> =
-  _hiddenClientsState.hiddenSet ||= _hydrateHiddenSet();
-const hiddenClientsListeners: Set<WorkspaceQueueListener> =
-  _hiddenClientsState.listeners ||= new Set<WorkspaceQueueListener>();
-
-function isClientHidden(clientId: string): boolean {
-  return hiddenClientIds.has(clientId);
-}
-function setClientHidden(clientId: string, hidden: boolean): void {
-  if (hidden) hiddenClientIds.add(clientId);
-  else hiddenClientIds.delete(clientId);
-  _persistHiddenSet(hiddenClientIds);
-  for (const listener of hiddenClientsListeners) listener();
 }
 
 function readStoredRecentUsedDocuments(clientId: string): RecentUsedDocument[] {
@@ -6867,8 +6818,9 @@ type ClientEditorModalProps = {
   onSubmit: (draft: ClientEditorDraft) => void | Promise<void>;
   onDelete: (draft: ClientEditorDraft, confirmInput: string) => void | Promise<void>;
   onInteractionState: (active: boolean, source: string, detail?: string | null) => void;
-  // 切换"全局冷冻"开关:调后端 freeze/unfreeze + 重新拉 clients 让 isFrozen 同步全局
-  onFreezeChange: (clientId: string, frozen: boolean) => Promise<void>;
+  viewerMembershipId?: string | null;
+  prefetchedMemberCandidates: MentionCandidate[];
+  memberDirectoryScopeKey: string;
 };
 
 function ClientEditorModal({
@@ -6878,7 +6830,9 @@ function ClientEditorModal({
   onSubmit,
   onDelete,
   onInteractionState,
-  onFreezeChange,
+  viewerMembershipId,
+  prefetchedMemberCandidates,
+  memberDirectoryScopeKey,
 }: ClientEditorModalProps) {
   const [draft, setDraft] = useState<ClientEditorDraft>(state.initialDraft);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -6886,31 +6840,16 @@ function ClientEditorModal({
   // 删除前的影响预览(连带删除的对话/文档数量),从后端拉
   const [deletePreview, setDeletePreview] = useState<ClientDeletePreview | null>(null);
   const [deletePreviewLoading, setDeletePreviewLoading] = useState(false);
-  // 当前项目是否被隐藏(本地 localStorage 状态,订阅 module-level listener)
-  const [isHidden, setIsHidden] = useState<boolean>(() =>
-    state.editingClientId ? isClientHidden(state.editingClientId) : false,
-  );
-  useEffect(() => {
-    if (!state.editingClientId) {
-      setIsHidden(false);
-      return;
-    }
-    setIsHidden(isClientHidden(state.editingClientId));
-    const listener = () => {
-      setIsHidden(state.editingClientId ? isClientHidden(state.editingClientId) : false);
-    };
-    hiddenClientsListeners.add(listener);
-    return () => {
-      hiddenClientsListeners.delete(listener);
-    };
-  }, [state.editingClientId, state.open]);
-
   // ─── 同事下拉 UI 局部 state（扩展业务字段已经合并进 draft 不再独立 useState） ───
   const [memberOptions, setMemberOptions] = useState<MentionCandidate[]>([]);
   const [memberDirectory, setMemberDirectory] = useState<MentionCandidate[]>([]);
   const [memberPickerOpen, setMemberPickerOpen] = useState(false);
   const [memberSearchQuery, setMemberSearchQuery] = useState('');
   const memberPickerRef = useRef<HTMLDivElement | null>(null);
+  const projectMemberCandidates = useMemo(
+    () => clients.find((client) => client.id === state.editingClientId)?.relatedUsers || [],
+    [clients, state.editingClientId],
+  );
 
   // 从 draft 直接派生（draft 由 buildClientEditorDraft 在打开 modal 时填充：
   // 来源优先级：backend client 字段 → localStorage 暂存值（旧版迁移） → 默认值）
@@ -6925,7 +6864,33 @@ function ClientEditorModal({
     setDeletePreview(null);
     setMemberPickerOpen(false);
     setMemberSearchQuery('');
-  }, [state.initialDraft, state.open, state.requestId, state.editingClientId]);
+    setMemberDirectory([]);
+    setMemberOptions([]);
+  }, [
+    memberDirectoryScopeKey,
+    state.initialDraft,
+    state.open,
+    state.requestId,
+    state.editingClientId,
+  ]);
+
+  useEffect(() => {
+    if (!state.open || projectMemberCandidates.length === 0) return;
+    setMemberDirectory((previous) => {
+      const merged = new Map(previous.map((member) => [member.id, member]));
+      projectMemberCandidates.forEach((member) => merged.set(member.id, member));
+      return Array.from(merged.values());
+    });
+  }, [projectMemberCandidates, state.open]);
+
+  useEffect(() => {
+    if (!state.open || prefetchedMemberCandidates.length === 0) return;
+    setMemberDirectory((previous) => {
+      const merged = new Map(previous.map((member) => [member.id, member]));
+      prefetchedMemberCandidates.forEach((member) => merged.set(member.id, member));
+      return Array.from(merged.values());
+    });
+  }, [prefetchedMemberCandidates, state.open]);
 
   // 打开删除确认时拉影响预览,让用户看到"将连带删除 N 条对话 / N 篇文档"再决定
   useEffect(() => {
@@ -6953,6 +6918,18 @@ function ClientEditorModal({
   // 拉同事列表（modal 打开时 + 搜索 query 变化）
   useEffect(() => {
     if (!state.open) return;
+    const normalizedQuery = memberSearchQuery.trim().toLocaleLowerCase('zh-CN');
+    if (prefetchedMemberCandidates.length > 0) {
+      setMemberOptions(prefetchedMemberCandidates.filter((member) => (
+        !member.isSelf
+        && (
+          !normalizedQuery
+          || member.fullName.toLocaleLowerCase('zh-CN').includes(normalizedQuery)
+          || (member.email || '').toLocaleLowerCase('zh-CN').includes(normalizedQuery)
+        )
+      )));
+      return;
+    }
     let cancelled = false;
     void getMentionCandidates(memberSearchQuery.trim()).then((list) => {
       if (cancelled) return;
@@ -6967,7 +6944,7 @@ function ClientEditorModal({
     return () => {
       cancelled = true;
     };
-  }, [state.open, memberSearchQuery]);
+  }, [prefetchedMemberCandidates, state.open, memberSearchQuery]);
 
   // 点击下拉外部 → 关闭下拉
   useEffect(() => {
@@ -6984,6 +6961,18 @@ function ClientEditorModal({
   if (!state.open) return null;
 
   const editingClientId = state.editingClientId;
+  const editingClient = clients.find((client) => client.id === editingClientId) || null;
+  // 创建者属于项目权威关系，不是可移除的普通共享成员。新建时当前成员就是创建者。
+  const creatorMembershipId = editingClient?.ownerMembershipId || viewerMembershipId || '';
+  const creator = memberDirectory.find((member) => member.id === creatorMembershipId);
+  const creatorName = creator?.fullName || (creatorMembershipId === viewerMembershipId ? '我' : '创建者');
+  const isViewerCreator = Boolean(
+    editingClientId
+    && creatorMembershipId
+    && viewerMembershipId
+    && creatorMembershipId === viewerMembershipId,
+  );
+  const removableMemberIds = selectedMemberIds.filter((id) => id !== creatorMembershipId);
   const modalDetail = editingClientId ? `editing:${editingClientId}` : 'creating';
   const updateDraft = (patch: Partial<ClientEditorDraft>) => {
     setDraft((previous) => ({
@@ -7008,6 +6997,7 @@ function ClientEditorModal({
   };
 
   const toggleMember = (id: string) => {
+    if (id === creatorMembershipId) return;
     const next = selectedMemberIds.includes(id)
       ? selectedMemberIds.filter((x) => x !== id)
       : [...selectedMemberIds, id];
@@ -7142,8 +7132,14 @@ function ClientEditorModal({
                       className="flex min-h-[40px] w-full items-center justify-between rounded-xl border border-gray-200 bg-white px-3 py-2 text-left transition hover:border-[#5B7BFE]"
                     >
                       <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
-                        {selectedMemberIds.length > 0 ? (
-                          selectedMemberIds.map((id) => {
+                        {creatorMembershipId && (
+                          <span className="inline-flex max-w-full items-center gap-1.5 rounded-full bg-blue-50 px-2.5 py-0.5 text-[12px] text-blue-700 ring-1 ring-inset ring-blue-200">
+                            <span className="truncate">{creatorName}</span>
+                            <span className="text-[10px] font-semibold">创建者</span>
+                          </span>
+                        )}
+                        {removableMemberIds.length > 0 ? (
+                          removableMemberIds.map((id) => {
                             const member = memberDirectory.find((m) => m.id === id);
                             const name = member?.fullName || '成员信息待刷新';
                             return (
@@ -7174,9 +7170,9 @@ function ClientEditorModal({
                               </span>
                             );
                           })
-                        ) : (
+                        ) : !creatorMembershipId ? (
                           <span className="text-[12px] text-gray-400">点击选择同事</span>
-                        )}
+                        ) : null}
                       </div>
                       <ChevronDown
                         size={16}
@@ -7197,7 +7193,7 @@ function ClientEditorModal({
                           {memberOptions.length === 0 ? (
                             <p className="px-2 py-3 text-center text-[12px] text-gray-400">未找到匹配同事</p>
                           ) : (
-                            memberOptions.map((member) => {
+                            memberOptions.filter((member) => member.id !== creatorMembershipId).map((member) => {
                               const checked = selectedMemberIds.includes(member.id);
                               return (
                                 <button
@@ -7282,8 +7278,7 @@ function ClientEditorModal({
           {/* Modal Footer */}
           <div className="px-7 py-4 border-t border-gray-100 flex items-center justify-between gap-3 shrink-0">
             <div className="flex items-center gap-3">
-              {editingClientId && (
-                <>
+              {isViewerCreator && (
                   <button
                     type="button"
                     onClick={() => setDeleteConfirmOpen(true)}
@@ -7291,50 +7286,6 @@ function ClientEditorModal({
                   >
                     删除项目
                   </button>
-                  {/* 全局冷冻开关 = iOS 风 toggle
-                      - 乐观更新本地 hiddenClientIds(立即 UI 响应)
-                      - 调后端 freeze/unfreeze API(持久化 + 自动 job 跳过)
-                      - 失败时由 onFreezeChange 内部回滚 + flash 报错 */}
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={isHidden}
-                    onClick={() => {
-                      const nextHidden = !isHidden;
-                      // 乐观更新:立即把开关切到位置(主组件 effect 会随 clients 刷新同步)
-                      setClientHidden(editingClientId, nextHidden);
-                      onInteractionState(
-                        false,
-                        'client_editor_hide_toggle',
-                        nextHidden
-                          ? `正在全局冷冻 ${draft.name || editingClientId}…`
-                          : `正在解冻 ${draft.name || editingClientId}…`,
-                      );
-                      // 调后端持久化(并 refetch clients 同步真实状态)
-                      void onFreezeChange(editingClientId, nextHidden);
-                    }}
-                    title={isHidden
-                      ? '当前已全局冷冻:所有非工作台面板下拉都不显示。点击恢复正常。'
-                      : '点击全局冷冻:左栏 + 战略陪伴 + 任务 + 资讯 + 计划等所有下拉都会同步隐藏。搜索仍可找回。'}
-                    className="inline-flex items-center gap-2.5 px-2 py-1.5 group"
-                  >
-                    <span className="text-[12px] font-medium text-gray-500 group-hover:text-gray-700 transition-colors">
-                      {isHidden ? '已冷冻项目' : '冷冻项目'}
-                    </span>
-                    <span
-                      className={`relative inline-flex h-[18px] w-[32px] items-center rounded-full transition-colors ${
-                        isHidden ? 'bg-[#5B7BFE]' : 'bg-gray-200'
-                      }`}
-                      aria-hidden
-                    >
-                      <span
-                        className={`inline-block h-[14px] w-[14px] rounded-full bg-white shadow-sm transition-transform ${
-                          isHidden ? 'translate-x-[16px]' : 'translate-x-[2px]'
-                        }`}
-                      />
-                    </span>
-                  </button>
-                </>
               )}
             </div>
             <div className="flex items-center gap-2">
@@ -7367,7 +7318,7 @@ function ClientEditorModal({
             <div className="px-6 pt-5 pb-4 flex items-start justify-between">
               <div className="min-w-0">
                 <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-rose-500">DANGER · 不可恢复</p>
-                <h3 className="mt-1.5 text-[18px] font-light tracking-tight text-gray-900">确认删除客户</h3>
+                <h3 className="mt-1.5 text-[18px] font-light tracking-tight text-gray-900">确认删除项目</h3>
               </div>
               <button
                 type="button"
@@ -7383,7 +7334,7 @@ function ClientEditorModal({
             </div>
             <div className="px-6 pb-5 space-y-4">
               <p className="text-[12px] leading-6 text-gray-600">
-                这会删除当前客户的资料、工作区、问答记录和知识索引,<strong className="text-rose-600">无法恢复</strong>。
+                项目将从所有成员的项目列表中移除，已有项目权限与派生内容随生命周期规则失效，<strong className="text-rose-600">无法恢复</strong>。
               </p>
 
               {/* 影响预览:列出 CASCADE 会清掉的内容数量,让用户看到代价 */}
@@ -7401,7 +7352,7 @@ function ClientEditorModal({
                   <div className={`text-[9px] font-semibold uppercase tracking-[0.18em] ${
                     deletePreview.isDemoClient ? 'text-amber-700' : 'text-rose-600'
                   }`}>
-                    {deletePreview.isDemoClient ? 'Demo · 演示数据' : 'Cascade · 连带删除'}
+                    {deletePreview.isDemoClient ? 'Demo · 演示数据' : 'Impact · 影响范围'}
                   </div>
                   {deletePreview.isDemoClient && (
                     <p className="mt-1 text-[11px] leading-5 text-amber-800">
@@ -7411,20 +7362,8 @@ function ClientEditorModal({
                     </p>
                   )}
                   <ul className="mt-2 space-y-0.5 text-[11.5px] leading-relaxed text-gray-700">
-                    {deletePreview.threadCount > 0 && (
-                      <li>· {deletePreview.threadCount} 个对话线程 + {deletePreview.messageCount} 条问答记录</li>
-                    )}
                     {deletePreview.documentCount > 0 && (
-                      <li>· {deletePreview.documentCount} 篇文档(物理文件也会被清掉)</li>
-                    )}
-                    {deletePreview.dnaCount > 0 && (
-                      <li>· {deletePreview.dnaCount} 条 DNA 词条</li>
-                    )}
-                    {deletePreview.goalCount > 0 && (
-                      <li>· {deletePreview.goalCount} 条目标记录</li>
-                    )}
-                    {deletePreview.meetingCount > 0 && (
-                      <li>· {deletePreview.meetingCount} 条会议记录</li>
+                      <li>· {deletePreview.documentCount} 份组织知识文档将不再通过该项目访问</li>
                     )}
                     {deletePreview.eventLineCount > 0 && (
                       <li>· {deletePreview.eventLineCount} 条事件线</li>
@@ -7432,15 +7371,18 @@ function ClientEditorModal({
                     {deletePreview.taskCount > 0 && (
                       <li>· {deletePreview.taskCount} 个任务</li>
                     )}
-                    {deletePreview.threadCount + deletePreview.documentCount + deletePreview.dnaCount + deletePreview.goalCount + deletePreview.meetingCount + deletePreview.eventLineCount + deletePreview.taskCount === 0 && (
-                      <li className="text-gray-400">· 客户下没有关联数据,删除是安全的</li>
+                    {deletePreview.narrativeCount > 0 && (
+                      <li>· {deletePreview.narrativeCount} 份项目档案或叙事版本</li>
+                    )}
+                    {deletePreview.documentCount + deletePreview.eventLineCount + deletePreview.taskCount + deletePreview.narrativeCount === 0 && (
+                      <li className="text-gray-400">· 项目下没有已登记的关联业务数据</li>
                     )}
                   </ul>
                 </div>
               )}
 
               <p className="text-[12px] leading-6 text-gray-600">
-                请输入客户名称
+                请输入项目名称
                 <span className="mx-1 font-medium text-gray-900">「{targetName}」</span>
                 以确认。
               </p>
@@ -7564,7 +7506,7 @@ function AgentSkillEditorModal({
 
   const handleSave = async () => {
     if (!shortName.trim()) {
-      flashError('请填写 Skill 简称');
+      flashError('请填写模板名称');
       return;
     }
     if (instructionList.length === 0) {
@@ -7612,7 +7554,7 @@ function AgentSkillEditorModal({
         : await createAgentSkill(draft);
       await onSaved(saved);
     } catch (error) {
-      flashError(error instanceof Error ? error.message : '创建 Skill 失败');
+      flashError(error instanceof Error ? error.message : '保存写作模板失败');
     } finally {
       setSaving(false);
     }
@@ -7625,10 +7567,10 @@ function AgentSkillEditorModal({
           <div>
             <div className="flex items-center gap-2 text-[16px] font-bold text-slate-900">
               <Wand2 size={17} className="text-indigo-600" />
-              {targetSkill ? `修改 Skill「${targetSkill.shortName}」` : '创建分析与产出 Skill'}
+              {targetSkill ? `修改写作模板「${targetSkill.shortName}」` : '创建写作模板'}
             </div>
             <p className="mt-1 text-[11.5px] leading-5 text-slate-500">
-              Skill 只扩展当前项目的分析方法和输出结构，不能越过权限或直接写入业务数据。
+              模板用于约束本轮分析方式与表达风格，不会越过权限或直接写入业务数据。
             </p>
           </div>
           <button type="button" onClick={onClose} className="rounded-full p-1.5 text-slate-400 hover:bg-slate-100">
@@ -7638,21 +7580,21 @@ function AgentSkillEditorModal({
         <div className="space-y-4 overflow-y-auto px-6 py-5">
           <div className="grid grid-cols-[180px_1fr] gap-3">
             <label className="space-y-1.5">
-              <span className="text-[11px] font-bold text-slate-600">简称</span>
-              <input value={shortName} onChange={(event) => setShortName(event.target.value)} maxLength={24} placeholder="例如：证据分析" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-[12px] outline-none focus:border-indigo-400" />
+              <span className="text-[11px] font-bold text-slate-600">模板名称</span>
+              <input value={shortName} onChange={(event) => setShortName(event.target.value)} maxLength={24} placeholder="例如：简洁分析" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-[12px] outline-none focus:border-indigo-400" />
             </label>
             <label className="space-y-1.5">
-              <span className="text-[11px] font-bold text-slate-600">用途说明</span>
-              <input value={description} onChange={(event) => setDescription(event.target.value)} maxLength={240} placeholder="这个 Skill 适合解决什么问题" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-[12px] outline-none focus:border-indigo-400" />
+              <span className="text-[11px] font-bold text-slate-600">风格描述</span>
+              <input value={description} onChange={(event) => setDescription(event.target.value)} maxLength={240} placeholder="例如：结论先行、克制、面向管理者" className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-[12px] outline-none focus:border-indigo-400" />
             </label>
           </div>
           <label className="block space-y-1.5">
-            <span className="text-[11px] font-bold text-slate-600">规则（每行一条）</span>
-            <textarea value={instructions} onChange={(event) => setInstructions(event.target.value)} placeholder={'先列出有直接来源支持的事实\n再给出判断并说明依据\n最后说明信息边界'} className="min-h-[130px] w-full resize-y rounded-xl border border-slate-200 px-3 py-2.5 text-[12px] leading-6 outline-none focus:border-indigo-400" />
+            <span className="text-[11px] font-bold text-slate-600">写作与分析要求（每行一条）</span>
+            <textarea value={instructions} onChange={(event) => setInstructions(event.target.value)} placeholder={'结论先行，再说明依据\n避免空泛套话\n信息不足时明确说明边界'} className="min-h-[130px] w-full resize-y rounded-xl border border-slate-200 px-3 py-2.5 text-[12px] leading-6 outline-none focus:border-indigo-400" />
           </label>
           <label className="block space-y-1.5">
-            <span className="text-[11px] font-bold text-slate-600">输出模板（可选）</span>
-            <textarea value={outputTemplate} onChange={(event) => setOutputTemplate(event.target.value)} placeholder={'## 已核实事实\n## 分析判断\n## 信息边界'} className="min-h-[92px] w-full resize-y rounded-xl border border-slate-200 px-3 py-2.5 font-mono text-[11px] leading-5 outline-none focus:border-indigo-400" />
+            <span className="text-[11px] font-bold text-slate-600">风格代表性样本（可选）</span>
+            <textarea value={outputTemplate} onChange={(event) => setOutputTemplate(event.target.value)} placeholder="粘贴一小段能代表该写作风格的文字；系统只模仿表达方式，不照抄其中事实。" className="min-h-[92px] w-full resize-y rounded-xl border border-slate-200 px-3 py-2.5 text-[11px] leading-5 outline-none focus:border-indigo-400" />
           </label>
           <div className="space-y-2 rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
             <div>
@@ -7721,7 +7663,7 @@ function AgentSkillEditorModal({
               </div>
             )}
             <div className="text-[10px] text-slate-500">
-              Skill 不能覆盖系统权限边界，也不会直接修改项目事实或业务数据。
+              写作模板不能覆盖系统权限边界，也不会直接修改项目事实或业务数据。
             </div>
           </div>
         </div>
@@ -8150,6 +8092,7 @@ export default function App() {
   const [authState, setAuthState] = useState<AuthState>(DEFAULT_LOCAL_AUTH_STATE);
   const [departmentOptions, setDepartmentOptions] = useState<DepartmentOption[]>([]);
   const [employeeReviews, setEmployeeReviews] = useState<EmployeeRecord[]>([]);
+  const [organizationMemberCandidates, setOrganizationMemberCandidates] = useState<MentionCandidate[]>([]);
   const [settingsState, setSettingsState] = useState<AppSettings | null>(null);
   const [orgAiRuntimeStatus, setOrgAiRuntimeStatus] = useState<OrgAiRuntimeStatus | null>(null);
   const [orgAiRuntimeSyncing, setOrgAiRuntimeSyncing] = useState(false);
@@ -8345,46 +8288,8 @@ export default function App() {
   ]);
 
   const [clients, setClients] = useState<ClientSummary[]>([]);
-  // 全局冷冻订阅 — 本地 hiddenClientIds Set 是 clients[].isFrozen 的镜像
-  // 当 clients refetch 后,把 isFrozen=true 的客户同步进 Set;反之则移除
-  // 这样所有依赖 isClientHidden() 的代码(下拉/列表)立刻反映后端真实状态
-  const [hiddenClientsVersion, setHiddenClientsVersion] = useState(0);
-  useEffect(() => {
-    const listener = () => setHiddenClientsVersion((v) => v + 1);
-    hiddenClientsListeners.add(listener);
-    return () => {
-      hiddenClientsListeners.delete(listener);
-    };
-  }, []);
-  // 把 clients[].isFrozen 同步进本地 Set(后端是 SOT)
-  // 注意:这个 effect 之前有一个 issue,当 clients 引用变(refetch)时会触发 listener,
-  //       而 listener setHiddenClientsVersion 让 dataCenterClients useMemo 重算 → 新引用,
-  //       下游 effect 看到新 deps 又跑 → 形成连锁。
-  // 防御:用 ref 缓存"上次同步过的"clients 引用,引用相同就跳过整个 effect 体
-  const lastSyncedClientsRef = useRef<ClientSummary[] | null>(null);
-  useEffect(() => {
-    if (lastSyncedClientsRef.current === clients) return;
-    lastSyncedClientsRef.current = clients;
-    let dirty = false;
-    for (const client of clients) {
-      const backendFrozen = Boolean(client.isFrozen);
-      const localHidden = hiddenClientIds.has(client.id);
-      if (backendFrozen !== localHidden) {
-        if (backendFrozen) hiddenClientIds.add(client.id);
-        else hiddenClientIds.delete(client.id);
-        dirty = true;
-      }
-    }
-    if (dirty) {
-      _persistHiddenSet(hiddenClientIds);
-      for (const listener of hiddenClientsListeners) listener();
-    }
-  }, [clients]);
-  // P7：参与数据中心的 client 子集（隐藏掉勾了"仅工作台"的项目，例如"新思考"/"顾源源文章"
-  // 这种资料筐）。客户工作台、项目编辑 modal 继续用全量 clients；战略陪伴 / 咨询 / 情报 /
-  // 任务的客户 selector 使用这个 memo，避免把资料筐客户暴露给数据中心计算视图。
-  // 增强:用户主动隐藏(isClientHidden)的项目也从这里过滤掉,实现"全局冷冻";
-  //       但当前正在浏览的 currentClientId 即使被隐藏也保留(避免切换中上下文丢失)
+  // 参与数据中心的项目子集只遵循正式的“参与数据中心”字段；项目冷冻功能已撤下，
+  // 不再用本机隐藏集合改变工作台、任务或战略模块可见性。
   const [currentClientId, setCurrentClientId] = useState<string>('');
   const currentClientIdRef = useRef('');
   const workspaceLoadGateRef = useRef(new ScopedAsyncGate());
@@ -8417,16 +8322,8 @@ export default function App() {
     writeStoredClientId(window.localStorage, { sandboxId, organizationId }, currentClientId);
   }, [authState.user?.organizationId, currentClientId, workspacesState?.activeSandboxId]);
   const dataCenterClients = useMemo(() => {
-    void hiddenClientsVersion;
-    // 冷冻的项目对所有非工作台 view 不可见 — 战略陪伴/资讯/计划/任务下拉统统过滤
-    // 例外:当前正在浏览的 currentClientId 即使被冷冻也保留(避免切换 view 时上下文丢失,
-    //       以及防止某些 effect 在 dataCenterClients 突然不含 currentClient 时陷入死循环)
-    return clients.filter((c) => {
-      if (c.isDataCenterIncluded === false) return false;
-      if (isClientHidden(c.id) && c.id !== currentClientId) return false;
-      return true;
-    });
-  }, [clients, hiddenClientsVersion, currentClientId]);
+    return clients.filter((client) => client.isDataCenterIncluded !== false);
+  }, [clients]);
   const [workspaceClientUiState, dispatchWorkspaceClientUi] = useReducer(
     workspaceClientUiReducer,
     initialWorkspaceClientUiState,
@@ -8802,12 +8699,16 @@ export default function App() {
   const [miniMode, setMiniMode] = useState(false);
   const miniData = useMemo(() => buildMiniData(tasks, new Date().toISOString().slice(0, 10)), [tasks]);
   const enterMiniMode = useCallback(() => {
-    setMiniMode(true);
-    void window.yiyuWorkbench?.setMiniMode?.(true);
+    void (async () => {
+      await window.yiyuWorkbench?.setMiniMode?.(true, 360);
+      setMiniMode(true);
+    })();
   }, []);
   const exitMiniMode = useCallback(() => {
-    setMiniMode(false);
-    void window.yiyuWorkbench?.setMiniMode?.(false);
+    void (async () => {
+      await window.yiyuWorkbench?.setMiniMode?.(false);
+      setMiniMode(false);
+    })();
   }, []);
   const handleMiniToggleTask = useCallback(async (id: string) => {
     if (workspaceWritesBlocked) {
@@ -8895,6 +8796,31 @@ export default function App() {
     && workspaceRuntimeStatus !== 'needs_login'
     && workspaceRuntimeStatus !== 'identity_error',
   );
+  useEffect(() => {
+    const sandboxId = workspacesState?.activeSandboxId || '';
+    if (!canLoadCurrentWorkspaceBusinessData || !sandboxId) {
+      setOrganizationMemberCandidates([]);
+      return undefined;
+    }
+    let cancelled = false;
+    setOrganizationMemberCandidates([]);
+    void getMentionCandidates('')
+      .then((items) => {
+        if (!cancelled && sandboxId === (activeSandboxIdRef.current || workspacesState?.activeSandboxId || '')) {
+          setOrganizationMemberCandidates(items || []);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setOrganizationMemberCandidates([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    authState.user?.id,
+    canLoadCurrentWorkspaceBusinessData,
+    workspacesState?.activeSandboxId,
+  ]);
   const isActiveYiyuOfficialWorkspace = isYiyuOfficialWorkspaceRecord(activeWorkspaceRecord);
   const currentMembershipStatus = getEffectiveMembershipStatus(authState);
   const canShowMaintenanceSyncPanel = Boolean(
@@ -9474,7 +9400,6 @@ export default function App() {
       updatedAt: 0,
     };
     activeWorkingDocumentsClientRef.current = '';
-    lastSyncedClientsRef.current = null;
     dispatchWorkspaceClientUi({ type: 'resetAll' });
     setClients([]);
     setCurrentClientId('');
@@ -11226,12 +11151,7 @@ export default function App() {
     if (!canApply()) return;
     console.info(`[bootstrap] loadClientBlock fetched clients=${clientItems.length}`);
     setClients(clientItems);
-    // 选客户优先级:
-    //   1. 显式 nextClientId(用户刚编辑/解冻/搜索点击,即使是冷冻的也尊重)
-    //   2. 当前 currentClientId — 但若它已被冷冻则跳过(否则刚冷冻当前项目又跳回来,死循环)
-    //   3. 第一个非冷冻客户
-    //   4. 实在没非冻就 fallback 全量第一个(防止所有项目都被冻)
-    const isUsable = (item: ClientSummary) => !item.isFrozen;
+    // 选项目优先级：显式目标、上次选择、当前项目、首个可见项目。
     const persistedClientId = readStoredClientId(window.localStorage, {
       sandboxId: startedSandboxId,
       organizationId: options?.organizationId || authState.user?.organizationId,
@@ -11239,12 +11159,11 @@ export default function App() {
     const preferredClientId =
       (nextClientId && clientItems.some((item) => item.id === nextClientId) && nextClientId) ||
       (persistedClientId
-        && clientItems.some((item) => item.id === persistedClientId && isUsable(item))
+        && clientItems.some((item) => item.id === persistedClientId)
         && persistedClientId) ||
       (currentClientId
-        && clientItems.some((item) => item.id === currentClientId && isUsable(item))
+        && clientItems.some((item) => item.id === currentClientId)
         && currentClientId) ||
-      clientItems.find(isUsable)?.id ||
       clientItems[0]?.id ||
       '';
     const targetClientId = preferredClientId;
@@ -11509,6 +11428,13 @@ export default function App() {
     if (!editingClientId) return;
     const targetClient = clients.find((client) => client.id === editingClientId);
     const targetName = targetClient?.name || draft.name.trim() || '该客户';
+    if (
+      !targetClient?.ownerMembershipId
+      || targetClient.ownerMembershipId !== viewerAuthorization?.membershipId
+    ) {
+      flash('error', '只有项目创建者可以删除项目');
+      return;
+    }
     if (confirmInput.trim() !== targetName) {
       flash('error', '项目名称不匹配，已取消删除');
       return;
@@ -11808,8 +11734,11 @@ export default function App() {
     ].join('|');
     const cached = organizationPlanningCacheRef.current;
     const hasCurrentScopeCache = cached.scopeKey === scopeKey && cached.loadedAt > 0;
-    const cacheIsFresh = hasCurrentScopeCache && Date.now() - cached.loadedAt < 5 * 60 * 1000;
-    if (!options?.force && cacheIsFresh) {
+    // 组织计划是低频变化的权威快照。页面切换本身不构成失效条件；保存计划、
+    // 任务改挂计划、删除任务和工作空间切换已经会显式 force/清空缓存。
+    // 因此只要仍在同一 sandbox + membership + organization，就直接复用，
+    // 避免每隔五分钟或反复切页时重新出现整页加载。
+    if (!options?.force && hasCurrentScopeCache) {
       setOrganizationPlanningLoadError('');
       setIsOrganizationPlanningLoading(false);
       return {
@@ -14118,6 +14047,32 @@ export default function App() {
       workspacesState?.activeSandboxId || 'local',
       currentTaskMembershipId || 'anonymous',
     ].join(':');
+    const meetingMigrationInFlightRef = useRef(new Set<string>());
+    useEffect(() => {
+      if (workspaceWritesBlocked || !currentTaskMembershipId || customerMeetings.length === 0) return;
+      const pending = customerMeetings.filter((meeting) => (
+        meeting.status !== 'cancelled'
+        && !meetingMigrationInFlightRef.current.has(meeting.id)
+      ));
+      if (pending.length === 0) return;
+      let cancelled = false;
+      pending.forEach((meeting) => meetingMigrationInFlightRef.current.add(meeting.id));
+      void Promise.allSettled(pending.map((meeting) => gc06Api.migrateMeetingToTask(meeting)))
+        .then((results) => {
+          if (cancelled) return;
+          const migratedIds = new Set(
+            results.flatMap((result, index) => (
+              result.status === 'fulfilled' ? [pending[index].id] : []
+            )),
+          );
+          if (migratedIds.size > 0) {
+            setCustomerMeetings((previous) => previous.filter((meeting) => !migratedIds.has(meeting.id)));
+            void loadTaskBlock();
+          }
+        })
+        .catch(() => undefined);
+      return () => { cancelled = true; };
+    }, [currentTaskMembershipId, customerMeetings, workspaceWritesBlocked]);
     const [taskPriorityFilter, setTaskPriorityFilter] = useRuntimeUiSessionState<TaskPriorityFilter>(`${taskUiSessionScope}:list:priority`, 'all');
     const [taskListTimeRangeFilter, setTaskListTimeRangeFilter] = useRuntimeUiSessionState<TaskTimeRangeFilter>(`${taskUiSessionScope}:list:range`, 'all');
     const [taskListCustomStartDate, setTaskListCustomStartDate] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:start`, '');
@@ -14139,8 +14094,6 @@ export default function App() {
     });
     const [isBatchBusy, setIsBatchBusy] = useState(false);
     const [hideCompletedInList, setHideCompletedInList] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:hide-completed`, false);
-    const [hideOverdueInList, setHideOverdueInList] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:hide-overdue`, false);
-    const [hidePersonalScheduleInList, setHidePersonalScheduleInList] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:hide-personal`, false);
     const [batchDueDate, setBatchDueDate] = useState('');
     const [batchEventLineId, setBatchEventLineId] = useState('');
     const [inboxTimeSort, setInboxTimeSort] = useRuntimeUiSessionState<TaskTimeSort>(`${taskUiSessionScope}:inbox:sort`, 'newest');
@@ -14327,7 +14280,6 @@ export default function App() {
     const [meetingContextBriefs, setMeetingContextBriefs] = useState<Record<string, MeetingContextBrief>>({});
     const [loadingMeetingContextBriefIds, setLoadingMeetingContextBriefIds] = useState<string[]>([]);
     const [proposalBusyState, setProposalBusyState] = useState<Record<string, string>>({});
-    const [selectedInboxIds, setSelectedInboxIds] = useRuntimeUiSessionState<string[]>(`${taskUiSessionScope}:inbox:selected`, []);
     const [transitioningInboxTaskIds, setTransitioningInboxTaskIds] = useState<string[]>([]);
     const [isRejectModalOpen, setIsRejectModalOpen] = useState(false);
     const [rejectingTaskIds, setRejectingTaskIds] = useState<string[]>([]);
@@ -14384,8 +14336,8 @@ export default function App() {
         details.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }, 180);
     };
-    const [hidePersonalTasks, setHidePersonalTasks] = useRuntimeUiSessionState(`${taskUiSessionScope}:calendar:hide-personal`, false);
-    const [reviewScope, setReviewScope] = useRuntimeUiSessionState<'work' | 'personal'>(`${taskUiSessionScope}:review:scope`, effectiveTaskSettings.defaultReviewScope);
+    const [calendarRoleFilter, setCalendarRoleFilter] = useRuntimeUiSessionState<'creator' | 'owner' | 'collaborator'>(`${taskUiSessionScope}:calendar:role-filter`, 'owner');
+    const [reviewScope, setReviewScope] = useRuntimeUiSessionState<'work' | 'personal'>(`${taskUiSessionScope}:review:scope`, 'work');
     const [activeReviewTab, setActiveReviewTab] = useRuntimeUiSessionState<'overview' | 'events' | 'signals'>(`${taskUiSessionScope}:review:tab`, 'events');
     const defaultReviewPerspective = useMemo(
       () => resolveDefaultReviewPerspectiveForUser(currentSessionUser),
@@ -15015,8 +14967,8 @@ export default function App() {
     }, [latestReview, selectedReviewWeekLabel, reviewForm.weekLabel, workReviewItems, personalReviewItems]);
 
     useEffect(() => {
-      setReviewScope(effectiveTaskSettings.defaultReviewScope);
-    }, [effectiveTaskSettings.defaultReviewScope]);
+      if (reviewScope !== 'work') setReviewScope('work');
+    }, [reviewScope, setReviewScope]);
 
     useEffect(() => {
       if (!isTaskModalOpen) {
@@ -15196,8 +15148,6 @@ export default function App() {
     const rawListTasks = sortTasksForListView(
       baseListTasks
         .filter((task) => !hideCompletedInList || task.status !== 'done')
-        .filter((task) => !hideOverdueInList || !isTaskOverdue(task))
-        .filter((task) => !hidePersonalScheduleInList || task.scopeMode !== 'PERSONAL_ONLY')
         .filter((task) => taskPriorityFilter === 'all' || task.priority === taskPriorityFilter)
         .filter((task) => taskMatchesTimeRange(task, taskListTimeRangeFilter, taskListCustomStartDate, taskListCustomEndDate)),
     );
@@ -15224,12 +15174,10 @@ export default function App() {
     }, [activeFormalTaskView, rawListTasks, taskSearchQuery]);
     const visibleListTasks = listTasks;
     const visibleListMeetings = useMemo(() => {
-      const startOfToday = startOfCalendarDay(new Date()).getTime();
       const query = taskSearchQuery.trim().toLowerCase();
       return customerMeetings
         .filter((meeting) => meeting.status !== 'cancelled')
         .filter((meeting) => !hideCompletedInList || meeting.status !== 'completed')
-        .filter((meeting) => !hideOverdueInList || meeting.status === 'completed' || new Date(meeting.startsAt).getTime() >= startOfToday)
         .filter(() => taskPriorityFilter === 'all')
         .filter((meeting) => meetingMatchesTimeRange(
           meeting,
@@ -15246,7 +15194,6 @@ export default function App() {
       clients,
       customerMeetings,
       hideCompletedInList,
-      hideOverdueInList,
       taskListCustomEndDate,
       taskListCustomStartDate,
       taskListTimeRangeFilter,
@@ -15289,14 +15236,6 @@ export default function App() {
       });
     }, [visibleListMeetingIds]);
     useEffect(() => {
-      const availableIds = new Set(actionableInboxTasks.map((task) => task.id));
-      setSelectedInboxIds((prev) => {
-        if (prev.length === 0) return prev;
-        const next = prev.filter((id) => availableIds.has(id));
-        return next.length === prev.length ? prev : next;
-      });
-    }, [actionableInboxTasks]);
-    useEffect(() => {
       if (taskViewMode !== 'list') return;
       const pendingClientIds = Array.from(
         new Set(
@@ -15318,7 +15257,14 @@ export default function App() {
       if (task.status === 'rejected') return false;
       if (task.status === 'inbox' || task.viewerInboxStatus === 'pending') return false;
       if (isTaskInboxNotification(task)) return false;
-      if (hidePersonalTasks && task.scopeMode === 'PERSONAL_ONLY') return false;
+      if (!currentTaskMembershipId) return false;
+      if (calendarRoleFilter === 'creator' && task.creatorId !== currentTaskMembershipId) return false;
+      if (calendarRoleFilter === 'owner' && task.ownerId !== currentTaskMembershipId) return false;
+      if (calendarRoleFilter === 'collaborator' && !task.collaborators.some((collaborator) => (
+        collaborator.userId === currentTaskMembershipId
+        && !collaborator.isOwner
+        && collaborator.inboxStatus === 'accepted'
+      ))) return false;
       return true;
     });
     const calendarTasks = useMemo(() => {
@@ -15328,7 +15274,28 @@ export default function App() {
         activeFormalTaskView,
       );
     }, [activeFormalTaskView, baseCalendarTasks]);
-    const isAllSelected = actionableInboxTasks.length > 0 && selectedInboxIds.length === actionableInboxTasks.length;
+    const calendarMeetings = useMemo(() => {
+      if (!currentTaskMembershipId) return [];
+      return customerMeetings.filter((meeting) => {
+        if (meeting.status === 'cancelled') return false;
+        if (calendarRoleFilter === 'creator') {
+          return meeting.createdByMembershipId === currentTaskMembershipId;
+        }
+        if (calendarRoleFilter === 'owner') {
+          return meeting.organizerMembershipId === currentTaskMembershipId
+            || meeting.collaborators?.some((collaborator) => (
+              collaborator.membershipId === currentTaskMembershipId
+              && collaborator.roleKey === 'owner'
+              && collaborator.inboxStatus === 'accepted'
+            ));
+        }
+        return meeting.collaborators?.some((collaborator) => (
+          collaborator.membershipId === currentTaskMembershipId
+          && collaborator.roleKey === 'collaborator'
+          && collaborator.inboxStatus === 'accepted'
+        ));
+      });
+    }, [calendarRoleFilter, currentTaskMembershipId, customerMeetings]);
     const toggleInboxSection = (section: 'actionable' | 'waiting') => {
       setInboxSectionOpen((prev) => ({ ...prev, [section]: !prev[section] }));
     };
@@ -15518,7 +15485,6 @@ export default function App() {
       () => clients.filter((client) => (
         Boolean((client.id || '').trim())
         && client.type !== 'organization_workspace'
-        && client.isFrozen !== true
       )),
       [clients],
     );
@@ -17165,7 +17131,7 @@ export default function App() {
       const ownerName = ownerCollaborator?.fullName || currentOperatorName;
       const payload: TaskMutationPayload = {
         expectedVersion: tasks.find((item: Task) => item.id === editingTask.id)?.version,
-        scopeMode: editingTask.scopeMode,
+        scopeMode: 'COLLAB_SHARED',
         title: editingTask.title.trim(),
         desc: editingTask.desc.trim(),
         priority: editingTask.priority,
@@ -17176,13 +17142,13 @@ export default function App() {
         dueDate: deadlineAt || scheduledStartAt,
         startDate: scheduledStartAt,
         durationMinutes: schedule.durationMinutes ?? editingTask.durationMinutes,
-        clientId: isEditingTaskPersonal ? null : (editingTask.clientId || null),
-        eventLineId: isEditingTaskPersonal ? null : (editingTask.eventLineId || null),
-        planningCycleId: !isEditingTaskPersonal && editingTask.planLinkSource === 'manager'
+        clientId: editingTask.clientId || null,
+        eventLineId: editingTask.eventLineId || null,
+        planningCycleId: editingTask.planLinkSource === 'manager'
           ? editingTask.planLinkPlanItemId || null
           : null,
-        projectModuleId: isEditingTaskPersonal ? null : (editingTask.projectModuleId || null),
-        projectFlowId: isEditingTaskPersonal ? null : (editingTask.projectFlowId || null),
+        projectModuleId: editingTask.projectModuleId || null,
+        projectFlowId: editingTask.projectFlowId || null,
         ddl: resolvedDdl,
         ownerId,
         ownerName,
@@ -17785,7 +17751,7 @@ export default function App() {
       }
     };
 
-    const isEditingTaskPersonal = editingTask.scopeMode === 'PERSONAL_ONLY';
+    const isEditingTaskPersonal = false;
 
     const ensureTagSelected = async (name: string, scope: 'org' | 'self' = defaultTagScope, color?: string) => {
       void name;
@@ -17891,7 +17857,7 @@ export default function App() {
         id: task.id,
         recordMode: 'task',
         recordVersion: task.version ?? null,
-        scopeMode: task.scopeMode || (isPrivateTask(task) ? 'PERSONAL_ONLY' : 'COLLAB_SHARED'),
+        scopeMode: 'COLLAB_SHARED',
         scopeModeTouched: true,
         title: task.title,
         desc: task.desc,
@@ -19290,7 +19256,6 @@ export default function App() {
       const taskIds = Array.from(new Set(idsToConfirm)).filter(Boolean);
       if (taskIds.length === 0) return;
       setTransitioningInboxTaskIds((prev) => Array.from(new Set([...prev, ...taskIds])));
-      setSelectedInboxIds((prev) => prev.filter((id) => !taskIds.includes(id)));
       try {
         const result = await handleTaskInboxBatch(taskIds);
         const handledCount = result.acceptedIds.length + result.acknowledgedIds.length;
@@ -19310,7 +19275,6 @@ export default function App() {
         }
       } catch (error) {
         setTransitioningInboxTaskIds((prev) => prev.filter((id) => !taskIds.includes(id)));
-        setSelectedInboxIds((prev) => Array.from(new Set([...prev, ...taskIds])));
         flash('error', error instanceof Error ? error.message : '批量接受/已阅失败');
       }
     };
@@ -19341,6 +19305,52 @@ export default function App() {
         flash('error', error instanceof Error ? error.message : '会议邀请处理失败');
       } finally {
         setTransitioningInboxTaskIds((previous) => previous.filter((id) => id !== meeting.id));
+      }
+    };
+
+    const handleAcceptAllInboxItems = async () => {
+      if (!guardWorkspaceWrite('处理协作收件箱')) return;
+      const taskIds = actionableInboxTasks.map((task) => task.id);
+      const meetingsToAccept = filteredInboundPendingMeetings.filter((meeting) => {
+        const collaboration = meetingViewerCollaboration(meeting, currentTaskMembershipId);
+        return collaboration?.inboxStatus === 'pending';
+      });
+      const recordIds = [...taskIds, ...meetingsToAccept.map((meeting) => meeting.id)];
+      if (!recordIds.length) return;
+      setTransitioningInboxTaskIds((previous) => [...new Set([...previous, ...recordIds])]);
+      try {
+        const taskResult = taskIds.length ? await handleTaskInboxBatch(taskIds) : null;
+        const meetingResults = await Promise.allSettled(
+          meetingsToAccept.map((meeting) => {
+            const collaboration = meetingViewerCollaboration(meeting, currentTaskMembershipId);
+            return gc06Api.transitionMeetingCollaboration(
+              meeting,
+              'accept',
+              collaboration?.version || 1,
+            );
+          }),
+        );
+        const acceptedMeetings = meetingResults
+          .filter((item): item is PromiseFulfilledResult<{ meeting: GC06Meeting }> => item.status === 'fulfilled')
+          .map((item) => item.value.meeting);
+        if (acceptedMeetings.length) {
+          const acceptedById = new Map(acceptedMeetings.map((meeting) => [meeting.id, meeting]));
+          setCustomerMeetings((previous) => previous.map((meeting) => acceptedById.get(meeting.id) || meeting));
+        }
+        await loadTaskBlock();
+        const handledTasks = (taskResult?.acceptedIds.length || 0) + (taskResult?.acknowledgedIds.length || 0);
+        const failedMeetings = meetingResults.length - acceptedMeetings.length;
+        const parts = [
+          handledTasks ? `已处理 ${handledTasks} 条任务` : '',
+          acceptedMeetings.length ? `已接受 ${acceptedMeetings.length} 场会议` : '',
+          failedMeetings ? `${failedMeetings} 场会议未处理` : '',
+        ].filter(Boolean);
+        if (handledTasks || acceptedMeetings.length) flash('success', parts.join('，'));
+        if (!handledTasks && !acceptedMeetings.length) flash('error', '当前记录均未能处理，请逐条查看原因。');
+      } catch (error) {
+        flash('error', error instanceof Error ? error.message : '批量接受/已阅失败');
+      } finally {
+        setTransitioningInboxTaskIds((previous) => previous.filter((id) => !recordIds.includes(id)));
       }
     };
 
@@ -19427,7 +19437,6 @@ export default function App() {
         return;
       }
       setTransitioningInboxTaskIds((prev) => Array.from(new Set([...prev, ...taskIds])));
-      setSelectedInboxIds((prev) => prev.filter((id) => !taskIds.includes(id)));
       setRejectingTaskIds([]);
       setRejectReason('');
       const results = await Promise.allSettled(taskIds.map((id) => rejectTask(id, submittedReason)));
@@ -19471,7 +19480,7 @@ export default function App() {
         notifyGrowthRefresh();
         setExpandedReviewGroupId(null);
         await loadTaskBlock();
-        flash('success', reviewScope === 'work' ? '本周复盘已更新。' : '成长复盘已更新。');
+        flash('success', '本周复盘已更新。');
       } catch (error) {
         flash('error', error instanceof Error ? error.message : '生成复盘草稿失败');
       } finally {
@@ -19727,8 +19736,8 @@ export default function App() {
     }
 
     return (
-      <div className="mx-auto w-full min-w-0 h-full flex flex-col pt-10 md:pt-12 pb-20 max-w-7xl px-5 lg:px-8 relative">
-        <div className="window-no-drag flex justify-between items-center mb-8 shrink-0">
+      <div className="mx-auto w-full min-w-0 h-full max-w-7xl flex flex-col px-5 pt-6 pb-8 md:pt-8 lg:px-8 relative">
+        <div className="window-no-drag flex justify-between items-center mb-5 shrink-0">
           <div className="flex items-center gap-4">
             <h1 className="text-[20px] lg:text-[24px] font-bold text-gray-900 tracking-tight">任务与日程</h1>
             {(() => {
@@ -19879,27 +19888,14 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setHideCompletedInList((prev) => !prev)}
-                    className={`rounded-2xl border px-3 py-2 text-[12px] font-bold transition-colors ${
-                      hideCompletedInList
-                        ? 'border-amber-200 bg-amber-50 text-amber-700'
-                        : 'border-gray-200 bg-white text-gray-500 hover:border-[#C9D6FF] hover:text-[#5B7BFE]'
-                    }`}
+                    role="switch"
+                    aria-checked={hideCompletedInList}
+                    className="inline-flex items-center gap-2 rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] font-bold text-gray-600"
                   >
-                    {hideCompletedInList ? '显示已完成' : '隐藏已完成'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setHideOverdueInList((prev) => !prev)}
-                    className={`rounded-2xl border px-3 py-2 text-[12px] font-bold transition-colors ${hideOverdueInList ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-gray-200 bg-white text-gray-500 hover:border-[#C9D6FF] hover:text-[#5B7BFE]'}`}
-                  >
-                    {hideOverdueInList ? '显示逾期' : '隐藏逾期'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setHidePersonalScheduleInList((prev) => !prev)}
-                    className={`rounded-2xl border px-3 py-2 text-[12px] font-bold transition-colors ${hidePersonalScheduleInList ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-gray-200 bg-white text-gray-500 hover:border-[#C9D6FF] hover:text-[#5B7BFE]'}`}
-                  >
-                    {hidePersonalScheduleInList ? '显示个人日程' : '隐藏个人日程'}
+                    <span>隐藏已完成</span>
+                    <span className={`relative inline-flex h-5 w-9 rounded-full transition-colors ${hideCompletedInList ? 'bg-[#5B7BFE]' : 'bg-gray-200'}`}>
+                      <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${hideCompletedInList ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+                    </span>
                   </button>
                   {taskListTimeRangeFilter === 'custom' && (
                     <>
@@ -20881,10 +20877,9 @@ export default function App() {
                         <span className="text-[13px] font-semibold text-gray-800">待我处理</span>
                         <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-bold text-blue-700">{actionableInboxTasks.length + filteredInboundPendingMeetings.length}</span>
                       </div>
-                      {actionableInboxTasks.length > 0 && (
+                      {actionableInboxTasks.length + filteredInboundPendingMeetings.length > 0 && (
                         <div className="flex items-center gap-2" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
-                          <Button onClick={() => setSelectedInboxIds(isAllSelected ? [] : actionableInboxTasks.map((task) => task.id))}>{isAllSelected ? '取消全选' : '全选'}</Button>
-                          <Button primary onClick={() => void handleConfirmTasks(selectedInboxIds.length ? selectedInboxIds : actionableInboxTasks.map((task) => task.id))}>
+                          <Button primary onClick={() => void handleAcceptAllInboxItems()}>
                             批量接受/已阅
                           </Button>
                         </div>
@@ -20899,14 +20894,6 @@ export default function App() {
                           const statusLabel = isOwnerAction ? '待接受' : '待阅';
                           return (
                             <div key={task.id} className="relative flex items-start gap-3 rounded-xl bg-white px-5 py-3.5 ring-1 ring-inset ring-gray-100 before:absolute before:bottom-3.5 before:left-0 before:top-3.5 before:w-[3px] before:rounded-r-full before:bg-blue-400/60">
-                              <input
-                                type="checkbox"
-                                checked={selectedInboxIds.includes(task.id)}
-                                onChange={(event) => setSelectedInboxIds((prev) => (
-                                  event.target.checked ? [...prev, task.id] : prev.filter((item) => item !== task.id)
-                                ))}
-                                className="mt-1 h-4 w-4 rounded border-gray-300 text-[#5B7BFE] focus:ring-[#5B7BFE]"
-                              />
                               <div className="min-w-0 flex-1">
                                 <div className="mb-2 flex flex-wrap items-center gap-2">
                                   <span className="text-[14px] font-medium tracking-tight text-gray-900">{task.title}</span>
@@ -21039,7 +21026,7 @@ export default function App() {
               <TaskCalendarView
                 uiSessionScopeKey={`${taskUiSessionScope}:calendar`}
                 tasks={calendarTasks}
-                meetings={customerMeetings}
+                meetings={calendarMeetings}
                 clientColorById={clientColorById}
                 currentUserId={currentTaskMembershipId}
                 calendarDisplayMode={taskCalendarDisplayMode}
@@ -21060,8 +21047,8 @@ export default function App() {
                 onApproveTaskReview={handleApproveTaskReview}
                 onReturnTaskReview={handleReturnTaskReview}
                 isTaskOverdue={isTaskOverdue}
-                showCollaborativeTasks={hidePersonalTasks}
-                onToggleCollaborativeTasks={() => setHidePersonalTasks((prev) => !prev)}
+                roleFilter={calendarRoleFilter}
+                onRoleFilterChange={setCalendarRoleFilter}
               />
             </div>
           )}
@@ -21655,34 +21642,6 @@ export default function App() {
               <div className="flex items-end justify-between gap-6 py-5 shrink-0">
                 <div className="flex items-baseline gap-6">
                   <h1 className="text-[26px] font-light tracking-tight text-gray-900">周复盘</h1>
-                  <div className="flex items-center gap-5 pb-1">
-                    <button
-                      type="button"
-                      onClick={() => setReviewScope('work')}
-                      className={`text-[12px] font-medium tracking-wide transition-colors ${
-                        reviewScope === 'work'
-                          ? 'text-gray-900 border-b-[1.5px] border-gray-900 pb-0.5'
-                          : 'text-gray-400 hover:text-gray-700'
-                      }`}
-                    >
-                      组织复盘
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => { if (!reviewPerspectiveRequiresWorkScope) setReviewScope('personal'); }}
-                      disabled={reviewPerspectiveRequiresWorkScope}
-                      title={reviewPerspectiveRequiresWorkScope ? '组织视角和部门视角只展示工作复盘' : undefined}
-                      className={`text-[12px] font-medium tracking-wide transition-colors ${
-                        reviewScope === 'personal' && !reviewPerspectiveRequiresWorkScope
-                          ? 'text-gray-900 border-b-[1.5px] border-gray-900 pb-0.5'
-                          : reviewPerspectiveRequiresWorkScope
-                            ? 'cursor-not-allowed text-gray-200'
-                            : 'text-gray-400 hover:text-gray-700'
-                      }`}
-                    >
-                      成长复盘
-                    </button>
-                  </div>
                 </div>
 
                 <div className="flex items-center gap-8">
@@ -22001,13 +21960,9 @@ export default function App() {
                 <div className="max-w-5xl pt-10 pb-20">
                   <div className="flex items-baseline justify-between mb-10">
                     <div>
-                      <h2 className="text-[20px] font-light tracking-tight text-gray-900">
-                        {reviewScope === 'work' ? '事件复盘' : '成长复盘'}
-                      </h2>
+                      <h2 className="text-[20px] font-light tracking-tight text-gray-900">事件复盘</h2>
                       <p className="mt-1 text-[12px] text-gray-400 max-w-xl leading-relaxed">
-                        {reviewScope === 'work'
-                          ? '系统按事件线归并相近任务，真正的复盘判断由你写'
-                          : '成长事项按事件线归并，避免重复围绕同一件事'}
+                        系统按事件线归并相近任务，真正的复盘判断由你写
                       </p>
                     </div>
                     <span className="text-[11px] tabular-nums text-gray-400">
@@ -22019,13 +21974,9 @@ export default function App() {
 
                   {activeReviewGroups.length === 0 && (
                     <div className="py-24 text-center">
-                      <p className="text-[14px] font-semibold text-gray-700">
-                        {reviewScope === 'work' ? '本周尚无可复盘的任务' : '本周尚无带私人标签的任务'}
-                      </p>
+                      <p className="text-[14px] font-semibold text-gray-700">本周尚无可复盘的任务</p>
                       <p className="mt-3 text-[12px] leading-relaxed text-gray-400 max-w-md mx-auto">
-                        {reviewScope === 'work'
-                          ? '先在任务列表推进本周的工作，完成的任务会自动出现在这里。'
-                          : '给任务添加私人标签后，它会自动进入成长复盘。'}
+                        先在任务列表推进本周的工作，完成的任务会自动出现在这里。
                       </p>
                     </div>
                   )}
@@ -22353,7 +22304,7 @@ export default function App() {
                   ) : (
                     <>
                       <Sparkles size={13} strokeWidth={2} />
-                      <span>{reviewScope === 'work' ? '生成周复盘' : '生成成长复盘'}</span>
+                      <span>生成周复盘</span>
                     </>
                   )}
                 </button>
@@ -23936,67 +23887,6 @@ export default function App() {
 
                 <div className="w-[340px] min-h-0 flex-shrink-0 overflow-y-auto border-l border-gray-100 bg-gray-50/30">
                   <div className="space-y-4 border-b border-gray-100 p-5">
-                    {editingTask.recordMode === 'task' && <div className="flex rounded-lg bg-gray-100 p-1">
-                      {([
-                        ['COLLAB_SHARED', '协作任务', Users],
-                        ['PERSONAL_ONLY', '个人日程', User],
-                      ] as const).map(([value, label, Icon]) => {
-                        const active = editingTask.scopeMode === value;
-                        return (
-                          <button
-                            key={value}
-                            type="button"
-                            onClick={() =>
-                              setEditingTask((prev) => {
-                                if (prev.scopeMode === value) return prev;
-                                if (value === 'PERSONAL_ONLY') {
-                                  const personalDefaultListId = resolveDefaultListId('personal');
-                                  return {
-                                    ...prev,
-                                    scopeMode: 'PERSONAL_ONLY',
-                                    listId: personalDefaultListId || prev.listId,
-                                    clientId: '',
-                                    clientTouched: true,
-                                    clientConfidence: 'manual',
-                                    clientReason: '个人日程不会关联客户或项目。',
-                                    eventLineId: '',
-                                    eventLineTouched: true,
-                                    eventLineReason: '个人日程不会挂到事件线。',
-                                    projectModuleId: '',
-                                    projectModuleTouched: true,
-                                    projectModuleReason: '个人日程不进入项目模块。',
-                                    projectFlowId: '',
-                                    projectFlowTouched: true,
-                                    projectFlowReason: '个人日程不进入标准流程。',
-                                  };
-                                }
-                                return {
-                                  ...prev,
-                                  scopeMode: 'COLLAB_SHARED',
-                                  listId: resolveDefaultListId('org') || prev.listId,
-                                  clientId: '',
-                                  clientTouched: false,
-                                  clientConfidence: 'none',
-                                  clientReason: organizationTaskAutoReason,
-                                  eventLineTouched: false,
-                                  eventLineReason: '可选：把任务挂到一条持续推进的事件线上，后续复盘会按事件线聚合。',
-                                  projectModuleTouched: false,
-                                  projectModuleReason: '可选：把任务挂到项目下的具体任务模块。',
-                                  projectFlowTouched: false,
-                                  projectFlowReason: '可选：把任务进一步挂到标准流程，后续复盘和日历会更贴近业务动作。',
-                                };
-                              })
-                            }
-                            className={`flex flex-1 items-center justify-center gap-2 rounded-md py-1.5 text-sm font-medium transition ${
-                              active ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
-                            }`}
-                          >
-                            <Icon size={16} />
-                            {label}
-                          </button>
-                        );
-                      })}
-                    </div>}
 
                     <TaskPropertyRow icon={<User size={16} />} label="负责人">
                       <div ref={ownerDropdownRef} className="relative w-full">
@@ -24176,21 +24066,6 @@ export default function App() {
                       </div>
                     </TaskPropertyRow>
 
-                    <TaskPropertyRow icon={<CalendarIcon size={16} />} label="跨天">
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={Boolean(editingTask.crossDay)}
-                        onClick={() => applyEditingTaskCrossDay(!editingTask.crossDay)}
-                        className="flex w-full items-center justify-between rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700"
-                      >
-                        <span>跨天</span>
-                        <span className={`inline-flex h-6 min-w-11 items-center rounded-full px-1 transition-colors ${editingTask.crossDay ? 'justify-end bg-[#5B7BFE]' : 'justify-start bg-gray-300'}`}>
-                          <span className="h-4 w-4 rounded-full bg-white shadow-sm" />
-                        </span>
-                      </button>
-                    </TaskPropertyRow>
-
                     <TaskPropertyRow icon={<Clock size={16} />} label="开始时间" stacked>
                       <div className="grid w-full min-w-0 grid-cols-[minmax(0,1.35fr)_minmax(0,0.9fr)] gap-2">
                         <input
@@ -24251,56 +24126,6 @@ export default function App() {
                       </select>
                     </TaskPropertyRow>}
 
-                    {!editingTask.id && (
-                      <TaskPropertyRow icon={<CalendarIcon size={16} />} label="客户会议">
-                        <label className="flex w-full items-center justify-between rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700">
-                          <span>{editingTask.recordMode === 'customer_meeting'
-                            ? '已切换为会议模式'
-                            : '作为客户会议保存'}</span>
-                          <input
-                            type="checkbox"
-                            checked={editingTask.recordMode === 'customer_meeting'}
-                            onChange={(event) => setEditingTask((previous) => ({
-                              ...previous,
-                              id: null,
-                              recordVersion: null,
-                              recordMode: event.target.checked ? 'customer_meeting' : 'task',
-                              scopeMode: 'COLLAB_SHARED',
-                              // 负责人、协作者和日期是任务/会议共用的编辑上下文。
-                              // 切换记录类型不能丢掉用户刚刚选好的人。
-                              collaborators: previous.collaborators.length
-                                ? previous.collaborators
-                                : buildDefaultCollaborators(),
-                              listId: event.target.checked ? '' : (resolveDefaultListId('org') || previous.listId),
-                            }))}
-                          />
-                        </label>
-                      </TaskPropertyRow>
-                    )}
-
-	                    {/* AUDIT-20260518-017: 组织任务清单已废弃,任务组织改由事件线、部门计划、
-                          项目模板/标准流程承接. 只在"个人日程"模式下保留 select(个人轻量分类),
-                          组织任务里不再展示这个字段, 用户也不能再误选已废弃的清单.
-                          保留 editingTask.listId 字段 + fallback 到 defaultListId 兼容历史. */}
-                    {editingTask.recordMode === 'task' && isEditingTaskPersonal && (
-                      <TaskPropertyRow icon={<Layout size={16} />} label="个人日程">
-                        <select
-                          value={editingTask.listId}
-                          onChange={(event) => setEditingTask((prev) => ({ ...prev, listId: event.target.value }))}
-                          className="w-full rounded border border-transparent bg-transparent px-2 py-1 text-sm font-medium text-gray-700 hover:bg-gray-100"
-                        >
-                          {personalTaskLists.length === 0 ? (
-                            <option value="">暂无个人日程清单</option>
-                          ) : (
-                            personalTaskLists.map((list) => (
-                              <option key={list.id} value={list.id}>
-                                {list.name}
-                              </option>
-                            ))
-                          )}
-                        </select>
-                      </TaskPropertyRow>
-                    )}
                   </div>
 
                   <div className="border-b border-gray-100 p-5">
@@ -25073,7 +24898,6 @@ export default function App() {
     const [searchQuery, setSearchQuery] = useRuntimeUiSessionState(`${workspaceUiSessionScope}:project-search`, '');
     // P9：左侧项目列表可收起。文档编辑模式或屏幕窄时主区会更宽。
     const [isClientListCollapsed, setIsClientListCollapsed] = useRuntimeUiSessionState(`${workspaceUiSessionScope}:project-list-collapsed`, false);
-    // 隐藏项目订阅已经提到主组件层(hiddenClientsVersion 闭包外层),这里不再重复订阅
     const workspaceClientUiKey = currentClientId || WORKSPACE_COMPOSER_NO_CLIENT_KEY;
     const workspaceRightTab = getWorkspaceRightTab(workspaceClientUiState, workspaceClientUiKey);
     const setWorkspaceRightTab = (tab: WorkspaceRightTabKey) =>
@@ -25174,6 +24998,16 @@ export default function App() {
     } | null>(null);
     const [answerCorrectionResult, setAnswerCorrectionResult] = useState<AnswerFactCorrectionResult | null>(null);
     const [isSubmittingAnswerCorrection, setIsSubmittingAnswerCorrection] = useState(false);
+    const normalizeAnswerSelectionForMatch = (value: string) => cleanChatOutput(value)
+      .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+      .replace(/^\s*(?:[-+*]|\d+[.)])\s+/gm, '')
+      .replace(/[*_~`]/g, '')
+      .replace(/[>|]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
     const handleAnswerTextSelection = (
       event: React.MouseEvent<HTMLDivElement>,
       message: DisplayChatMessage,
@@ -25188,12 +25022,18 @@ export default function App() {
       const focus = selection.focusNode;
       if (!anchor || !focus || !event.currentTarget.contains(anchor) || !event.currentTarget.contains(focus)) return;
       const selectedText = selection.toString().trim();
-      const collapsedSelected = selectedText.replace(/\s+/g, ' ');
-      const collapsedAnswer = cleanChatOutput(message.content || '').replace(/\s+/g, ' ');
+      const collapsedSelected = normalizeAnswerSelectionForMatch(selectedText);
+      const collapsedAnswer = normalizeAnswerSelectionForMatch(message.content || '');
+      const compactSelected = collapsedSelected.replace(/\s+/g, '');
+      const compactAnswer = collapsedAnswer.replace(/\s+/g, '');
       if (
         selectedText.length < 2
         || selectedText.length > 2_000
-        || !collapsedAnswer.includes(collapsedSelected)
+        || !collapsedSelected
+        || (
+          !collapsedAnswer.includes(collapsedSelected)
+          && !compactAnswer.includes(compactSelected)
+        )
       ) {
         setAnswerTextSelection(null);
         return;
@@ -25249,6 +25089,43 @@ export default function App() {
       fileName: string;
     } | null>(null);
     const [isDeletingDocument, setIsDeletingDocument] = useState(false);
+    const [isDocumentRecycleBinOpen, setIsDocumentRecycleBinOpen] = useState(false);
+    const [recycledDocuments, setRecycledDocuments] = useState<RecycledClientDocument[]>([]);
+    const [isLoadingDocumentRecycleBin, setIsLoadingDocumentRecycleBin] = useState(false);
+    const [restoringDocumentId, setRestoringDocumentId] = useState<string | null>(null);
+    const openDocumentRecycleBin = async () => {
+      if (!currentClientId) return;
+      setIsDocumentRecycleBinOpen(true);
+      setIsLoadingDocumentRecycleBin(true);
+      try {
+        const result = await getClientDocumentRecycleBin(currentClientId);
+        setRecycledDocuments(result.items || []);
+      } catch (error) {
+        setRecycledDocuments([]);
+        flash('error', error instanceof Error ? error.message : '回收站加载失败');
+      } finally {
+        setIsLoadingDocumentRecycleBin(false);
+      }
+    };
+    const handleRestoreDocument = async (document: RecycledClientDocument) => {
+      if (!currentClientId || restoringDocumentId) return;
+      setRestoringDocumentId(document.documentId);
+      try {
+        const result = await restoreClientDocument(currentClientId, document.documentId);
+        setRecycledDocuments((previous) => previous.filter((item) => item.documentId !== document.documentId));
+        await refreshWorkspace(currentClientId);
+        flash(
+          result.overallState === 'ready' ? 'success' : 'error',
+          result.overallState === 'ready'
+            ? `已恢复「${result.fileName || document.fileName}」`
+            : `「${result.fileName || document.fileName}」已恢复到本机，组织云摘要仍在同步`,
+        );
+      } catch (error) {
+        flash('error', error instanceof Error ? error.message : '恢复失败');
+      } finally {
+        setRestoringDocumentId(null);
+      }
+    };
     const handleConfirmDeleteDocument = async () => {
       if (!guardWorkspaceWrite('删除文档')) return;
       if (!pendingDeleteDocument || !currentClientId) return;
@@ -25263,7 +25140,7 @@ export default function App() {
             result.message || '本机资料已删除；组织云元数据尚待同步',
           );
         } else {
-          flash('success', `已删除「${result.fileName || pendingDeleteDocument.fileName}」，30 天内可在回收站恢复`);
+          flash('success', `已将「${result.fileName || pendingDeleteDocument.fileName}」移入回收站`);
         }
         setPendingDeleteDocument(null);
       } catch (error) {
@@ -25894,6 +25771,9 @@ export default function App() {
       };
     }, [workspaceClientUiKey, workspaceUiSessionScope]);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const chatImageInputRef = useRef<HTMLInputElement | null>(null);
+  const [pendingChatImages, setPendingChatImages] = useState<PendingChatImage[]>([]);
+  const [chatImagePreview, setChatImagePreview] = useState<Pick<PendingChatImage, 'name' | 'dataUrl'> | null>(null);
   const analysisRunPollTimerRef = useRef<number | null>(null);
   const activePollingRunIdRef = useRef<string | null>(null);
   // 顾源源 5/26 真用反馈 P0-C: pollRun 真连续失败计数. 3 次失败后真清 polling + mark failed.
@@ -25906,6 +25786,11 @@ export default function App() {
   // 深度思考沿用现有问答链：模型先核对事实边界、冲突和缺口，再输出结论。
   // 不展示隐藏思维过程，但请求、来源清单和回答回执会登记该模式。
   const [deepThinking, setDeepThinking] = useState(false);
+
+  useEffect(() => {
+    setPendingChatImages([]);
+    setChatImagePreview(null);
+  }, [currentClientId]);
 
   // R7：创意度三档（creative / balanced / strict）默认 balanced
   const [creativityMode, setCreativityMode] = useState<import('../shared/types').CreativityMode>(() => {
@@ -26875,17 +26760,9 @@ export default function App() {
     }, [currentClientId, isImportSubmitting, workspace?.knowledgeStatus?.lastJobStatus]);
 
     // 工作台左栏项目顺序固定按中文拼音排列；选择项目只改变选中态，不改变位置。
-    // 隐藏的项目:
-    //   - 无搜索时:从列表里隐去(默认看不到)
-    //   - 有搜索时:仍然出现(便于用户找回),但需要 UI 上标 "已隐藏"
-    //   - 当前正在浏览的项目(currentClientId)即使被隐藏也保留显示,避免上下文丢失
-    // 「近期项目」主列表:严格不显示冷冻的(即使是 currentClient 也不例外)
-    // 这样冷冻 = 真正"消失",必须搜索才能临时找回,必须解冻才永久回归
     const filteredClients = useMemo(() => {
-      void hiddenClientsVersion;
       const query = searchQuery.trim();
       const matched = clients.filter((client) => {
-        if (isClientHidden(client.id)) return false;
         if (!query) return true;
         return `${client.name}${client.alias}${client.domain}`.includes(query);
       });
@@ -26897,19 +26774,7 @@ export default function App() {
         pinyinCollator.compare(a.name.trim(), b.name.trim())
         || a.id.localeCompare(b.id)
       ));
-    }, [clients, searchQuery, hiddenClientsVersion]);
-
-    // 「已冷冻 · 搜索匹配」:仅在用户搜索时出现,展示冷冻项目让他能临时进入
-    // 点击只是 setCurrentClientId(临时访问),并不会让它出现在主列表 — 必须解冻才回归
-    const hiddenSearchMatches = useMemo(() => {
-      void hiddenClientsVersion;
-      const query = searchQuery.trim();
-      if (!query) return [];
-      return clients.filter((client) =>
-        isClientHidden(client.id)
-        && `${client.name}${client.alias}${client.domain}`.includes(query),
-      );
-    }, [clients, searchQuery, hiddenClientsVersion]);
+    }, [clients, searchQuery]);
     const currentThreadId = useMemo(
       () =>
         pickWorkspaceCurrentThreadId({
@@ -27376,12 +27241,16 @@ export default function App() {
             lastEventMessage: null,
             recentEvents: [],
             queuedItemLabels: [],
+            canResume: false,
+            resumeDocumentIds: [],
             status: lr.status || 'running',
           };
         }
         const processed = latestKnowledgeJob?.processedItems || 0;
         const total = latestKnowledgeJob?.totalItems || 0;
-        const activeJob = latestKnowledgeJob?.status === 'queued' || latestKnowledgeJob?.status === 'running';
+        const activeJob = latestKnowledgeJob?.status === 'queued'
+          || latestKnowledgeJob?.status === 'running'
+          || latestKnowledgeJob?.status === 'interrupted';
         const hasActivity =
           isTemplateFilling ||
           isLinkImporting ||
@@ -27402,10 +27271,14 @@ export default function App() {
             ? ''
             : total <= 0
               ? ''
+              : latestKnowledgeJob?.status === 'interrupted'
+                ? `重新解析已中断 · ${processed}/${total}`
               : activeJob && completed
                 ? '正在收尾建库'
                 : activeJob
-                  ? `正在处理 ${Math.min(processed + 1, total)}/${total}`
+                  ? latestKnowledgeJob?.jobType === 'local_material_reprocessing'
+                    ? `正在重新解析 ${Math.min(processed + 1, total)}/${total}`
+                    : `正在处理 ${Math.min(processed + 1, total)}/${total}`
                   : latestKnowledgeJob?.status === 'completed'
                     ? `已完成 ${processed}/${total || processed}`
                     : '正在同步资料状态';
@@ -27421,6 +27294,9 @@ export default function App() {
           lastEventMessage: latestKnowledgeJob?.lastEventMessage || null,
           recentEvents: latestKnowledgeJob?.recentEvents || [],
           queuedItemLabels: latestKnowledgeJob?.queuedItemLabels || [],
+          canResume: latestKnowledgeJob?.status === 'interrupted'
+            && Boolean(latestKnowledgeJob?.resumeDocumentIds?.length),
+          resumeDocumentIds: latestKnowledgeJob?.resumeDocumentIds || [],
           status: latestKnowledgeJob?.status || (hasActivity ? 'running' : 'completed'),
         };
       }, [
@@ -27435,6 +27311,29 @@ export default function App() {
         knowledgeStatus?.runningJobs,
         latestKnowledgeJob,
       ]);
+      const resumeInterruptedMaterialBatch = () => {
+        const documentIds = knowledgeJobProgressView.resumeDocumentIds;
+        if (!currentClientId || documentIds.length === 0 || isImportSubmitting) return;
+        const startedSandboxId = currentActiveSandboxId();
+        importProgressHoldUntilRef.current = Date.now() + 3000;
+        setIsImportSubmitting(true);
+        showGlobalBanner('info', `继续处理剩余 ${documentIds.length} 份资料`);
+        void processPendingProjectMaterials(currentClientId, {
+          documentIds,
+          force: true,
+        }).then(() => {
+          if (shouldApplyWorkspaceLoad(null, startedSandboxId)) {
+            markClientKnowledgeChanged(currentClientId, 'material_imported');
+            void refreshWorkspace(currentClientId).catch(() => undefined);
+          }
+        }).catch((error) => {
+          setIsImportSubmitting(false);
+          showGlobalBanner(
+            'error',
+            error instanceof Error ? error.message : '继续解析失败，请重试',
+          );
+        });
+      };
       const workspaceRealAiReady = isRealAiConfigured(health?.ai);
       const workspaceAiUnavailableReason = getWorkspaceAiUnavailableReason(health?.ai);
       const composerProviderLabel = workspaceRealAiReady
@@ -28357,6 +28256,46 @@ export default function App() {
       }
     };
 
+    const appendPendingChatImages = async (files: File[]) => {
+      const supported = files.filter((file) => ['image/png', 'image/jpeg', 'image/webp'].includes(file.type));
+      if (!supported.length) {
+        flash('error', '仅支持 PNG、JPG 和 WebP 图片');
+        return;
+      }
+      const availableSlots = Math.max(0, 4 - pendingChatImages.length);
+      if (availableSlots === 0) {
+        flash('error', '一次最多附加4张图片');
+        return;
+      }
+      const accepted = supported.slice(0, availableSlots);
+      if (accepted.some((file) => file.size > 8 * 1024 * 1024)) {
+        flash('error', '单张图片不能超过8MB');
+        return;
+      }
+      const next = await Promise.all(accepted.map((file) => new Promise<PendingChatImage>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error(`无法读取图片：${file.name}`));
+        reader.onload = () => resolve({
+          id: `chat_image_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          name: file.name || '截图',
+          mimeType: file.type,
+          dataUrl: String(reader.result || ''),
+          size: file.size,
+        });
+        reader.readAsDataURL(file);
+      })));
+      setPendingChatImages((current) => [...current, ...next].slice(0, 4));
+    };
+
+    const handleComposerPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const images = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith('image/'));
+      if (!images.length) return;
+      if (!event.clipboardData.getData('text/plain')) event.preventDefault();
+      void appendPendingChatImages(images).catch((error) => {
+        flash('error', error instanceof Error ? error.message : '读取截图失败');
+      });
+    };
+
     const handleDroppedClientFiles = async (paths: string[], options?: { attachToComposer?: boolean }) => {
       if (!paths.length) {
         flash('error', '没有识别到可导入文件。');
@@ -28419,6 +28358,18 @@ export default function App() {
         event.stopPropagation();
         resetClientImportDropZone(zone);
         const droppedPaths = extractDroppedFilePaths(event.dataTransfer);
+        if (zone === 'composer') {
+          const imageFiles = Array.from(event.dataTransfer.files).filter((file) => file.type.startsWith('image/'));
+          if (imageFiles.length) {
+            void appendPendingChatImages(imageFiles).catch((error) => {
+              flash('error', error instanceof Error ? error.message : '读取图片失败');
+            });
+            const nonImagePaths = droppedPaths.filter((path) => !/\.(?:png|jpe?g|webp)$/i.test(path));
+            if (!nonImagePaths.length) return;
+            void handleDroppedClientFiles(nonImagePaths, { attachToComposer: true });
+            return;
+          }
+        }
         if (droppedDataContainsDirectory(event.dataTransfer)) {
           const inferredDirectoryPath = inferDroppedDirectoryPath(droppedPaths);
           if (inferredDirectoryPath) {
@@ -28451,10 +28402,10 @@ export default function App() {
     };
 
     const sendMessage = async (overridePrompt?: string, options?: { fromQueue?: boolean }) => {
-      const rawPrompt = (overridePrompt ?? inputValue).trim();
+      const rawPrompt = (overridePrompt ?? inputValue).trim() || (pendingChatImages.length ? '请理解这些图片，并结合当前项目上下文回答。' : '');
       const activeAgentSkillLabel = activeAgentSkills.map((skill) => skill.shortName).join(' + ');
       const resolvedPrompt = activeAgentSkillLabel
-        ? rawPrompt.replace(/(?:当前|这个|该)\s*Skill/gi, `「${activeAgentSkillLabel}」 Skill`)
+        ? rawPrompt.replace(/(?:当前|这个|该)\s*(?:Skill|模板)/gi, `「${activeAgentSkillLabel}」写作模板`)
         : rawPrompt;
       if (!resolvedPrompt || !currentClientId) return;
       if (backendCompatibilityError) {
@@ -28463,6 +28414,10 @@ export default function App() {
       }
       // AI 还在跑：进入排队，不当场发送。fromQueue 表示自动派发，避免无限入队。
       if (!options?.fromQueue && (hasPendingAnalysisRun || isComposerStartingMessage)) {
+        if (pendingChatImages.length) {
+          flash('info', '图片问题请等待当前回答完成后发送');
+          return;
+        }
         if (enqueueQuestion(resolvedPrompt)) {
           const queued = getWorkspaceQuestionQueue(currentClientId).length || 1;
           setInputValue('', { commit: true });
@@ -28483,10 +28438,13 @@ export default function App() {
         status: 'success',
         evidence: [],
         activeSkillIds: [...activeAgentSkillIds],
+        imageAttachments: pendingChatImages.map(({ id, name, mimeType, dataUrl }) => ({ id, name, mimeType, dataUrl })),
       };
+      const submittedImages = [...pendingChatImages];
       flushSync(() => {
         setThreadOptimisticMessages(draftThreadId, [userMessage]);
         setInputValue('', { commit: true });
+        setPendingChatImages([]);
         workspaceComposerFocusRef.current = {
           ...workspaceComposerFocusRef.current,
           key: workspaceComposerDraftKey,
@@ -28523,9 +28481,10 @@ export default function App() {
           workingDocumentIds,
           { signal: controller.signal },
           deepThinking,
-          activeSkillId,
+          null,
           creativityMode,
           activeAgentSkillIds,
+          submittedImages,
         );
         if (currentClientIdRef.current !== submittedClientId) return;
         upsertAnalysisRun(started.analysisRun);
@@ -28536,7 +28495,13 @@ export default function App() {
         }
         flushSync(() => {
           setThreadOptimisticMessages(draftThreadId, []);
-          upsertWorkspaceMessages([started.userMessage as DisplayChatMessage, started.assistantMessage as DisplayChatMessage], started.threadId);
+          upsertWorkspaceMessages([
+            {
+              ...(started.userMessage as DisplayChatMessage),
+              imageAttachments: submittedImages.map(({ id, name, mimeType, dataUrl }) => ({ id, name, mimeType, dataUrl })),
+            },
+            started.assistantMessage as DisplayChatMessage,
+          ], started.threadId);
           setClientPendingQuestion(currentClientId, null);
           setActiveMessageId(started.assistantMessage.id);
           setIsStartingMessage(false);
@@ -28578,6 +28543,7 @@ export default function App() {
           setClientPendingQuestion(currentClientId, null);
           setThreadOptimisticMessages(draftThreadId, []);
           setInputValue(prompt, { commit: true });
+          setPendingChatImages(submittedImages);
           flash('info', '已停止发送，问题草稿已保留');
           return;
         }
@@ -28619,6 +28585,7 @@ export default function App() {
             },
           },
         ]);
+        setPendingChatImages(submittedImages);
         flash('error', detail);
         void Promise.all([
           loadOrgAiRuntimeBlock(),
@@ -29456,7 +29423,7 @@ export default function App() {
                       </div>
                     );
                   })}
-                  {filteredClients.length === 0 && hiddenSearchMatches.length === 0 && (
+                  {filteredClients.length === 0 && (
                     <div className="px-2 py-4 text-center">
                       <p className="text-[11.5px] text-gray-400">没有找到匹配的项目</p>
                       <button
@@ -29473,60 +29440,6 @@ export default function App() {
                   )}
                 </div>
 
-                {/* 已冷冻 · 搜索匹配 — 单独分区,只在搜索时出现;点击只是临时进入,不会让它出现在主列表 */}
-                {hiddenSearchMatches.length > 0 && (
-                  <div className="mt-5">
-                    <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400 mb-2 px-1 inline-flex items-center gap-1.5">
-                      <Snowflake size={10} strokeWidth={2} />
-                      已冷冻 · 搜索匹配
-                    </p>
-                    <div className="-mx-1 pr-1">
-                      {hiddenSearchMatches.map((client) => {
-                        const isActive = currentClientId === client.id;
-                        return (
-                          <div
-                            key={`frozen-${client.id}`}
-                            className={`relative flex items-center group transition-colors duration-150 border-l-[2.5px] rounded-r-md ${
-                              isActive
-                                ? 'border-[#5B7BFE] bg-gray-100/70'
-                                : 'border-transparent hover:bg-gray-50'
-                            }`}
-                          >
-                            <button
-                              type="button"
-                              onClick={() => {
-                                resetFilesTabSearchForClientSwitch();
-                                dispatchWorkspaceClientUi({ type: 'setSurfaceMode', clientId: client.id, mode: 'workspace' });
-                                setCurrentClientId(client.id);
-                                void refreshWorkspace(client.id);
-                                setActiveMessageId(null);
-                              }}
-                              onDoubleClick={() => {
-                                if (canManageClientProject(client)) openEditClientModal(client);
-                              }}
-                              className={`flex-1 min-w-0 text-left pl-3.5 pr-2 py-2 text-[13px] tracking-[0.005em] truncate inline-flex items-center gap-1.5 transition-colors ${
-                                isActive ? 'font-semibold text-gray-700' : 'font-medium text-gray-400 italic hover:text-gray-700'
-                              }`}
-                              title={`${client.name} (已冷冻 · 不参与自动计算。打开编辑器可解冻)`}
-                            >
-                              <span className="truncate">{client.name}</span>
-                            </button>
-                            {canManageClientProject(client) && (
-                              <button
-                                type="button"
-                                onClick={() => openEditClientModal(client)}
-                                className="shrink-0 mr-1 p-1.5 rounded-md text-gray-300 hover:text-[#5B7BFE] hover:bg-white opacity-0 group-hover:opacity-100 transition-all"
-                                title={`编辑/解冻:${client.name}`}
-                              >
-                                <PenTool size={13} />
-                              </button>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
               </div>
             </div>
           </div>
@@ -29884,13 +29797,36 @@ export default function App() {
                                   return (
                                     <span key={skillId} className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2 py-0.5 text-[9.5px] font-bold text-indigo-700 ring-1 ring-inset ring-indigo-200">
                                       <Wand2 size={9} />
-                                      {skill?.shortName || 'Skill'}
+                                      {skill?.shortName || '写作模板'}
                                     </span>
                                   );
                                 })}
                               </div>
-                            )}
-                            {/* 用户气泡:去 shadow,改用 #5B7BFE 实色 + rounded-2xl,跟全局 chip / button 一致 */}
+	                            )}
+	                            {(msg.imageAttachments || []).length > 0 && (
+	                              <div className="mb-1.5 flex max-w-full flex-wrap justify-end gap-2">
+	                                {(msg.imageAttachments || []).map((image) => image.dataUrl ? (
+	                                  <button
+	                                    key={image.id}
+	                                    type="button"
+	                                    onClick={(event) => {
+	                                      event.stopPropagation();
+	                                      setChatImagePreview({ name: image.name, dataUrl: image.dataUrl || '' });
+	                                    }}
+	                                    className="cursor-zoom-in overflow-hidden rounded-xl border border-blue-200 bg-white transition hover:border-blue-400 hover:shadow-md"
+	                                    aria-label={`查看大图 ${image.name}`}
+	                                    title={`查看大图：${image.name}`}
+	                                  >
+	                                    <img
+	                                      src={image.dataUrl}
+	                                      alt={image.name}
+	                                      className="max-h-40 max-w-[220px] object-contain"
+	                                    />
+	                                  </button>
+	                                ) : null)}
+	                              </div>
+	                            )}
+	                            {/* 用户气泡:去 shadow,改用 #5B7BFE 实色 + rounded-2xl,跟全局 chip / button 一致 */}
                             <div className="bg-[#5B7BFE] text-white px-4 py-3 xl:px-5 xl:py-3.5 rounded-2xl text-[13.5px] xl:text-[14.5px] font-medium leading-[1.65] tracking-[0.005em]">
                               {msg.content}
                             </div>
@@ -30084,10 +30020,10 @@ export default function App() {
                                         <span
                                           key={skillId}
                                           className="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-[2px] text-[9px] font-semibold tracking-[0.08em] text-indigo-700 ring-1 ring-inset ring-indigo-300/55"
-                                          title={`本条回答使用了分析与产出 Skill：${skill?.shortName || skillId}`}
+                                          title={`本条回答使用了写作模板：${skill?.shortName || skillId}`}
                                         >
                                           <Wand2 size={9} strokeWidth={2.4} />
-                                          {skill?.shortName || 'Skill'}
+                                          {skill?.shortName || '写作模板'}
                                         </span>
                                       );
                                     })}
@@ -30887,15 +30823,55 @@ export default function App() {
                 onDragLeave={handleClientImportDragLeave('composer')}
                 onDrop={handleClientImportDrop('composer')}
               >
-                {clientImportDropZone === 'composer' && (
-                  <div className="pointer-events-none absolute inset-1 z-10 flex items-center justify-center rounded-[20px] border-2 border-dashed border-[#5B7BFE] bg-white/92 backdrop-blur-sm">
-	                    <div className="text-center px-6">
-	                      <p className="text-[13px] font-bold text-[#3652c9]">松手即可自动识别处理</p>
-	                      <p className="mt-1 text-[11px] text-[#5c6fb8]">文件会自动归档，并作为当前对话的优先背景</p>
-	                    </div>
-	                  </div>
-	                )}
 	                <div className="min-w-0 flex-1">
+	                  {pendingChatImages.length > 0 && (
+	                    <div className="flex max-h-[86px] gap-2 overflow-x-auto px-2.5 pt-1">
+	                      {pendingChatImages.map((image) => (
+	                        <div key={image.id} className="group relative h-16 w-16 shrink-0 overflow-hidden rounded-xl border border-blue-200 bg-blue-50">
+	                          <button
+	                            type="button"
+	                            onClick={() => setChatImagePreview({ name: image.name, dataUrl: image.dataUrl })}
+	                            className="h-full w-full cursor-zoom-in"
+	                            aria-label={`查看大图 ${image.name}`}
+	                            title={`查看大图：${image.name}`}
+	                          >
+	                            <img src={image.dataUrl} alt={image.name} className="h-full w-full object-cover" />
+	                          </button>
+	                          <button
+	                            type="button"
+	                            aria-label={`移除图片 ${image.name}`}
+	                            onClick={() => setPendingChatImages((current) => current.filter((item) => item.id !== image.id))}
+	                            className="absolute right-1 top-1 rounded-full bg-slate-900/70 p-0.5 text-white opacity-0 transition group-hover:opacity-100"
+	                          >
+	                            <X size={11} />
+	                          </button>
+	                        </div>
+	                      ))}
+	                    </div>
+	                  )}
+	                  {activeAgentSkills.length > 0 && (
+	                    <div className="flex max-h-[70px] flex-wrap gap-1.5 overflow-y-auto px-2.5 pt-1">
+	                      {activeAgentSkills.map((skill) => (
+	                        <span
+	                          key={skill.skillId}
+	                          className="group inline-flex max-w-full items-center gap-1.5 rounded-xl border border-indigo-200 bg-indigo-50 px-2 py-1 text-[11px] font-semibold text-indigo-700"
+	                          title={`本轮使用写作模板：${skill.shortName}`}
+	                        >
+	                          <Wand2 size={12} className="shrink-0" />
+	                          <span className="max-w-[220px] truncate">{skill.shortName}</span>
+	                          <span className="shrink-0 opacity-70">已选择</span>
+	                          <button
+	                            type="button"
+	                            className="shrink-0 rounded-full p-0.5 opacity-55 transition hover:bg-white/70 hover:opacity-100"
+	                            aria-label={`取消选择写作模板 ${skill.shortName}`}
+	                            onClick={() => setActiveAgentSkillIds((current) => current.filter((id) => id !== skill.skillId))}
+	                          >
+	                            <X size={11} />
+	                          </button>
+	                        </span>
+	                      ))}
+	                    </div>
+	                  )}
 	                  {/* chat composer 的 chip 列表:inline editor 打开时隐藏,避免和 popover 里的 chip 双显示 */}
 	                  {!clientWorkspaceInlineEditor && activeWorkingDocuments.length > 0 && (
 	                    <div className="flex max-h-[70px] flex-wrap gap-1.5 overflow-y-auto px-2.5 pt-1">
@@ -30982,10 +30958,34 @@ export default function App() {
 	                      updateComposerFocusSnapshot(event.currentTarget);
 	                      setInputValue(event.target.value);
 	                    }}
+	                    onPaste={handleComposerPaste}
 	                    onKeyDown={handleComposerKeyDown}
 	                    disabled={isBackendBlocked}
 	                  />
 	                  <div className="flex items-center gap-2 px-2 pb-1 pt-0.5">
+	                    <input
+	                      ref={chatImageInputRef}
+	                      type="file"
+	                      accept="image/png,image/jpeg,image/webp"
+	                      multiple
+	                      className="hidden"
+	                      onChange={(event) => {
+	                        const files = Array.from(event.currentTarget.files || []);
+	                        event.currentTarget.value = '';
+	                        void appendPendingChatImages(files).catch((error) => {
+	                          flash('error', error instanceof Error ? error.message : '读取图片失败');
+	                        });
+	                      }}
+	                    />
+	                    <button
+	                      type="button"
+	                      title="添加图片（仅用于本轮理解，不加入项目文件）"
+	                      aria-label="添加图片"
+	                      onClick={() => chatImageInputRef.current?.click()}
+	                      className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-white text-slate-500 ring-1 ring-inset ring-slate-200 transition hover:text-indigo-600 hover:ring-indigo-300"
+	                    >
+	                      <Plus size={13} />
+	                    </button>
 	                    <button
 	                      type="button"
 	                      onClick={() => setDeepThinking((previous) => !previous)}
@@ -31085,9 +31085,7 @@ export default function App() {
 	                          if (next) void refreshAgentSkills();
 	                          return next;
 	                        })}
-	                        title={activeAgentSkills.length > 0
-	                          ? `已启用：${activeAgentSkills.map((skill) => skill.shortName).join('、')}`
-	                          : '选择或创建分析与产出 Skill'}
+	                        title="选择写作模板"
 	                        aria-pressed={activeAgentSkills.length > 0}
 	                        className={`group inline-flex max-w-[220px] items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold transition-colors ring-1 ring-inset ${
 	                          activeAgentSkills.length > 0
@@ -31097,9 +31095,7 @@ export default function App() {
 	                      >
 	                        <Wand2 size={12} strokeWidth={2.4} className={activeAgentSkills.length > 0 ? 'text-indigo-600' : 'text-slate-400 group-hover:text-indigo-500'} />
 	                        <span className="truncate">
-	                          {activeAgentSkills.length > 0
-	                            ? `Skill · ${activeAgentSkills.map((skill) => skill.shortName).join(' + ')}`
-	                            : 'Skill +'}
+	                          写作模板
 	                        </span>
 	                        {activeAgentSkills.length > 1 && (
 	                          <span className="rounded-full bg-indigo-600 px-1.5 text-[9px] leading-4 text-white">{activeAgentSkills.length}</span>
@@ -31112,8 +31108,8 @@ export default function App() {
 	                            <div className="border-b border-slate-100 px-4 py-3">
 	                              <div className="flex items-center justify-between gap-3">
 	                                <div>
-	                                  <div className="text-[12px] font-bold text-slate-800">分析与产出 Skill</div>
-	                                  <div className="mt-0.5 text-[10px] text-slate-500">可多选，按选中顺序共同约束本轮回答</div>
+	                                  <div className="text-[12px] font-bold text-slate-800">写作模板</div>
+	                                  <div className="mt-0.5 text-[10px] text-slate-500">可组合使用，最多选择5个</div>
 	                                </div>
 	                                <button
 	                                  type="button"
@@ -31131,50 +31127,48 @@ export default function App() {
 	                            <div className="max-h-[330px] overflow-y-auto p-2">
 	                              {agentSkills.length === 0 && (
 	                                <div className="rounded-xl bg-slate-50 px-3 py-4 text-[11px] leading-5 text-slate-500">
-	                                  当前还没有可用 Skill。点击右上角“创建”，添加一个可复用的分析方法。
+	                                  当前还没有写作模板。点击右上角“创建”，保存常用的分析方法和表达风格。
 	                                </div>
 	                              )}
 	                              {agentSkills.map((skill) => {
 	                                const selected = activeAgentSkillIds.includes(skill.skillId);
+	                                const toggleTemplateSelection = async () => {
+	                                  if (selected) {
+	                                    setActiveAgentSkillIds((current) => current.filter((id) => id !== skill.skillId));
+	                                    return;
+	                                  }
+	                                  if (activeAgentSkillIds.length >= 5) {
+	                                    flash('error', '一次最多组合5个写作模板');
+	                                    return;
+	                                  }
+	                                  try {
+	                                    // 选择就是唯一的用户动作；历史停用模板被选中时自动恢复可用。
+	                                    if (!skill.enabled) {
+	                                      await setAgentSkillEnabled(skill.skillId, true, skill.version);
+	                                      await refreshAgentSkills();
+	                                    }
+	                                    setActiveAgentSkillIds((current) => current.includes(skill.skillId)
+	                                      ? current
+	                                      : [...current, skill.skillId].slice(0, 5));
+	                                  } catch (error) {
+	                                    flash('error', error instanceof Error ? error.message : '选择写作模板失败');
+	                                  }
+	                                };
 	                                return (
 	                                  <div key={skill.skillId} className={`mb-1 rounded-xl border px-3 py-2.5 ${selected ? 'border-indigo-200 bg-indigo-50/70' : 'border-transparent hover:bg-slate-50'}`}>
 	                                    <div className="flex items-start gap-2.5">
 	                                      <button
 	                                        type="button"
-	                                        disabled={!skill.enabled}
-	                                        onClick={() => setActiveAgentSkillIds((current) => {
-	                                          if (current.includes(skill.skillId)) return current.filter((id) => id !== skill.skillId);
-	                                          if (current.length >= 5) {
-	                                            flash('error', '一次最多组合5个 Skill');
-	                                            return current;
-	                                          }
-	                                          return [...current, skill.skillId];
-	                                        })}
-	                                        className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border border-indigo-300 bg-white text-indigo-600 disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-300"
+	                                        onClick={() => void toggleTemplateSelection()}
+	                                        className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border border-indigo-300 bg-white text-indigo-600"
 	                                        aria-label={`${selected ? '取消选择' : '选择'} ${skill.shortName}`}
 	                                      >
 	                                        {selected && <Check size={11} strokeWidth={3} />}
 	                                      </button>
-	                                      {skill.canManage && (
-	                                        <button
-	                                          type="button"
-	                                          title="修改 Skill"
-	                                          aria-label={`修改 ${skill.shortName}`}
-	                                          onClick={() => {
-	                                            setAgentSkillEditorTargetId(skill.skillId);
-	                                            setAgentSkillCreateOpen(true);
-	                                            setAgentSkillPickerOpen(false);
-	                                          }}
-	                                          className="mt-0.5 shrink-0 rounded-md p-1 text-slate-400 hover:bg-white hover:text-indigo-600"
-	                                        >
-	                                          <Pencil size={12} />
-	                                        </button>
-	                                      )}
 	                                      <button
 	                                        type="button"
-	                                        disabled={!skill.enabled}
-	                                        onClick={() => setActiveAgentSkillIds((current) => current.includes(skill.skillId) ? current.filter((id) => id !== skill.skillId) : current.length < 5 ? [...current, skill.skillId] : current)}
-	                                        className="min-w-0 flex-1 text-left disabled:opacity-50"
+	                                        onClick={() => void toggleTemplateSelection()}
+	                                        className="min-w-0 flex-1 text-left"
 	                                      >
 	                                        <div className="flex items-center gap-2">
 	                                          <span className="truncate text-[12px] font-bold text-slate-800">{skill.shortName}</span>
@@ -31194,19 +31188,37 @@ export default function App() {
 	                                      {skill.canManage && (
 	                                        <button
 	                                          type="button"
-	                                          title={skill.enabled ? '停用 Skill' : '启用 Skill'}
+	                                          title="修改写作模板"
+	                                          aria-label={`修改 ${skill.shortName}`}
+	                                          onClick={() => {
+	                                            setAgentSkillEditorTargetId(skill.skillId);
+	                                            setAgentSkillCreateOpen(true);
+	                                            setAgentSkillPickerOpen(false);
+	                                          }}
+	                                          className="mt-0.5 shrink-0 rounded-md p-1 text-slate-400 hover:bg-white hover:text-indigo-600"
+	                                        >
+	                                          <Pencil size={12} />
+	                                        </button>
+	                                      )}
+	                                      {skill.canManage && (
+	                                        <button
+	                                          type="button"
+	                                          title="删除写作模板"
+	                                          aria-label={`删除 ${skill.shortName}`}
 	                                          onClick={async () => {
+	                                            if (!window.confirm(`删除写作模板「${skill.shortName}」？历史回答仍会保留当时使用的版本。`)) return;
 	                                            try {
-	                                              await setAgentSkillEnabled(skill.skillId, !skill.enabled, skill.version);
-	                                              if (skill.enabled) setActiveAgentSkillIds((current) => current.filter((id) => id !== skill.skillId));
+	                                              await deleteAgentSkill(skill.skillId, skill.version);
+	                                              setActiveAgentSkillIds((current) => current.filter((id) => id !== skill.skillId));
 	                                              await refreshAgentSkills();
+	                                              flash('success', '写作模板已删除');
 	                                            } catch (error) {
-	                                              flash('error', error instanceof Error ? error.message : '更新 Skill 状态失败');
+	                                              flash('error', error instanceof Error ? error.message : '删除写作模板失败');
 	                                            }
 	                                          }}
-	                                          className={`relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors ${skill.enabled ? 'bg-indigo-600' : 'bg-slate-200'}`}
+	                                          className="mt-0.5 shrink-0 rounded-md p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
 	                                        >
-	                                          <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-all ${skill.enabled ? 'left-[18px]' : 'left-0.5'}`} />
+	                                          <Trash2 size={12} />
 	                                        </button>
 	                                      )}
 	                                    </div>
@@ -31215,14 +31227,14 @@ export default function App() {
 	                              })}
 	                            </div>
 	                            <div className="border-t border-slate-100 bg-slate-50/70 px-3 py-2 text-[9.5px] leading-4 text-slate-500">
-	                              Skill 不会自动修改项目事实；业务写入仍需走正式命令。
+	                              模板只影响本轮分析与表达；业务写入仍需走正式命令。
 	                            </div>
 	                          </div>
 	                        </>
 	                      )}
 	                    </div>
 	                    {/* R6: 写作风格选择按钮 */}
-	                    <div className="relative">
+	                    <div className="hidden">
 	                      <button
 	                        type="button"
 	                        onClick={() => setSkillPickerOpen((prev) => !prev)}
@@ -31362,7 +31374,7 @@ export default function App() {
 	                  </div>
 	                </div>
                 {(() => {
-                  const hasComposerDraft = inputValue.trim().length > 0;
+                  const hasComposerDraft = inputValue.trim().length > 0 || pendingChatImages.length > 0;
                   // 有草稿时永远是"发送/排队"（sendMessage 内部会自动决定立刻发还是入队）；
                   // 无草稿且 AI 正在跑时变"停止"；其余情况禁用。
                   const isStopMode = composerBusyMode && !hasComposerDraft;
@@ -31933,6 +31945,14 @@ export default function App() {
                     disabled: isBackendBlocked,
                   },
                   {
+                    key: 'recycle_bin',
+                    icon: <RotateCcw size={18} />,
+                    label: '资料回收',
+                    title: '资料回收 · 只显示当前设备仍能识别到原件的已删除文件',
+                    onClick: () => void openDocumentRecycleBin(),
+                    disabled: isBackendBlocked || !currentClientId,
+                  },
+                  {
                     key: 'fill_template',
                     icon: <LayoutTemplate size={18} />,
                     label: '填写模板',
@@ -31955,14 +31975,6 @@ export default function App() {
                     title: '链接转资料',
                     onClick: () => setLinkPanelOpen((v) => !v),
                     disabled: isBackendBlocked,
-                  },
-                  {
-                    key: 'repair_materials',
-                    icon: <Wand2 size={18} />,
-                    label: '整理资料',
-                    title: '整理资料 · 从本机正文生成并发布组织共享摘要',
-                    onClick: () => void handlePreviewDocumentAutoRepair(),
-                    disabled: isBackendBlocked || !currentClientId,
                   },
                   {
                     key: 'feishu_import',
@@ -32229,9 +32241,20 @@ export default function App() {
                             style={{ width: `${Math.min(Math.max(knowledgeJobProgressView.percent, 0), 100)}%` }}
                           />
                         </div>
-                        <p className="mt-1.5 truncate text-[10px] font-medium text-slate-500" title={knowledgeJobProgressView.currentItemLabel || knowledgeJobProgressView.lastEventMessage || ''}>
-                          {knowledgeJobProgressView.currentItemLabel || knowledgeJobProgressView.lastEventMessage || '正在等待后台返回当前文件'}
-                        </p>
+                        <div className="mt-1.5 flex items-center gap-2">
+                          <p className="min-w-0 flex-1 truncate text-[10px] font-medium text-slate-500" title={knowledgeJobProgressView.currentItemLabel || knowledgeJobProgressView.lastEventMessage || ''}>
+                            {knowledgeJobProgressView.currentItemLabel || knowledgeJobProgressView.lastEventMessage || '正在等待后台返回当前文件'}
+                          </p>
+                          {knowledgeJobProgressView.canResume && (
+                            <button
+                              type="button"
+                              onClick={resumeInterruptedMaterialBatch}
+                              className="shrink-0 rounded-lg border border-blue-200 bg-white px-2 py-1 text-[10px] font-bold text-[#5B7BFE] hover:bg-blue-50"
+                            >
+                              继续处理
+                            </button>
+                          )}
+                        </div>
                       </div>
                     </div>
 
@@ -32418,7 +32441,6 @@ export default function App() {
                           { key: 'fill_template', icon: <LayoutTemplate size={23} />, title: '填写模板', onClick: () => void handleFillTemplate(), disabled: isBackendBlocked || isTemplateFilling },
                           { key: 'text_doc', icon: <PenTool size={23} />, title: '智能编辑', onClick: openClientTextDocumentOverlay, disabled: isBackendBlocked },
                           { key: 'link_material', icon: <Link2 size={23} />, title: '链接转资料', onClick: () => setLinkPanelOpen((v) => !v), disabled: isBackendBlocked },
-                          { key: 'repair_materials', icon: <Wand2 size={23} />, title: '整理资料 · 从本机正文生成并发布组织共享摘要', onClick: () => void handlePreviewDocumentAutoRepair(), disabled: isBackendBlocked || !currentClientId },
                           { key: 'feishu_import', icon: <Download size={23} />, title: '从飞书导入文档', onClick: () => void openFeishuDocImportModal(), disabled: isBackendBlocked || !currentClientId },
                           { key: 'smart_import', icon: <Sparkles size={23} />, title: '智能文件导入 · 讲故事 + 挂文件,自动分类归档', onClick: () => setIsSmartFileImportOpen(true), disabled: isBackendBlocked || !currentClientId },
                         ] as const).map((tool) => {
@@ -32853,8 +32875,11 @@ export default function App() {
                         // 可可靠读取为文本的资料均可进入智能编辑；录音转写
                         // 是 .txt，不应仅因扩展名不是 Word 而被挡在入口外。
                         const lowered = (path || '').toLowerCase();
-                        const isTextEditable = /\.(?:docx?|rtf|odt|xls|xlsx|xlsm|xlsb|ods|ppt|pptx|pptm|odp|pages|numbers|key|pdf|txt|md|markdown|csv|tsv|json|jsonl|xml|html?|mhtml|ya?ml|png|jpe?g|webp|tiff?|bmp|heic)$/i.test(lowered);
-                        if (!isTextEditable || !documentId || parseStatus !== 'ready') return null;
+                        const isSmartEditorReadable = /\.(?:docx?|rtf|odt|xls|xlsx|xlsm|xlsb|ods|ppt|pptx|pptm|odp|pages|numbers|key|pdf|txt|md|markdown|csv|tsv|xml|html?|mht|mhtml|ya?ml|png|jpe?g|webp|tiff?|bmp|heic)$/i.test(lowered);
+                        const isDirectlyEditable = /\.(?:docx|txt|md|markdown|csv|tsv|xml|html?|mht|mhtml|ya?ml)$/i.test(lowered);
+                        // 本机生成/导出的 Markdown、文本和 docx 本来就能直接读取，
+                        // 不应因异步知识加工尚未把 parseStatus 推到 ready 而丢失智能编辑入口。
+                        if (!isSmartEditorReadable || !documentId || (!isDirectlyEditable && parseStatus !== 'ready')) return null;
                         // 智能编辑器已经打开时锁住此按钮,避免覆盖当前正在编辑的内容
                         const editorBusy = clientWorkspaceInlineEditor !== null;
                         return (
@@ -32874,7 +32899,9 @@ export default function App() {
                                   title: result.title || fileLabel,
                                   content: result.content || '',
                                   titleEdited: true,
-                                  sourceDocumentId: documentId,
+                                  // 可原位编辑的格式保存回同一资料；PDF/图片/旧 Office
+                                  // 等提取文本则另存为新文档，避免拿派生文本覆盖原件。
+                                  sourceDocumentId: (result.editableInPlace ?? isDirectlyEditable) ? documentId : undefined,
                                 });
                               } catch (error) {
                                 flash('error', error instanceof Error ? `打开失败：${error.message}` : '打开失败');
@@ -33224,6 +33251,67 @@ export default function App() {
                       );
                     })()}
                   </div>
+                  {isDocumentRecycleBinOpen && createPortal((
+                    <div
+                      className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/40 px-6"
+                      onMouseDown={(e) => { backdropMouseDownRef.current = (e.target === e.currentTarget); }}
+                      onClick={(e) => {
+                        const downedHere = backdropMouseDownRef.current;
+                        backdropMouseDownRef.current = false;
+                        if (downedHere && e.target === e.currentTarget && !restoringDocumentId) setIsDocumentRecycleBinOpen(false);
+                      }}
+                    >
+                      <div className="flex max-h-[70vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+                        <div className="flex items-center justify-between gap-3 border-b border-gray-100 px-5 py-4">
+                          <div>
+                            <h3 className="text-[14px] font-bold text-gray-900">资料回收站</h3>
+                            <p className="mt-1 text-[10px] text-gray-400">仅显示30天内、当前设备仍能识别到原件的资料</p>
+                          </div>
+                          <button
+                            type="button"
+                            className="rounded-full p-2 text-gray-400 transition hover:bg-gray-100 hover:text-gray-700"
+                            onClick={() => setIsDocumentRecycleBinOpen(false)}
+                            disabled={Boolean(restoringDocumentId)}
+                            aria-label="关闭资料回收站"
+                          >
+                            <X size={16} />
+                          </button>
+                        </div>
+                        <div className="min-h-[180px] overflow-y-auto px-5 py-4">
+                          {isLoadingDocumentRecycleBin ? (
+                            <div className="flex h-36 items-center justify-center text-[12px] text-gray-400">正在检查可恢复文件…</div>
+                          ) : recycledDocuments.length === 0 ? (
+                            <div className="flex h-36 flex-col items-center justify-center text-center">
+                              <RotateCcw size={22} className="mb-2 text-gray-300" />
+                              <p className="text-[12px] font-bold text-gray-500">暂无可恢复资料</p>
+                              <p className="mt-1 text-[10px] text-gray-400">原件已不存在的删除记录不会显示</p>
+                            </div>
+                          ) : (
+                            <div className="space-y-2">
+                              {recycledDocuments.map((document) => (
+                                <div key={document.documentId} className="flex items-center gap-3 rounded-xl border border-gray-100 bg-gray-50/70 px-3 py-3">
+                                  <div className="min-w-0 flex-1">
+                                    <p className="truncate text-[12px] font-bold text-gray-800">{document.fileName}</p>
+                                    <p className="mt-1 text-[10px] text-gray-400">
+                                      删除于 {document.deletedAt ? new Date(document.deletedAt).toLocaleString('zh-CN') : '未知时间'}
+                                    </p>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    className="shrink-0 rounded-lg border border-blue-100 bg-white px-3 py-1.5 text-[11px] font-bold text-[#4A63CF] transition hover:bg-blue-50 disabled:opacity-50"
+                                    onClick={() => void handleRestoreDocument(document)}
+                                    disabled={Boolean(restoringDocumentId)}
+                                  >
+                                    {restoringDocumentId === document.documentId ? '恢复中…' : '恢复'}
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ), document.body)}
                   {pendingDeleteDocument && (
                     <div
                       className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/40 px-6"
@@ -33239,14 +33327,14 @@ export default function App() {
                           <div className="shrink-0 inline-flex items-center justify-center w-8 h-8 rounded-full bg-rose-50">
                             <Trash2 size={16} className="text-rose-600" />
                           </div>
-                          <h3 className="text-[14px] font-bold text-gray-900">删除文件并清空数据中心</h3>
+                          <h3 className="text-[14px] font-bold text-gray-900">删除文件并清理派生内容</h3>
                         </div>
                         <div className="px-5 py-4 space-y-2">
                           <p className="text-[12px] text-gray-700 leading-5">
                             确认将文件「<span className="font-bold text-gray-900">{pendingDeleteDocument.fileName}</span>」放入回收站？
                           </p>
                           <p className="text-[11px] text-gray-500 leading-5">
-                            将一并删除该文件在数据中心的解析数据（章节 / 切片 / 索引）。文件本身保留在回收站 30 天内可恢复。
+                            将一并失效该文件的章节、切片与索引。当前设备仍能识别到原件时，30天内可从资料回收站恢复。
                           </p>
                         </div>
                         <div className="px-5 py-3 border-t border-gray-100 flex items-center justify-end gap-2">
@@ -34492,6 +34580,35 @@ export default function App() {
           </div>
         )}
 
+        {chatImagePreview && (
+          <div
+            className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/75 p-6 backdrop-blur-sm"
+            onClick={() => setChatImagePreview(null)}
+            role="dialog"
+            aria-modal="true"
+            aria-label={`图片预览 ${chatImagePreview.name}`}
+          >
+            <div className="relative flex max-h-full max-w-full flex-col items-center gap-3" onClick={(event) => event.stopPropagation()}>
+              <button
+                type="button"
+                onClick={() => setChatImagePreview(null)}
+                className="absolute -right-3 -top-3 z-10 rounded-full bg-white p-2 text-slate-600 shadow-lg hover:text-slate-950"
+                aria-label="关闭大图"
+              >
+                <X size={18} />
+              </button>
+              <img
+                src={chatImagePreview.dataUrl}
+                alt={chatImagePreview.name}
+                className="max-h-[84vh] max-w-[92vw] rounded-2xl bg-white object-contain shadow-2xl"
+              />
+              <div className="max-w-[88vw] truncate rounded-full bg-slate-950/65 px-3 py-1 text-[11px] text-white">
+                {chatImagePreview.name}
+              </div>
+            </div>
+          </div>
+        )}
+
         {agentSkillCreateOpen && (
           <AgentSkillEditorModal
             targetSkill={agentSkillEditorTargetId
@@ -34513,7 +34630,7 @@ export default function App() {
               setActiveAgentSkillIds((current) => [...current.filter((id) => id !== savedSkill.skillId), savedSkill.skillId].slice(-5));
               setAgentSkillCreateOpen(false);
               setAgentSkillEditorTargetId(null);
-              flash('success', `已保存 Skill「${savedSkill.shortName}」`);
+              flash('success', `已保存写作模板「${savedSkill.shortName}」`);
             }}
             flashError={(message) => flash('error', message)}
           />
@@ -34542,36 +34659,19 @@ export default function App() {
     );
   };
 
-	  const handleClientFreezeChange = async (clientId: string, frozen: boolean) => {
-	    if (!guardWorkspaceWrite(frozen ? '冷冻项目' : '解冻项目')) return;
-	    try {
-	      const next = frozen ? await freezeClient(clientId) : await unfreezeClient(clientId);
-	      // refetch 让 clients state 同步真实 isFrozen,主组件 effect 会用它矫正本地 Set
-	      await loadClientBlock();
-	      flash(
-	        'success',
-	        frozen
-	          ? `已全局冷冻「${next.name}」— 所有自动计算、爬取、下拉都已跳过它`
-	          : `已解冻「${next.name}」— 重新参与所有自动计算`,
-	      );
-	    } catch (error) {
-	      // 后端失败:回滚本地 Set,让 UI 跟实际状态一致
-	      setClientHidden(clientId, !frozen);
-	      flash('error', error instanceof Error ? error.message : '切换冷冻状态失败');
-	    }
-	  };
-
 	  const renderClientEditorModal = () => {
 	    return (
-	      <ClientEditorModal
+      <ClientEditorModal
 	        state={clientEditorModalState}
         clients={clients}
         onClose={closeClientEditorModal}
         onSubmit={submitClientEditorModal}
         onDelete={confirmClientEditorDelete}
         onInteractionState={reportWorkspaceInteractionState}
-        onFreezeChange={handleClientFreezeChange}
-	      />
+        viewerMembershipId={viewerAuthorization?.membershipId || null}
+        prefetchedMemberCandidates={organizationMemberCandidates}
+        memberDirectoryScopeKey={workspacesState?.activeSandboxId || 'local'}
+      />
 	    );
 	  };
 
@@ -36312,13 +36412,6 @@ export default function App() {
               </select>
             </div>
             <div>
-              {renderFieldLabel('周复盘入口')}
-              <select value={taskSettingsDraft.defaultReviewScope} onChange={(event) => setTaskSettingsDraft((prev) => ({ ...prev, defaultReviewScope: event.target.value as TaskSettings['defaultReviewScope'] }))} className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-[13px] font-medium text-gray-900 outline-none focus:border-[#5B7BFE] disabled:opacity-60" disabled={!canEditBusinessSettings}>
-                <option value="work">组织复盘</option>
-                <option value="personal">成长复盘</option>
-              </select>
-            </div>
-            <div>
               {renderFieldLabel('未选协作者时')}
               <select value={taskSettingsDraft.autoAssignSelf ? 'self' : 'empty'} onChange={(event) => setTaskSettingsDraft((prev) => ({ ...prev, autoAssignSelf: event.target.value === 'self' }))} className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-[13px] font-medium text-gray-900 outline-none focus:border-[#5B7BFE] disabled:opacity-60" disabled={!canEditBusinessSettings}>
                 <option value="self">默认给自己</option>
@@ -37682,6 +37775,9 @@ export default function App() {
         onOpenEvent={handleMiniOpenTask}
         onRestore={exitMiniMode}
         onRescheduleTask={handleMiniRescheduleTask}
+        onViewChange={(view) => {
+          void window.yiyuWorkbench?.setMiniMode?.(true, view === 'calendar' ? 620 : 360);
+        }}
       />
     );
   }

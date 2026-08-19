@@ -267,6 +267,7 @@ def test_docx_editor_roundtrip_preserves_package_cas_and_idempotency(
         ],
     )
     before = store.document_text("document-docx")
+    assert before["editableInPlace"] is True
     managed_path = Path(before["path"])
     managed_before = managed_path.read_bytes()
 
@@ -289,8 +290,12 @@ def test_docx_editor_roundtrip_preserves_package_cas_and_idempotency(
     assert saved["storageVersion"] == before["storageVersion"] + 1
     assert saved["idempotentReplay"] is False
     assert saved["mediaType"] == store.DOCX_MEDIA_TYPE
+    assert saved["fileName"] == "日慈项目资料.docx"
+    assert Path(saved["path"]).name.endswith("-日慈项目资料.docx")
+    assert not managed_path.exists()
     assert hashlib.sha256(source.read_bytes()).hexdigest() == original_source_hash
 
+    managed_path = Path(saved["path"])
     rendered = Document(managed_path)
     rendered_text = _all_text(rendered)
     assert "日慈项目资料" in rendered_text
@@ -357,6 +362,7 @@ def test_docx_editor_roundtrip_preserves_package_cas_and_idempotency(
 
     restarted = _restart(runtime.database_path, sandbox_id)
     restored = restarted.document_text("document-docx")
+    assert restored["editableInPlace"] is True
     assert restored["storageVersion"] == saved["storageVersion"]
     assert "更新后的正文" in restored["content"]
     assert managed_before != managed_path.read_bytes()

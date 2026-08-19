@@ -850,6 +850,21 @@ class LocalGC06PlanningProjection:
 
         return self._transaction(apply)
 
+    def apply_meeting_migration(self, *, meeting_id: str, task_id: str) -> dict[str, Any]:
+        """Rebind device-local recording projections after cloud authority migration."""
+
+        def apply(connection: Any, _: Any, scope_id: str, sandbox_id: str, now: str) -> int:
+            return int(
+                connection.execute(
+                    "UPDATE recordings SET task_id=?,meeting_id=NULL,binding_kind='task',"
+                    "updated_at=? WHERE scope_id=? AND meeting_id=?",
+                    (task_id, now, scope_id, meeting_id),
+                ).rowcount
+                or 0
+            )
+
+        return self._transaction(apply)
+
     def apply_calendar(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         def apply(connection: Any, _: Any, scope_id: str, __: str, ___: str) -> int:
             for row in rows:

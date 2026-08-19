@@ -10,6 +10,7 @@ import {
   isTaskInCurrentWeek,
   isTaskOverdue,
   isTaskToday,
+  splitTaskDateTime,
 } from './taskTime.js';
 import type { Task } from './types.js';
 
@@ -114,6 +115,28 @@ test('task display time includes explicit scheduled time range', () => {
     kind: 'scheduled',
     dateLabel: '2026-05-03',
     timeLabel: '14:30-16:00',
+  });
+});
+
+test('timezone-aware migrated meeting time is rendered in Asia/Shanghai wall time', () => {
+  assert.deepEqual(splitTaskDateTime('2026-08-19T07:00:00Z'), {
+    date: '2026-08-19',
+    time: '15:00',
+  });
+  assert.deepEqual(splitTaskDateTime('2026-08-19T15:00:00+08:00'), {
+    date: '2026-08-19',
+    time: '15:00',
+  });
+
+  const record = task({
+    sourceType: 'meeting_migration',
+    scheduledStartAt: '2026-08-19T07:00:00Z',
+    scheduledEndAt: '2026-08-19T08:00:00Z',
+  });
+  assert.deepEqual(getTaskDisplayTime(record), {
+    kind: 'scheduled',
+    dateLabel: '2026-08-19',
+    timeLabel: '15:00-16:00',
   });
 });
 

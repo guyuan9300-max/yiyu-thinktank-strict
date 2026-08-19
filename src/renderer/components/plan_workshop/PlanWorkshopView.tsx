@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Archive, ChevronDown, ChevronLeft, ChevronRight, Pencil, Plus, Sparkles, Trash2, X } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Pencil, Plus, Sparkles, Trash2, X } from 'lucide-react';
 
 import { getPlanItemTaskCounts, getTasksForPlanItem, parseDepartmentPlan } from '../../lib/api';
 import {
@@ -176,7 +176,7 @@ export function PlanWorkshopView({
   const [taskSearchQuery, setTaskSearchQuery] = useRuntimeUiSessionState(`${uiSessionScopeKey}:search`, '');
   const [periodFilterType, setPeriodFilterType] = useRuntimeUiSessionState<PeriodFilterType>(`${uiSessionScopeKey}:period-type`, 'all');
   const [periodFilterValue, setPeriodFilterValue] = useRuntimeUiSessionState(`${uiSessionScopeKey}:period-value`, '');
-  const [showArchived, setShowArchived] = useRuntimeUiSessionState(`${uiSessionScopeKey}:show-archived`, false);
+  const [showArchived, setShowArchived] = useRuntimeUiSessionState(`${uiSessionScopeKey}:show-completed`, false);
   const [lifecycleBusyPlanId, setLifecycleBusyPlanId] = useState<string | null>(null);
   const [pendingLifecyclePlan, setPendingLifecyclePlan] = useState<OrgDepartmentPlanSettings | null>(null);
   const [lifecycleError, setLifecycleError] = useState('');
@@ -268,7 +268,7 @@ export function PlanWorkshopView({
       }
       setPendingLifecyclePlan(null);
     } catch (error) {
-      setLifecycleError(error instanceof Error ? error.message : linkedCount > 0 ? '归档计划失败' : '删除计划失败');
+      setLifecycleError(error instanceof Error ? error.message : linkedCount > 0 ? '完成计划失败' : '删除计划失败');
     } finally {
       setLifecycleBusyPlanId(null);
     }
@@ -429,13 +429,15 @@ export function PlanWorkshopView({
                 <button
                   type="button"
                   onClick={() => setShowArchived((current) => !current)}
-                  className={`rounded-2xl border px-3 py-2 text-[12px] font-bold transition-colors ${
-                    showArchived
-                      ? 'border-gray-200 bg-white text-gray-500 hover:border-[#C9D6FF] hover:text-[#5B7BFE]'
-                      : 'border-amber-200 bg-amber-50 text-amber-700'
-                  }`}
+                  role="switch"
+                  aria-checked={!showArchived}
+                  className="inline-flex items-center gap-2 rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] font-bold text-gray-600"
                 >
-                  {showArchived ? '隐藏已归档' : '显示已归档'} ({archivedCount})
+                  <span>隐藏已完成</span>
+                  <span className={`relative inline-flex h-5 w-9 rounded-full transition-colors ${!showArchived ? 'bg-[#5B7BFE]' : 'bg-gray-200'}`}>
+                    <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${!showArchived ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+                  </span>
+                  <span className="tabular-nums text-[10px] text-gray-400">({archivedCount})</span>
                 </button>
                 <button type="button" onClick={openAiSplit} className="inline-flex items-center gap-1.5 rounded-xl border border-[#5B7BFE]/30 bg-white px-3.5 py-2 text-[12px] font-bold text-[#4A66D8] hover:bg-[#5B7BFE]/5">
                   <Sparkles size={14} /> AI 拆解多计划
@@ -541,7 +543,7 @@ export function PlanWorkshopView({
                             {taskSearchQuery || periodFilterType !== 'all'
                               ? '当前筛选条件下没有匹配的计划或关联任务'
                               : row.plans.length > 0
-                                ? '当前仅有已归档计划，可用右上角开关显示'
+                                ? '当前仅有已完成计划，可用右上角开关显示'
                                 : '尚未制定计划'}
                           </p>
                         ) : displayedPlans.map((plan) => {
@@ -551,7 +553,7 @@ export function PlanWorkshopView({
                             <button key={plan.id} type="button" onClick={() => setSelectedPlanId(plan.id)} className={`relative w-full rounded-xl border py-3.5 pl-6 pr-4 text-left transition-all before:absolute before:bottom-3.5 before:left-3 before:top-3.5 before:w-[2.5px] before:rounded-full ${archived ? 'before:bg-gray-300 opacity-55' : 'before:bg-[#5B7BFE]'} ${selected ? 'border-[#9FB2FF] bg-[#5B7BFE]/[0.04]' : 'border-gray-100 bg-white hover:border-gray-200 hover:bg-gray-50/40'}`}>
                               <span className="flex items-start gap-2">
                                 <span className={`min-w-0 flex-1 text-[13.5px] font-medium ${selected ? 'text-[#3D5CD9]' : 'text-gray-900'}`}>{planLabel(plan)}</span>
-                                <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${archived ? 'bg-gray-100 text-gray-500' : 'bg-[#5B7BFE]/10 text-[#5B7BFE]'}`}>{archived ? '已归档' : `关联 ${taskCounts[plan.id] || 0}`}</span>
+                                <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${archived ? 'bg-gray-100 text-gray-500' : 'bg-[#5B7BFE]/10 text-[#5B7BFE]'}`}>{archived ? '已完成' : `关联 ${taskCounts[plan.id] || 0}`}</span>
                               </span>
                               <span className="mt-1.5 block text-[11.5px] leading-[1.65] text-gray-500">{formatPlanningPeriodLabel(plan.weekLabel)}{plan.summary ? ` · ${plan.summary}` : ''}</span>
                             </button>
@@ -580,19 +582,13 @@ export function PlanWorkshopView({
                     {selectedPlan.status !== 'closed' && <div className="flex items-center gap-1">
                       {onSavePlan && <button type="button" onClick={() => { setFormError(''); setEditingPlan({ ...selectedPlan, items: [] }); }} className="rounded-md p-2 text-gray-400 hover:bg-gray-100 hover:text-[#5B7BFE]" title="编辑计划"><Pencil size={15} /></button>}
                       {(taskCounts[selectedPlan.id] || 0) > 0 ? (
-                        <button type="button" disabled={lifecycleBusyPlanId === selectedPlan.id} onClick={() => { setLifecycleError(''); setPendingLifecyclePlan(selectedPlan); }} className="rounded-md p-2 text-gray-400 hover:bg-gray-100 hover:text-amber-600 disabled:opacity-40" title="归档计划"><Archive size={15} /></button>
+                        <button type="button" disabled={lifecycleBusyPlanId === selectedPlan.id} onClick={() => { setLifecycleError(''); setPendingLifecyclePlan(selectedPlan); }} className="rounded-md p-2 text-gray-400 hover:bg-gray-100 hover:text-emerald-600 disabled:opacity-40" title="完成计划"><CheckCircle2 size={15} /></button>
                       ) : (
                         <button type="button" disabled={lifecycleBusyPlanId === selectedPlan.id} onClick={() => { setLifecycleError(''); setPendingLifecyclePlan(selectedPlan); }} className="rounded-md p-2 text-gray-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-40" title="删除未关联任务的计划"><Trash2 size={15} /></button>
                       )}
                     </div>}
                   </div>
                   {lifecycleError && <p className="rounded-xl border border-rose-100 bg-rose-50 px-3 py-2 text-[11px] text-rose-600">{lifecycleError}</p>}
-                  <div className="grid grid-cols-2 gap-x-6 gap-y-5 border-y border-gray-100 py-5">
-                    <Detail label="计划周期" value={formatPlanningPeriodLabel(selectedPlan.weekLabel)} />
-                    <Detail label="关联任务" value={`${taskCounts[selectedPlan.id] || 0} 项`} />
-                    <Detail label="计划范围" value={selectedScope?.scopeKind === 'org' ? '当前组织' : selectedScope?.scopeName || '当前部门'} />
-                    <Detail label="状态" value={selectedPlan.status === 'active' ? '已发布' : selectedPlan.status === 'closed' ? '已归档' : '草稿'} />
-                  </div>
                   <div>
                     <p className="text-[10px] font-bold uppercase tracking-[0.15em] text-gray-400">计划说明</p>
                     <p className="mt-3 whitespace-pre-wrap text-[13px] leading-7 text-gray-600">{selectedPlan.summary || '暂无说明'}</p>
@@ -661,8 +657,8 @@ export function PlanWorkshopView({
             <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl">
               <div className="flex items-start justify-between border-b border-gray-100 px-6 py-5">
                 <div>
-                  <p className={`text-[10px] font-bold uppercase tracking-[0.18em] ${isArchive ? 'text-amber-600' : 'text-rose-600'}`}>{isArchive ? 'ARCHIVE PLAN' : 'DELETE PLAN'}</p>
-                  <h2 className="mt-1 text-xl font-light">{isArchive ? '确认归档计划？' : '确认删除计划？'}</h2>
+                  <p className={`text-[10px] font-bold uppercase tracking-[0.18em] ${isArchive ? 'text-emerald-600' : 'text-rose-600'}`}>{isArchive ? 'COMPLETE PLAN' : 'DELETE PLAN'}</p>
+                  <h2 className="mt-1 text-xl font-light">{isArchive ? '确认完成计划？' : '确认删除计划？'}</h2>
                 </div>
                 <button type="button" disabled={Boolean(lifecycleBusyPlanId)} onClick={() => { setPendingLifecyclePlan(null); setLifecycleError(''); }} className="rounded-lg p-2 text-gray-400 hover:bg-gray-100 disabled:opacity-40"><X size={18} /></button>
               </div>
@@ -670,14 +666,14 @@ export function PlanWorkshopView({
                 <p className="text-[13px] font-medium text-gray-900">{planLabel(pendingLifecyclePlan)}</p>
                 <p className="text-[12px] leading-6 text-gray-500">
                   {isArchive
-                    ? `该计划已有 ${linkedCount} 条任务承接。归档后仍保留在组织计划中，但不会再出现在任务编辑器的可关联计划列表。`
+                    ? `该计划已有 ${linkedCount} 条任务承接。完成后仍保留在组织计划中，但不会再出现在任务编辑器的可关联计划列表。`
                     : '该计划尚未关联任务或会议。删除后不会再出现在组织计划和任务编辑器中；审计与生命周期记录仍会保留。'}
                 </p>
                 {lifecycleError && <p className="rounded-xl border border-rose-100 bg-rose-50 px-3 py-2 text-[11px] text-rose-600">{lifecycleError}</p>}
               </div>
               <div className="flex justify-end gap-2 border-t border-gray-100 px-6 py-4">
                 <button type="button" disabled={Boolean(lifecycleBusyPlanId)} onClick={() => { setPendingLifecyclePlan(null); setLifecycleError(''); }} className="rounded-lg border border-gray-200 px-4 py-2 text-[12px] disabled:opacity-40">取消</button>
-                <button type="button" disabled={Boolean(lifecycleBusyPlanId)} onClick={() => void changePlanLifecycle(pendingLifecyclePlan)} className={`rounded-lg px-4 py-2 text-[12px] font-bold text-white disabled:opacity-50 ${isArchive ? 'bg-amber-500 hover:bg-amber-600' : 'bg-rose-500 hover:bg-rose-600'}`}>{lifecycleBusyPlanId ? '处理中…' : isArchive ? '确认归档' : '确认删除'}</button>
+                <button type="button" disabled={Boolean(lifecycleBusyPlanId)} onClick={() => void changePlanLifecycle(pendingLifecyclePlan)} className={`rounded-lg px-4 py-2 text-[12px] font-bold text-white disabled:opacity-50 ${isArchive ? 'bg-emerald-500 hover:bg-emerald-600' : 'bg-rose-500 hover:bg-rose-600'}`}>{lifecycleBusyPlanId ? '处理中…' : isArchive ? '确认完成' : '确认删除'}</button>
               </div>
             </div>
           </div>
@@ -717,10 +713,6 @@ function PageHeading({ subtitle, error = '' }: { subtitle: string; error?: strin
 function Metric({ label, value, hint, accent = 'gray' }: { label: string; value: string; hint: string; accent?: 'gray' | 'amber' | 'blue' }) {
   const valueClass = accent === 'amber' ? 'text-amber-600' : accent === 'blue' ? 'text-[#5B7BFE]' : 'text-gray-900';
   return <div><p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">{label}</p><p className={`mt-2 text-[28px] font-light leading-none tracking-tight ${valueClass}`}>{value}</p><p className="mt-2 text-[11px] text-gray-400">{hint}</p></div>;
-}
-
-function Detail({ label, value }: { label: string; value: string }) {
-  return <div><p className="text-[10px] font-bold uppercase tracking-[0.14em] text-gray-400">{label}</p><p className="mt-1.5 text-[13px] text-gray-700">{value}</p></div>;
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
