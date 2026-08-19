@@ -19736,7 +19736,7 @@ export default function App() {
     }
 
     return (
-      <div className="mx-auto w-full min-w-0 h-full max-w-7xl flex flex-col px-5 pt-6 pb-8 md:pt-8 lg:px-8 relative">
+      <div className="mx-auto flex h-full w-full min-w-0 flex-col px-5 pb-6 pt-5 md:pt-6 lg:px-8 2xl:px-10 relative">
         <div className="window-no-drag flex justify-between items-center mb-5 shrink-0">
           <div className="flex items-center gap-4">
             <h1 className="text-[20px] lg:text-[24px] font-bold text-gray-900 tracking-tight">任务与日程</h1>
@@ -19839,7 +19839,7 @@ export default function App() {
         >
         <div ref={taskViewportRef} className="flex-1 min-w-0 overflow-y-auto scrollbar-hide">
           {taskViewMode === 'list' && (
-            <div className="max-w-4xl">
+            <div className="w-full">
               <div className="sticky top-0 z-30 mb-4 rounded-2xl border border-gray-100 bg-white/95 px-4 py-3 shadow-sm backdrop-blur">
                 <div className="flex flex-wrap items-center gap-2">
                   <div className="flex items-center gap-1.5 rounded-2xl border border-gray-200 bg-white px-3 py-2">
@@ -20672,7 +20672,7 @@ export default function App() {
           )}
 
           {taskViewMode === 'inbox' && (
-            <div className="h-full min-h-0 max-w-4xl">
+            <div className="h-full min-h-0 w-full">
               <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-2xl border border-gray-100 bg-white p-6">
                 <div className="flex flex-wrap items-start justify-between gap-3 mb-5">
                   <div>
@@ -21022,7 +21022,7 @@ export default function App() {
           )}
 
           {taskViewMode === 'calendar' && (
-            <div className="space-y-3">
+            <div className="h-full min-h-0">
               <TaskCalendarView
                 uiSessionScopeKey={`${taskUiSessionScope}:calendar`}
                 tasks={calendarTasks}
@@ -21100,7 +21100,7 @@ export default function App() {
                 ? `所有项目（${eventLineProjectOptions.length}）`
                 : (eventLineProjectOptions.find((o) => o.id === eventLineProjectFilterId)?.label ?? '未知项目');
             return (
-            <div className="event-lines-panel mx-auto flex h-full min-h-0 max-w-6xl flex-col overflow-hidden">
+            <div className="event-lines-panel flex h-full min-h-0 w-full flex-col overflow-hidden">
               {/* 顶部标题区 */}
               <header className="z-30 flex shrink-0 items-end justify-between gap-6 border-b border-gray-100 bg-[#F9FAFB] py-5">
                 <div>
@@ -21636,7 +21636,7 @@ export default function App() {
           })()}
 
           {taskViewMode === 'review' && (
-            <div className="mx-auto flex h-full min-h-0 max-w-6xl flex-col overflow-hidden">
+            <div className="flex h-full min-h-0 w-full flex-col overflow-hidden">
 
               {/* ── 顶部控制栏 · 极简 typography ── */}
               <div className="flex items-end justify-between gap-6 py-5 shrink-0">
@@ -21828,7 +21828,7 @@ export default function App() {
 
               {/* ── 本周概览 · 极简 typography ── */}
               {activeReviewTab === 'overview' && (
-                <div className="max-w-5xl space-y-16 pt-10 pb-20">
+                <div className="w-full space-y-16 pt-10 pb-20">
                   {/* 本周总览 · quote 风格 */}
                   <section>
                     <div className="flex items-center justify-between mb-6">
@@ -21957,7 +21957,7 @@ export default function App() {
 
               {/* ── 事件复盘 · 极简 typography ── */}
               {activeReviewTab === 'events' && (
-                <div className="max-w-5xl pt-10 pb-20">
+                <div className="w-full pt-10 pb-20">
                   <div className="flex items-baseline justify-between mb-10">
                     <div>
                       <h2 className="text-[20px] font-light tracking-tight text-gray-900">事件复盘</h2>

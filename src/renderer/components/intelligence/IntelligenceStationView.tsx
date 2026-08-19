@@ -1489,7 +1489,7 @@ export function IntelligenceStationView({
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-white font-sans text-gray-900">
-      <div className="mx-auto flex h-full min-h-0 w-full max-w-[1320px] flex-col px-6 pt-6 lg:px-8">
+      <div className="mx-auto flex h-full min-h-0 w-full flex-col px-5 pt-5 md:pt-6 lg:px-8 2xl:px-10">
         {/* 页面进入后直接展示指标；当前板块和项目由下方固定标签栏表达。 */}
         <header className="shrink-0">
           {/* 4 KPI block — tab-aware: 品牌监测显示品牌健康 KPI, 时效情报显示信号流通 KPI */}

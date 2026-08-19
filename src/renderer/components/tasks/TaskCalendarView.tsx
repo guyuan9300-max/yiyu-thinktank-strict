@@ -1521,8 +1521,8 @@ export function TaskCalendarView({
   const periodTitle = calendarDisplayMode === 'week' ? visibleWeekPage.title : formatMonthTitle(activeMonthDate);
 
   return (
-    <div className="w-full min-w-0 grid grid-cols-1 gap-6 items-start transition-all xl:grid-cols-[minmax(0,1fr)]">
-      <div className="min-w-0 w-full bg-white border border-gray-100 rounded-2xl overflow-visible">
+    <div className="grid h-full min-h-0 w-full min-w-0 grid-cols-1 items-stretch gap-6 transition-all xl:grid-cols-[minmax(0,1fr)]">
+      <div className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-visible rounded-2xl border border-gray-100 bg-white">
         <div ref={calendarToolbarRef} className="sticky top-0 z-40 flex flex-col gap-3 rounded-t-2xl border-b border-gray-100 bg-white/95 px-5 py-5 backdrop-blur lg:px-6">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
             <div className="space-y-3">
@@ -1632,7 +1632,7 @@ export function TaskCalendarView({
         </div>
 
         {calendarDisplayMode === 'month' ? (
-          <>
+          <div className="flex min-h-0 flex-1 flex-col">
             <div
               className="sticky z-30 grid grid-cols-7 border-b border-gray-100 bg-white/95 px-5 pt-5 pb-3 text-center text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-400 backdrop-blur lg:px-6"
               style={{ top: `${calendarToolbarHeight}px` }}
@@ -1642,9 +1642,12 @@ export function TaskCalendarView({
               ))}
             </div>
 
-            <div>
+            <div
+              className="grid min-h-0 flex-1"
+              style={{ gridTemplateRows: `repeat(${monthTimelineWeeks.length}, minmax(146px, 1fr))` }}
+            >
               {monthTimelineWeeks.map((week) => (
-                <div key={week.key} className="grid w-full grid-cols-7">
+                <div key={week.key} className="grid min-h-0 w-full grid-cols-7">
                   {week.days.map(({ date: cellDate, dayTasks }) => {
                     const isActiveSelection = isSameDay(cellDate, selectedDate);
                     const isToday = isSameDay(cellDate, today);
@@ -2033,7 +2036,7 @@ export function TaskCalendarView({
                 </div>
               ))}
             </div>
-          </>
+          </div>
         ) : (
           <div className="border-t border-gray-100">
             <div

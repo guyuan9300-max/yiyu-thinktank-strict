@@ -100,8 +100,8 @@ const GROWTH_CSS = `
 .gc-root { height: 100%; display: flex; flex-direction: column; overflow: hidden; background: #fff; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'PingFang SC', 'Hiragino Sans GB', sans-serif; color: #374151; -webkit-font-smoothing: antialiased; }
 
 /* Header */
-.gc-header { background: #fff; border-bottom: 1px solid #F3F4F6; padding: 24px 32px 0; flex-shrink: 0; }
-.gc-header-inner { width: 100%; max-width: 1160px; margin: 0 auto; box-sizing: border-box; }
+.gc-header { background: #fff; border-bottom: 1px solid #F3F4F6; padding: 20px clamp(20px, 2.2vw, 48px) 0; flex-shrink: 0; }
+.gc-header-inner { width: 100%; margin: 0 auto; box-sizing: border-box; }
 .gc-header-top { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 20px; gap: 16px; }
 .gc-page-eyebrow { font-size: 10px; font-weight: 600; color: #9ca3af; letter-spacing: 0.18em; text-transform: uppercase; }
 .gc-page-title { font-size: 22px; font-weight: 300; color: #111827; letter-spacing: -0.4px; margin-top: 4px; }
@@ -119,8 +119,8 @@ const GROWTH_CSS = `
 .gc-tab-btn.active { color: #5B7BFE; border-bottom-color: #5B7BFE; }
 
 /* Content */
-.gc-content { flex: 1; overflow-y: auto; padding: 20px 24px; }
-.gc-content-inner { width: 100%; max-width: 1160px; margin: 0 auto; box-sizing: border-box; }
+.gc-content { flex: 1; overflow-y: auto; padding: 20px clamp(20px, 2.2vw, 48px) 40px; }
+.gc-content-inner { width: 100%; margin: 0 auto; box-sizing: border-box; }
 
 /* Cards */
 .gc-card { background: #fff; border: 1px solid #f3f4f6; border-radius: 16px; }
