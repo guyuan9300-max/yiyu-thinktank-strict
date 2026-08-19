@@ -408,7 +408,7 @@ export function PlanWorkshopView({
   if (isLoading) {
     return (
       <div className="h-full overflow-y-auto">
-        <div className="mx-auto max-w-7xl space-y-8 px-6 pb-20 pt-8 lg:px-8">
+        <div className="w-full space-y-8 pb-20 pt-8">
           <PageHeading subtitle={subtitle} />
           <div className="rounded-2xl border border-blue-100 bg-blue-50/60 px-5 py-10 text-center text-[12px] text-blue-700">
             正在读取正式组织、部门和计划，请稍候…
@@ -420,7 +420,7 @@ export function PlanWorkshopView({
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
-      <div className="mx-auto flex h-full min-h-0 w-full max-w-7xl flex-col px-6 pt-6 lg:px-8">
+      <div className="flex h-full min-h-0 w-full flex-col pt-6">
         <div className="z-30 -mx-2 shrink-0 border-b border-gray-100 bg-[#F9FAFB] px-2 pb-3 pt-1">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <PageHeading subtitle={subtitle} error={loadError} />
