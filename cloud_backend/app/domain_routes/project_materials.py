@@ -313,6 +313,28 @@ def register_gc07_routes(
             idempotency_key=idempotency_key or new_id(),
         )
 
+    @app.post(
+        "/api/v2/domain/project-materials/projects/{project_id}"
+        "/documents/{document_id}/publish-local-summary"
+    )
+    def publish_local_material_summary(
+        project_id: str,
+        document_id: str,
+        payload: Annotated[dict[str, Any], Body()],
+        identity: Annotated[SessionIdentity, Depends(identity_dependency)],
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key"),
+        ] = None,
+    ) -> dict[str, Any]:
+        return domain.publish_local_material_summary(
+            identity,
+            project_id=project_id,
+            document_id=document_id,
+            payload=payload,
+            idempotency_key=idempotency_key or new_id(),
+        )
+
     @app.delete(
         "/api/v2/domain/project-materials/projects/{project_id}"
         "/documents/{document_id}"

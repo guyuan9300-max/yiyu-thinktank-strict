@@ -323,6 +323,14 @@ def test_gc04_task_cas_collaboration_calendar_list_lifecycle_and_proposal(
     )
     assert pending["inbox_status"] == "pending"
 
+    # 待接收任务本体仍返回给协作收件箱，但不能提前泄漏到常规月历。
+    pending_board = domain.board(peer)
+    pending_task = next(item for item in pending_board["tasks"] if item["id"] == task_id)
+    assert pending_task["viewer_inbox_status"] == "pending"
+    assert all(
+        item.get("task_id") != task_id for item in pending_board["calendarEntries"]
+    )
+
     accepted = domain.handle_inbox(
         peer,
         task_id=task_id,
@@ -333,6 +341,10 @@ def test_gc04_task_cas_collaboration_calendar_list_lifecycle_and_proposal(
     )
     assert accepted["collaborator"]["inbox_status"] == "accepted"
     assert accepted["notificationResult"]["state"] == "not_connected"
+    accepted_board = domain.board(peer)
+    assert any(
+        item.get("task_id") == task_id for item in accepted_board["calendarEntries"]
+    )
 
     owner = next(
         item for item in created["task"]["collaborators"] if item["role_key"] == "owner"

@@ -1494,13 +1494,28 @@ class GC04TaskRepository:
                 (identity.scope_id,),
             ).fetchall()
             visible_ids = {str(row["id"]) for row in visible}
-            calendar = [row for row in calendar if str(row["task_id"] or "") in visible_ids]
+            task_payloads = [
+                self._task_payload(connection, identity, row) for row in visible
+            ]
+            # 待接收协作任务必须只进入协作收件箱。任务本体仍随 board
+            # 返回，供收件箱呈现和接受/退回；但在当前成员接受前，不得进入
+            # 常规清单或日历投影。接受后仍复用同一 tasks 权威行和 task_id。
+            standard_view_ids = {
+                str(task["id"])
+                for task in task_payloads
+                if str(task.get("viewer_inbox_status") or "") != "pending"
+            }
+            calendar = [
+                row
+                for row in calendar
+                if str(row["task_id"] or "") in standard_view_ids
+            ]
             projection = self._projection_for_tasks(connection, identity, visible_ids)
             projection["task_lists"] = [self._row_dict(row) for row in lists]
             projection["task_views"] = [self._row_dict(row) for row in views]
             projection["calendar_entries"] = [self._row_dict(row) for row in calendar]
             return {
-                "tasks": [self._task_payload(connection, identity, row) for row in visible],
+                "tasks": task_payloads,
                 "taskLists": [self._row_dict(row) for row in lists],
                 "taskViews": [self._row_dict(row) for row in views],
                 "taskTags": tags,

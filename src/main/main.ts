@@ -619,6 +619,7 @@ async function startBackend(): Promise<void> {
 }
 
 function createWindow(): void {
+  const developmentUrl = process.env.VITE_DEV_SERVER_URL;
   mainWindow = new BrowserWindow({
     title: APP_NAME,
     width: 1440,
@@ -626,7 +627,9 @@ function createWindow(): void {
     minWidth: 1080,
     minHeight: 700,
     backgroundColor: '#f4f6f9',
-    show: false,
+    // Keep the development window observable even while Vite compiles the
+    // large renderer; packaged builds still wait for ready-to-show.
+    show: Boolean(developmentUrl),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -642,7 +645,6 @@ function createWindow(): void {
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
   });
-  const developmentUrl = process.env.VITE_DEV_SERVER_URL;
   if (developmentUrl) {
     void mainWindow.loadURL(developmentUrl);
   } else {

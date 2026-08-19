@@ -2818,6 +2818,7 @@ def test_local_wiki_retrieval_tokens_and_fact_locators_are_rebuildable() -> None
 
 def test_local_pdf_text_and_scanned_pdf_state_are_explicit(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from pypdf import PdfWriter
     from pypdf.generic import (
@@ -2892,7 +2893,10 @@ def test_local_pdf_text_and_scanned_pdf_state_are_explicit(
         ],
     )
     assert "PDF_TEXT_SENTINEL" in store.document_text("pdf-text")["content"]
-    with pytest.raises(LocalRuntimeError) as exc_info:
-        store.document_text("pdf-scanned")
-    assert exc_info.value.code == "local_document_ocr_required"
-    assert "OCR" in exc_info.value.message
+    monkeypatch.setattr(
+        "backend.app.project_materials_local.extract_ocr_text",
+        lambda _path, **_kwargs: "OCR_TEXT_SENTINEL",
+    )
+    scanned = store.document_text("pdf-scanned")
+    assert scanned["kind"] == "pdf_ocr"
+    assert scanned["content"] == "OCR_TEXT_SENTINEL"

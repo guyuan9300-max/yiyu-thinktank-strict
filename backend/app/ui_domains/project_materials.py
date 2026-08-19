@@ -28,6 +28,151 @@ def _segment(value: str) -> str:
     return quote(str(value), safe="")
 
 
+def _publish_ready_material_summaries(
+    *,
+    runtime: Any,
+    store: LocalProjectMaterialsRepository,
+    project_id: str,
+    document_ids: list[str],
+    limit: int = 1,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Publish bounded safe summaries for parse-ready local files.
+
+    One document per automatic request keeps a large project from occupying a
+    local dispatch worker for minutes.  The renderer refreshes the workspace
+    after each settled item and continues with the next missing summary.
+    """
+
+    visible = {
+        str(item.get("id") or ""): dict(item)
+        for item in store.documents(project_id)
+    }
+    candidates = [
+        document_id
+        for document_id in document_ids
+        if document_id in visible
+        and str(visible[document_id].get("parseStatus") or "") == "ready"
+        and (
+            force
+            or str(visible[document_id].get("sharedSummaryState") or "")
+            != "ready"
+        )
+    ][: max(1, int(limit))]
+    results: list[dict[str, Any]] = []
+    for document_id in candidates:
+        try:
+            local = store.document_text(document_id)
+            content = str(local.get("content") or "").strip()
+            if not content:
+                raise LocalRuntimeError(422, "local_document_empty", "本机源文件没有可解析正文")
+            reading = runtime.cloud_query(
+                f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
+                f"/documents/{_segment(document_id)}/reading-preview"
+            )
+            source_hash = str(local.get("contentHash") or "")
+            if (
+                not force
+                and bool(reading.get("publishedSummary"))
+                and str(reading.get("publishedSourceContentHash") or "")
+                == source_hash
+            ):
+                store.update_shared_summary_state(
+                    document_id,
+                    state="ready",
+                    source_content_hash=source_hash,
+                )
+                results.append({"documentId": document_id, "state": "ready", "reused": True})
+                continue
+            # Very long transcripts and reports used to send their first
+            # 120k characters in one blocking request.  A bounded
+            # beginning/middle/end evidence pack is both more representative
+            # and reliably finishes within the organization-model deadline.
+            if len(content) <= 30_000:
+                summary_source = content
+            else:
+                middle = max(0, len(content) // 2 - 5_000)
+                summary_source = "\n\n".join(
+                    (
+                        "[文件开头]\n" + content[:10_000],
+                        "[文件中段]\n" + content[middle : middle + 10_000],
+                        "[文件结尾]\n" + content[-10_000:],
+                    )
+                )
+            completion = runtime.private_ai_completion(
+                system_prompt=(
+                    "你是项目资料摘要器。只根据当前成员设备上的文件正文生成"
+                    "可供本组织共享的中文项目摘要。覆盖文件的核心主题、主体、"
+                    "事实、时间、承诺、风险和待办；忽略排版噪音，不补造信息，"
+                    "不输出本机路径。"
+                ),
+                prompt=summary_source,
+                creativity_mode="strict",
+                read_timeout_seconds=100.0,
+                max_output_tokens=1_200,
+            )
+            summary = str(completion.get("content") or "").strip()
+            if not summary:
+                raise LocalRuntimeError(502, "local_ai_summary_empty", "组织模型没有生成可共享摘要")
+            model_name = str(completion.get("modelName") or "organization_default")
+            store.update_ai_summary(
+                document_id,
+                summary=summary,
+                model_name=model_name,
+            )
+            published = runtime.cloud_command(
+                "POST",
+                f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
+                f"/documents/{_segment(document_id)}/publish-local-summary",
+                payload={
+                    "expectedVersion": int(reading.get("aggregateVersion") or 1),
+                    "sourceContentHash": source_hash,
+                    "summary": summary[:4000],
+                    "generatorVersion": model_name,
+                },
+                idempotency_key=(
+                    "project-material-auto-summary:"
+                    + sha256_text(f"{project_id}:{document_id}:{source_hash}")[:32]
+                ),
+                refresh_business=False,
+            )
+            store.update_shared_summary_state(
+                document_id,
+                state="ready",
+                source_content_hash=source_hash,
+            )
+            results.append(
+                {
+                    "documentId": document_id,
+                    "state": "ready",
+                    "summaryDocumentId": published.get("documentId"),
+                    "reused": False,
+                }
+            )
+        except LocalRuntimeError as exc:
+            state = "failed_retryable" if exc.status_code >= 500 else "blocked"
+            store.update_shared_summary_state(
+                document_id,
+                state=state,
+                message=exc.message,
+            )
+            results.append(
+                {
+                    "documentId": document_id,
+                    "state": state,
+                    "errorCode": exc.code,
+                    "message": exc.message,
+                }
+            )
+    return {
+        "attempted": len(results),
+        "ready": sum(item["state"] == "ready" for item in results),
+        "failedRetryable": sum(item["state"] == "failed_retryable" for item in results),
+        "blocked": sum(item["state"] == "blocked" for item in results),
+        "items": results,
+    }
+
+
 def register_and_process_local_materials(
     *,
     runtime: Any,
@@ -111,11 +256,22 @@ def register_and_process_local_materials(
         project_id=project_id,
         document_ids=document_ids,
     )
+    shared_summaries = _publish_ready_material_summaries(
+        runtime=runtime,
+        store=store,
+        project_id=project_id,
+        document_ids=[
+            str(item.get("documentId") or "")
+            for item in processing.get("items") or []
+            if str(item.get("documentId") or "")
+        ],
+    )
     return {
         "documentIds": document_ids,
         "cloudMetadataState": cloud_state,
         "cloudError": cloud_error,
         "processing": processing,
+        "sharedSummaries": shared_summaries,
         "overallState": (
             "ready"
             if cloud_state == "ready"
@@ -553,13 +709,28 @@ def process_pending_materials(
     match: Any,
 ) -> dict[str, Any]:
     _require_project_read(compatibility, match.group("project_id"))
-    return _local_call(
-        lambda: _local_store(compatibility).process_pending_documents(
+    store = _local_store(compatibility)
+    processing = _local_call(
+        lambda: store.process_pending_documents(
             project_id=match.group("project_id"),
             document_ids=request.body.get("documentIds") or [],
             force=bool(request.body.get("force")),
         )
     )
+    shared_summaries = _local_call(
+        lambda: _publish_ready_material_summaries(
+            runtime=compatibility.runtime,
+            store=store,
+            project_id=match.group("project_id"),
+            document_ids=[
+                str(item.get("documentId") or "")
+                for item in processing.get("items") or []
+                if str(item.get("documentId") or "")
+            ],
+            force=bool(request.body.get("force")),
+        )
+    )
+    return {**processing, "sharedSummaries": shared_summaries}
 
 
 @router.get(r"clients/(?P<project_id>[^/]+)/knowledge/progress")
@@ -2397,6 +2568,8 @@ def start_link_import_run(
                 },
             )
         )
+
+
     try:
         database_path = getattr(compatibility.runtime, "database_path", None)
         fetched = fetch_link_material(
@@ -2554,6 +2727,62 @@ def start_link_import_run(
     )
 
 
+@router.get(r"clients/(?P<project_id>[^/]+)/mobile-link-transfers/pending")
+def pending_mobile_link_transfers(
+    compatibility: Any,
+    request: UiRequest,
+    match: Any,
+) -> dict[str, Any]:
+    project_id = match.group("project_id")
+    _require_project_read(compatibility, project_id)
+    return compatibility.runtime.cloud_query(
+        "/api/v2/mobile-link-transfers/pending",
+        query={"projectId": project_id},
+    )
+
+
+@router.post(
+    r"clients/(?P<project_id>[^/]+)/mobile-link-transfers/"
+    r"(?P<run_id>[^/]+)/claim"
+)
+def claim_mobile_link_transfer(
+    compatibility: Any,
+    request: UiRequest,
+    match: Any,
+) -> dict[str, Any]:
+    project_id = match.group("project_id")
+    _require_project_read(compatibility, project_id)
+    return compatibility.runtime.cloud_command(
+        "POST",
+        "/api/v2/mobile-link-transfers/"
+        f"{_segment(match.group('run_id'))}/claim",
+        payload={},
+        idempotency_key=request.idempotency_key,
+        refresh_business=False,
+    )
+
+
+@router.post(
+    r"clients/(?P<project_id>[^/]+)/mobile-link-transfers/"
+    r"(?P<run_id>[^/]+)/settle"
+)
+def settle_mobile_link_transfer(
+    compatibility: Any,
+    request: UiRequest,
+    match: Any,
+) -> dict[str, Any]:
+    project_id = match.group("project_id")
+    _require_project_read(compatibility, project_id)
+    return compatibility.runtime.cloud_command(
+        "POST",
+        "/api/v2/mobile-link-transfers/"
+        f"{_segment(match.group('run_id'))}/settle",
+        payload=dict(request.body),
+        idempotency_key=request.idempotency_key,
+        refresh_business=False,
+    )
+
+
 @router.post(r"imports")
 def import_paths(
     compatibility: Any,
@@ -2626,10 +2855,13 @@ def import_paths(
                 "retryable": exc.status_code >= 500,
                 "message": "文件已保存到当前设备；组织云元数据尚待同步",
                 "importedCount": len(local["materials"]),
-                "skippedCount": 0,
+                "skippedCount": int(local.get("skippedCount") or 0),
                 "duplicateCount": 0,
                 "versionUpgradeCount": 0,
-                "unsupportedCount": 0,
+                "unsupportedCount": int(local.get("unsupportedCount") or 0),
+                "filteredSystemCount": int(local.get("filteredSystemCount") or 0),
+                "filteredVideoCount": int(local.get("filteredVideoCount") or 0),
+                "skippedFiles": list(local.get("skipped") or []),
                 "createdAt": utc_now(),
                 "jobId": None,
                 "documents": [
@@ -2682,10 +2914,14 @@ def import_paths(
             "overallState": "ready",
             "retryable": False,
             "importedCount": int(cloud.get("importedCount") or 0),
-            "skippedCount": int(cloud.get("skippedCount") or 0),
+            "skippedCount": int(local.get("skippedCount") or 0)
+            + int(cloud.get("skippedCount") or 0),
             "duplicateCount": 0,
             "versionUpgradeCount": 0,
-            "unsupportedCount": 0,
+            "unsupportedCount": int(local.get("unsupportedCount") or 0),
+            "filteredSystemCount": int(local.get("filteredSystemCount") or 0),
+            "filteredVideoCount": int(local.get("filteredVideoCount") or 0),
+            "skippedFiles": list(local.get("skipped") or []),
             "createdAt": cloud.get("createdAt"),
             "jobId": None,
             "documents": documents,

@@ -527,6 +527,8 @@ export function TaskCalendarView({
   const weekCreateCleanupRef = useRef<(() => void) | null>(null);
   const weekTimelineScrollRef = useRef<HTMLDivElement | null>(null);
   const weekPagerRef = useRef<HTMLDivElement | null>(null);
+  const calendarToolbarRef = useRef<HTMLDivElement | null>(null);
+  const [calendarToolbarHeight, setCalendarToolbarHeight] = useState(0);
   const weekPagerIdleTimerRef = useRef<number | null>(null);
   const weekPagerVerticalSyncRef = useRef(false);
   const weekPagerGestureDeadlineRef = useRef(0);
@@ -537,6 +539,15 @@ export function TaskCalendarView({
   // 软件长时间打开跨过零点后, today 仍指向昨天, 月历高亮和"今日"判断全错.
   // 改为 state + 分钟级 interval + window focus 重算, 跨零点立刻刷新.
   const [today, setToday] = useState(() => new Date());
+  useEffect(() => {
+    const node = calendarToolbarRef.current;
+    if (!node) return;
+    const update = () => setCalendarToolbarHeight(Math.ceil(node.getBoundingClientRect().height));
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
   useEffect(() => {
     const ymd = (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
     const refresh = () => {
@@ -916,12 +927,28 @@ export function TaskCalendarView({
     [calendarDisplayMode, draggingTaskId, visibleTasks, weekTasks],
   );
 
+  const draggedMeeting = useMemo(() => {
+    if (!draggingTaskId?.startsWith('meeting:')) return null;
+    const meetingId = draggingTaskId.slice('meeting:'.length);
+    return meetings.find((meeting) => meeting.id === meetingId) || null;
+  }, [draggingTaskId, meetings]);
+
+  const draggedScheduleTitle = draggedTask?.title || draggedMeeting?.title || '';
+
   const draggedDurationMinutes = useMemo(() => {
+    if (draggedMeeting) {
+      const startsAt = new Date(draggedMeeting.startsAt).getTime();
+      const endsAt = new Date(draggedMeeting.endsAt).getTime();
+      if (Number.isFinite(startsAt) && Number.isFinite(endsAt) && endsAt > startsAt) {
+        return Math.max(DAY_TIMELINE_SLOT_MINUTES, Math.round((endsAt - startsAt) / 60_000));
+      }
+      return DAY_TIMELINE_DEFAULT_DURATION_MINUTES;
+    }
     if (!draggedTask) return DAY_TIMELINE_DEFAULT_DURATION_MINUTES;
     const timedMatch = weekTimedTasks.find((item) => item.task.id === draggedTask.id);
     if (timedMatch) return timedMatch.durationMinutes;
     return Math.max(DAY_TIMELINE_SLOT_MINUTES, draggedTask.durationMinutes ?? DAY_TIMELINE_DEFAULT_DURATION_MINUTES);
-  }, [draggedTask, weekTimedTasks]);
+  }, [draggedMeeting, draggedTask, weekTimedTasks]);
 
   useEffect(() => {
     if (calendarDisplayMode !== 'week') return;
@@ -1195,6 +1222,19 @@ export function TaskCalendarView({
       onSelectDate(dayDate);
     } catch {
       // rollback 已处理。
+    }
+  };
+
+  const handleWeekTimelineMeetingDrop = async (meeting: GC06Meeting, dayDate: Date, minuteOfDay: number) => {
+    const nextStartDateTime = combineDateAndTime(dayDate, minuteOfDay);
+    setDragTargetMinute(null);
+    setDragTargetDay(null);
+    setDraggingTaskId(null);
+    try {
+      await onRescheduleMeeting?.(meeting, nextStartDateTime);
+      onSelectDate(dayDate);
+    } catch {
+      // App 层负责回滚会议投影并显示真实错误。
     }
   };
 
@@ -1488,7 +1528,7 @@ export function TaskCalendarView({
   return (
     <div className="w-full min-w-0 grid grid-cols-1 gap-6 items-start transition-all xl:grid-cols-[minmax(0,1fr)]">
       <div className="min-w-0 w-full bg-white border border-gray-100 rounded-2xl overflow-visible">
-        <div className="sticky top-0 z-40 flex flex-col gap-3 rounded-t-2xl border-b border-gray-100 bg-white/95 px-5 py-5 backdrop-blur lg:px-6">
+        <div ref={calendarToolbarRef} className="sticky top-0 z-40 flex flex-col gap-3 rounded-t-2xl border-b border-gray-100 bg-white/95 px-5 py-5 backdrop-blur lg:px-6">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
             <div className="space-y-3">
               <div className="flex flex-wrap items-center gap-3">
@@ -1603,7 +1643,10 @@ export function TaskCalendarView({
 
         {calendarDisplayMode === 'month' ? (
           <>
-            <div className="grid grid-cols-7 text-center text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-400 px-5 lg:px-6 pt-5 pb-3">
+            <div
+              className="sticky z-30 grid grid-cols-7 border-b border-gray-100 bg-white/95 px-5 pt-5 pb-3 text-center text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-400 backdrop-blur lg:px-6"
+              style={{ top: `${calendarToolbarHeight}px` }}
+            >
               {['周一', '周二', '周三', '周四', '周五', '周六', '周日'].map((day) => (
                 <div key={day}>{day}</div>
               ))}
@@ -2008,6 +2051,56 @@ export function TaskCalendarView({
         ) : (
           <div className="border-t border-gray-100">
             <div
+              className="sticky z-30 grid grid-cols-[56px_repeat(7,minmax(0,1fr))] border-b border-gray-100 bg-white/95 backdrop-blur"
+              style={{ top: `${calendarToolbarHeight}px` }}
+            >
+              <div />
+              {visibleWeekPage.days.map((day) => {
+                const isActive = isSameDay(day, selectedDate);
+                const isToday = isSameDay(day, today);
+                const chinaCalendarMarkers = getChinaCalendarMarkers(day);
+                const weekdayShort = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'][day.getDay()];
+                return (
+                  <button
+                    key={`fixed-${day.toISOString()}`}
+                    type="button"
+                    className={`relative border-l border-gray-100 px-2 pt-4 pb-3 text-center transition-colors ${
+                      isActive ? 'bg-[#5B7BFE]/[0.04]' : 'hover:bg-gray-50/60'
+                    }`}
+                    onClick={() => handleDaySelect(day)}
+                  >
+                    <p className={`text-[10px] font-bold uppercase tracking-[0.18em] transition-colors ${
+                      isToday ? 'text-[#5B7BFE]' : isActive ? 'text-gray-700' : 'text-gray-400'
+                    }`}>
+                      {weekdayShort}
+                    </p>
+                    <div className="mt-2.5 flex items-center justify-center">
+                      <span className={`text-[28px] leading-none font-light tracking-tight transition-colors ${
+                        isToday ? 'text-[#5B7BFE]' : isActive ? 'text-gray-900' : 'text-gray-700'
+                      }`}>
+                        {String(day.getDate()).padStart(2, '0')}
+                      </span>
+                    </div>
+                    {chinaCalendarMarkers.length > 0 && (
+                      <div className="mt-2 flex flex-wrap items-center justify-center gap-1">
+                        {chinaCalendarMarkers.slice(0, 2).map((marker) => (
+                          <span
+                            key={`fixed-${day.toISOString()}-${marker.kind}-${marker.label}`}
+                            className={`rounded-full border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.06em] leading-none ${calendarMarkerClassName(marker)}`}
+                          >
+                            {marker.label}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    <span className={`pointer-events-none absolute left-0 right-0 -bottom-px h-[2px] rounded-full transition-colors ${
+                      isToday ? 'bg-[#5B7BFE]' : isActive ? 'bg-[#9FB2FF]' : 'bg-transparent'
+                    }`} />
+                  </button>
+                );
+              })}
+            </div>
+            <div
               ref={weekPagerRef}
               className="overflow-x-auto overscroll-x-contain snap-x snap-proximity"
               onScroll={handleWeekPagerScroll}
@@ -2033,55 +2126,6 @@ export function TaskCalendarView({
                       willChange: 'opacity',
                     }}
                   >
-                    <div className="grid grid-cols-[56px_repeat(7,minmax(0,1fr))] border-b border-gray-100 bg-white">
-                      <div />
-                      {page.days.map((day) => {
-                        const isActive = isSameDay(day, selectedDate);
-                        const isToday = isSameDay(day, today);
-                        const chinaCalendarMarkers = getChinaCalendarMarkers(day);
-                        const weekdayShort = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'][day.getDay()];
-                        return (
-                          <button
-                            key={day.toISOString()}
-                            type="button"
-                            className={`relative border-l border-gray-100 px-2 pt-4 pb-3 text-center transition-colors ${
-                              isActive ? 'bg-[#5B7BFE]/[0.04]' : 'hover:bg-gray-50/60'
-                            }`}
-                            onClick={() => handleDaySelect(day)}
-                          >
-                            <p className={`text-[10px] font-bold uppercase tracking-[0.18em] transition-colors ${
-                              isToday ? 'text-[#5B7BFE]' : isActive ? 'text-gray-700' : 'text-gray-400'
-                            }`}>
-                              {weekdayShort}
-                            </p>
-                            <div className="mt-2.5 flex items-center justify-center">
-                              <span className={`text-[28px] leading-none font-light tracking-tight transition-colors ${
-                                isToday ? 'text-[#5B7BFE]' : isActive ? 'text-gray-900' : 'text-gray-700'
-                              }`}>
-                                {String(day.getDate()).padStart(2, '0')}
-                              </span>
-                            </div>
-                            {chinaCalendarMarkers.length > 0 && (
-                              <div className="mt-2 flex flex-wrap items-center justify-center gap-1">
-                                {chinaCalendarMarkers.slice(0, 2).map((marker) => (
-                                  <span
-                                    key={`${day.toISOString()}-${marker.kind}-${marker.label}`}
-                                    className={`rounded-full border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.06em] leading-none ${calendarMarkerClassName(marker)}`}
-                                  >
-                                    {marker.label}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                            {/* 底部锚线:今天用品牌色,选中(非今天)用浅紫,默认透明 */}
-                            <span className={`pointer-events-none absolute left-0 right-0 -bottom-px h-[2px] rounded-full transition-colors ${
-                              isToday ? 'bg-[#5B7BFE]' : isActive ? 'bg-[#9FB2FF]' : 'bg-transparent'
-                            }`} />
-                          </button>
-                        );
-                      })}
-                    </div>
-
                     {/* 未安排时间行 —— 有 dueDate 但没 scheduledStartAt 的任务在这里露面；
                         卡片可拖到下方时间格，复用 handleWeekTimelineTaskDrop 自动分配时间。 */}
                     {page.unscheduledByDay.some((items) => items.length > 0) && (
@@ -2198,7 +2242,19 @@ export function TaskCalendarView({
                       data-week-scroll="true"
                       onScroll={handleWeekVerticalScroll}
                     >
-                      <div className="grid grid-cols-[60px_repeat(7,minmax(0,1fr))] bg-white">
+                      <div className="relative grid grid-cols-[60px_repeat(7,minmax(0,1fr))] bg-white">
+                        {(draggedTask || draggedMeeting) && dragTargetMinute !== null && (
+                          <div
+                            className="pointer-events-none absolute left-0 right-0 z-[75] flex items-center"
+                            style={{ top: `${(dragTargetMinute / DAY_TIMELINE_SLOT_MINUTES) * DAY_TIMELINE_SLOT_HEIGHT}px` }}
+                            aria-hidden="true"
+                          >
+                            <span className="w-[60px] -translate-y-1/2 pr-2 text-right text-[10px] font-bold tabular-nums text-[#5B7BFE]">
+                              {formatMinuteOfDay(dragTargetMinute)}
+                            </span>
+                            <span className="flex-1 border-t-2 border-dashed border-[#5B7BFE]" />
+                          </div>
+                        )}
                         <div className="relative">
                           {/* 时间标签:垂直中心对齐 hour line,而不是贴在 line 上。
                               用绝对定位让数字的水平中线刚好落在 hour line 上,符合 Google Calendar / TickTick 习惯。 */}
@@ -2297,8 +2353,13 @@ export function TaskCalendarView({
                                   const draggedTaskId = resolveDraggedTaskId(event);
                                   if (!draggedTaskId) return;
                                   event.preventDefault();
-                                  const droppedTask = page.tasks.find((task) => task.id === draggedTaskId) || visibleTasks.find((task) => task.id === draggedTaskId);
-                                  if (!droppedTask) {
+                                  const droppedMeeting = draggedTaskId.startsWith('meeting:')
+                                    ? meetings.find((meeting) => meeting.id === draggedTaskId.slice('meeting:'.length))
+                                    : null;
+                                  const droppedTask = droppedMeeting
+                                    ? null
+                                    : page.tasks.find((task) => task.id === draggedTaskId) || visibleTasks.find((task) => task.id === draggedTaskId);
+                                  if (!droppedMeeting && !droppedTask) {
                                     setDragTargetMinute(null);
                                     setDragTargetDay(null);
                                     setDraggingTaskId(null);
@@ -2313,7 +2374,11 @@ export function TaskCalendarView({
                                   const snappedMinute = offsetY > rect.height - 3 && minute + DAY_TIMELINE_SLOT_MINUTES < DAY_MINUTES
                                     ? minute + DAY_TIMELINE_SLOT_MINUTES
                                     : minute;
-                                  void handleWeekTimelineTaskDrop(droppedTask, day, snappedMinute);
+                                  if (droppedMeeting) {
+                                    void handleWeekTimelineMeetingDrop(droppedMeeting, day, snappedMinute);
+                                  } else if (droppedTask) {
+                                    void handleWeekTimelineTaskDrop(droppedTask, day, snappedMinute);
+                                  }
                                 }}
                                 title={`${formatDateInputValue(day)} ${formatMinuteOfDay(minute)} 新建任务`}
                               >
@@ -2324,7 +2389,7 @@ export function TaskCalendarView({
                                 </span>
                               </div>
                             ))}
-                            {draggedTask && dragTargetDay === day.getTime() && dragTargetMinute !== null && (
+                            {(draggedTask || draggedMeeting) && dragTargetDay === day.getTime() && dragTargetMinute !== null && (
                               <div
                                 className="pointer-events-none absolute left-1.5 right-1.5 z-[40] rounded-md border-2 border-dashed border-[#5B7BFE] bg-[#5B7BFE]/[0.06]"
                                 style={{
@@ -2334,7 +2399,7 @@ export function TaskCalendarView({
                                 }}
                               >
                                 <div className="flex h-full items-start justify-between gap-2 px-2.5 py-1.5 text-[#5B7BFE]">
-                                  <span className="min-w-0 flex-1 text-[12px] font-semibold leading-[1.35] line-clamp-2">{draggedTask.title}</span>
+                                  <span className="min-w-0 flex-1 text-[12px] font-semibold leading-[1.35] line-clamp-2">{draggedScheduleTitle}</span>
                                   <span className="shrink-0 text-[9.5px] font-semibold tracking-[0.02em] opacity-75">{`${formatMinuteOfDay(dragTargetMinute)}-${formatMinuteOfDay(Math.min(dragTargetMinute + draggedDurationMinutes, 24 * 60))}`}</span>
                                 </div>
                               </div>
@@ -2348,7 +2413,33 @@ export function TaskCalendarView({
                                 <button
                                   key={`week-meeting-${item.meeting.id}-${dayIndex}`}
                                   type="button"
+                                  draggable
                                   onMouseDown={(event) => event.stopPropagation()}
+                                  onDragStart={(event) => {
+                                    event.stopPropagation();
+                                    const meetingDragId = `meeting:${item.meeting.id}`;
+                                    event.dataTransfer.effectAllowed = 'move';
+                                    event.dataTransfer.setData('text/plain', meetingDragId);
+                                    const dragGhost = event.currentTarget.cloneNode(true) as HTMLElement;
+                                    dragGhost.style.position = 'fixed';
+                                    dragGhost.style.left = '-9999px';
+                                    dragGhost.style.top = '-9999px';
+                                    dragGhost.style.width = `${Math.max(170, event.currentTarget.offsetWidth)}px`;
+                                    dragGhost.style.height = `${Math.max(44, event.currentTarget.offsetHeight)}px`;
+                                    dragGhost.style.opacity = '0.96';
+                                    dragGhost.style.pointerEvents = 'none';
+                                    document.body.appendChild(dragGhost);
+                                    event.dataTransfer.setDragImage(dragGhost, 18, 16);
+                                    requestAnimationFrame(() => dragGhost.remove());
+                                    setDraggingTaskId(meetingDragId);
+                                    setDragTargetDay(day.getTime());
+                                    setDragTargetMinute(item.startMinute);
+                                  }}
+                                  onDragEnd={() => {
+                                    setDraggingTaskId(null);
+                                    setDragTargetDay(null);
+                                    setDragTargetMinute(null);
+                                  }}
                                   onClick={(event) => {
                                     event.stopPropagation();
                                     onOpenMeetingEditor?.(item.meeting);
@@ -2472,7 +2563,7 @@ export function TaskCalendarView({
                                   key={task.id}
                                   role="button"
                                   tabIndex={0}
-                                  draggable={false}
+                                  draggable={!isTaskLocalDraft && !isResizing}
                                   onDragStart={(event) => {
                                     event.stopPropagation();
                                     // 拒绝在 resize 进行中的 drag 启动 —— 否则 resize handle 的 mousedown

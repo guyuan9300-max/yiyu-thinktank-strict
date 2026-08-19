@@ -20,7 +20,7 @@ def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_detects_bv_and_share_copy_but_rejects_insecure_urls() -> None:
+def test_detects_bv_and_share_copy_and_upgrades_supported_short_links() -> None:
     url, platform = fetcher._validated_url("BV1ab411c7d9")  # noqa: SLF001
     assert url == "https://www.bilibili.com/video/BV1ab411c7d9"
     assert platform == "bilibili"
@@ -31,12 +31,11 @@ def test_detects_bv_and_share_copy_but_rejects_insecure_urls() -> None:
     assert url == "https://xhslink.com/aBc123"
     assert platform == "xiaohongshu"
 
-    with pytest.raises(fetcher.LinkMaterialFetchError) as blocked:
-        fetcher._validated_url(  # noqa: SLF001
-            "http://www.bilibili.com/video/BV1ab411c7d9"
-        )
-    assert blocked.value.state == "blocked"
-    assert blocked.value.retryable is False
+    url, platform = fetcher._validated_url(  # noqa: SLF001
+        "跟着胡楚靓复刻工作台 http://xhslink.cn/o/1iMsOGprLCS 复制文字"
+    )
+    assert url == "https://xhslink.cn/o/1iMsOGprLCS"
+    assert platform == "xiaohongshu"
 
 
 def test_ssrf_rejects_private_dns_resolution(
@@ -201,6 +200,32 @@ def test_xiaohongshu_audio_falls_back_to_device_local_asr(
     assert result["text"] == "说话人A：这是本机转写正文"
     assert result["metadata"]["transcriptSource"] == "local_asr"
     assert list((tmp_path / "tmp" / "link-material").iterdir()) == []
+
+
+def test_xiaohongshu_public_text_note_does_not_require_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_public_html",
+        lambda *_args: (
+            "https://www.xiaohongshu.com/discovery/item/example123",
+            "text/html; charset=utf-8",
+            '<script>window.__INITIAL_STATE__={"noteDetailMap":{"example123":'
+            '{"note":{"title":"WorkBuddy AI工作台","desc":"普通人也能上手\\n提高日常效率"}}}}</script>',
+        ),
+    )
+    monkeypatch.setattr(
+        fetcher,
+        "_download_public_media",
+        lambda *_args, **_kwargs: pytest.fail("文字笔记不应尝试下载视频"),
+    )
+    result = fetcher.fetch_link_material(
+        "https://www.xiaohongshu.com/explore/example123"
+    )
+    assert result["title"] == "WorkBuddy AI工作台"
+    assert "提高日常效率" in result["text"]
+    assert result["metadata"]["transcriptSource"] == "note_description"
 
 
 def test_missing_local_asr_model_is_accurately_blocked(

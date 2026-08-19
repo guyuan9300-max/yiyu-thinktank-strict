@@ -257,8 +257,13 @@ export function getWorkspaceLinkMaterialState(state: WorkspaceClientUiState, cli
 export function getWorkspaceRightTab(state: WorkspaceClientUiState, clientId: string): WorkspaceRightTabKey {
   const raw = state.rightTabByClient[clientId];
   // 兼容已撤下的旧标签：evidence 已并入 files；proposal 只作为
-  // 底层待确认机制，不再作为工作台独立产品入口。
-  if (!raw || (raw as string) === 'evidence' || (raw as string) === 'proposals') return 'files';
+  // 底层待确认机制；tools 已并入顶部快捷工具区。
+  if (
+    !raw
+    || (raw as string) === 'evidence'
+    || (raw as string) === 'proposals'
+    || (raw as string) === 'tools'
+  ) return 'files';
   return raw;
 }
 
@@ -542,7 +547,7 @@ export function workspaceClientUiReducer(
       // 兼容老 state：以前持久化过 'evidence' 的客户在升级后自动迁移到 'files'，
       // 后者承担了原引证视图（作为过滤模式）。
       const nextTab: WorkspaceRightTabKey =
-        (action.tab as string) === 'evidence' ? 'files' : action.tab;
+        ['evidence', 'tools', 'proposals'].includes(action.tab as string) ? 'files' : action.tab;
       return {
         ...state,
         rightTabByClient: { ...state.rightTabByClient, [action.clientId]: nextTab },

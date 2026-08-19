@@ -1,0 +1,66 @@
+{
+  "formatVersion": 1,
+  "packageId": "pp-ocrv6-tiny-onnx",
+  "displayName": "PP-OCRv6 Tiny",
+  "version": "2026-06-11",
+  "license": "Apache-2.0",
+  "officialDocumentation": "https://www.paddleocr.ai/latest/en/version3.x/algorithm/PP-OCRv6/PP-OCRv6.html",
+  "runtime": "onnxruntime",
+  "expectedDownloadBytes": 6637826,
+  "models": [
+    {
+      "id": "PP-OCRv6_tiny_det_onnx",
+      "role": "text_detection",
+      "files": [
+        {
+          "name": "inference.onnx",
+          "sizeBytes": 1780590,
+          "sha256": "193bab7a04fca699a6c82e6abb5b81bdb28177f0abd4062552b04908dafb19f8",
+          "primaryUrl": "https://huggingface.co/PaddlePaddle/PP-OCRv6_tiny_det_onnx/resolve/main/inference.onnx",
+          "mirrorUrl": "https://hf-mirror.com/PaddlePaddle/PP-OCRv6_tiny_det_onnx/resolve/main/inference.onnx"
+        },
+        {
+          "name": "inference.yml",
+          "sizeBytes": 883,
+          "sha256": "3ac018be6f97499a08faa3bbdeb33640968d9307f6736d152902747a9f259593",
+          "primaryUrl": "https://huggingface.co/PaddlePaddle/PP-OCRv6_tiny_det_onnx/resolve/main/inference.yml",
+          "mirrorUrl": "https://hf-mirror.com/PaddlePaddle/PP-OCRv6_tiny_det_onnx/resolve/main/inference.yml"
+        },
+        {
+          "name": "inference.json",
+          "sizeBytes": 229184,
+          "sha256": "935c18972799dd8f2a2ff424b9f8b2c6adee4b89f3a76f0746210ec33ba9b3d8",
+          "primaryUrl": "https://huggingface.co/PaddlePaddle/PP-OCRv6_tiny_det_onnx/resolve/main/inference.json",
+          "mirrorUrl": "https://hf-mirror.com/PaddlePaddle/PP-OCRv6_tiny_det_onnx/resolve/main/inference.json"
+        }
+      ]
+    },
+    {
+      "id": "PP-OCRv6_tiny_rec_onnx",
+      "role": "text_recognition",
+      "files": [
+        {
+          "name": "inference.onnx",
+          "sizeBytes": 4462639,
+          "sha256": "9ef676d6ed3c88256a2d92c640c44f25b0c40947e111b14b8be8f594091563e6",
+          "primaryUrl": "https://huggingface.co/PaddlePaddle/PP-OCRv6_tiny_rec_onnx/resolve/main/inference.onnx",
+          "mirrorUrl": "https://hf-mirror.com/PaddlePaddle/PP-OCRv6_tiny_rec_onnx/resolve/main/inference.onnx"
+        },
+        {
+          "name": "inference.yml",
+          "sizeBytes": 55571,
+          "sha256": "66170210bad538e83fff3c4a3867e547d6bf20b50d64b20347c4b913f3034ea1",
+          "primaryUrl": "https://huggingface.co/PaddlePaddle/PP-OCRv6_tiny_rec_onnx/resolve/main/inference.yml",
+          "mirrorUrl": "https://hf-mirror.com/PaddlePaddle/PP-OCRv6_tiny_rec_onnx/resolve/main/inference.yml"
+        },
+        {
+          "name": "inference.json",
+          "sizeBytes": 108959,
+          "sha256": "b5b14770c7dcf092781e92f4278a2ae5f95048f08b4b8a04140e88cb2745f147",
+          "primaryUrl": "https://huggingface.co/PaddlePaddle/PP-OCRv6_tiny_rec_onnx/resolve/main/inference.json",
+          "mirrorUrl": "https://hf-mirror.com/PaddlePaddle/PP-OCRv6_tiny_rec_onnx/resolve/main/inference.json"
+        }
+      ]
+    }
+  ]
+}

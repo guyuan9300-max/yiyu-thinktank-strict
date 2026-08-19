@@ -3008,6 +3008,17 @@ export interface ProjectMaterialProcessingResult {
   state: 'ready' | 'blocked' | 'failed_retryable' | string;
   retryable: boolean;
   updatedAt: string;
+  sharedSummaries?: {
+    attempted: number;
+    ready: number;
+    failedRetryable: number;
+    blocked: number;
+    items: Array<{
+      documentId: string;
+      state: string;
+      message?: string;
+    }>;
+  };
 }
 
 export async function processPendingProjectMaterials(
@@ -5212,16 +5223,67 @@ export async function documentAiAction(
 export async function startClientLinkMaterialImport(
   clientId: string,
   url: string,
-  options: { useBrowserCookies?: boolean; cookieBrowser?: 'firefox' | 'chrome' | 'edge' | 'safari' } = {},
+  options: {
+    useBrowserCookies?: boolean;
+    cookieBrowser?: 'firefox' | 'chrome' | 'edge' | 'safari';
+    idempotencyKey?: string;
+  } = {},
 ) {
   return request<LinkMaterialImportRun>(`/api/v2/ui/clients/${clientId}/link-materials/import/start`, {
     method: 'POST',
+    headers: options.idempotencyKey
+      ? { 'Idempotency-Key': options.idempotencyKey }
+      : undefined,
     body: JSON.stringify({
       url,
       useBrowserCookies: Boolean(options.useBrowserCookies),
       cookieBrowser: options.cookieBrowser || 'firefox',
     }),
   });
+}
+
+export type MobileLinkTransfer = {
+  runId: string;
+  projectId: string;
+  sourceUrl: string;
+  sourcePlatform: 'xiaohongshu' | 'bilibili' | 'wechat_article' | string;
+  status: 'queued' | 'running' | 'completed' | 'failed_retryable' | 'blocked' | string;
+  stage: string;
+  title?: string;
+  documentId?: string | null;
+  error?: string | null;
+  retryable?: boolean;
+  version: number;
+};
+
+export async function listPendingMobileLinkTransfers(clientId: string) {
+  const result = await request<{ transfers: MobileLinkTransfer[] }>(
+    `/api/v2/ui/clients/${clientId}/mobile-link-transfers/pending`,
+  );
+  return result.transfers ?? [];
+}
+
+export async function claimMobileLinkTransfer(clientId: string, runId: string) {
+  return request<MobileLinkTransfer>(
+    `/api/v2/ui/clients/${clientId}/mobile-link-transfers/${runId}/claim`,
+    { method: 'POST', body: '{}' },
+  );
+}
+
+export async function settleMobileLinkTransfer(
+  clientId: string,
+  runId: string,
+  payload: {
+    status: 'completed' | 'failed_retryable' | 'blocked';
+    title?: string;
+    documentId?: string | null;
+    error?: string;
+  },
+) {
+  return request<MobileLinkTransfer>(
+    `/api/v2/ui/clients/${clientId}/mobile-link-transfers/${runId}/settle`,
+    { method: 'POST', body: JSON.stringify(payload) },
+  );
 }
 
 export async function getLatestClientLinkMaterialImportRun(clientId: string) {

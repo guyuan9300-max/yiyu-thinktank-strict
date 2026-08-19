@@ -8,6 +8,8 @@ which current-sandbox ``storage_object`` receives the extracted text.
 from __future__ import annotations
 
 import ipaddress
+import json
+import html
 import re
 import socket
 import tempfile
@@ -26,15 +28,15 @@ from .runtime import LocalRuntimeError
 
 _SUPPORTED_HOSTS = {
     "bilibili": ("bilibili.com", "b23.tv"),
-    "xiaohongshu": ("xiaohongshu.com", "xhslink.com", "xhs.cn"),
+    "xiaohongshu": ("xiaohongshu.com", "xhslink.com", "xhslink.cn", "xhs.cn"),
     "wechat_article": ("mp.weixin.qq.com",),
 }
-_SHORT_LINK_HOSTS = {"b23.tv", "xhslink.com", "xhs.cn"}
+_SHORT_LINK_HOSTS = {"b23.tv", "xhslink.com", "xhslink.cn", "xhs.cn"}
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 _MAX_MEDIA_BYTES = 512 * 1024 * 1024
 _MAX_TEXT_CHARS = 2_000_000
 _MAX_MEDIA_DURATION_SECONDS = 4 * 60 * 60
-_URL_IN_TEXT = re.compile(r"https://[^\s<>\"'，。；、）】]+", re.IGNORECASE)
+_URL_IN_TEXT = re.compile(r"https?://[^\s<>\"'，。；、）】]+", re.IGNORECASE)
 _BILIBILI_ID = re.compile(r"^BV[0-9A-Za-z]{8,}$", re.IGNORECASE)
 _BILIBILI_VIDEO_PATH = re.compile(
     r"^/video/(?:BV[0-9A-Za-z]{8,}|av[0-9]+)(?:/)?$",
@@ -159,6 +161,9 @@ def _validated_url(value: str) -> tuple[str, str]:
             "link_import_url_invalid",
             "资料链接格式无效",
         ) from exc
+    if parsed.scheme == "http" and parsed.hostname and _platform(parsed.hostname):
+        normalized = "https://" + normalized.split("://", 1)[1]
+        parsed = urlparse(normalized)
     if (
         parsed.scheme != "https"
         or not hostname
@@ -846,6 +851,68 @@ def _wechat_material(url: str) -> dict[str, Any]:
     }
 
 
+def _xiaohongshu_text_material(url: str) -> dict[str, Any] | None:
+    """Read a public image/text note before attempting media download.
+
+    Xiaohongshu's public page embeds the note title and description in its
+    server-rendered state even when yt-dlp correctly reports that the note has
+    no video formats.  Treating such a note as missing media used to reject
+    perfectly readable text posts.
+    """
+
+    final_url, content_type, text = _fetch_public_html(url, "xiaohongshu")
+    if "html" not in content_type.lower() and "<html" not in text[:1000].lower():
+        return None
+    state_start = text.find('"noteDetailMap"')
+    state = text[state_start : state_start + 500_000] if state_start >= 0 else text
+    matched = re.search(
+        r'"title":"((?:\\.|[^"\\])*)","desc":"((?:\\.|[^"\\])*)"',
+        state,
+    )
+    if matched is not None:
+        try:
+            title = str(json.loads(f'"{matched.group(1)}"')).strip()
+            description = str(json.loads(f'"{matched.group(2)}"')).strip()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            title = ""
+            description = ""
+    else:
+        # Some public-page variants omit the hydrated note map but retain
+        # standards-based OpenGraph metadata.  It is still public note text,
+        # not a browser-session or cookie fallback.
+        title_match = re.search(
+            r'<meta\s+property="og:title"\s+content="([^"]+)"',
+            text,
+            flags=re.IGNORECASE,
+        )
+        description_match = re.search(
+            r'<meta\s+property="og:description"\s+content="([^"]+)"',
+            text,
+            flags=re.IGNORECASE,
+        )
+        title = html.unescape(title_match.group(1)).strip() if title_match else ""
+        description = (
+            html.unescape(description_match.group(1)).strip()
+            if description_match
+            else ""
+        )
+    if not description:
+        return None
+    readable = f"{title}\n\n{description}".strip() if title else description
+    return {
+        "platform": "xiaohongshu",
+        "sourceUrl": final_url,
+        "title": (title or "小红书公开笔记")[:200],
+        "text": readable[:_MAX_TEXT_CHARS],
+        "metadata": {
+            "extractionMode": "public_note_text",
+            "transcriptSource": "note_description",
+            "mediaCacheStatus": "not_downloaded",
+            "temporaryFilesCleaned": True,
+        },
+    }
+
+
 def fetch_link_material(
     url: str,
     *,
@@ -859,6 +926,15 @@ def fetch_link_material(
         return _wechat_material(normalized)
     normalized = _resolve_short_url(normalized, platform)
     normalized = _validated_media_content_url(normalized, platform)
+    if platform == "xiaohongshu":
+        try:
+            public_note = _xiaohongshu_text_material(normalized)
+        except LinkMaterialFetchError:
+            # Text-first extraction is an enhancement.  A transient HTML
+            # failure must not block a public video note that yt-dlp can read.
+            public_note = None
+        if public_note is not None:
+            return public_note
     root = Path(data_root).resolve() if data_root is not None else Path(tempfile.gettempdir())
     temporary_root = root / "tmp" / "link-material"
     temporary_root.mkdir(parents=True, exist_ok=True)

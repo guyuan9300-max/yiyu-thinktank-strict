@@ -352,6 +352,9 @@ import {
   restoreReportArtifactVersion,
   updateReportArtifact,
   startClientLinkMaterialImport,
+  listPendingMobileLinkTransfers,
+  claimMobileLinkTransfer,
+  settleMobileLinkTransfer,
   getLatestClientLinkMaterialImportRun,
   getClientLinkMaterialImportRun,
   listClientLinkMaterialImportRuns,
@@ -655,8 +658,6 @@ import { AppLogoMark, BrandLogoMark } from './components/settings/BrandLogoSetti
 import { FileSearchResultPanel } from './components/data_center/FileSearchResultPanel';
 import { ContradictionAlertPanel } from './components/client_workspace/ContradictionAlertPanel';
 import { GlossaryDriftAlertPanel } from './components/client_workspace/GlossaryDriftAlertPanel';
-import { EntityListPanel } from './components/client_workspace/EntityListPanel';
-import { ClientFactListPanel } from './components/client_workspace/ClientFactListPanel';
 import { GlossaryPendingBadge } from './components/client_workspace/GlossaryPendingBadge';
 import { RichTextDocumentEditor } from './components/client_workspace/RichTextDocumentEditor';
 import { SystemStatusPanel } from './components/global/SystemStatusPanel';
@@ -6906,6 +6907,7 @@ function ClientEditorModal({
 
   // ─── 同事下拉 UI 局部 state（扩展业务字段已经合并进 draft 不再独立 useState） ───
   const [memberOptions, setMemberOptions] = useState<MentionCandidate[]>([]);
+  const [memberDirectory, setMemberDirectory] = useState<MentionCandidate[]>([]);
   const [memberPickerOpen, setMemberPickerOpen] = useState(false);
   const [memberSearchQuery, setMemberSearchQuery] = useState('');
   const memberPickerRef = useRef<HTMLDivElement | null>(null);
@@ -6954,7 +6956,13 @@ function ClientEditorModal({
     let cancelled = false;
     void getMentionCandidates(memberSearchQuery.trim()).then((list) => {
       if (cancelled) return;
-      setMemberOptions((list || []).filter((member) => !member.isSelf));
+      const candidates = list || [];
+      setMemberOptions(candidates.filter((member) => !member.isSelf));
+      setMemberDirectory((previous) => {
+        const merged = new Map(previous.map((member) => [member.id, member]));
+        candidates.forEach((member) => merged.set(member.id, member));
+        return Array.from(merged.values());
+      });
     }).catch(() => undefined);
     return () => {
       cancelled = true;
@@ -7136,8 +7144,8 @@ function ClientEditorModal({
                       <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
                         {selectedMemberIds.length > 0 ? (
                           selectedMemberIds.map((id) => {
-                            const member = memberOptions.find((m) => m.id === id);
-                            const name = member?.fullName || id;
+                            const member = memberDirectory.find((m) => m.id === id);
+                            const name = member?.fullName || '成员信息待刷新';
                             return (
                               <span
                                 key={id}
@@ -7480,6 +7488,7 @@ type TaskPropertyRowProps = {
   icon: React.ReactNode;
   label: string;
   children: React.ReactNode;
+  stacked?: boolean;
 };
 
 const COMMON_SURNAME_SET = new Set(['王', '张', '李', '赵', '刘', '陈', '杨', '黄', '周', '吴', '徐', '孙', '胡', '朱', '高', '林', '何', '郭', '马', '罗', '梁', '宋', '郑', '谢', '韩', '唐', '冯', '于', '董', '程']);
@@ -7494,10 +7503,10 @@ const buildNameBadge = (name: string) => {
   return firstChar;
 };
 
-function TaskPropertyRow({ icon, label, children }: TaskPropertyRowProps) {
+function TaskPropertyRow({ icon, label, children, stacked = false }: TaskPropertyRowProps) {
   return (
-    <div className="flex items-center">
-      <div className="flex w-[104px] flex-shrink-0 items-center gap-2 text-gray-500">
+    <div className={stacked ? 'flex flex-col gap-2' : 'flex items-center'}>
+      <div className={`flex flex-shrink-0 items-center gap-2 text-gray-500 ${stacked ? 'w-full' : 'w-[104px]'}`}>
         {icon}
         <span className="text-sm">{label}</span>
       </div>
@@ -8091,50 +8100,6 @@ export default function App() {
   const [inlineReportVersionsOpen, setInlineReportVersionsOpen] = useState(false);
   const [inlineReportVersionsLoading, setInlineReportVersionsLoading] = useState(false);
 
-  // 用户收藏的快捷工具 key 列表。
-  // 工具页里点 ☆ 加入收藏，会持久化到 localStorage，并在快捷工具区下方追加显示。
-  // 与原有 5 个固定按钮并存——固定按钮是产品默认入口，收藏是用户主导的额外快捷。
-  const [favoriteWorkspaceTools, setFavoriteWorkspaceTools] = useState<string[]>(() => {
-    if (typeof window === 'undefined') return [];
-    try {
-      const raw = window.localStorage.getItem('yiyu.workspace.favoriteTools');
-      const parsed = raw ? JSON.parse(raw) : [];
-      const list = Array.isArray(parsed)
-        ? parsed.filter((item): item is string => typeof item === 'string')
-        : [];
-      // 顾源源 5/26: 真 migration — 旧 key 'import_folder' / 'import_files' 真已合并为 'import'.
-      // 真自动迁移 (用户旧收藏不丢, 真去重) + 真清除 registry 已不存在的 invalid key.
-      // 真原 bug: 旧 key 真占 favorite slot 但 UI 真过滤掉 → 用户感觉"加 1 个占 2 位".
-      const KNOWN_TOOL_KEYS = new Set([
-        'import', 'fill_template', 'text_doc', 'link_material', 'smart_import',
-      ]);
-      const migrated: string[] = [];
-      let hasLegacyImport = false;
-      for (const key of list) {
-        if (key === 'import_folder' || key === 'import_files') {
-          hasLegacyImport = true;
-          continue;
-        }
-        if (KNOWN_TOOL_KEYS.has(key) && !migrated.includes(key)) {
-          migrated.push(key);
-        }
-      }
-      if (hasLegacyImport && !migrated.includes('import')) {
-        migrated.unshift('import');
-      }
-      return migrated;
-    } catch {
-      return [];
-    }
-  });
-  useEffect(() => {
-    try {
-      window.localStorage.setItem('yiyu.workspace.favoriteTools', JSON.stringify(favoriteWorkspaceTools));
-    } catch {
-      // localStorage 写失败（隐私模式 / 配额满）不影响主流程
-    }
-  }, [favoriteWorkspaceTools]);
-
   // inline editor 草稿 debounce 写入 localStorage —— 防丢失底线(Tier 1)
   // 只在钢笔新建 entry(enableDraftPersist=true)启用,避免覆盖来自已有文档的 entry。
   useEffect(() => {
@@ -8158,26 +8123,12 @@ export default function App() {
     clientWorkspaceInlineEditor?.enableDraftPersist,
   ]);
 
-  // 快捷工具区最多 5 个，超出时拒绝并 flash 提示。
-  // flash 函数在文件下方才声明（line ~7399），这里用 ref 转一手避免"used before declaration"。
+  // flash 函数在文件下方才声明，这里用 ref 供早期副作用安全调用。
   const flashRef = useRef<((type: 'success' | 'error' | 'info', text: string) => void) | null>(null);
   // 多个 modal 的 backdrop 点击关闭共享 ref —— 这些 modal 互斥渲染.
   // 用于区分"真点击 backdrop"和"从 modal 内部 input/textarea 拖选鼠标滑出".
   // 详见 src/renderer/lib/useBackdropClickClose.ts
   const backdropMouseDownRef = useRef(false);
-  const toggleFavoriteWorkspaceTool = useCallback((toolKey: string) => {
-    const FAVORITE_LIMIT = 5;
-    setFavoriteWorkspaceTools((prev) => {
-      if (prev.includes(toolKey)) {
-        return prev.filter((key) => key !== toolKey);
-      }
-      if (prev.length >= FAVORITE_LIMIT) {
-        flashRef.current?.('info', `快捷工具区最多 ${FAVORITE_LIMIT} 个，请先移除一个再添加`);
-        return prev;
-      }
-      return [...prev, toolKey];
-    });
-  }, []);
   const [clientEditorModalState, setClientEditorModalState] = useState<ClientEditorModalState>(() => ({
     open: false,
     origin: 'default',
@@ -9232,7 +9183,7 @@ export default function App() {
       reportClientError('error', text);
     }
   };
-  // 同步 flash 到 flashRef，让上方早期声明的 toggleFavoriteWorkspaceTool 能调用最新的 flash
+  // 同步 flash 到 ref，供异步转写等早期副作用使用最新提示函数。
   flashRef.current = flash;
 
   const guardWorkspaceWrite = (actionLabel = '继续操作') => {
@@ -11515,6 +11466,34 @@ export default function App() {
         clientId: modalState.editingClientId,
         message: error instanceof Error ? error.message : String(error),
       });
+      if (
+        modalState.editingClientId
+        && error instanceof ApiRequestError
+        && error.statusCode === 409
+        && error.code === 'project_version_conflict'
+      ) {
+        try {
+          const latestClients = await getClients();
+          const latestClient = latestClients.find((item) => item.id === modalState.editingClientId);
+          setClients(latestClients);
+          if (latestClient?._strictVersion) {
+            // 保留用户本轮填写和共享选择，只换成云端最新 CAS 版本。
+            // 不自动重放整份表单，避免覆盖另一位管理者刚保存的元数据。
+            setClientEditorModalState((previous) => ({
+              ...previous,
+              requestId: createUiId('client-editor-refresh'),
+              initialDraft: {
+                ...draft,
+                strictVersion: latestClient._strictVersion ?? null,
+              },
+            }));
+            flash('info', '项目刚被其他操作更新；已刷新版本并保留本次共享选择，请再点一次保存。');
+            return;
+          }
+        } catch (refreshError) {
+          console.warn('[client-editor] version conflict refresh failed', refreshError);
+        }
+      }
       const state = gc02MutationFailureState(error);
       flash(
         'error',
@@ -12593,6 +12572,8 @@ export default function App() {
         item.id,
         item.parseStatus,
         item.wikiStatus,
+        item.sharedSummaryState,
+        item.sharedSummaryUpdatedAt,
         item.processingAttemptNo,
         item.processingErrorCode,
       ].join(':'))
@@ -12602,6 +12583,8 @@ export default function App() {
         item.id,
         item.parseStatus,
         item.wikiStatus,
+        item.sharedSummaryState,
+        item.sharedSummaryUpdatedAt,
         item.processingAttemptNo,
         item.processingErrorCode,
       ].join(':'))
@@ -12694,6 +12677,10 @@ export default function App() {
           document.parseStatus === 'ready'
           && (!document.wikiStatus || ['not_requested', 'queued'].includes(document.wikiStatus))
         )
+        || (
+          document.parseStatus === 'ready'
+          && (!document.sharedSummaryState || document.sharedSummaryState === 'not_requested')
+        )
       ),
     );
     if (pending.length === 0) return;
@@ -12707,7 +12694,18 @@ export default function App() {
     projectMaterialProcessingKeysRef.current.add(key);
     void processPendingProjectMaterials(currentClientId, {
       documentIds: pending.map((document) => document.id),
-    }).then(() => {
+    }).then((result) => {
+      if ((result.sharedSummaries?.ready || 0) > 0) {
+        writeRuntimeUiSessionValue(
+          [
+            'workspace-knowledge-presentation',
+            startedSandboxId || 'local',
+            currentClientId,
+          ].join(':'),
+          null,
+        );
+        markClientKnowledgeChanged(currentClientId, 'material_imported');
+      }
       if (
         shouldApplyWorkspaceLoad(null, startedSandboxId)
         && currentClientIdRef.current === currentClientId
@@ -12728,6 +12726,87 @@ export default function App() {
     activeTab,
     currentClientId,
     workspace,
+    workspacesState?.activeSandboxId,
+  ]);
+
+  const mobileLinkTransferProcessingRef = useRef(new Set<string>());
+  useEffect(() => {
+    if (
+      activeTab !== 'client_workspace'
+      || !currentClientId
+      || !workspace
+      || workspace.client?.id !== currentClientId
+      || authState.sessionMode !== 'cloud'
+    ) return;
+    let disposed = false;
+    const processNext = async () => {
+      if (disposed) return;
+      const pending = await listPendingMobileLinkTransfers(currentClientId);
+      const transfer = pending.find(
+        (item) => !mobileLinkTransferProcessingRef.current.has(item.runId),
+      );
+      if (!transfer || disposed) return;
+      mobileLinkTransferProcessingRef.current.add(transfer.runId);
+      try {
+        await claimMobileLinkTransfer(currentClientId, transfer.runId);
+        const localRun = await startClientLinkMaterialImport(
+          currentClientId,
+          transfer.sourceUrl,
+          {
+            useBrowserCookies: false,
+            idempotencyKey: `mobile-link-transfer:${transfer.runId}`,
+          },
+        );
+        if (localRun.status === 'completed' && localRun.documentId) {
+          await settleMobileLinkTransfer(currentClientId, transfer.runId, {
+            status: 'completed',
+            title: localRun.title || undefined,
+            documentId: localRun.documentId,
+          });
+          markClientKnowledgeChanged(currentClientId, 'material_imported');
+          await refreshWorkspace(currentClientId);
+        } else {
+          await settleMobileLinkTransfer(currentClientId, transfer.runId, {
+            status: /暂不支持|登录|Cookie|权限/i.test(localRun.error || '')
+              ? 'blocked'
+              : 'failed_retryable',
+            title: localRun.title || undefined,
+            error: localRun.error || '当前设备未能完成链接转存',
+          });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        try {
+          await settleMobileLinkTransfer(currentClientId, transfer.runId, {
+            status: /暂不支持|登录|Cookie|权限/i.test(message)
+              ? 'blocked'
+              : 'failed_retryable',
+            error: message,
+          });
+        } catch (settlementError) {
+          console.warn('[mobile-link-transfer] settlement failed', settlementError);
+        }
+      } finally {
+        mobileLinkTransferProcessingRef.current.delete(transfer.runId);
+      }
+    };
+    void processNext().catch((error) => {
+      console.warn('[mobile-link-transfer] intake check failed', error);
+    });
+    const timer = window.setInterval(() => {
+      void processNext().catch((error) => {
+        console.warn('[mobile-link-transfer] intake check failed', error);
+      });
+    }, 10_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    activeTab,
+    authState.sessionMode,
+    currentClientId,
+    workspace?.client?.id,
     workspacesState?.activeSandboxId,
   ]);
 
@@ -15237,6 +15316,7 @@ export default function App() {
     }, [listTasks, loadProjectStructureForClient, projectStructureCache, taskViewMode, workspace?.client.id]);
     const baseCalendarTasks = tasks.filter((task) => {
       if (task.status === 'rejected') return false;
+      if (task.status === 'inbox' || task.viewerInboxStatus === 'pending') return false;
       if (isTaskInboxNotification(task)) return false;
       if (hidePersonalTasks && task.scopeMode === 'PERSONAL_ONLY') return false;
       return true;
@@ -17050,6 +17130,17 @@ export default function App() {
         setPendingTaskSaveCount(pendingTaskSaveCountRef.current);
         return;
       }
+      if (editingTask.dueDate && editingTask.dueTime && duePickerEndTime) {
+        const startsAt = combineTaskDueDateTime(editingTask.dueDate, editingTask.dueTime);
+        const endsAt = combineTaskDueDateTime(duePickerEndDate, duePickerEndTime);
+        if (!startsAt || !endsAt || new Date(endsAt).getTime() <= new Date(startsAt).getTime()) {
+          flash('error', '任务结束时间必须晚于开始时间');
+          setIsSavingTask(false);
+          pendingTaskSaveCountRef.current = Math.max(0, pendingTaskSaveCountRef.current - 1);
+          setPendingTaskSaveCount(pendingTaskSaveCountRef.current);
+          return;
+        }
+      }
       const schedule = buildTaskScheduleFromStartEnd({
         startDate: editingTask.dueDate || null,
         startTime: editingTask.dueTime || null,
@@ -18003,8 +18094,10 @@ export default function App() {
       const currentStart = new Date(meeting.startsAt);
       const currentEnd = new Date(meeting.endsAt);
       const durationMs = Math.max(15 * 60_000, currentEnd.getTime() - currentStart.getTime());
-      const startTime = `${String(currentStart.getHours()).padStart(2, '0')}:${String(currentStart.getMinutes()).padStart(2, '0')}`;
-      const localStart = combineTaskDueDateTime(nextStartDate, startTime);
+      const requestedStart = splitTaskDueDateTime(nextStartDate);
+      const startDate = requestedStart.date || nextStartDate;
+      const startTime = requestedStart.time || `${String(currentStart.getHours()).padStart(2, '0')}:${String(currentStart.getMinutes()).padStart(2, '0')}`;
+      const localStart = combineTaskDueDateTime(startDate, startTime);
       if (!localStart) throw new Error('会议开始时间无效');
       const startsAt = `${localStart}:00+08:00`;
       const nextEnd = new Date(new Date(startsAt).getTime() + durationMs);
@@ -19013,33 +19106,30 @@ export default function App() {
       const nextParts = splitTaskDueDateTime(nextValue);
       if (!nextParts.date || !nextParts.time) return;
       setEditingTask((prev) => {
-        const nextEndDate = prev.crossDay
-          ? (prev.endDate && prev.endDate > nextParts.date
-              ? prev.endDate
-              : (() => {
-                  const start = parseTaskDateValue(nextParts.date);
-                  return start
-                    ? formatDateOnlyValue(new Date(start.getFullYear(), start.getMonth(), start.getDate() + 1))
-                    : nextParts.date;
-                })())
-          : nextParts.date;
-        const nextEndTime = prev.endTime || (() => {
-          const [hours, minutes] = nextParts.time.split(':').map(Number);
-          const end = hours * 60 + minutes + 60;
-          return `${String(Math.floor((end % 1440) / 60)).padStart(2, '0')}:${String(end % 60).padStart(2, '0')}`;
-        })();
         const startValue = combineTaskDueDateTime(nextParts.date, nextParts.time);
-        const endValue = combineTaskDueDateTime(nextEndDate, nextEndTime);
-        const duration = startValue && endValue
-          ? Math.round((new Date(endValue).getTime() - new Date(startValue).getTime()) / 60_000)
-          : prev.durationMinutes;
+        const previousStartValue = combineTaskDueDateTime(prev.dueDate, prev.dueTime);
+        const previousEndValue = combineTaskDueDateTime(
+          prev.crossDay ? (prev.endDate || prev.dueDate) : prev.dueDate,
+          prev.endTime || duePickerEndTime,
+        );
+        const previousRangeMinutes = previousStartValue && previousEndValue
+          ? Math.round((new Date(previousEndValue).getTime() - new Date(previousStartValue).getTime()) / 60_000)
+          : 0;
+        const preservedDuration = previousRangeMinutes > 0
+          ? previousRangeMinutes
+          : Math.max(15, prev.durationMinutes || 60);
+        const startInstant = new Date(startValue);
+        const endInstant = new Date(startInstant.getTime() + preservedDuration * 60_000);
+        const nextEndDate = formatDateOnlyValue(endInstant);
+        const nextEndTime = `${String(endInstant.getHours()).padStart(2, '0')}:${String(endInstant.getMinutes()).padStart(2, '0')}`;
         return {
           ...prev,
           dueDate: nextParts.date,
           dueTime: nextParts.time,
           endDate: nextEndDate,
           endTime: nextEndTime,
-          durationMinutes: Number.isFinite(duration) && duration > 0 ? duration : prev.durationMinutes,
+          crossDay: nextEndDate > nextParts.date,
+          durationMinutes: preservedDuration,
           ddl: formatTaskDueLabel(startValue),
         };
       });
@@ -24096,32 +24186,50 @@ export default function App() {
                       >
                         <span>跨天</span>
                         <span className={`inline-flex h-6 min-w-11 items-center rounded-full px-1 transition-colors ${editingTask.crossDay ? 'justify-end bg-[#5B7BFE]' : 'justify-start bg-gray-300'}`}>
-                          <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-white px-1 text-[9px] font-bold text-gray-500 shadow-sm">
-                            {editingTask.crossDay ? '开' : '关'}
-                          </span>
+                          <span className="h-4 w-4 rounded-full bg-white shadow-sm" />
                         </span>
                       </button>
                     </TaskPropertyRow>
 
-                    <TaskPropertyRow icon={<Clock size={16} />} label="开始时间">
-                      <input
-                        type="datetime-local"
-                        lang="zh-CN"
-                        value={combineTaskDueDateTime(editingTask.dueDate, editingTask.dueTime || '09:00')}
-                        onChange={(event) => applyEditingTaskStartDateTime(event.target.value)}
-                        className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
-                      />
+                    <TaskPropertyRow icon={<Clock size={16} />} label="开始时间" stacked>
+                      <div className="grid w-full min-w-0 grid-cols-[minmax(0,1.35fr)_minmax(0,0.9fr)] gap-2">
+                        <input
+                          type="date"
+                          lang="zh-CN"
+                          value={editingTask.dueDate}
+                          onChange={(event) => applyEditingTaskStartDateTime(combineTaskDueDateTime(event.target.value, editingTask.dueTime || '09:00'))}
+                          className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
+                        />
+                        <input
+                          type="time"
+                          lang="zh-CN"
+                          step={900}
+                          value={editingTask.dueTime || '09:00'}
+                          onChange={(event) => applyEditingTaskStartDateTime(combineTaskDueDateTime(editingTask.dueDate, event.target.value))}
+                          className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
+                        />
+                      </div>
                     </TaskPropertyRow>
 
-                    <TaskPropertyRow icon={<Clock size={16} />} label="结束时间">
-                      <input
-                        type="datetime-local"
-                        lang="zh-CN"
-                        value={combineTaskDueDateTime(duePickerEndDate, duePickerEndTime)}
-                        min={combineTaskDueDateTime(editingTask.dueDate, editingTask.dueTime || '09:00') || undefined}
-                        onChange={(event) => applyEditingTaskEndDateTime(event.target.value)}
-                        className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
-                      />
+                    <TaskPropertyRow icon={<Clock size={16} />} label="结束时间" stacked>
+                      <div className="grid w-full min-w-0 grid-cols-[minmax(0,1.35fr)_minmax(0,0.9fr)] gap-2">
+                        <input
+                          type="date"
+                          lang="zh-CN"
+                          min={editingTask.dueDate || undefined}
+                          value={duePickerEndDate}
+                          onChange={(event) => applyEditingTaskEndDateTime(combineTaskDueDateTime(event.target.value, duePickerEndTime || '10:00'))}
+                          className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
+                        />
+                        <input
+                          type="time"
+                          lang="zh-CN"
+                          step={900}
+                          value={duePickerEndTime}
+                          onChange={(event) => applyEditingTaskEndDateTime(combineTaskDueDateTime(duePickerEndDate, event.target.value))}
+                          className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
+                        />
+                      </div>
                     </TaskPropertyRow>
 
                     {editingTask.recordMode === 'task' && <TaskPropertyRow icon={<Flag size={16} className="text-red-500" />} label="优先级">
@@ -24143,34 +24251,32 @@ export default function App() {
                       </select>
                     </TaskPropertyRow>}
 
-                    <TaskPropertyRow icon={<CalendarIcon size={16} />} label="客户会议">
-                      <label className="flex w-full items-center justify-between rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700">
-                        <span>{editingTask.id
-                          ? (editingTask.recordMode === 'customer_meeting' ? '客户会议' : '当前为任务')
-                          : editingTask.recordMode === 'customer_meeting'
+                    {!editingTask.id && (
+                      <TaskPropertyRow icon={<CalendarIcon size={16} />} label="客户会议">
+                        <label className="flex w-full items-center justify-between rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700">
+                          <span>{editingTask.recordMode === 'customer_meeting'
                             ? '已切换为会议模式'
                             : '作为客户会议保存'}</span>
-                        <input
-                          type="checkbox"
-                          checked={editingTask.recordMode === 'customer_meeting'}
-                          disabled={Boolean(editingTask.id)}
-                          title={editingTask.id ? '已保存的任务或会议不能直接转换记录类型' : undefined}
-                          onChange={(event) => setEditingTask((previous) => ({
-                            ...previous,
-                            id: null,
-                            recordVersion: null,
-                            recordMode: event.target.checked ? 'customer_meeting' : 'task',
-                            scopeMode: 'COLLAB_SHARED',
-                            // 负责人、协作者和日期是任务/会议共用的编辑上下文。
-                            // 切换记录类型不能丢掉用户刚刚选好的人。
-                            collaborators: previous.collaborators.length
-                              ? previous.collaborators
-                              : buildDefaultCollaborators(),
-                            listId: event.target.checked ? '' : (resolveDefaultListId('org') || previous.listId),
-                          }))}
-                        />
-                      </label>
-                    </TaskPropertyRow>
+                          <input
+                            type="checkbox"
+                            checked={editingTask.recordMode === 'customer_meeting'}
+                            onChange={(event) => setEditingTask((previous) => ({
+                              ...previous,
+                              id: null,
+                              recordVersion: null,
+                              recordMode: event.target.checked ? 'customer_meeting' : 'task',
+                              scopeMode: 'COLLAB_SHARED',
+                              // 负责人、协作者和日期是任务/会议共用的编辑上下文。
+                              // 切换记录类型不能丢掉用户刚刚选好的人。
+                              collaborators: previous.collaborators.length
+                                ? previous.collaborators
+                                : buildDefaultCollaborators(),
+                              listId: event.target.checked ? '' : (resolveDefaultListId('org') || previous.listId),
+                            }))}
+                          />
+                        </label>
+                      </TaskPropertyRow>
+                    )}
 
 	                    {/* AUDIT-20260518-017: 组织任务清单已废弃,任务组织改由事件线、部门计划、
                           项目模板/标准流程承接. 只在"个人日程"模式下保留 select(个人轻量分类),
@@ -24972,6 +25078,9 @@ export default function App() {
     const workspaceRightTab = getWorkspaceRightTab(workspaceClientUiState, workspaceClientUiKey);
     const setWorkspaceRightTab = (tab: WorkspaceRightTabKey) =>
       dispatchWorkspaceClientUi({ type: 'setRightTab', clientId: workspaceClientUiKey, tab });
+    const [activeMemoryLane, setActiveMemoryLane] = useRuntimeUiSessionState<
+      'explicit_memory' | 'correction' | 'favorite'
+    >(`${workspaceUiSessionScope}:memory-lane:${workspaceClientUiKey}`, 'explicit_memory');
     const workspaceComposerDraftKey = currentClientId || WORKSPACE_COMPOSER_NO_CLIENT_KEY;
     const [localInputValue, setLocalInputValue] = useState(() => (
       workspaceComposerDraftRef.current[workspaceComposerDraftKey]
@@ -25263,7 +25372,21 @@ export default function App() {
       setFilesTabSearchResult(null);
       setIsFilesTabSearching(false);
     }, [currentClientId, workspacesState?.activeSandboxId]);
-    const [knowledgePresentation, setKnowledgePresentation] = useState<KnowledgePresentation | null>(null);
+    type KnowledgePresentationRuntimeCache = {
+      value: KnowledgePresentation;
+      fetchedAt: number;
+    };
+    const knowledgePresentationCacheKey = [
+      'workspace-knowledge-presentation',
+      workspacesState?.activeSandboxId || 'local',
+      currentClientId || 'none',
+    ].join(':');
+    const [knowledgePresentation, setKnowledgePresentation] = useState<KnowledgePresentation | null>(() => (
+      readRuntimeUiSessionValue<KnowledgePresentationRuntimeCache | null>(
+        knowledgePresentationCacheKey,
+        null,
+      )?.value || null
+    ));
     const [knowledgePresentationError, setKnowledgePresentationError] = useState<string | null>(null);
     const [memorySyncDialogOpen, setMemorySyncDialogOpen] = useState(false);
     const [memorySyncStatus, setMemorySyncStatus] = useState<KnowledgeMemorySyncStatus | null>(null);
@@ -25281,6 +25404,14 @@ export default function App() {
           || !shouldApplyWorkspaceLoad(null, startedSandboxId)
         ) return null;
         setKnowledgePresentation(result);
+        writeRuntimeUiSessionValue<KnowledgePresentationRuntimeCache>(
+          [
+            'workspace-knowledge-presentation',
+            startedSandboxId || 'local',
+            targetClientId,
+          ].join(':'),
+          { value: result, fetchedAt: Date.now() },
+        );
         setKnowledgePresentationError(null);
         return result;
       } catch (error) {
@@ -25297,19 +25428,26 @@ export default function App() {
     useEffect(() => {
       const targetClientId = currentClientId;
       let cancelled = false;
-      setKnowledgePresentation(null);
+      const cached = readRuntimeUiSessionValue<KnowledgePresentationRuntimeCache | null>(
+        knowledgePresentationCacheKey,
+        null,
+      );
+      setKnowledgePresentation(cached?.value || null);
       setKnowledgePresentationError(null);
       setMemorySyncDialogOpen(false);
       setMemorySyncStatus(null);
       setMemorySyncError(null);
       setIsMemorySyncing(false);
       if (!targetClientId) return () => { cancelled = true; };
+      if (cached && Date.now() - cached.fetchedAt < 5 * 60 * 1000) {
+        return () => { cancelled = true; };
+      }
       void refreshKnowledgePresentationForScope(targetClientId)
         .then((result) => {
           if (cancelled || !result) return;
         });
       return () => { cancelled = true; };
-    }, [currentClientId, workspacesState?.activeSandboxId]);
+    }, [currentClientId, knowledgePresentationCacheKey, workspacesState?.activeSandboxId]);
     const controlledSavedMemories = (knowledgePresentation?.savedMemories || []).filter(
       (item) => ['explicit_memory', 'favorite', 'correction'].includes(item.memoryKind),
     );
@@ -25318,6 +25456,20 @@ export default function App() {
       favorite: controlledSavedMemories.filter((item) => item.memoryKind === 'favorite').length,
       correction: controlledSavedMemories.filter((item) => item.memoryKind === 'correction').length,
     };
+    const visibleSavedMemories = controlledSavedMemories.filter(
+      (item) => item.memoryKind === activeMemoryLane,
+    );
+    const activeMemoryLaneLabel = activeMemoryLane === 'favorite'
+      ? '收藏'
+      : activeMemoryLane === 'correction'
+        ? '纠错/补充'
+        : '明确记忆';
+    const organizationSharedKnowledgeCount = knowledgePresentation?.sourceGroups?.find(
+      (group) => group.key === 'organization_knowledge',
+    )?.count ?? null;
+    const officialWebsiteFactCount = knowledgePresentation?.sourceGroups?.find(
+      (group) => group.key === 'official_website',
+    )?.count ?? null;
     const openMemorySyncDialog = async () => {
       if (!currentClientId) {
         flash('info', '请先选择项目');
@@ -27760,8 +27912,18 @@ export default function App() {
         const duplicateCount = importResults.reduce((sum, item) => sum + (item.duplicateCount || 0), 0);
         const versionUpgradeCount = importResults.reduce((sum, item) => sum + (item.versionUpgradeCount || 0), 0);
         const unsupportedCount = importResults.reduce((sum, item) => sum + (item.unsupportedCount || 0), 0);
+        const filteredSystemCount = importResults.reduce((sum, item) => sum + (item.filteredSystemCount || 0), 0);
+        const filteredVideoCount = importResults.reduce((sum, item) => sum + (item.filteredVideoCount || 0), 0);
         const queuedImports = importResults.filter((item) => item.status === 'queued').length;
         if (importedCount > 0) {
+          writeRuntimeUiSessionValue(
+            [
+              'workspace-knowledge-presentation',
+              currentActiveSandboxId() || 'local',
+              currentClientId,
+            ].join(':'),
+            null,
+          );
           markClientKnowledgeChanged(currentClientId, 'material_imported');
         }
         const partialImports = importResults.filter(
@@ -27789,6 +27951,8 @@ export default function App() {
           if (duplicateCount > 0) parts.push(`${duplicateCount} 份内容已存在（自动去重）`);
           if (versionUpgradeCount > 0) parts.push(`${versionUpgradeCount} 份内容已变化（视为新版本入库）`);
           if (unsupportedCount > 0) parts.push(`${unsupportedCount} 份格式不支持`);
+          if (filteredSystemCount > 0) parts.push(`${filteredSystemCount} 个系统或临时文件已过滤`);
+          if (filteredVideoCount > 0) parts.push(`${filteredVideoCount} 个视频已过滤`);
           return parts.length > 0 ? parts.join('，') : null;
         };
         const skipDetail = buildSkipDetail();
@@ -28901,6 +29065,14 @@ export default function App() {
         onClose={() => setIsSmartFileImportOpen(false)}
         onImported={(stats) => {
           if (currentClientId && stats.documents_created > 0) {
+            writeRuntimeUiSessionValue(
+              [
+                'workspace-knowledge-presentation',
+                currentActiveSandboxId() || 'local',
+                currentClientId,
+              ].join(':'),
+              null,
+            );
             markClientKnowledgeChanged(currentClientId, 'material_imported');
           }
           flash('success',
@@ -29366,7 +29538,7 @@ export default function App() {
               <div className="min-w-0 flex-1">
                 <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">WORKSPACE</p>
                 <h2 className="mt-0.5 text-[18px] xl:text-[20px] font-light tracking-tight text-gray-900 truncate">
-                  {currentClient?.name || '未选择客户'}
+                  {currentClient?.name || '未选择项目'}
                 </h2>
                 {currentClient && (
                   <p className="mt-0.5 truncate text-[11px] text-gray-400">
@@ -31725,6 +31897,7 @@ export default function App() {
           </div>
 
           <div className="w-[260px] xl:w-[320px] bg-white border-l border-gray-100 flex flex-col h-full shrink-0 z-10 shadow-[-2px_0_10px_rgba(0,0,0,0.02)]">
+            {currentClientId && (
             <div
               className={`relative shrink-0 border-b border-gray-100 px-3 pt-3 pb-2 transition-colors ${
                 clientImportDropZone === 'favorites'
@@ -31748,103 +31921,86 @@ export default function App() {
                   </div>
                 </div>
               )}
-              <div className="flex items-center justify-between gap-3">
-                <h3 className="text-[11px] font-bold tracking-[0.18em] text-gray-400">快捷工具</h3>
-                <button
-                  type="button"
-                  className="text-[10px] font-bold text-[#5B7BFE] hover:text-[#4A63CF] transition-colors"
-                  onClick={() => setWorkspaceRightTab('tools')}
-                >
-                  打开工具页
-                </button>
-              </div>
+              <h3 className="text-[11px] font-bold tracking-[0.18em] text-gray-400">快捷工具</h3>
               {(() => {
-                const quickToolButtonClass =
-                  'aspect-square rounded-[18px] border border-gray-200 bg-white text-slate-600 shadow-sm transition hover:border-[#C7D5FF] hover:text-[#4A63CF] hover:shadow-[0_8px_20px_rgba(91,123,254,0.08)] disabled:cursor-not-allowed disabled:opacity-50';
+                const workspaceQuickTools = [
+                  {
+                    key: 'import',
+                    icon: <UploadCloud size={18} />,
+                    label: '导入资料',
+                    title: '导入 · 点击选文件，或直接拖入文件/文件夹',
+                    onClick: () => void handleSelectImportFiles(),
+                    disabled: isBackendBlocked,
+                  },
+                  {
+                    key: 'fill_template',
+                    icon: <LayoutTemplate size={18} />,
+                    label: '填写模板',
+                    title: '填写模板',
+                    onClick: () => void handleFillTemplate(),
+                    disabled: isBackendBlocked || isTemplateFilling,
+                  },
+                  {
+                    key: 'text_doc',
+                    icon: <PenTool size={18} />,
+                    label: '智能编辑',
+                    title: '智能编辑',
+                    onClick: openClientTextDocumentOverlay,
+                    disabled: isBackendBlocked,
+                  },
+                  {
+                    key: 'link_material',
+                    icon: <Link2 size={18} />,
+                    label: '链接转存',
+                    title: '链接转资料',
+                    onClick: () => setLinkPanelOpen((v) => !v),
+                    disabled: isBackendBlocked,
+                  },
+                  {
+                    key: 'repair_materials',
+                    icon: <Wand2 size={18} />,
+                    label: '整理资料',
+                    title: '整理资料 · 从本机正文生成并发布组织共享摘要',
+                    onClick: () => void handlePreviewDocumentAutoRepair(),
+                    disabled: isBackendBlocked || !currentClientId,
+                  },
+                  {
+                    key: 'feishu_import',
+                    icon: <Download size={18} />,
+                    label: '飞书导入',
+                    title: '从飞书导入文档',
+                    onClick: () => void openFeishuDocImportModal(),
+                    disabled: isBackendBlocked || !currentClientId,
+                  },
+                  {
+                    key: 'smart_import',
+                    icon: <Sparkles size={18} />,
+                    label: '智能归档',
+                    title: '智能文件导入 · 讲故事 + 挂文件，自动分类归档',
+                    onClick: () => setIsSmartFileImportOpen(true),
+                    disabled: isBackendBlocked || !currentClientId,
+                  },
+                ] as const;
                 return (
                   <>
-                    {(() => {
-                      // 快捷工具区：完全由用户从工具页 ☆ 收藏管理，最多 5 个。默认空。
-                      // workspaceToolsRegistry 集中定义每个 tool 的 icon/title/onClick/disabled，
-                      // 跟工具页里 6 个按钮严格一一对应；未来加新工具时这里和工具页同步加一条。
-                      const workspaceToolsRegistry: Record<string, {
-                        icon: React.ReactNode;
-                        title: string;
-                        onClick: () => void;
-                        disabled: boolean;
-                      }> = {
-                        // 顾源源 5/26: 真合并 "导入文件" + "导入文件夹" 为 1 个 "导入" 按钮 (方案 A).
-                        // 点击真弹文件选择器, 拖入时真自动识别 file/folder (现有 drop zone 真覆盖).
-                        import: {
-                          icon: <UploadCloud size={18} />,
-                          title: '导入 · 点击选文件，或直接拖入文件/文件夹',
-                          onClick: () => void handleSelectImportFiles(),
-                          disabled: isBackendBlocked,
-                        },
-                        fill_template: {
-                          icon: <LayoutTemplate size={18} />,
-                          title: '填写模板',
-                          onClick: () => void handleFillTemplate(),
-                          disabled: isBackendBlocked || isTemplateFilling,
-                        },
-                        text_doc: {
-                          icon: <PenTool size={18} />,
-                          title: '智能编辑',
-                          onClick: openClientTextDocumentOverlay,
-                          disabled: isBackendBlocked,
-                        },
-                        link_material: {
-                          icon: <Link2 size={18} />,
-                          title: '链接转资料',
-                          onClick: () => setLinkPanelOpen((v) => !v),
-                          disabled: isBackendBlocked,
-                        },
-                        feishu_import: {
-                          icon: <Download size={18} />,
-                          title: '从飞书导入文档',
-                          onClick: () => void openFeishuDocImportModal(),
-                          disabled: isBackendBlocked || !currentClientId,
-                        },
-                        smart_import: {
-                          icon: <Sparkles size={18} />,
-                          title: '智能文件导入',
-                          onClick: () => setIsSmartFileImportOpen(true),
-                          disabled: isBackendBlocked || !currentClientId,
-                        },
-                      };
-                      const validFavorites = favoriteWorkspaceTools.filter((key) => workspaceToolsRegistry[key]);
-                      if (validFavorites.length === 0) {
-                        return (
-                          <div className="mt-3 rounded-2xl border border-dashed border-gray-200 bg-gray-50/60 px-3 py-4 text-center">
-                            <p className="text-[11px] leading-5 text-gray-400">
-                              暂无快捷工具 · 在右边「工具」里点 ☆ 收藏（最多 5 个）
-                            </p>
-                          </div>
-                        );
-                      }
-                      return (
-                        <div className="mt-3 grid grid-cols-5 gap-2">
-                          {validFavorites.map((key) => {
-                            const tool = workspaceToolsRegistry[key];
-                            return (
-                              <button
-                                key={`fav-${key}`}
-                                type="button"
-                                className={quickToolButtonClass}
-                                disabled={tool.disabled}
-                                onClick={tool.onClick}
-                                title={tool.title}
-                                aria-label={tool.title}
-                              >
-                                <span className="flex h-full w-full items-center justify-center">
-                                  {tool.icon}
-                                </span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      );
-                    })()}
+                    <div className="mt-3 grid grid-cols-4 gap-x-2 gap-y-3">
+                      {workspaceQuickTools.map((tool) => (
+                        <button
+                          key={tool.key}
+                          type="button"
+                          className="group flex min-w-0 flex-col items-center gap-1.5 text-slate-500 transition hover:text-[#4A63CF] disabled:cursor-not-allowed disabled:opacity-45"
+                          disabled={tool.disabled}
+                          onClick={tool.onClick}
+                          title={tool.title}
+                          aria-label={`${tool.label}：${tool.title}`}
+                        >
+                          <span className="flex h-11 w-11 items-center justify-center rounded-[16px] border border-gray-200 bg-white shadow-sm transition group-hover:border-[#C7D5FF] group-hover:shadow-[0_8px_20px_rgba(91,123,254,0.08)]">
+                            {tool.icon}
+                          </span>
+                          <span className="whitespace-nowrap text-[10px] font-bold leading-none">{tool.label}</span>
+                        </button>
+                      ))}
+                    </div>
 
                     {isLinkMaterialInlineExpanded && (
                       <div className="mt-2.5 space-y-2">
@@ -32187,12 +32343,13 @@ export default function App() {
                 );
               })()}
             </div>
+            )}
 
             {/* 资料状态摘要(挪到 Tab bar 上方更显眼):份数 / OCR / 待清单 */}
             <div className="flex items-center justify-between gap-3 border-b border-gray-100 bg-gray-50/40 px-4 py-1.5 text-[10px] leading-4 text-gray-400 shrink-0">
               <span>{workspace?.documents?.length || 0} 份本机可访问文件</span>
               <span>
-                组织共享摘要 {workspace?.knowledgeContext?.counts?.organizationShared || 0} 条
+                共享摘要 {organizationSharedKnowledgeCount ?? '—'} · 官网事实 {officialWebsiteFactCount ?? '—'}
               </span>
               {currentClientId && (
                 <GlossaryPendingBadge
@@ -32207,7 +32364,6 @@ export default function App() {
               {([
                 { key: 'files', label: '文件', icon: FolderOpen },
                 { key: 'memory', label: '记忆', icon: BrainCircuit },
-                { key: 'tools', label: '工具', icon: UploadCloud },
               ] as const).map((tab) => (
                 <button
                   key={tab.key}
@@ -32266,7 +32422,7 @@ export default function App() {
                           { key: 'feishu_import', icon: <Download size={23} />, title: '从飞书导入文档', onClick: () => void openFeishuDocImportModal(), disabled: isBackendBlocked || !currentClientId },
                           { key: 'smart_import', icon: <Sparkles size={23} />, title: '智能文件导入 · 讲故事 + 挂文件,自动分类归档', onClick: () => setIsSmartFileImportOpen(true), disabled: isBackendBlocked || !currentClientId },
                         ] as const).map((tool) => {
-                          const isFavorited = favoriteWorkspaceTools.includes(tool.key);
+                          const isFavorited = false;
                           return (
                             <div key={tool.key} className="relative group/tool">
                               <button
@@ -32290,7 +32446,7 @@ export default function App() {
                                 }`}
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  toggleFavoriteWorkspaceTool(tool.key);
+                                  // 工具已全部常驻快捷工具区，不再提供收藏开关。
                                 }}
                                 title={isFavorited ? '从快捷工具区移除' : '加入快捷工具区'}
                                 aria-label={isFavorited ? '从快捷工具区移除' : '加入快捷工具区'}
@@ -32346,8 +32502,6 @@ export default function App() {
                       {currentClientId && <GlossaryDriftAlertPanel clientId={currentClientId} />}
                       {currentClientId && <ContradictionAlertPanel clientId={currentClientId} />}
                       {currentClientId && <DuplicateDocumentsSection clientId={currentClientId} hideWhenEmpty />}
-                      {currentClientId && <EntityListPanel clientId={currentClientId} />}
-                      {currentClientId && <ClientFactListPanel clientId={currentClientId} />}
                     </>
                   );
                 })()}
@@ -32611,8 +32765,14 @@ export default function App() {
                               : parseStatus === 'failed_retryable'
                                 ? '解析失败，可以重试'
                                 : parseStatus === 'blocked'
-                                  ? (processingErrorCode === 'local_document_ocr_required'
+                                  ? (processingErrorCode === 'local_ocr_not_configured'
+                                      ? '需要 OCR · 请先配置本机识别能力'
+                                      : processingErrorCode === 'local_asr_not_connected'
+                                        ? '需要 ASR · 音频原件已保留'
+                                      : processingErrorCode === 'local_document_ocr_required'
                                       ? '扫描 PDF 需要 OCR'
+                                      : processingErrorCode === 'local_document_empty'
+                                        ? '未识别到可用正文'
                                       : processingErrorCode === 'local_document_preview_unsupported'
                                         ? '当前格式暂不支持解析'
                                         : processingMessage || '当前资料暂不能解析')
@@ -32620,7 +32780,20 @@ export default function App() {
                                     ? `正在转写 · ${processingMessage}`
                                     : '正在解析'}
                           </span>
-                          {processingRetryable && (parseStatus === 'failed_retryable' || wikiStatus === 'failed_retryable') && (
+                          {['local_ocr_not_configured', 'local_asr_not_connected'].includes(processingErrorCode || '') && (
+                            <button
+                              type="button"
+                              onClick={openAiSettingsFromWorkspace}
+                              className="ml-auto rounded-md px-1.5 py-0.5 font-bold text-blue-600 hover:bg-blue-50"
+                            >
+                              {processingErrorCode === 'local_asr_not_connected' ? '去配置 ASR' : '去配置 OCR'}
+                            </button>
+                          )}
+                          {processingRetryable && (
+                            parseStatus === 'failed_retryable'
+                            || wikiStatus === 'failed_retryable'
+                            || ['local_ocr_not_configured', 'local_asr_not_connected'].includes(processingErrorCode || '')
+                          ) && (
                             <button
                               type="button"
                               disabled={retryingProjectMaterialIds.includes(documentId)}
@@ -32680,7 +32853,7 @@ export default function App() {
                         // 可可靠读取为文本的资料均可进入智能编辑；录音转写
                         // 是 .txt，不应仅因扩展名不是 Word 而被挡在入口外。
                         const lowered = (path || '').toLowerCase();
-                        const isTextEditable = /\.(?:docx?|txt|md|markdown|rtf)$/i.test(lowered);
+                        const isTextEditable = /\.(?:docx?|rtf|odt|xls|xlsx|xlsm|xlsb|ods|ppt|pptx|pptm|odp|pages|numbers|key|pdf|txt|md|markdown|csv|tsv|json|jsonl|xml|html?|mhtml|ya?ml|png|jpe?g|webp|tiff?|bmp|heic)$/i.test(lowered);
                         if (!isTextEditable || !documentId || parseStatus !== 'ready') return null;
                         // 智能编辑器已经打开时锁住此按钮,避免覆盖当前正在编辑的内容
                         const editorBusy = clientWorkspaceInlineEditor !== null;
@@ -33401,14 +33574,24 @@ export default function App() {
               <p className="mb-3 text-[11px] text-gray-400">显示当前项目的正式记住/纠错知识与本人的收藏；系统自动推断不在这里展示。</p>
               <div className="mb-4 grid grid-cols-3 gap-2">
                 {([
-                  { key: 'explicit', label: '明确记忆', count: controlledMemoryCounts.explicitMemory },
+                  { key: 'explicit_memory', label: '明确记忆', count: controlledMemoryCounts.explicitMemory },
                   { key: 'correction', label: '纠错/补充', count: controlledMemoryCounts.correction },
                   { key: 'favorite', label: '收藏', count: controlledMemoryCounts.favorite },
                 ] as const).map((lane) => (
-                  <div key={lane.key} className="rounded-xl border border-slate-100 bg-slate-50/70 px-2 py-2 text-center">
-                    <p className="text-[9.5px] font-bold text-slate-500">{lane.label}</p>
-                    <p className="mt-1 text-[14px] font-bold text-slate-800">{lane.count}</p>
-                  </div>
+                  <button
+                    key={lane.key}
+                    type="button"
+                    aria-pressed={activeMemoryLane === lane.key}
+                    onClick={() => setActiveMemoryLane(lane.key)}
+                    className={`rounded-xl border px-2 py-2 text-center transition ${
+                      activeMemoryLane === lane.key
+                        ? 'border-purple-200 bg-purple-50 shadow-[0_4px_12px_rgba(126,87,194,0.08)]'
+                        : 'border-slate-100 bg-slate-50/70 hover:border-purple-100 hover:bg-purple-50/50'
+                    }`}
+                  >
+                    <p className={`text-[9.5px] font-bold ${activeMemoryLane === lane.key ? 'text-purple-700' : 'text-slate-500'}`}>{lane.label}</p>
+                    <p className={`mt-1 text-[14px] font-bold ${activeMemoryLane === lane.key ? 'text-purple-800' : 'text-slate-800'}`}>{lane.count}</p>
+                  </button>
                 ))}
               </div>
               <div className="space-y-3" id="workspace-memory-facts-container">
@@ -33418,10 +33601,10 @@ export default function App() {
                   </p>
                 ) : !knowledgePresentation ? (
                   <p className="text-[12px] text-gray-400">正在读取当前项目记忆…</p>
-                ) : controlledSavedMemories.length === 0 ? (
-                  <p className="text-[12px] text-gray-400 italic">当前项目还没有明确记忆、纠错/补充或收藏。</p>
+                ) : visibleSavedMemories.length === 0 ? (
+                  <p className="text-[12px] text-gray-400 italic">当前项目还没有{activeMemoryLaneLabel}。</p>
                 ) : (
-                  controlledSavedMemories.map((card) => {
+                  visibleSavedMemories.map((card) => {
                     const memoryTitle = card.title || '已存记忆';
                     const kindLabel = card.memoryKind === 'favorite'
                       ? '收藏'
@@ -33467,27 +33650,6 @@ export default function App() {
               <div className="mt-4 rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
                 <p className="text-[10px] font-bold text-slate-600">单设备同步边界</p>
                 <p className="mt-1 text-[10px] leading-4 text-slate-500">本环节只准备来源哈希、版本和数量；原对话、回答正文、文件正文、本地路径和密钥不会进入同步清单。</p>
-              </div>
-              <div className="mt-5 border-t border-gray-100 pt-4">
-                <h4 className="mb-2 text-[11px] font-bold text-gray-700">项目关系</h4>
-                {!knowledgePresentation || knowledgePresentation.relationshipCards.length === 0 ? (
-                  <p className="text-[11px] text-gray-400">暂无可展示的项目关系；候选关系不会冒充正式事实。</p>
-                ) : (
-                  <div className="space-y-2">
-                    {knowledgePresentation.relationshipCards.map((card) => (
-                      <div key={card.id} className="rounded-xl border border-slate-200 bg-slate-50/60 px-3 py-2.5">
-                        <p className="text-[11px] leading-5 text-slate-700">
-                          <span className="font-bold">{card.subject}</span>
-                          <span className="mx-1.5 text-slate-400">{card.predicate}</span>
-                          <span className="font-bold">{card.object}</span>
-                        </p>
-                        <p className="mt-1 text-[9.5px] text-slate-400">
-                          {card.verificationState === 'verified' ? '已确认关系' : '候选关系 · 待核实'}
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                )}
               </div>
             </div>}
 

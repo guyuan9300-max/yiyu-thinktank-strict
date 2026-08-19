@@ -385,6 +385,8 @@ class WorkspaceRuntime:
                 return True
             if path == "/api/v2/platform-integrations/query":
                 return True
+            if path == "/api/v2/mobile-link-transfers/pending":
+                return True
             if path in {
                 "/api/v2/data-center-support/team-sync/stats",
                 "/api/v2/data-center-support/evidence-quality",
@@ -625,6 +627,12 @@ class WorkspaceRuntime:
                 )
                 or bool(
                     re.fullmatch(
+                        r"/api/v2/mobile-link-transfers/[^/]+/(?:claim|settle)",
+                        path,
+                    )
+                )
+                or bool(
+                    re.fullmatch(
                         r"/api/v2/gc13/growth/weekly-review-candidates/[^/]+/(?:confirm|ignore)",
                         path,
                     )
@@ -740,6 +748,13 @@ class WorkspaceRuntime:
                     re.fullmatch(
                         r"/api/v2/domain/project-materials/projects/[^/]+/"
                         r"governance-decisions/[^/]+",
+                        path,
+                    )
+                )
+                or bool(
+                    re.fullmatch(
+                        r"/api/v2/domain/project-materials/projects/[^/]+/"
+                        r"documents/[^/]+/publish-local-summary",
                         path,
                     )
                 )

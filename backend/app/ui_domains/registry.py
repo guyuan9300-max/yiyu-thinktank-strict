@@ -122,6 +122,20 @@ def build_default_registry() -> UiDomainRegistry:
             "POST",
             r"clients/(?P<project_id>[^/]+)/link-materials/import/start",
         ),
+        (
+            "GET",
+            r"clients/(?P<project_id>[^/]+)/mobile-link-transfers/pending",
+        ),
+        (
+            "POST",
+            r"clients/(?P<project_id>[^/]+)/mobile-link-transfers/"
+            r"(?P<run_id>[^/]+)/claim",
+        ),
+        (
+            "POST",
+            r"clients/(?P<project_id>[^/]+)/mobile-link-transfers/"
+            r"(?P<run_id>[^/]+)/settle",
+        ),
         ("GET", r"documents/(?P<document_id>[^/]+)/text"),
         (
             "GET",

@@ -46,6 +46,15 @@ test('同日时间段 → duration = end - start', () => {
   assert.equal(r.durationMinutes, 150);
 });
 
+test('正午 12 点保持 24 小时制，不得变成 00 点', () => {
+  const r = buildTaskScheduleFromStartEnd({
+    startDate: '2026-08-20', startTime: '12:00', endDate: '2026-08-20', endTime: '13:00',
+  });
+  assert.equal(r.scheduledStartAt, '2026-08-20T12:00');
+  assert.equal(r.scheduledEndAt, '2026-08-20T13:00');
+  assert.equal(r.durationMinutes, 60);
+});
+
 test('跨天时间段 → duration 可 >1440', () => {
   // 6/10 22:00 → 6/11 02:00 = 4 小时
   const r = buildTaskScheduleFromStartEnd({

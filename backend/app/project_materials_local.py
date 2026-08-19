@@ -12,6 +12,9 @@ import json
 import math
 import mimetypes
 import re
+import subprocess
+import sys
+import tempfile
 import zipfile
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -23,6 +26,17 @@ from xml.sax.saxutils import escape
 
 from strict_common.ids import canonical_json, new_id, utc_now
 
+from .local_asr.models import SENSE_VOICE_MODEL, model_ready
+from .local_asr.subprocess_runner import run_local_asr_subprocess
+from .local_ocr import OcrUnavailableError, extract_text as extract_ocr_text
+from .material_ingestion import (
+    APPLE_OFFICE_EXTENSIONS,
+    AUDIO_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    OFFICE_EXTENSIONS,
+    classify_import_path,
+    discover_import_paths,
+)
 from .runtime import LocalRuntimeError, WorkspaceRuntime
 
 
@@ -53,6 +67,9 @@ class LocalProjectMaterialsRepository:
     PROJECT_STATE_MEDIA_TYPE = "application/vnd.yiyu.project-local-state+json"
     IMPORT_OPERATION_MEDIA_TYPE = (
         "application/vnd.yiyu.project-material-import-operation+json"
+    )
+    EXTRACTED_TEXT_MEDIA_TYPE = (
+        "application/vnd.yiyu.local-extracted-text+json"
     )
     WIKI_DOCUMENT_MEDIA_TYPE = "text/vnd.yiyu.local-wiki-document"
     WIKI_CHUNK_MEDIA_TYPE = "text/vnd.yiyu.local-wiki-chunk"
@@ -1706,11 +1723,16 @@ class LocalProjectMaterialsRepository:
     def _processing_error_state(exc: LocalRuntimeError) -> tuple[str, bool]:
         if exc.code in {
             "local_document_ocr_required",
+            "local_ocr_not_configured",
+            "local_asr_not_connected",
             "local_document_preview_unsupported",
             "local_document_pdf_encrypted",
             "local_document_encoding_unsupported",
             "local_document_source_missing",
             "local_storage_object_missing",
+            "apple_office_parser_unavailable",
+            "apple_office_text_unavailable",
+            "local_document_empty",
         }:
             return "blocked", False
         if exc.status_code >= 500:
@@ -1881,7 +1903,9 @@ class LocalProjectMaterialsRepository:
             ),
             "processingRetryable": parsed_status
             in {"not_requested", "failed_retryable"}
-            or wiki_status in {"not_requested", "failed_retryable"},
+            or wiki_status in {"not_requested", "failed_retryable"}
+            or str(active_error.get("error_code") or "")
+            in {"local_ocr_not_configured", "local_asr_not_connected"},
             "processedAt": (
                 (wiki or {}).get("finished_at")
                 or (wiki or {}).get("started_at")
@@ -4792,6 +4816,209 @@ class LocalProjectMaterialsRepository:
             message="Word 文档保存失败，原文件未被修改",
         )
 
+    @staticmethod
+    def _sharepoint_document_text(path: Path) -> str:
+        """Extract Office/OpenDocument text without LibreOffice or Java."""
+        # Apple's system importer handles CJK text in legacy Word documents
+        # more faithfully than the format's old code-page heuristics.  Keep
+        # sharepoint-to-text as the cross-platform parser, but prefer this
+        # zero-install native path for .doc on macOS.
+        if path.suffix.lower() == ".doc" and sys.platform == "darwin":
+            try:
+                native = subprocess.run(
+                    ["textutil", "-convert", "txt", "-stdout", str(path)],
+                    check=False,
+                    capture_output=True,
+                    timeout=60,
+                )
+                if native.returncode == 0:
+                    value = native.stdout.decode("utf-8", errors="replace").strip()
+                    if value:
+                        return value
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        try:
+            import sharepoint2text
+        except ImportError as exc:
+            raise LocalRuntimeError(
+                503,
+                "office_text_executor_not_connected",
+                "Office 正文读取组件尚未安装，请重新安装当前版本",
+            ) from exc
+        try:
+            sections: list[str] = []
+            for result in sharepoint2text.read_file(
+                path,
+                ignore_images=True,
+                include_attachments=False,
+            ):
+                markdown = ""
+                try:
+                    markdown = str(result.get_full_markdown() or "").strip()
+                except (AttributeError, TypeError):
+                    markdown = ""
+                text = markdown or str(result.get_full_text() or "").strip()
+                if text:
+                    sections.append(text)
+            return "\n\n".join(sections).strip()
+        except LocalRuntimeError:
+            raise
+        except Exception as exc:
+            raise LocalRuntimeError(
+                415,
+                "office_document_invalid",
+                "Office 文档结构异常或已加密，无法读取正文",
+            ) from exc
+
+    @staticmethod
+    def _decoded_text(path: Path) -> str:
+        data = path.read_bytes()
+        try:
+            return data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                from charset_normalizer import from_bytes
+
+                match = from_bytes(data).best()
+                if match is not None:
+                    return str(match)
+            except ImportError:
+                pass
+        raise LocalRuntimeError(
+            415,
+            "local_document_encoding_unsupported",
+            "当前文本编码无法可靠识别",
+        )
+
+    @staticmethod
+    def _apple_office_text(path: Path) -> str:
+        """Use the macOS metadata/Quick Look stack for iWork documents."""
+        try:
+            result = subprocess.run(
+                ["mdls", "-raw", "-name", "kMDItemTextContent", str(path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise LocalRuntimeError(
+                424,
+                "apple_office_parser_unavailable",
+                "当前设备无法读取 Apple 办公文档",
+            ) from exc
+        text = str(result.stdout or "").strip()
+        if result.returncode == 0 and text not in {"", "(null)"}:
+            return text
+        # Spotlight may not have indexed a newly created document yet.  Quick
+        # Look still gives us a faithful first-page rendering that Vision can
+        # read, without asking the member to export it manually.
+        try:
+            with tempfile.TemporaryDirectory(prefix="yiyu-iwork-preview-") as raw:
+                target = Path(raw)
+                preview = subprocess.run(
+                    ["qlmanage", "-t", "-s", "2400", "-o", str(target), str(path)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                image = next(iter(sorted(target.glob("*.png"))), None)
+                if preview.returncode == 0 and image is not None:
+                    value = extract_ocr_text(image, max_pages=1)
+                    if value:
+                        return value
+        except OcrUnavailableError as exc:
+            raise LocalRuntimeError(
+                424,
+                "local_ocr_not_configured",
+                str(exc),
+            ) from exc
+        except (OSError, subprocess.TimeoutExpired, RuntimeError):
+            pass
+        raise LocalRuntimeError(
+            415,
+            "apple_office_text_unavailable",
+            "Apple 办公文档未提取到可读正文；原文件仍保留在本机",
+        )
+
+    def _audio_document_text(self, path: Path) -> str:
+        model_root = self.runtime.database_path.parent / "models"
+        if not model_ready(model_root, SENSE_VOICE_MODEL):
+            raise LocalRuntimeError(
+                424,
+                "local_asr_not_connected",
+                "音频原件已保留；请前往系统设置配置 ASR 后重试转写",
+            )
+        try:
+            output = run_local_asr_subprocess(
+                model_root=model_root,
+                audio_path=path,
+                language="auto",
+            )
+        except Exception as exc:
+            raise LocalRuntimeError(
+                503,
+                "local_asr_failed_retryable",
+                "本机音频转写暂时失败，可以重试",
+            ) from exc
+        return str(
+            output.get("dialogue_text")
+            or output.get("dialogueText")
+            or output.get("text")
+            or ""
+        ).strip()
+
+    def _extracted_text_cache(
+        self,
+        *,
+        source_id: str,
+        content_hash: str,
+    ) -> dict[str, Any] | None:
+        context = self._context()
+        object_id = "local-extracted:" + self._stable_segment(
+            f"{source_id}|{content_hash}"
+        )
+        row = self.runtime.local_storage_object_get(
+            sandbox_id=context.sandbox_id,
+            object_id=object_id,
+        )
+        if row is None or str(row["lifecycle_state"]) != "active":
+            return None
+        try:
+            payload = json.loads(
+                self._managed_path(str(row["storage_key"])).read_text("utf-8")
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _store_extracted_text_cache(
+        self,
+        *,
+        source_id: str,
+        content_hash: str,
+        content: str,
+        kind: str,
+    ) -> None:
+        context = self._context()
+        segment = self._stable_segment(f"{source_id}|{content_hash}")
+        self._upsert_object(
+            sandbox_id=context.sandbox_id,
+            object_id=f"local-extracted:{segment}",
+            storage_key=f"local-extracted/{segment}.json",
+            media_type=self.EXTRACTED_TEXT_MEDIA_TYPE,
+            data=canonical_json(
+                {
+                    "content": content,
+                    "kind": kind,
+                    "sourceId": source_id,
+                    "contentHash": content_hash,
+                    "updatedAt": utc_now(),
+                }
+            ).encode("utf-8"),
+        )
+
     def document_text(self, document_id: str) -> dict[str, Any]:
         context = self._context()
         project_id, state, entry = self._document_entry(document_id)
@@ -4806,10 +5033,32 @@ class LocalProjectMaterialsRepository:
             sandbox_id=context.sandbox_id,
         )
         media_type = str(entry.get("mediaType") or row["media_type"] or "")
-        if path.suffix.lower() == ".docx":
+        source_id = str(row["id"])
+        content_hash = str(row["content_hash"])
+        cached = self._extracted_text_cache(
+            source_id=source_id,
+            content_hash=content_hash,
+        )
+        if cached is not None and str(cached.get("content") or "").strip():
+            return {
+                "documentId": document_id,
+                "projectId": project_id,
+                "content": str(cached["content"]),
+                "kind": str(cached.get("kind") or "text"),
+                "title": entry.get("title") or entry.get("fileName") or path.name,
+                "fileName": entry.get("fileName") or path.name,
+                "path": str(path),
+                "sourceScope": "local_private",
+                "contentHash": content_hash,
+                "byteSize": int(row["byte_size"]),
+                "mediaType": media_type,
+                "storageVersion": int(row["version"]),
+            }
+        suffix = path.suffix.lower()
+        if suffix == ".docx":
             content = self._docx_text(path)
             kind = "docx"
-        elif path.suffix.lower() == ".pdf" or media_type == "application/pdf":
+        elif suffix == ".pdf" or media_type == "application/pdf":
             try:
                 from pypdf import PdfReader
             except ImportError as exc:
@@ -4841,36 +5090,89 @@ class LocalProjectMaterialsRepository:
                     "local_document_pdf_invalid",
                     "PDF 文件结构异常，无法读取正文",
                 ) from exc
+            had_text_layer = bool(content)
             if not content:
-                raise LocalRuntimeError(
-                    415,
-                    "local_document_ocr_required",
-                    "PDF 未检测到可读取文字，需要 OCR；自动 OCR 尚未接通",
-                )
-            kind = "pdf"
-        elif media_type.startswith("text/") or path.suffix.lower() in {
+                try:
+                    content = extract_ocr_text(path)
+                except OcrUnavailableError as exc:
+                    raise LocalRuntimeError(
+                        424,
+                        "local_ocr_not_configured",
+                        str(exc),
+                    ) from exc
+                except RuntimeError as exc:
+                    raise LocalRuntimeError(
+                        503,
+                        "local_ocr_failed_retryable",
+                        "PDF OCR 暂时失败，可以重试",
+                    ) from exc
+                if not content:
+                    raise LocalRuntimeError(
+                        415,
+                        "local_document_empty",
+                        "PDF 未识别到文字；原文件仍保留在本机",
+                    )
+            kind = "pdf" if had_text_layer else "pdf_ocr"
+        elif suffix in IMAGE_EXTENSIONS or media_type.startswith("image/"):
+            try:
+                content = extract_ocr_text(path, max_pages=1)
+            except OcrUnavailableError as exc:
+                raise LocalRuntimeError(424, "local_ocr_not_configured", str(exc)) from exc
+            except RuntimeError as exc:
+                raise LocalRuntimeError(503, "local_ocr_failed_retryable", "图片 OCR 暂时失败，可以重试") from exc
+            if not content:
+                raise LocalRuntimeError(415, "local_document_empty", "图片未识别到文字；原文件仍保留在本机")
+            kind = "image_ocr"
+        elif suffix in AUDIO_EXTENSIONS or media_type.startswith("audio/"):
+            content = self._audio_document_text(path)
+            if not content:
+                raise LocalRuntimeError(415, "local_document_empty", "音频未识别到语音文字；原件仍保留在本机")
+            kind = "audio_transcript"
+        elif suffix in APPLE_OFFICE_EXTENSIONS:
+            content = self._apple_office_text(path)
+            kind = suffix.lstrip(".")
+        elif suffix in OFFICE_EXTENSIONS:
+            content = self._sharepoint_document_text(path)
+            if not content and suffix in {".pptx", ".pptm"}:
+                try:
+                    content = extract_ocr_text(path)
+                except OcrUnavailableError as exc:
+                    raise LocalRuntimeError(424, "local_ocr_not_configured", str(exc)) from exc
+                except RuntimeError as exc:
+                    raise LocalRuntimeError(503, "local_ocr_failed_retryable", "演示文稿 OCR 暂时失败，可以重试") from exc
+            if not content:
+                raise LocalRuntimeError(415, "local_document_empty", "文档未提取到可读正文；原文件仍保留在本机")
+            kind = suffix.lstrip(".")
+        elif media_type.startswith("text/") or suffix in {
             ".md",
+            ".markdown",
             ".txt",
             ".json",
+            ".jsonl",
             ".csv",
             ".tsv",
             ".xml",
             ".html",
+            ".htm",
+            ".mhtml",
+            ".mht",
+            ".yaml",
+            ".yml",
         }:
-            try:
-                content = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError as exc:
-                raise LocalRuntimeError(
-                    415,
-                    "local_document_encoding_unsupported",
-                    "当前文件不是 UTF-8 文本，暂不能在编辑器中打开",
-                ) from exc
-            kind = path.suffix.lower().lstrip(".") or "text"
+            content = self._decoded_text(path)
+            kind = suffix.lstrip(".") or "text"
         else:
             raise LocalRuntimeError(
                 415,
                 "local_document_preview_unsupported",
                 "该文件格式只能作为本机原文件使用，暂不能以文本编辑器打开",
+            )
+        if content.strip():
+            self._store_extracted_text_cache(
+                source_id=source_id,
+                content_hash=content_hash,
+                content=content,
+                kind=kind,
             )
         return {
             "documentId": document_id,
@@ -4881,7 +5183,7 @@ class LocalProjectMaterialsRepository:
             "fileName": entry.get("fileName") or path.name,
             "path": str(path),
             "sourceScope": "local_private",
-            "contentHash": row["content_hash"],
+            "contentHash": content_hash,
             "byteSize": int(row["byte_size"]),
             "mediaType": media_type,
             "storageVersion": int(row["version"]),
@@ -5363,6 +5665,42 @@ class LocalProjectMaterialsRepository:
             "updatedAt": stored["updatedAt"],
         }
 
+    def update_shared_summary_state(
+        self,
+        document_id: str,
+        *,
+        state: str,
+        message: str = "",
+        source_content_hash: str = "",
+    ) -> dict[str, Any]:
+        """Remember only the delivery state of a safe cloud summary.
+
+        The summary body remains in the existing local sidecar.  This marker
+        prevents page switches from repeatedly regenerating a summary that was
+        already published for the same source version.
+        """
+
+        if state not in {"ready", "blocked", "failed_retryable", "not_requested"}:
+            raise LocalRuntimeError(422, "shared_summary_state_invalid", "共享摘要状态无效")
+        project_id, project_state, entry = self._document_entry(document_id)
+        current_hash = str(entry.get("contentHash") or "")
+        entry["sharedSummaryState"] = state
+        entry["sharedSummaryMessage"] = str(message or "")[:500]
+        entry["sharedSummarySourceContentHash"] = (
+            str(source_content_hash or current_hash) if state == "ready" else ""
+        )
+        entry["sharedSummaryUpdatedAt"] = utc_now()
+        project_state["documents"][document_id] = entry
+        self._write_project_state(project_id, project_state)
+        return {
+            "projectId": project_id,
+            "documentId": document_id,
+            "sharedSummaryState": state,
+            "sharedSummaryMessage": entry["sharedSummaryMessage"],
+            "sharedSummarySourceContentHash": entry["sharedSummarySourceContentHash"],
+            "updatedAt": entry["sharedSummaryUpdatedAt"],
+        }
+
     @staticmethod
     def _folder_dto(
         project_id: str,
@@ -5432,6 +5770,16 @@ class LocalProjectMaterialsRepository:
             processing_states,
             strict=True,
         ):
+            display_name = str(
+                entry.get("fileName") or entry.get("title") or ""
+            ).strip()
+            if display_name and not classify_import_path(
+                Path(display_name)
+            ).accepted:
+                # Old clients could register Finder/Windows metadata, videos
+                # and arbitrary binaries. Keep their audit rows intact, but do
+                # not expose them as usable project material.
+                continue
             source_id = str(entry.get("localSourceId") or "").strip()
             source_manifest = source_manifests.get(source_id)
             if (
@@ -5487,6 +5835,15 @@ class LocalProjectMaterialsRepository:
                     "cloudMetadataState": (
                         entry.get("cloudMetadataState") or "ready"
                     ),
+                    "sharedSummaryState": (
+                        "ready"
+                        if str(entry.get("sharedSummaryState") or "") == "ready"
+                        and str(entry.get("sharedSummarySourceContentHash") or "")
+                        == str(entry.get("contentHash") or "")
+                        else entry.get("sharedSummaryState") or "not_requested"
+                    ),
+                    "sharedSummaryMessage": entry.get("sharedSummaryMessage") or "",
+                    "sharedSummaryUpdatedAt": entry.get("sharedSummaryUpdatedAt"),
                     "localState": "ready",
                     "importedAt": entry.get("updatedAt"),
                     **processing,
@@ -6342,7 +6699,11 @@ class LocalProjectMaterialsRepository:
                 "template_file_missing",
                 "模板文件不存在",
             ) from exc
-        if not source.is_file():
+        is_apple_package = (
+            source.is_dir()
+            and source.suffix.lower() in APPLE_OFFICE_EXTENSIONS
+        )
+        if not source.is_file() and not is_apple_package:
             raise LocalRuntimeError(
                 422,
                 "template_file_missing",
@@ -6641,7 +7002,11 @@ class LocalProjectMaterialsRepository:
         project_id: str,
         source: Path,
     ) -> dict[str, Any]:
-        if not source.is_file():
+        is_apple_package = (
+            source.is_dir()
+            and source.suffix.lower() in APPLE_OFFICE_EXTENSIONS
+        )
+        if not source.is_file() and not is_apple_package:
             raise LocalRuntimeError(
                 422,
                 "material_file_missing",
@@ -6663,21 +7028,43 @@ class LocalProjectMaterialsRepository:
             temporary = target.with_name(f".{target.name}.{new_id()}.tmp")
             digest = hashlib.sha256()
             byte_size = 0
-            with (
-                source.open("rb") as input_stream,
-                temporary.open("wb") as output_stream,
-            ):
-                while True:
-                    chunk = input_stream.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    digest.update(chunk)
-                    byte_size += len(chunk)
-                    output_stream.write(chunk)
+            if is_apple_package:
+                with zipfile.ZipFile(
+                    temporary,
+                    mode="w",
+                    compression=zipfile.ZIP_DEFLATED,
+                ) as package:
+                    for child in sorted(source.rglob("*")):
+                        if child.is_file() and not child.name.startswith("."):
+                            package.write(child, child.relative_to(source))
+                with temporary.open("rb") as input_stream:
+                    while True:
+                        chunk = input_stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        byte_size += len(chunk)
+            else:
+                with (
+                    source.open("rb") as input_stream,
+                    temporary.open("wb") as output_stream,
+                ):
+                    while True:
+                        chunk = input_stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        byte_size += len(chunk)
+                        output_stream.write(chunk)
             temporary.replace(target)
-            media_type = (
+            media_type = {
+                ".pages": "application/vnd.apple.pages",
+                ".numbers": "application/vnd.apple.numbers",
+                ".key": "application/vnd.apple.keynote",
+            }.get(
+                source.suffix.lower(),
                 mimetypes.guess_type(source.name)[0]
-                or "application/octet-stream"
+                or "application/octet-stream",
             )
             stored = self.runtime.local_storage_object_put(
                 sandbox_id=sandbox_id,
@@ -6751,17 +7138,14 @@ class LocalProjectMaterialsRepository:
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         context = self._context()
-        selected: list[Path] = []
-        for raw in paths:
-            candidate = Path(str(raw)).expanduser().resolve()
-            if candidate.is_dir():
-                selected.extend(
-                    path for path in sorted(candidate.rglob("*")) if path.is_file()
-                )
-            else:
-                selected.append(candidate)
-        unique_files = list(dict.fromkeys(selected))
+        unique_files, skipped = discover_import_paths(paths)
         if not unique_files:
+            if skipped:
+                raise LocalRuntimeError(
+                    422,
+                    "no_importable_materials",
+                    "所选内容没有可导入资料；系统文件、视频、临时文件和不支持格式已自动过滤",
+                )
             raise LocalRuntimeError(422, "materials_required", "请选择要导入的资料")
         if len(unique_files) > 1000:
             raise LocalRuntimeError(
@@ -6777,6 +7161,7 @@ class LocalProjectMaterialsRepository:
                     "projectId": project_id,
                     "mode": normalized_mode,
                     "paths": [str(path) for path in unique_files],
+                    "skipped": skipped,
                 }
             ).encode("utf-8")
         ).hexdigest()
@@ -6809,6 +7194,17 @@ class LocalProjectMaterialsRepository:
                 "projectId": project_id,
                 "mode": normalized_mode,
                 "materials": materials,
+                "skipped": skipped,
+                "skippedCount": len(skipped),
+                "unsupportedCount": sum(
+                    item.get("category") == "unsupported" for item in skipped
+                ),
+                "filteredSystemCount": sum(
+                    item.get("category") == "ignored" for item in skipped
+                ),
+                "filteredVideoCount": sum(
+                    item.get("category") == "video" for item in skipped
+                ),
             }
             self._write_import_operation(
                 sandbox_id=context.sandbox_id,
@@ -7381,27 +7777,38 @@ class LocalProjectMaterialsRepository:
         ).suffix.lower()
         if suffix == ".docx":
             return self._docx_text(path).strip()
+        if suffix in OFFICE_EXTENSIONS:
+            return self._sharepoint_document_text(path).strip()
+        if suffix in APPLE_OFFICE_EXTENSIONS:
+            return self._apple_office_text(path).strip()
+        if suffix == ".pdf" or suffix in IMAGE_EXTENSIONS:
+            try:
+                return extract_ocr_text(path).strip()
+            except OcrUnavailableError as exc:
+                raise LocalRuntimeError(
+                    424,
+                    "local_ocr_not_configured",
+                    str(exc),
+                ) from exc
         if media_type.startswith("text/") or suffix in {
             ".md",
+            ".markdown",
             ".txt",
             ".json",
+            ".jsonl",
             ".csv",
             ".tsv",
             ".xml",
             ".html",
+            ".htm",
+            ".yaml",
+            ".yml",
         }:
-            try:
-                return data.decode("utf-8-sig").strip()
-            except UnicodeDecodeError as exc:
-                raise LocalRuntimeError(
-                    415,
-                    "smart_import_file_encoding_unsupported",
-                    "智能导入文件不是 UTF-8 文本，请转换编码后重试",
-                ) from exc
+            return self._decoded_text(path).strip()
         raise LocalRuntimeError(
             415,
             "smart_import_file_content_unsupported",
-            "当前文件格式尚不能提取正文；请改用文本、Markdown 或 Word 文档",
+            "当前文件格式尚不能提取正文",
         )
 
     def parse_smart_chunk(self, chunk_id: str) -> dict[str, Any]:

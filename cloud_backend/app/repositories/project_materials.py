@@ -2354,6 +2354,37 @@ class GC07ProjectMaterialsRepository:
                 raise RepositoryError(404, "material_metadata_missing", "资料元数据不存在或已删除")
             if str(row["created_by_membership_id"] or "") != identity.membership_id:
                 raise RepositoryError(403, "material_metadata_owner_required", "只能管理本人设备登记的资料元数据")
+            summary_row = connection.execute(
+                """
+                SELECT d.id, d.current_version, d.version, m.receipt
+                FROM knowledge_documents AS d
+                JOIN document_versions AS v
+                  ON v.scope_id=d.scope_id AND v.document_id=d.id
+                 AND v.version=d.current_version
+                 AND v.publication_state='published'
+                LEFT JOIN object_manifests AS m
+                  ON m.scope_id=v.scope_id AND m.id=v.object_manifest_id
+                 AND m.lifecycle_state='active'
+                WHERE d.scope_id=? AND d.client_id=? AND d.source_asset_id=?
+                  AND d.document_kind='shared_summary'
+                  AND d.visibility_scope='organization'
+                  AND d.publication_state='published'
+                  AND d.lifecycle_state='active'
+                ORDER BY d.updated_at DESC, d.id
+                LIMIT 1
+                """,
+                (identity.scope_id, project_id, document_id),
+            ).fetchone()
+            published_source_hash = ""
+            if summary_row is not None:
+                try:
+                    summary_receipt = json.loads(str(summary_row["receipt"] or "{}"))
+                except json.JSONDecodeError:
+                    summary_receipt = {}
+                if isinstance(summary_receipt, dict):
+                    published_source_hash = str(
+                        summary_receipt.get("sourceContentHash") or ""
+                    )
             return {
                 "documentId": str(row["id"]),
                 "sourceAssetId": str(row["id"]),
@@ -2365,6 +2396,16 @@ class GC07ProjectMaterialsRepository:
                 "mediaType": str(row["media_type"] or "application/octet-stream"),
                 "parseState": "local_only",
                 "aggregateVersion": int(row["version"] or 1),
+                "publishedSummary": summary_row is not None,
+                "publishedSummaryDocumentId": (
+                    str(summary_row["id"]) if summary_row is not None else None
+                ),
+                "publishedSummaryVersion": (
+                    int(summary_row["version"] or 1)
+                    if summary_row is not None
+                    else None
+                ),
+                "publishedSourceContentHash": published_source_hash or None,
                 "lifecycleState": "active",
                 "materialBoundary": {
                     "sourceFileContentUploaded": False,
@@ -2372,6 +2413,266 @@ class GC07ProjectMaterialsRepository:
                     "localSummaryUploaded": False,
                 },
             }
+
+    def publish_local_material_summary(
+        self,
+        identity: SessionIdentity,
+        *,
+        project_id: str,
+        document_id: str,
+        payload: Mapping[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Publish one safe organization summary for a member-local source.
+
+        The source body and path remain on the member device.  The cloud stores
+        only the source hash, safe summary and the explicit source_asset ->
+        knowledge_document relation already defined by the 88-table blueprint.
+        """
+
+        summary = str(payload.get("summary") or "").strip()
+        source_hash = str(payload.get("sourceContentHash") or "").strip().lower()
+        generator_version = str(
+            payload.get("generatorVersion") or "organization_default"
+        ).strip()[:120]
+        try:
+            expected_source_version = int(payload.get("expectedVersion"))
+        except (TypeError, ValueError) as exc:
+            raise RepositoryError(
+                409,
+                "material_summary_version_required",
+                "发布共享摘要需要有效的资料版本",
+            ) from exc
+        if not summary:
+            raise RepositoryError(422, "material_summary_required", "共享摘要不能为空")
+        if len(summary) > 4000:
+            raise RepositoryError(422, "material_summary_too_long", "共享摘要不能超过 4000 字")
+        if len(source_hash) != 64 or any(c not in "0123456789abcdef" for c in source_hash):
+            raise RepositoryError(422, "material_source_hash_invalid", "资料内容哈希无效")
+
+        normalized = {
+            "projectId": project_id,
+            "sourceAssetId": document_id,
+            "expectedSourceVersion": expected_source_version,
+            "sourceContentHash": source_hash,
+            "summaryHash": sha256_text(summary),
+            "generatorVersion": generator_version,
+        }
+        payload_hash = self._payload_hash(normalized)
+        with self.repository._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                replay = self._receipt(
+                    connection,
+                    identity,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                )
+                if replay is not None:
+                    connection.rollback()
+                    return replay
+                self.repository._require_project_access(
+                    connection,
+                    identity,
+                    project_id=project_id,
+                    capability="knowledge_write",
+                )
+                source = connection.execute(
+                    """
+                    SELECT * FROM source_assets
+                    WHERE id=? AND scope_id=? AND client_id=?
+                      AND record_kind='asset' AND lifecycle_state='active'
+                    """,
+                    (document_id, identity.scope_id, project_id),
+                ).fetchone()
+                if source is None:
+                    raise RepositoryError(404, "material_metadata_missing", "资料元数据不存在或已删除")
+                if str(source["created_by_membership_id"] or "") != identity.membership_id:
+                    raise RepositoryError(403, "local_material_owner_required", "只有持有本机原件的成员可以发布摘要")
+                if int(source["version"] or 1) != expected_source_version:
+                    raise RepositoryError(409, "document_version_conflict", "资料版本已变化，请刷新后重试")
+                if str(source["content_hash"] or "") != source_hash:
+                    raise RepositoryError(409, "local_material_content_changed", "资料内容已变化，请重新解析后重试")
+
+                now = utc_now()
+                summary_hash = sha256_text(summary)
+                summary_document_id = self.repository._record_id(  # noqa: SLF001
+                    "knowledge_document", document_id, "shared-summary"
+                )
+                current = connection.execute(
+                    "SELECT current_version,version FROM knowledge_documents "
+                    "WHERE id=? AND scope_id=?",
+                    (summary_document_id, identity.scope_id),
+                ).fetchone()
+                content_version = int(current["current_version"] or 0) + 1 if current else 1
+                aggregate_version = int(current["version"] or 0) + 1 if current else 1
+                summary_receipt = canonical_json(
+                    {
+                        "schema": "yiyu.project-material-shared-summary.v1",
+                        "summary": summary,
+                        "sourceAssetId": document_id,
+                        "sourceContentHash": source_hash,
+                        "generatorVersion": generator_version,
+                        "sourceFileContentUploaded": False,
+                        "sourceFilePathUploaded": False,
+                    }
+                )
+                manifest_id = self.repository._record_id(  # noqa: SLF001
+                    "manifest", summary_document_id, content_version
+                )
+                receipt_hash = sha256_text(summary_receipt)
+                connection.execute(
+                    """
+                    INSERT INTO object_manifests (
+                        id,scope_id,storage_key,content_hash,lifecycle_state,
+                        receipt,holder_role,holder_instance_id,storage_kind,
+                        byte_size,media_type,availability_state,receipt_hash,
+                        created_at,verified_at,deleted_at,authority_role,
+                        origin_instance_id
+                    ) VALUES (?,?,NULL,?,'active',?,'organization_cloud',?,
+                              'organization_shared_summary',?,
+                              'application/vnd.yiyu.project-summary+json',
+                              'ready',?,?,?,NULL,'cloud',?)
+                    """,
+                    (
+                        manifest_id,
+                        identity.scope_id,
+                        summary_hash,
+                        summary_receipt,
+                        identity.cloud_instance_id,
+                        len(summary_receipt.encode("utf-8")),
+                        receipt_hash,
+                        now,
+                        now,
+                        identity.cloud_instance_id,
+                    ),
+                )
+                if current is None:
+                    connection.execute(
+                        """
+                        INSERT INTO secured_resources (
+                            id,scope_id,resource_kind,lifecycle_state,version,
+                            resource_type_key,created_at,updated_at,deleted_at,
+                            authority_role,origin_instance_id
+                        ) VALUES (?,?,'knowledge_document','active',1,
+                                  'project_material_shared_summary',?,?,NULL,
+                                  'cloud',?)
+                        """,
+                        (summary_document_id, identity.scope_id, now, now, identity.cloud_instance_id),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO knowledge_documents (
+                            id,scope_id,source_asset_id,client_id,current_version,
+                            owner_membership_id,title,document_kind,
+                            visibility_scope,parse_state,publication_state,
+                            published_at,version,lifecycle_state,created_at,
+                            updated_at,deleted_at
+                        ) VALUES (?,?,?,?,?,?,?,'shared_summary','organization',
+                                  'ready','published',?,1,'active',?,?,NULL)
+                        """,
+                        (
+                            summary_document_id,
+                            identity.scope_id,
+                            document_id,
+                            project_id,
+                            content_version,
+                            identity.membership_id,
+                            str(source["display_name"] or "项目资料摘要"),
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE knowledge_documents
+                        SET current_version=?,title=?,parse_state='ready',
+                            publication_state='published',published_at=?,
+                            version=?,lifecycle_state='active',updated_at=?,
+                            deleted_at=NULL
+                        WHERE id=? AND scope_id=?
+                        """,
+                        (
+                            content_version,
+                            str(source["display_name"] or "项目资料摘要"),
+                            now,
+                            aggregate_version,
+                            now,
+                            summary_document_id,
+                            identity.scope_id,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE secured_resources SET lifecycle_state='active',version=?,"
+                        "updated_at=?,deleted_at=NULL WHERE id=? AND scope_id=?",
+                        (aggregate_version, now, summary_document_id, identity.scope_id),
+                    )
+                version_id = self.repository._record_id(  # noqa: SLF001
+                    "document_version", summary_document_id, content_version
+                )
+                connection.execute(
+                    """
+                    INSERT INTO document_versions (
+                        id,scope_id,document_id,version,content_hash,created_at,
+                        object_manifest_id,source_asset_version,
+                        publication_state,created_by_membership_id,
+                        origin_instance_id,integrity_hash
+                    ) VALUES (?,?,?,?,?,?,?,?,'published',?,?,?)
+                    """,
+                    (
+                        version_id,
+                        identity.scope_id,
+                        summary_document_id,
+                        content_version,
+                        summary_hash,
+                        now,
+                        manifest_id,
+                        expected_source_version,
+                        identity.membership_id,
+                        identity.cloud_instance_id,
+                        summary_hash,
+                    ),
+                )
+                result = {
+                    "projectId": project_id,
+                    "sourceAssetId": document_id,
+                    "documentId": summary_document_id,
+                    "documentVersionId": version_id,
+                    "parseState": "ready",
+                    "visibilityScope": "organization",
+                    "documentKind": "shared_summary",
+                    "contentVersion": content_version,
+                    "version": aggregate_version,
+                    "contentHash": summary_hash,
+                    "sourceContentHash": source_hash,
+                    "updatedAt": now,
+                    "materialBoundary": {
+                        "sourceFileContentUploaded": False,
+                        "sourceFilePathUploaded": False,
+                        "storageLocatorUploaded": False,
+                        "organizationSummaryUploaded": True,
+                    },
+                }
+                self._record_command(
+                    connection,
+                    identity,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                    command_type="project_material.shared_summary_published",
+                    aggregate_type="knowledge_document",
+                    aggregate_id=summary_document_id,
+                    aggregate_version=aggregate_version,
+                    expected_aggregate_version=(int(current["version"]) if current else None),
+                    result=result,
+                    target_resource_id=summary_document_id,
+                )
+                connection.commit()
+                return result
+            except Exception:
+                connection.rollback()
+                raise
 
     def update_local_material_metadata(
         self,

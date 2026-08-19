@@ -984,6 +984,9 @@ export interface DocumentRecord {
   processingMessage?: string | null;
   processingRetryable?: boolean;
   processedAt?: string | null;
+  sharedSummaryState?: 'not_requested' | 'ready' | 'blocked' | 'failed_retryable' | string;
+  sharedSummaryMessage?: string | null;
+  sharedSummaryUpdatedAt?: string | null;
 }
 
 export interface KnowledgeStatus {
@@ -1166,6 +1169,14 @@ export interface ImportRecord {
   duplicateCount?: number;
   versionUpgradeCount?: number;
   unsupportedCount?: number;
+  filteredSystemCount?: number;
+  filteredVideoCount?: number;
+  skippedFiles?: Array<{
+    path: string;
+    fileName: string;
+    reason: string;
+    category: string;
+  }>;
   createdAt: string;
   jobId?: string | null;
   documents?: ImportDocumentRecord[];
