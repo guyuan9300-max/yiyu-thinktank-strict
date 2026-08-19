@@ -1643,7 +1643,7 @@ export function TaskCalendarView({
             </div>
 
             <div
-              className="grid min-h-0 flex-1"
+              className="grid min-h-0 flex-1 bg-white"
               style={{ gridTemplateRows: `repeat(${monthTimelineWeeks.length}, minmax(146px, 1fr))` }}
             >
               {monthTimelineWeeks.map((week) => (
@@ -1705,8 +1705,8 @@ export function TaskCalendarView({
                         }}
                         data-calendar-date={formatDateInputValue(cellDate)}
                         data-day-drop={formatDateInputValue(cellDate)}
-                        className={`relative min-h-[146px] rounded-none border-r border-b border-gray-100 bg-transparent p-2.5 text-left align-top outline-none transition-colors focus:outline-none focus-visible:outline-none cursor-pointer hover:bg-slate-50 ${
-                          isActiveSelection ? 'bg-blue-50/40' : ''
+                        className={`relative min-h-[146px] rounded-none border-r border-b border-gray-100 p-2.5 text-left align-top outline-none transition-colors focus:outline-none focus-visible:outline-none cursor-pointer hover:bg-slate-50 ${
+                          isActiveSelection ? 'bg-blue-50/40' : 'bg-white'
                         } ${
                           dragTargetDay === cellDate.getTime() ? 'bg-blue-100 ring-2 ring-inset ring-[#5B7BFE]/40' : ''
                         }`}
