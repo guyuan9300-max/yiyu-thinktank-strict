@@ -14,6 +14,7 @@ from backend.app.local_input_memory import (
 )
 from backend.app.project_materials_local import LocalProjectMaterialsRepository
 from backend.app.runtime import LocalRuntimeError
+from backend.app.ui_idempotency import replayable_cloud_mutation
 
 from .routing import UiDomainRouter, UiRequest
 
@@ -146,29 +147,41 @@ def _cloud_cas_command(
     payload: Mapping[str, Any] | None = None,
     scope_aware: bool = False,
 ) -> dict[str, Any]:
-    current, captured = _cloud_get_captured(compatibility, read_path)
-    command_payload = dict(payload or request.body)
-    if "expectedVersion" not in command_payload:
-        if scope_aware:
-            scope_kind = _text(
-                command_payload,
-                "scopeKind",
-                "scope_kind",
-            ) or str(current.get("defaultWriteScope") or "personal")
-            versions = current.get("scopeVersions")
-            if not isinstance(versions, Mapping):
-                versions = {}
-            command_payload["scopeKind"] = scope_kind
-            command_payload["expectedVersion"] = int(versions.get(scope_kind) or 0)
-        else:
-            command_payload["expectedVersion"] = int(
-                current.get("expectedVersion", current.get("version", 0)) or 0
-            )
-    result = compatibility.runtime.cloud_command(
-        method,
-        command_path or read_path,
-        payload=command_payload,
+    captured = compatibility.runtime.capture_sandbox_context()
+
+    def command_payload_factory() -> dict[str, Any]:
+        current, _ = _cloud_get_captured(compatibility, read_path)
+        command_payload = dict(payload or request.body)
+        if "expectedVersion" not in command_payload:
+            if scope_aware:
+                scope_kind = _text(
+                    command_payload,
+                    "scopeKind",
+                    "scope_kind",
+                ) or str(current.get("defaultWriteScope") or "personal")
+                versions = current.get("scopeVersions")
+                if not isinstance(versions, Mapping):
+                    versions = {}
+                command_payload["scopeKind"] = scope_kind
+                command_payload["expectedVersion"] = int(
+                    versions.get(scope_kind) or 0
+                )
+            else:
+                command_payload["expectedVersion"] = int(
+                    current.get("expectedVersion", current.get("version", 0)) or 0
+                )
+        return command_payload
+
+    result = replayable_cloud_mutation(
+        compatibility.runtime,
         idempotency_key=request.idempotency_key,
+        command_type="organization_access.cas_command",
+        aggregate_type="organization_configuration",
+        aggregate_id=command_path or read_path,
+        method=method,
+        path=command_path or read_path,
+        request_payload=dict(payload or request.body),
+        cloud_payload_factory=command_payload_factory,
         refresh_business=False,
     )
     compatibility.runtime.capture_sandbox_context(

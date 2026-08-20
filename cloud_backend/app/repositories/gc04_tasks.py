@@ -630,6 +630,7 @@ class GC04TaskRepository:
         collaborator = connection.execute(
             "SELECT 1 FROM task_collaborators WHERE scope_id=? AND task_id=? "
             "AND subject_membership_id=? AND lifecycle_state='active' "
+            "AND assignment_state='assigned' "
             "AND inbox_status IN ('pending','accepted') LIMIT 1",
             (identity.scope_id, row["id"], identity.membership_id),
         ).fetchone()
@@ -1045,7 +1046,8 @@ class GC04TaskRepository:
         if owner_present or collaborators_present:
             current_owner = connection.execute(
                 "SELECT subject_membership_id FROM task_collaborators WHERE scope_id=? "
-                "AND task_id=? AND role_key='owner' AND assignment_state='assigned' "
+                "AND task_id=? AND role_key='owner' "
+                "AND assignment_state IN ('assigned','returned') "
                 "AND lifecycle_state='active' ORDER BY updated_at DESC, id LIMIT 1",
                 (identity.scope_id, row["id"]),
             ).fetchone()
@@ -1070,7 +1072,8 @@ class GC04TaskRepository:
                     for item in connection.execute(
                         "SELECT subject_membership_id FROM task_collaborators "
                         "WHERE scope_id=? AND task_id=? AND role_key='collaborator' "
-                        "AND lifecycle_state='active' AND assignment_state='assigned'",
+                        "AND lifecycle_state='active' "
+                        "AND assignment_state IN ('assigned','awaiting_owner')",
                         (identity.scope_id, row["id"]),
                     ).fetchall()
                     if str(item["subject_membership_id"] or "") != owner_id
@@ -1146,8 +1149,13 @@ class GC04TaskRepository:
             LEFT JOIN principals AS principal ON principal.id=membership.principal_id
             WHERE collaborator.scope_id=? AND collaborator.task_id=?
               AND collaborator.lifecycle_state='active'
-              AND collaborator.assignment_state='assigned'
+              AND collaborator.assignment_state IN ('assigned','awaiting_owner','returned')
             ORDER BY CASE collaborator.role_key WHEN 'owner' THEN 0 ELSE 1 END,
+                     CASE collaborator.assignment_state
+                       WHEN 'assigned' THEN 0
+                       WHEN 'awaiting_owner' THEN 1
+                       ELSE 2
+                     END,
                      collaborator.assigned_at, collaborator.id
             """,
             (identity.scope_id, task_id),
@@ -1240,6 +1248,23 @@ class GC04TaskRepository:
                 and item.get("inbox_status") in {"pending", "accepted", "returned"}
             ),
             None,
+        )
+        task["viewer_role_key"] = next(
+            (
+                item["role_key"]
+                for item in task["collaborators"]
+                if item.get("subject_membership_id") == identity.membership_id
+            ),
+            None,
+        )
+        task["returned_to_creator"] = (
+            str(row["creator_membership_id"] or "") == identity.membership_id
+            and any(
+                item.get("role_key") == "owner"
+                and item.get("assignment_state") == "returned"
+                and item.get("inbox_status") == "returned"
+                for item in task["collaborators"]
+            )
         )
         task["progress_status"] = "done" if row["completed_at"] else "todo"
         return task
@@ -1378,6 +1403,7 @@ class GC04TaskRepository:
         task_id: str,
         owner_membership_id: str,
         collaborator_membership_ids: Iterable[str],
+        creator_membership_id: str,
         now: str,
     ) -> int:
         desired = {(owner_membership_id, "owner")}
@@ -1387,11 +1413,20 @@ class GC04TaskRepository:
             "AND lifecycle_state='active'",
             (identity.scope_id, task_id),
         ).fetchall()
+        active_by_key = {
+            (str(row["subject_membership_id"] or ""), str(row["role_key"] or "")): row
+            for row in active
+        }
+        current_owner = active_by_key.get((owner_membership_id, "owner"))
+        owner_accepted = owner_membership_id == creator_membership_id or bool(
+            current_owner is not None
+            and str(current_owner["assignment_state"] or "") == "assigned"
+            and str(current_owner["inbox_status"] or "") == "accepted"
+        )
         changed = 0
         for row in active:
             key = (str(row["subject_membership_id"] or ""), str(row["role_key"] or ""))
             if key in desired:
-                desired.remove(key)
                 continue
             connection.execute(
                 "UPDATE task_collaborators SET assignment_state='removed', "
@@ -1404,11 +1439,25 @@ class GC04TaskRepository:
             collaborator_id = _stable_id(
                 "task_member", identity.scope_id, task_id, membership_id, role_key
             )
-            inbox_status = "accepted" if membership_id == identity.membership_id else "pending"
-            existing = connection.execute(
-                "SELECT * FROM task_collaborators WHERE id=? AND scope_id=?",
-                (collaborator_id, identity.scope_id),
-            ).fetchone()
+            existing = active_by_key.get((membership_id, role_key))
+            if existing is None:
+                existing = connection.execute(
+                    "SELECT * FROM task_collaborators WHERE id=? AND scope_id=?",
+                    (collaborator_id, identity.scope_id),
+                ).fetchone()
+            if role_key == "owner":
+                assignment_state = "assigned"
+                inbox_status = "accepted" if owner_accepted else "pending"
+            else:
+                assignment_state = "assigned" if owner_accepted else "awaiting_owner"
+                inbox_status = (
+                    "accepted"
+                    if owner_accepted
+                    and existing is not None
+                    and str(existing["assignment_state"] or "") == "assigned"
+                    and str(existing["inbox_status"] or "") == "accepted"
+                    else "pending"
+                )
             if existing is None:
                 connection.execute(
                     """
@@ -1417,23 +1466,30 @@ class GC04TaskRepository:
                         subject_membership_id, role_key, assignment_state,
                         inbox_status, assigned_at, responded_at, version,
                         lifecycle_state, created_at, updated_at, deleted_at
-                    ) VALUES (?, ?, ?, NULL, ?, ?, 'assigned', ?, ?, ?, 1,
+                    ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 1,
                               'active', ?, ?, NULL)
                     """,
                     (
                         collaborator_id, identity.scope_id, task_id, membership_id,
-                        role_key, inbox_status, now,
+                        role_key, assignment_state, inbox_status, now,
                         now if inbox_status == "accepted" else None, now, now,
                     ),
                 )
             else:
+                already_current = (
+                    str(existing["assignment_state"] or "") == assignment_state
+                    and str(existing["inbox_status"] or "") == inbox_status
+                    and str(existing["lifecycle_state"] or "") == "active"
+                )
+                if already_current:
+                    continue
                 connection.execute(
-                    "UPDATE task_collaborators SET assignment_state='assigned', "
+                    "UPDATE task_collaborators SET assignment_state=?, "
                     "inbox_status=?, assigned_at=?, responded_at=?, "
                     "version=COALESCE(version,1)+1, lifecycle_state='active', "
                     "updated_at=?, deleted_at=NULL WHERE id=? AND scope_id=?",
                     (
-                        inbox_status, now,
+                        assignment_state, inbox_status, now,
                         now if inbox_status == "accepted" else None,
                         now, collaborator_id, identity.scope_id,
                     ),
@@ -1503,7 +1559,11 @@ class GC04TaskRepository:
             standard_view_ids = {
                 str(task["id"])
                 for task in task_payloads
-                if str(task.get("viewer_inbox_status") or "") != "pending"
+                if not bool(task.get("returned_to_creator"))
+                and not (
+                    str(task.get("viewer_inbox_status") or "") == "pending"
+                    and str(task.get("viewer_role_key") or "") == "owner"
+                )
             }
             calendar = [
                 row
@@ -1650,6 +1710,7 @@ class GC04TaskRepository:
                     connection, identity, task_id=task_id,
                     owner_membership_id=normalized["owner_membership_id"],
                     collaborator_membership_ids=normalized["collaborator_membership_ids"],
+                    creator_membership_id=identity.membership_id,
                     now=now,
                 )
                 self._replace_task_tags(
@@ -1666,8 +1727,10 @@ class GC04TaskRepository:
                     identity,
                     task_id=task_id,
                     membership_ids=[
-                        normalized["owner_membership_id"],
-                        *normalized["collaborator_membership_ids"],
+                        str(item["subject_membership_id"])
+                        for item in self._collaborators(connection, identity, task_id)
+                        if item.get("assignment_state") == "assigned"
+                        and item.get("inbox_status") == "pending"
                     ],
                     now=now,
                 )
@@ -1728,6 +1791,9 @@ class GC04TaskRepository:
                     connection, identity, task_id=str(row["id"]),
                     owner_membership_id=owner_id,
                     collaborator_membership_ids=collaborator_ids,
+                    creator_membership_id=str(
+                        row["creator_membership_id"] or identity.membership_id
+                    ),
                     now=now,
                 )
             if "tag_ids" in collaborator_patch:
@@ -1782,8 +1848,10 @@ class GC04TaskRepository:
                         identity,
                         task_id=task_id,
                         membership_ids=[
-                            patch.get("owner_membership_id"),
-                            *(patch.get("collaborator_membership_ids") or []),
+                            str(item["subject_membership_id"])
+                            for item in self._collaborators(connection, identity, task_id)
+                            if item.get("assignment_state") == "assigned"
+                            and item.get("inbox_status") == "pending"
                         ],
                         now=now,
                     )
@@ -1945,6 +2013,7 @@ class GC04TaskRepository:
                 collaborator = connection.execute(
                     "SELECT * FROM task_collaborators WHERE scope_id=? AND task_id=? "
                     "AND subject_membership_id=? AND lifecycle_state='active' "
+                    "AND assignment_state='assigned' "
                     "AND inbox_status='pending' ORDER BY CASE role_key WHEN 'owner' THEN 0 ELSE 1 END, id LIMIT 1",
                     (identity.scope_id, task_id, identity.membership_id),
                 ).fetchone()
@@ -1971,40 +2040,58 @@ class GC04TaskRepository:
                     "SELECT * FROM task_collaborators WHERE id=?",
                     (collaborator["id"],),
                 ).fetchone()
-                restored_owner = None
-                if action == "return" and str(collaborator["role_key"] or "") == "owner":
-                    previous_owner = connection.execute(
-                        "SELECT * FROM task_collaborators WHERE scope_id=? AND task_id=? "
-                        "AND role_key='owner' AND assignment_state='transferred' "
-                        "AND lifecycle_state='active' AND id!=? "
-                        "ORDER BY updated_at DESC,id LIMIT 1",
-                        (identity.scope_id, task_id, collaborator["id"]),
-                    ).fetchone()
-                    if previous_owner is None:
-                        raise RepositoryError(
-                            409,
-                            "task_owner_restore_missing",
-                            "负责人转交已变化，请刷新后重试",
+                notification_memberships: list[str] = []
+                if str(collaborator["role_key"] or "") == "owner":
+                    if action == "accept":
+                        staged = connection.execute(
+                            "SELECT subject_membership_id FROM task_collaborators "
+                            "WHERE scope_id=? AND task_id=? AND role_key='collaborator' "
+                            "AND assignment_state='awaiting_owner' "
+                            "AND lifecycle_state='active' ORDER BY assigned_at,id",
+                            (identity.scope_id, task_id),
+                        ).fetchall()
+                        connection.execute(
+                            "UPDATE task_collaborators SET assignment_state='assigned', "
+                            "version=COALESCE(version,1)+1, updated_at=? "
+                            "WHERE scope_id=? AND task_id=? AND role_key='collaborator' "
+                            "AND assignment_state='awaiting_owner' "
+                            "AND lifecycle_state='active'",
+                            (now, identity.scope_id, task_id),
                         )
-                    connection.execute(
-                        "UPDATE task_collaborators SET assignment_state='assigned',"
-                        "inbox_status='accepted',responded_at=?,version=COALESCE(version,1)+1,"
-                        "updated_at=? WHERE id=? AND scope_id=?",
-                        (now, now, previous_owner["id"], identity.scope_id),
-                    )
-                    restored_owner = connection.execute(
-                        "SELECT * FROM task_collaborators WHERE id=?",
-                        (previous_owner["id"],),
-                    ).fetchone()
+                        notification_memberships = [
+                            str(item["subject_membership_id"] or "")
+                            for item in staged
+                            if str(item["subject_membership_id"] or "")
+                        ]
+                    else:
+                        # 负责人退回的业务去向始终是 tasks.creator_membership_id。
+                        # 普通协作者继续被负责人闸门挡住，不提前看到任务。
+                        connection.execute(
+                            "UPDATE task_collaborators SET assignment_state='awaiting_owner', "
+                            "inbox_status='pending', responded_at=NULL, "
+                            "version=COALESCE(version,1)+1, updated_at=? "
+                            "WHERE scope_id=? AND task_id=? AND role_key='collaborator' "
+                            "AND lifecycle_state='active'",
+                            (now, identity.scope_id, task_id),
+                        )
+                        creator_membership_id = str(task["creator_membership_id"] or "")
+                        if creator_membership_id:
+                            notification_memberships = [creator_membership_id]
+                elif action == "return":
+                    creator_membership_id = str(task["creator_membership_id"] or "")
+                    if creator_membership_id:
+                        notification_memberships = [creator_membership_id]
                 result = {
                     "task": self._task_payload(connection, identity, task),
                     "collaborator": self._row_dict(changed),
-                    "restoredOwnerCollaborator": (
-                        self._row_dict(restored_owner)
-                        if restored_owner is not None
-                        else None
+                    "restoredOwnerCollaborator": None,
+                    "notificationResult": self._record_notification_intents(
+                        connection,
+                        identity,
+                        task_id=task_id,
+                        membership_ids=notification_memberships,
+                        now=now,
                     ),
-                    "notificationResult": self._notification_result(requested_recipients=1),
                     "projection": self._projection_for_tasks(connection, identity, [task_id]),
                 }
                 command_type = f"task.inbox_{'accepted' if action == 'accept' else 'returned'}"
@@ -2071,6 +2158,32 @@ class GC04TaskRepository:
                     "updated_at=? WHERE id=? AND scope_id=? AND version=?",
                     (now, now, owner["id"], identity.scope_id, expected_owner_version),
                 )
+                owner_accepted = target == str(task["creator_membership_id"] or "")
+                connection.execute(
+                    "UPDATE task_collaborators SET assignment_state='removed', "
+                    "lifecycle_state='deleted', deleted_at=?, "
+                    "version=COALESCE(version,1)+1, updated_at=? "
+                    "WHERE scope_id=? AND task_id=? AND role_key='collaborator' "
+                    "AND subject_membership_id=? AND lifecycle_state='active'",
+                    (now, now, identity.scope_id, task_id, target),
+                )
+                if owner_accepted:
+                    connection.execute(
+                        "UPDATE task_collaborators SET assignment_state='assigned', "
+                        "version=COALESCE(version,1)+1, updated_at=? "
+                        "WHERE scope_id=? AND task_id=? AND role_key='collaborator' "
+                        "AND assignment_state='awaiting_owner' AND lifecycle_state='active'",
+                        (now, identity.scope_id, task_id),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE task_collaborators SET assignment_state='awaiting_owner', "
+                        "inbox_status='pending', responded_at=NULL, "
+                        "version=COALESCE(version,1)+1, updated_at=? "
+                        "WHERE scope_id=? AND task_id=? AND role_key='collaborator' "
+                        "AND lifecycle_state='active'",
+                        (now, identity.scope_id, task_id),
+                    )
                 new_owner_id = _stable_id(
                     "task_member", identity.scope_id, task_id, target, "owner"
                 )
@@ -2078,7 +2191,7 @@ class GC04TaskRepository:
                     "SELECT * FROM task_collaborators WHERE id=? AND scope_id=?",
                     (new_owner_id, identity.scope_id),
                 ).fetchone()
-                inbox_status = "accepted" if target == identity.membership_id else "pending"
+                inbox_status = "accepted" if owner_accepted else "pending"
                 if existing is None:
                     connection.execute(
                         "INSERT INTO task_collaborators (id,scope_id,task_id,"

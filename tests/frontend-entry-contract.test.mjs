@@ -51,6 +51,11 @@ const systemStatusSource = fs.readFileSync(
   path.join(root, 'src', 'renderer', 'components', 'global', 'SystemStatusPanel.tsx'),
   'utf8',
 );
+const mainSource = fs.readFileSync(
+  path.join(root, 'src', 'main', 'main.ts'),
+  'utf8',
+);
+const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 
 test('all frozen user-facing entry points remain present', () => {
   const required = [
@@ -76,6 +81,17 @@ test('renderer only calls v2 and never calls legacy endpoints', () => {
   assert.equal(source.includes('latest.yml'), false);
   assert.equal(source.includes('organization_cloud_proxy'), false);
   assert.ok(source.includes('/api/v2'));
+});
+
+test('task collaboration return goes back to the creator and time controls stay 24-hour', () => {
+  assert.match(appSource, /returnedCreatorTasks/);
+  assert.match(appSource, /负责人已退回/);
+  assert.match(appSource, />修改</);
+  assert.match(appSource, /TaskTime24Input/);
+  assert.match(appSource, /inputMode="numeric"/);
+  assert.equal(/type=["']time["']/.test(source), false);
+  assert.match(mainSource, /appendSwitch\('lang', 'zh-CN'\)/);
+  assert.deepEqual(packageJson.build.mac.electronLanguages, ['zh_CN']);
 });
 
 test('all renderer mutations carry one stable idempotency key across retries', () => {

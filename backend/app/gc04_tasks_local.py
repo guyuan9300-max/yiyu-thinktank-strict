@@ -7,6 +7,7 @@ commands to the matching sandbox projection in the frozen local schema.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 
@@ -153,6 +154,7 @@ class LocalGC04TaskProjection:
         context, sandbox_id = self._context()
         now = utc_now()
         counts: dict[str, int] = {table: 0 for table in _PROJECTION_TABLES}
+        skipped: dict[str, list[str]] = {table: [] for table in _PROJECTION_TABLES}
         with self.runtime._connection() as connection:  # noqa: SLF001
             scope_id = self.runtime._local_object_scope_id(  # noqa: SLF001
                 connection, sandbox_id
@@ -165,42 +167,67 @@ class LocalGC04TaskProjection:
                     normalized_rows[table] = [
                         item for item in raw if isinstance(item, Mapping)
                     ] if isinstance(raw, list) else []
+                savepoint_index = 0
+
+                def apply_row(table: str, row: Mapping[str, Any]) -> None:
+                    """Apply one disposable projection row without inventing FK parents.
+
+                    A member's first task-board read can legitimately arrive before the
+                    referenced member, client, event-line or planning projection has
+                    reached this sandbox.  That is a cache-ordering condition, not a
+                    failure of the cloud-authoritative task read.  Keep the previous
+                    confirmed projection and retry on a later read instead of rolling
+                    back every otherwise valid row or blocking consumers such as the
+                    weekly review.
+                    """
+
+                    nonlocal savepoint_index
+                    savepoint_index += 1
+                    savepoint = f"gc04_projection_row_{savepoint_index}"
+                    connection.execute(f"SAVEPOINT {savepoint}")
+                    try:
+                        if table in _RESOURCE_KINDS:
+                            resource_kind = _RESOURCE_KINDS[table]
+                            self._upsert_resource(
+                                connection,
+                                scope_id=scope_id,
+                                cloud_instance_id=context.cloud_instance_id,
+                                resource_id=str(row.get("id") or ""),
+                                resource_kind=resource_kind,
+                                version=self._source_version(row),
+                                lifecycle_state=str(
+                                    row.get("lifecycle_state") or "active"
+                                ),
+                                created_at=str(row.get("created_at") or now),
+                                updated_at=str(row.get("updated_at") or now),
+                                deleted_at=row.get("deleted_at"),
+                            )
+                        self._upsert_row(
+                            connection,
+                            table=table,
+                            row=row,
+                            scope_id=scope_id,
+                            sandbox_id=sandbox_id,
+                            now=now,
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                        if "FOREIGN KEY constraint failed" not in str(exc):
+                            raise
+                        skipped[table].append(str(row.get("id") or ""))
+                        return
+                    connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    counts[table] += 1
+
                 for table in ("task_lists", "tasks", "task_views"):
                     for row in normalized_rows[table]:
-                        resource_kind = _RESOURCE_KINDS[table]
-                        self._upsert_resource(
-                            connection,
-                            scope_id=scope_id,
-                            cloud_instance_id=context.cloud_instance_id,
-                            resource_id=str(row.get("id") or ""),
-                            resource_kind=resource_kind,
-                            version=self._source_version(row),
-                            lifecycle_state=str(row.get("lifecycle_state") or "active"),
-                            created_at=str(row.get("created_at") or now),
-                            updated_at=str(row.get("updated_at") or now),
-                            deleted_at=row.get("deleted_at"),
-                        )
-                        self._upsert_row(
-                            connection,
-                            table=table,
-                            row=row,
-                            scope_id=scope_id,
-                            sandbox_id=sandbox_id,
-                            now=now,
-                        )
-                        counts[table] += 1
+                        apply_row(table, row)
                 for table in ("task_collaborators", "calendar_entries"):
                     for row in normalized_rows[table]:
-                        self._upsert_row(
-                            connection,
-                            table=table,
-                            row=row,
-                            scope_id=scope_id,
-                            sandbox_id=sandbox_id,
-                            now=now,
-                        )
-                        counts[table] += 1
-                if replace_snapshot:
+                        apply_row(table, row)
+                has_deferred_rows = any(skipped.values())
+                if replace_snapshot and not has_deferred_rows:
                     self._mark_absent_stale(
                         connection,
                         rows=normalized_rows,
@@ -219,10 +246,11 @@ class LocalGC04TaskProjection:
                     "任务云投影缺少本机稳定身份、项目或事件线依赖，未写入假投影",
                 ) from exc
         return {
-            "state": "current",
+            "state": "pending_retry" if any(skipped.values()) else "current",
             "scopeId": scope_id,
             "sandboxId": sandbox_id,
             "counts": counts,
+            "deferred": {table: ids for table, ids in skipped.items() if ids},
             "projectedAt": now,
         }
 

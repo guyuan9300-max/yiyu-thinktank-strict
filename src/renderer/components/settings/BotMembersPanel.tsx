@@ -716,7 +716,7 @@ curl -X POST http://127.0.0.1:47831/api/v2/ui/documents/generate \\
                         const ts = tokenInfoOverride?.token_rotated_at || existingBot.token_rotated_at;
                         if (!ts) return <span className="ml-1 text-gray-400">从未重置 (使用创建时的密钥)</span>;
                         try {
-                          return <span className="ml-1 text-gray-700">{new Date(ts).toLocaleString()}</span>;
+                          return <span className="ml-1 text-gray-700">{new Date(ts).toLocaleString('zh-CN', { hourCycle: 'h23' })}</span>;
                         } catch {
                           return <span className="ml-1 text-gray-700">{ts}</span>;
                         }

@@ -90,6 +90,7 @@ def _collaborator_ui(row: Mapping[str, Any], index: int) -> dict[str, Any]:
         "email": "",
         "orderIndex": index,
         "isOwner": str(row.get("role_key") or "") == "owner",
+        "assignmentState": str(row.get("assignment_state") or "assigned"),
         "inboxStatus": str(row.get("inbox_status") or "accepted"),
         "returnReason": None,
         "handledAt": row.get("responded_at"),
@@ -123,6 +124,8 @@ def _task_ui(
     done = bool(row.get("completed_at"))
     task_kind = str(row.get("task_kind") or "task")
     viewer_inbox_status = row.get("viewer_inbox_status")
+    viewer_role_key = row.get("viewer_role_key")
+    returned_to_creator = bool(row.get("returned_to_creator"))
     counts: dict[str, int] = {}
     for collaborator in collaborators:
         state = str(collaborator.get("inboxStatus") or "accepted")
@@ -163,8 +166,10 @@ def _task_ui(
         "status": (
             "done"
             if done
+            else "rejected"
+            if returned_to_creator
             else "inbox"
-            if viewer_inbox_status == "pending"
+            if viewer_inbox_status == "pending" and viewer_role_key == "owner"
             else "todo"
         ),
         "creatorId": str(row.get("creator_membership_id") or "") or None,
@@ -208,6 +213,7 @@ def _task_ui(
         "collaborators": collaborators,
         "collaborationSummary": counts,
         "viewerInboxStatus": viewer_inbox_status,
+        "viewerCollaborationRole": viewer_role_key,
         "syncStatus": "synced",
         "syncError": None,
         "createdAt": str(row.get("created_at") or ""),

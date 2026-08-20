@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -24,6 +25,7 @@ from ..project_materials_local import (
     select_relevant_excerpt,
 )
 from ..runtime import LocalRuntimeError
+from ..ui_idempotency import replayable_cloud_mutation
 from .routing import UiDomainRouter, UiRequest
 
 
@@ -33,8 +35,108 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _stable_ui_id(prefix: str, *parts: Any) -> str:
+    material = "|".join(str(part) for part in parts)
+    return f"{prefix}_{sha256_text(material)[:32]}"
+
+
 def _string(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _fallback_public_analysis_plan(
+    prompt: str,
+    *,
+    selected_titles: Sequence[str] = (),
+    mode: str = "balanced",
+) -> dict[str, Any]:
+    question = _string(prompt)
+    focus = question[:90] + ("…" if len(question) > 90 else "")
+    directions = [
+        f"先明确“{focus}”中需要确认的对象、边界和期望结论",
+        "再把可核实事实、基于事实的判断和仍需补证的部分分开",
+    ]
+    if any(token in question for token in ("为什么", "原因", "根因")):
+        directions.append("区分直接原因、结构性原因和表面现象，并反查相互矛盾的解释")
+    elif any(token in question for token in ("怎么", "如何", "方案", "建议")):
+        directions.append("比较可行路径、使用条件和风险，再给出可执行次序")
+    elif any(token in question for token in ("比较", "区别", "优劣", "是否")):
+        directions.append("按同一组判断标准比较候选结论，避免只罗列各自特点")
+    elif any(token in question for token in ("关系", "联系", "关联", "作用", "影响")):
+        directions.append("分别界定两边各自承担的作用，再核对它们之间的支撑、反馈、因果与边界")
+    else:
+        directions.append("围绕问题核心归纳证据，并检查结论是否真正回答了用户所问")
+    planned_sources = [f"用户本轮指定的《{title}》" for title in selected_titles[:4]]
+    if not planned_sources:
+        planned_sources = [
+            "当前项目的本机可读资料与相关原文片段",
+            "组织共享摘要、客户档案、官网事实及人工纠错/补充",
+            "当前对话中与本题直接相关的上下文",
+        ]
+    cautions = [
+        "不把历史回答或一般常识冒充当前项目事实",
+        (
+            "资料不足时明确缺口，同时把可行创意标成假设"
+            if mode == "creative"
+            else "资料不足时明确缺口，不用无证据内容补齐"
+        ),
+    ]
+    narrative = (
+        f"我理解你不是要我分别介绍相关概念，而是要围绕“{focus}”找出真正的连接方式与判断依据。"
+        f"我会先{directions[0]}，再{directions[1]}，并继续{directions[2]}。\n\n"
+        f"接下来优先核对{'、'.join(planned_sources[:3])}，看现有材料能否支持这些关系，"
+        "尤其区分已经明确写出的事实、从事实推导出的判断，以及目前仍缺证据的部分。\n\n"
+        f"组织答案时会特别注意{cautions[0]}；{cautions[1]}。"
+    )
+    return {
+        "narrative": narrative,
+        "intent": f"用户希望围绕“{focus}”得到一份直接、可核实且能用于下一步判断的回答。",
+        "directions": directions[:4],
+        "plannedSources": planned_sources[:5],
+        "cautions": cautions,
+    }
+
+
+def _normalize_public_analysis_plan(
+    raw_content: Any,
+    *,
+    prompt: str,
+    selected_titles: Sequence[str],
+    mode: str,
+) -> dict[str, Any]:
+    fallback = _fallback_public_analysis_plan(
+        prompt,
+        selected_titles=selected_titles,
+        mode=mode,
+    )
+    text = _string(raw_content)
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S)
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        match = re.search(r"\{[\s\S]*\}", text)
+        try:
+            parsed = json.loads(match.group(0)) if match else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = {}
+    if not isinstance(parsed, Mapping):
+        return fallback
+
+    def _items(key: str, limit: int) -> list[str]:
+        values = parsed.get(key)
+        if not isinstance(values, list):
+            return list(fallback[key])
+        result = [_string(item)[:180] for item in values if _string(item)]
+        return result[:limit] or list(fallback[key])
+
+    return {
+        "narrative": _string(parsed.get("narrative"))[:1_800] or fallback["narrative"],
+        "intent": _string(parsed.get("intent"))[:260] or fallback["intent"],
+        "directions": _items("directions", 4),
+        "plannedSources": _items("plannedSources", 5),
+        "cautions": _items("cautions", 3),
+    }
 
 
 def _sanitize_answer_export_title(value: Any) -> str:
@@ -529,6 +631,29 @@ def _cloud_command(
     )
 
 
+def _replayable_workbench_mutation(
+    compatibility: Any,
+    request: UiRequest,
+    method: str,
+    path: str,
+    *,
+    aggregate_type: str,
+    aggregate_id: str,
+    payload_factory: Any,
+) -> dict[str, Any]:
+    return replayable_cloud_mutation(
+        compatibility.runtime,
+        idempotency_key=request.idempotency_key,
+        command_type="workbench.ui.cas_mutation",
+        aggregate_type=aggregate_type,
+        aggregate_id=aggregate_id,
+        method=method,
+        path=path,
+        request_payload=request.body,
+        cloud_payload_factory=payload_factory,
+    )
+
+
 def _require_project_read(compatibility: Any, project_id: str) -> dict[str, Any]:
     return compatibility.runtime.require_project_capability(project_id, "read")
 
@@ -756,6 +881,7 @@ def _chat_messages(
         "deepThinkingRequested": bool(
             source_manifest.get("deepThinkingRequested")
         ),
+        "timing": dict(source_manifest.get("timing") or {}),
         "activeSkillId": source_manifest.get("activeSkillId"),
         "activeSkillIds": list(source_manifest.get("activeSkillIds") or []),
         "retrievalSummary": {
@@ -782,6 +908,24 @@ def _chat_messages(
             "agentKind": source_manifest.get("agentKind"),
             "providerResourceId": source_manifest.get("providerResourceId"),
             "modelName": source_manifest.get("modelName") or answer.get("modelName"),
+            "multipassUsed": bool(source_manifest.get("multipassUsed")),
+            "retrievalPassCount": int(source_manifest.get("retrievalPassCount") or 1),
+            "analysisTrace": [
+                _string(item)
+                for item in source_manifest.get("analysisTrace") or []
+                if _string(item)
+            ],
+            "publicAnalysisPlan": (
+                dict(source_manifest.get("publicAnalysisPlan") or {})
+                if isinstance(source_manifest.get("publicAnalysisPlan"), Mapping)
+                else None
+            ),
+            "providerReasoningContent": _string(
+                source_manifest.get("providerReasoningContent")
+            ),
+            "providerFinishReason": _string(
+                source_manifest.get("providerFinishReason")
+            ),
             "answerVersion": int(answer.get("version") or 1),
             "selectedHits": evidence,
             "primarySources": [
@@ -806,6 +950,14 @@ def _chat_messages(
                 "memoryMessage": source_manifest.get("memoryMessage"),
                 "deepThinkingRequested": bool(
                     source_manifest.get("deepThinkingRequested")
+                ),
+                "publicAnalysisPlan": (
+                    dict(source_manifest.get("publicAnalysisPlan") or {})
+                    if isinstance(source_manifest.get("publicAnalysisPlan"), Mapping)
+                    else None
+                ),
+                "providerReasoningContent": _string(
+                    source_manifest.get("providerReasoningContent")
                 ),
             },
         },
@@ -838,7 +990,7 @@ def _analysis_run(
         "progressFloor": 100 if completed else 0,
         "progressCeiling": 100,
         "stageLabel": None,
-        "elapsedMs": 0,
+        "elapsedMs": int((assistant.get("timing") or {}).get("totalMs") or 0),
         "evidenceSummary": {
             "summaryText": "",
             "masterHitCount": 0,
@@ -856,7 +1008,7 @@ def _analysis_run(
         "llmInvoked": completed,
         "providerUsed": "organization_direct" if completed else None,
         "failureReason": None,
-        "timing": {},
+        "timing": dict(assistant.get("timing") or {}),
         "assistantMessage": assistant if completed else None,
         "createdAt": answer.get("createdAt") or _now(),
         "updatedAt": answer.get("updatedAt") or answer.get("createdAt") or _now(),
@@ -1460,6 +1612,116 @@ def sync_project(
     return _project_summary(workspace["project"], workspace)
 
 
+@router.post(r"clients/([^/]+)/workspace/chat/plan")
+def plan_chat(
+    compatibility: Any,
+    request: UiRequest,
+    match: re.Match[str],
+) -> Any:
+    """Create a question-specific, user-visible analysis outline.
+
+    This route intentionally asks the model for a concise public plan rather
+    than returning provider reasoning tokens.  It is read-only and stores no
+    second business fact.
+    """
+
+    started_at = time.monotonic()
+    project_id = match.group(1)
+    _require_project_read(compatibility, project_id)
+    prompt = _string(request.body.get("prompt"))
+    if not prompt:
+        raise LocalRuntimeError(422, "prompt_required", "请输入问题")
+    mode = _string(request.body.get("creativityMode")) or "balanced"
+    if mode not in {"creative", "balanced", "strict"}:
+        mode = "balanced"
+    selected_document_ids = [
+        _string(value)
+        for value in request.body.get("workingDocumentIds") or []
+        if _string(value)
+    ][:8]
+    selected_titles: list[str] = []
+    if selected_document_ids and hasattr(compatibility.runtime, "database_path"):
+        store = LocalProjectMaterialsRepository(compatibility.runtime)
+        for document_id in selected_document_ids:
+            try:
+                document = store.document_text(document_id)
+            except LocalRuntimeError:
+                continue
+            if _string(document.get("projectId")) != project_id:
+                continue
+            title = _string(document.get("title"))
+            if title:
+                selected_titles.append(title)
+
+    mode_instruction = {
+        "strict": "资料优先：事实、推断、未知必须严格分开。",
+        "balanced": "兼顾资料：以项目事实为底色，再作必要分析。",
+        "creative": "创意优先：项目事实仍是边界，可提出多种假设方向。",
+    }[mode]
+    source_hint = (
+        "用户已指定资料：" + "、".join(f"《{title}》" for title in selected_titles)
+        if selected_titles
+        else (
+            "可按问题需要查找：当前项目本机资料、组织共享摘要、客户档案、"
+            "官网事实、正式会议纪要、人工纠错/补充和当前对话。"
+        )
+    )
+    planning_prompt = (
+        "你正在为用户生成一份可公开展示的本题分析思路。"
+        "它不是最终答案，也不是隐藏思维链逐字稿；必须具体对应用户的问题，"
+        "让用户看懂你如何理解意图、准备从哪些方向分析、将查找哪些资料、"
+        "以及会防止哪些误判。不要使用‘深入分析’‘综合考虑’等空话。\n"
+        f"回答模式：{mode_instruction}\n{source_hint}\n"
+        "只输出一个 JSON 对象，不要 Markdown。narrative 要写成连贯的第一人称分析叙述，"
+        "不是字段说明或机械步骤；用三至六个短段落，说清楚我怎样理解问题、准备怎样判断、"
+        "会核对哪些资料以及证据不足时怎样收束，不要提前给最终答案："
+        '{"narrative":"针对本题的连续分析叙述",'
+        '"intent":"一句话说明对本题意图的具体理解",'
+        '"directions":["具体分析方向1","具体分析方向2"],'
+        '"plannedSources":["具体资料或知识类别1","具体资料或知识类别2"],'
+        '"cautions":["本题需要防止的误判1"]}\n'
+        f"用户问题：{prompt[:4_000]}"
+    )
+    plan = _fallback_public_analysis_plan(
+        prompt,
+        selected_titles=selected_titles,
+        mode=mode,
+    )
+    try:
+        completion = compatibility.runtime.organization_ai_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你只负责生成面向用户的公开分析计划，不回答最终问题。",
+                },
+                {"role": "user", "content": planning_prompt},
+            ],
+            temperature=0.15,
+            # The public analysis should become visible while the final
+            # answer is still running.  Keep its own provider wait shorter
+            # than the interactive dispatch deadline; a question-specific
+            # fallback is preferable to an empty progress card.
+            read_timeout_seconds=25.0,
+            max_output_tokens=1_000,
+            thinking_enabled=False,
+        )
+        plan = _normalize_public_analysis_plan(
+            completion.get("content"),
+            prompt=prompt,
+            selected_titles=selected_titles,
+            mode=mode,
+        )
+    except Exception:
+        # The final answer remains available even if this optional public-plan
+        # pass fails.  The fallback is question-specific and does not claim a
+        # provider call succeeded.
+        pass
+    return {
+        "plan": plan,
+        "elapsedMs": max(1, int((time.monotonic() - started_at) * 1000)),
+    }
+
+
 @router.post(r"clients/([^/]+)/workspace/chat/start")
 def start_chat(
     compatibility: Any,
@@ -1517,8 +1779,19 @@ def start_chat(
     mode = _string(request.body.get("creativityMode")) or "balanced"
     if mode not in {"creative", "balanced", "strict"}:
         mode = "balanced"
+    deep_thinking_requested = bool(request.body.get("deepThinking"))
+    stream_event_callback = request.body.get("_streamEventCallback")
+    if not callable(stream_event_callback):
+        stream_event_callback = None
+    public_analysis_plan = request.body.get("publicAnalysisPlan")
+    if not isinstance(public_analysis_plan, Mapping):
+        public_analysis_plan = None
     requested_thread_id = _string(request.body.get("threadId"))
-    thread_id = requested_thread_id or new_id()
+    thread_id = requested_thread_id or _stable_ui_id(
+        "chat_thread",
+        project_id,
+        request.idempotency_key,
+    )
     local_image_receipts: list[dict[str, Any]] = []
     if local_image_objects:
         if not hasattr(compatibility.runtime, "persist_workbench_chat_images"):
@@ -1544,6 +1817,7 @@ def start_chat(
     private_context_items: list[dict[str, Any]] = []
     selected_sources: list[dict[str, Any]] = []
     retrieved_sources: list[dict[str, Any]] = []
+    retrieval_pass_count = 1
     local_retrieval_state = "selected_documents" if selected_document_ids else "ready"
     local_retrieval_message: str | None = None
     store: LocalProjectMaterialsRepository | None = None
@@ -1589,20 +1863,35 @@ def start_chat(
         # scope; this branch is the automatic project-Wiki recall path.
         store = LocalProjectMaterialsRepository(compatibility.runtime)
         try:
-            retrieval = store.search_local_wiki(
-                project_id=project_id,
-                query=prompt,
-                limit=12,
-            )
+            retrieval_queries = [prompt]
+            if deep_thinking_requested:
+                # 深度思考会把复合问题拆成少量检索面，避免只用整句查询
+                # 命中一个表面相似片段。拆解只用于检索，不被当作事实。
+                for clause in re.split(r"[。！？!?；;\n]+", prompt):
+                    normalized_clause = _string(clause)
+                    if 4 <= len(normalized_clause) <= 120 and normalized_clause not in retrieval_queries:
+                        retrieval_queries.append(normalized_clause)
+                    if len(retrieval_queries) >= 4:
+                        break
+            retrieval_pass_count = len(retrieval_queries)
             hits_by_document: dict[str, list[dict[str, Any]]] = {}
-            for raw_hit in retrieval.get("hits") or []:
-                if not isinstance(raw_hit, Mapping):
-                    continue
-                document_id = _string(raw_hit.get("documentId"))
-                excerpt = _string(raw_hit.get("excerpt"))
-                if not document_id or not excerpt:
-                    continue
-                hits_by_document.setdefault(document_id, []).append(dict(raw_hit))
+            seen_hits: set[tuple[str, str]] = set()
+            for retrieval_query in retrieval_queries:
+                retrieval = store.search_local_wiki(
+                    project_id=project_id,
+                    query=retrieval_query,
+                    limit=12 if deep_thinking_requested else 12,
+                )
+                for raw_hit in retrieval.get("hits") or []:
+                    if not isinstance(raw_hit, Mapping):
+                        continue
+                    document_id = _string(raw_hit.get("documentId"))
+                    excerpt = _string(raw_hit.get("excerpt"))
+                    hit_key = (document_id, _string(raw_hit.get("chunkId")) or excerpt[:120])
+                    if not document_id or not excerpt or hit_key in seen_hits:
+                        continue
+                    seen_hits.add(hit_key)
+                    hits_by_document.setdefault(document_id, []).append(dict(raw_hit))
             for document_id, hits in list(hits_by_document.items())[:4]:
                 local = store.document_text(document_id)
                 if _string(local.get("projectId")) != project_id:
@@ -1721,7 +2010,8 @@ def start_chat(
         writing_style=writing_style,
         agent_skills=agent_skills,
         image_context_items=image_context_items,
-        deep_thinking=bool(request.body.get("deepThinking")),
+        deep_thinking=deep_thinking_requested,
+        stream_event_callback=stream_event_callback,
         source_manifest_extra={
             "operationKey": f"{request.idempotency_key}:chat-answer",
             "workbenchKind": "project_chat",
@@ -1740,6 +2030,8 @@ def start_chat(
             "retrievedDocuments": retrieved_sources,
             "localRetrievalState": local_retrieval_state,
             "localRetrievalMessage": local_retrieval_message,
+            "retrievalPassCount": retrieval_pass_count,
+            "publicAnalysisPlan": dict(public_analysis_plan or {}),
             "transientImageInputs": image_source_receipts,
             "localChatImageInputs": local_image_receipts,
         },
@@ -1917,18 +2209,30 @@ def delete_chat_pair(
     match: re.Match[str],
 ) -> Any:
     project_id, message_id = match.group(1), match.group(2)
-    answer = _answer_for_message(
-        compatibility,
-        message_id,
-        expected_project_id=project_id,
+    answer_id = (
+        message_id[: -len(":question")]
+        if message_id.endswith(":question")
+        else message_id
     )
-    answer_id = _string(answer.get("answerId"))
-    _cloud_command(
-        compatibility,
-        request,
-        "DELETE",
-        f"/api/v2/workbench/answers/{answer_id}",
-        {"expectedVersion": answer.get("version")},
+
+    def delete_payload() -> dict[str, Any]:
+        answer = _answer_for_message(
+            compatibility,
+            message_id,
+            expected_project_id=project_id,
+        )
+        return {"expectedVersion": answer.get("version")}
+
+    replayable_cloud_mutation(
+        compatibility.runtime,
+        idempotency_key=request.idempotency_key,
+        command_type="workbench.chat_pair_delete",
+        aggregate_type="ai_answer",
+        aggregate_id=answer_id,
+        method="DELETE",
+        path=f"/api/v2/workbench/answers/{answer_id}",
+        request_payload={"projectId": project_id, "messageId": message_id},
+        cloud_payload_factory=delete_payload,
     )
     return {
         "clientId": project_id,
@@ -2385,27 +2689,38 @@ def clear_narrative_stale(
     request: UiRequest,
     match: re.Match[str],
 ) -> Any:
-    narrative_data = _cloud_query(
-        compatibility,
-        f"/api/v2/workbench/projects/{match.group(1)}/narrative",
-    )
-    report = _cloud_query(
-        compatibility,
-        f"/api/v2/workbench/reports/{narrative_data['id']}",
-    )
-    latest = report.get("latest") or {}
-    _cloud_command(
-        compatibility,
-        request,
-        "PATCH",
-        f"/api/v2/workbench/reports/{narrative_data['id']}",
-        {
+    project_id = match.group(1)
+
+    def payload_factory() -> dict[str, Any]:
+        narrative_data = _cloud_query(
+            compatibility,
+            f"/api/v2/workbench/projects/{project_id}/narrative",
+        )
+        report = _cloud_query(
+            compatibility,
+            f"/api/v2/workbench/reports/{narrative_data['id']}",
+        )
+        latest = report.get("latest") or {}
+        return {
             "expectedVersion": report.get("aggregateVersion"),
             "title": report.get("title"),
             "contentMarkdown": latest.get("content_markdown"),
             "contentJson": latest.get("content_payload") or {},
             "changeSummary": "确认当前叙事版本仍然有效",
-        },
+        }
+
+    narrative_data = _cloud_query(
+        compatibility,
+        f"/api/v2/workbench/projects/{project_id}/narrative",
+    )
+    _replayable_workbench_mutation(
+        compatibility,
+        request,
+        "PATCH",
+        f"/api/v2/workbench/reports/{narrative_data['id']}",
+        aggregate_type="narrative_output",
+        aggregate_id=_string(narrative_data.get("id")),
+        payload_factory=payload_factory,
     )
     return {"ok": True}
 
@@ -3437,17 +3752,20 @@ def _library_upsert(
 ) -> dict[str, Any]:
     payload = {**request.body, **(extra or {})}
     if item_id:
-        current = _cloud_query(
-            compatibility,
-            f"/api/v2/workbench/libraries/{kind}/{item_id}",
-        )
-        payload["expectedVersion"] = current.get("version")
-        return _cloud_command(
+        path = f"/api/v2/workbench/libraries/{kind}/{item_id}"
+
+        def payload_factory() -> dict[str, Any]:
+            current = _cloud_query(compatibility, path)
+            return {**payload, "expectedVersion": current.get("version")}
+
+        return _replayable_workbench_mutation(
             compatibility,
             request,
             "PUT",
-            f"/api/v2/workbench/libraries/{kind}/{item_id}",
-            payload,
+            path,
+            aggregate_type="automation_rule",
+            aggregate_id=item_id,
+            payload_factory=payload_factory,
         )
     return _cloud_command(
         compatibility,
@@ -3465,21 +3783,25 @@ def _delete_library(
     kind: str,
     item_id: str,
 ) -> dict[str, Any]:
-    try:
-        current = _cloud_query(
-            compatibility,
-            f"/api/v2/workbench/libraries/{kind}/{item_id}",
-        )
-    except LocalRuntimeError as exc:
-        if exc.status_code != 404:
-            raise
-        current = {"version": 1}
-    return _cloud_command(
+    path = f"/api/v2/workbench/libraries/{kind}/{item_id}"
+
+    def payload_factory() -> dict[str, Any]:
+        try:
+            current = _cloud_query(compatibility, path)
+        except LocalRuntimeError as exc:
+            if exc.status_code != 404:
+                raise
+            current = {"version": 1}
+        return {"expectedVersion": current.get("version")}
+
+    return _replayable_workbench_mutation(
         compatibility,
         request,
         "DELETE",
-        f"/api/v2/workbench/libraries/{kind}/{item_id}",
-        {"expectedVersion": current.get("version")},
+        path,
+        aggregate_type="automation_rule",
+        aggregate_id=item_id,
+        payload_factory=payload_factory,
     )
 
 
@@ -3492,21 +3814,28 @@ def _project_text_save(
     title: str,
     markdown: str,
 ) -> dict[str, Any]:
-    items = _cloud_query(
-        compatibility,
-        f"/api/v2/workbench/projects/{project_id}/texts",
-    )
-    current = items.get(key) or {}
-    return _cloud_command(
-        compatibility,
-        request,
-        "PUT",
-        f"/api/v2/workbench/projects/{project_id}/texts/{key}",
-        {
+    path = f"/api/v2/workbench/projects/{project_id}/texts/{key}"
+
+    def payload_factory() -> dict[str, Any]:
+        items = _cloud_query(
+            compatibility,
+            f"/api/v2/workbench/projects/{project_id}/texts",
+        )
+        current = items.get(key) or {}
+        return {
             "title": title,
             "markdownContent": markdown,
             "expectedVersion": int(current.get("version") or 0),
-        },
+        }
+
+    return _replayable_workbench_mutation(
+        compatibility,
+        request,
+        "PUT",
+        path,
+        aggregate_type="project_text",
+        aggregate_id=f"{project_id}:{key}",
+        payload_factory=payload_factory,
     )
 
 
@@ -3843,18 +4172,25 @@ def delete_strategic_doc(
     doc_type = match.group(2)
     if doc_type not in {"strategy", "methodology"}:
         raise LocalRuntimeError(422, "strategic_doc_type_invalid", "战略文档类型无效")
-    items = _cloud_query(
-        compatibility,
-        f"/api/v2/workbench/projects/{match.group(1)}/texts",
-    )
-    item = items.get(f"strategic_doc:{doc_type}")
-    expected_version = int((item or {}).get("version") or 1)
-    return _cloud_command(
+    project_id = match.group(1)
+    path = f"/api/v2/workbench/projects/{project_id}/texts/strategic_doc:{doc_type}"
+
+    def payload_factory() -> dict[str, Any]:
+        items = _cloud_query(
+            compatibility,
+            f"/api/v2/workbench/projects/{project_id}/texts",
+        )
+        item = items.get(f"strategic_doc:{doc_type}")
+        return {"expectedVersion": int((item or {}).get("version") or 1)}
+
+    return _replayable_workbench_mutation(
         compatibility,
         request,
         "DELETE",
-        f"/api/v2/workbench/projects/{match.group(1)}/texts/strategic_doc:{doc_type}",
-        {"expectedVersion": expected_version},
+        path,
+        aggregate_type="project_text",
+        aggregate_id=f"{project_id}:strategic_doc:{doc_type}",
+        payload_factory=payload_factory,
     )
 
 
@@ -4618,23 +4954,27 @@ def save_retrieval_settings(
     request: UiRequest,
     __: re.Match[str],
 ) -> Any:
-    payload = dict(request.body)
-    try:
-        current = _cloud_query(
-            compatibility,
-            "/api/v2/workbench/retrieval-settings",
-        )
-    except LocalRuntimeError as exc:
-        if exc.status_code != 404:
-            raise
-    else:
-        payload["expectedVersion"] = current.get("version")
-    return _cloud_command(
+    path = "/api/v2/workbench/retrieval-settings"
+
+    def payload_factory() -> dict[str, Any]:
+        payload = dict(request.body)
+        try:
+            current = _cloud_query(compatibility, path)
+        except LocalRuntimeError as exc:
+            if exc.status_code != 404:
+                raise
+        else:
+            payload["expectedVersion"] = current.get("version")
+        return payload
+
+    return _replayable_workbench_mutation(
         compatibility,
         request,
         "POST",
-        "/api/v2/workbench/retrieval-settings",
-        payload,
+        path,
+        aggregate_type="retrieval_settings",
+        aggregate_id="organization-retrieval-settings",
+        payload_factory=payload_factory,
     )
 
 
@@ -4811,16 +5151,23 @@ def confirm_workspace_judgment(
     judgment_id = _string(request.body.get("judgmentId"))
     if not judgment_id:
         raise LocalRuntimeError(422, "judgment_id_required", "judgmentId 不能为空")
-    current = _cloud_query(
-        compatibility,
-        f"/api/v2/workbench/judgments/{judgment_id}",
-    )
-    return _cloud_command(
+    path = f"/api/v2/workbench/judgments/{judgment_id}/confirm"
+
+    def payload_factory() -> dict[str, Any]:
+        current = _cloud_query(
+            compatibility,
+            f"/api/v2/workbench/judgments/{judgment_id}",
+        )
+        return {**request.body, "expectedVersion": current.get("aggregateVersion")}
+
+    return _replayable_workbench_mutation(
         compatibility,
         request,
         "POST",
-        f"/api/v2/workbench/judgments/{judgment_id}/confirm",
-        {**request.body, "expectedVersion": current.get("aggregateVersion")},
+        path,
+        aggregate_type="ai_proposal",
+        aggregate_id=judgment_id,
+        payload_factory=payload_factory,
     )
 
 
@@ -4847,16 +5194,23 @@ def resolve_workspace_answer_quality_failure(
     match: re.Match[str],
 ) -> Any:
     failure_id = match.group(1)
-    current = _cloud_query(
-        compatibility,
-        f"/api/v2/workbench/answer-quality-failures/{failure_id}",
-    )
-    return _cloud_command(
+    path = f"/api/v2/workbench/answer-quality-failures/{failure_id}/resolve"
+
+    def payload_factory() -> dict[str, Any]:
+        current = _cloud_query(
+            compatibility,
+            f"/api/v2/workbench/answer-quality-failures/{failure_id}",
+        )
+        return {**request.body, "expectedVersion": current.get("version")}
+
+    return _replayable_workbench_mutation(
         compatibility,
         request,
         "POST",
-        f"/api/v2/workbench/answer-quality-failures/{failure_id}/resolve",
-        {**request.body, "expectedVersion": current.get("version")},
+        path,
+        aggregate_type="answer_quality_failure",
+        aggregate_id=failure_id,
+        payload_factory=payload_factory,
     )
 
 
@@ -5272,7 +5626,9 @@ def _save_meeting(
     project_id: str,
     meeting: Mapping[str, Any],
 ) -> dict[str, Any]:
-    meeting_id = _string(meeting.get("id")) or new_id()
+    meeting_id = _string(meeting.get("id")) or _stable_ui_id(
+        "meeting", project_id, request.idempotency_key
+    )
     payload = {
         **dict(meeting),
         "id": meeting_id,
@@ -5384,7 +5740,9 @@ def create_meeting(
         request,
         project_id=match.group(1),
         meeting={
-            "id": new_id(),
+            "id": _stable_ui_id(
+                "meeting", match.group(1), request.idempotency_key
+            ),
             "title": title,
             "stage": "prepared",
             "scheduledAt": request.body.get("scheduledAt"),
@@ -5429,23 +5787,30 @@ def update_meeting_pipeline(
             if line.strip(" -•\t")
         ]
         meeting["decisions"] = [
-            {"id": new_id(), "summary": line[:300]}
-            for line in lines
+            {
+                "id": _stable_ui_id("decision", meeting_id, index, line),
+                "summary": line[:300],
+            }
+            for index, line in enumerate(lines)
             if any(token in line for token in ("决定", "确认", "同意"))
         ]
         meeting["risks"] = [
-            {"id": new_id(), "summary": line[:300], "severity": "normal"}
-            for line in lines
+            {
+                "id": _stable_ui_id("risk", meeting_id, index, line),
+                "summary": line[:300],
+                "severity": "normal",
+            }
+            for index, line in enumerate(lines)
             if any(token in line for token in ("风险", "困难", "阻碍"))
         ]
         meeting["ambiguities"] = [
             {
-                "id": new_id(),
+                "id": _stable_ui_id("ambiguity", meeting_id, index, line),
                 "rawText": line[:300],
                 "candidates": [],
                 "status": "pending",
             }
-            for line in lines
+            for index, line in enumerate(lines)
             if any(token in line for token in ("待确认", "不确定", "？", "?"))
         ]
         meeting["stage"] = "extracted"
@@ -5489,7 +5854,9 @@ def launch_feishu_meeting(
     title = _string(request.body.get("title"))
     if not title:
         raise LocalRuntimeError(422, "meeting_title_required", "请输入会议标题")
-    meeting_id = new_id()
+    meeting_id = _stable_ui_id(
+        "meeting", project_id, request.idempotency_key, "feishu"
+    )
     meeting = _save_meeting(
         compatibility,
         request,
@@ -5919,6 +6286,12 @@ def export_answer(
         project_id=project_id,
         title=export_title,
         content=content,
+        # The UI request may be replayed after the cloud registration has
+        # committed but before its response reaches Electron.  Bind the local
+        # file preparation to the same user intent so a replay reuses the
+        # original localSourceId/path instead of producing a different cloud
+        # metadata payload under the same idempotency key.
+        idempotency_key=f"{request.idempotency_key}:local-answer-export",
     )
     registered = _cloud_command(
         compatibility,
@@ -6097,7 +6470,11 @@ def project_knowledge_action(
     succeeded = sum(item["status"] == "succeeded" for item in items)
     failed = sum(item["status"] == "failed" for item in items)
     return {
-        "batchId": new_id(),
+        "batchId": _stable_ui_id(
+            "knowledge_batch",
+            project_id,
+            request.idempotency_key,
+        ),
         "attempted": len(items),
         "succeeded": succeeded,
         "failed": failed,

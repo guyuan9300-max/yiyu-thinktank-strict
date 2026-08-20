@@ -1687,13 +1687,39 @@ class WorkspaceRuntime:
         temperature: float,
         read_timeout_seconds: float = 45.0,
         max_output_tokens: int = 2_048,
-    ) -> str:
+        thinking_enabled: bool = False,
+    ) -> dict[str, Any]:
         base_url = str(provider.get("baseUrl") or "").strip().rstrip("/")
         endpoint = (
             base_url
             if base_url.endswith("/chat/completions")
             else f"{base_url}/chat/completions"
         )
+        request_payload: dict[str, Any] = {
+            "model": str(provider["modelName"]),
+            "messages": messages,
+            "max_tokens": max(256, min(8_192, int(max_output_tokens))),
+            "stream": False,
+        }
+        # 快速问答沿用最广泛兼容的 Chat Completions 请求；只有用户明确
+        # 开启深度思考时才发送供应商的原生推理开关，避免其他兼容模型因
+        # 不认识 thinking 字段而拒绝普通问答。响应仍只消费最终 content。
+        if thinking_enabled:
+            request_payload["thinking"] = {"type": "enabled"}
+        else:
+            request_payload["temperature"] = temperature
+            # Doubao Seed 2.1 Pro defaults to an implicit reasoning pass when
+            # the field is omitted.  That made quick answers slow and made a
+            # deep answer reason twice (once publicly, then once invisibly).
+            # Disable only for the provider family known to support this
+            # contract; other OpenAI-compatible providers keep the broadly
+            # compatible request shape.
+            provider_signature = " ".join(
+                str(provider.get(key) or "").lower()
+                for key in ("provider", "providerLabel", "baseUrl", "modelName")
+            )
+            if "doubao" in provider_signature or "volces" in provider_signature:
+                request_payload["thinking"] = {"type": "disabled"}
         try:
             with httpx.Client(
                 timeout=httpx.Timeout(
@@ -1711,15 +1737,7 @@ class WorkspaceRuntime:
                         "Authorization": f"Bearer {provider['apiKey']}",
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "model": str(provider["modelName"]),
-                        "messages": messages,
-                        "temperature": temperature,
-                        # 基础问答走低延迟通道；深度思考仍是明确的待接能力。
-                        "thinking": {"type": "disabled"},
-                        "max_tokens": max(256, min(8_192, int(max_output_tokens))),
-                        "stream": False,
-                    },
+                    json=request_payload,
                 )
         except httpx.TimeoutException as exc:
             raise LocalRuntimeError(
@@ -1753,7 +1771,11 @@ class WorkspaceRuntime:
                 ),
             )
         try:
-            content = str(response_payload["choices"][0]["message"]["content"]).strip()
+            choice = response_payload["choices"][0]
+            message = choice["message"]
+            content = str(message.get("content") or "").strip()
+            reasoning_content = str(message.get("reasoning_content") or "").strip()
+            finish_reason = str(choice.get("finish_reason") or "").strip()
         except (KeyError, IndexError, TypeError) as exc:
             raise LocalRuntimeError(
                 502,
@@ -1761,8 +1783,21 @@ class WorkspaceRuntime:
                 "组织模型返回了无效回答",
             ) from exc
         if not content:
+            if thinking_enabled and reasoning_content:
+                raise LocalRuntimeError(
+                    503,
+                    "organization_ai_final_content_missing",
+                    "深度思考已返回，但最终答案尚未形成，可以重试",
+                )
             raise LocalRuntimeError(502, "organization_ai_response_empty", "组织模型返回了空回答")
-        return content
+        usage = response_payload.get("usage")
+        safe_usage = dict(usage) if isinstance(usage, Mapping) else {}
+        return {
+            "content": content,
+            "reasoningContent": reasoning_content if thinking_enabled else "",
+            "finishReason": finish_reason,
+            "usage": safe_usage,
+        }
 
     def organization_ai_completion(
         self,
@@ -1771,15 +1806,17 @@ class WorkspaceRuntime:
         temperature: float,
         read_timeout_seconds: float = 45.0,
         max_output_tokens: int = 2_048,
+        thinking_enabled: bool = False,
     ) -> dict[str, Any]:
         captured = self.capture_sandbox_context()
         provider = self._organization_ai_runtime_secret()
-        content = self._invoke_organization_ai(
+        completion = self._invoke_organization_ai(
             provider,
             messages=messages,
             temperature=temperature,
             read_timeout_seconds=read_timeout_seconds,
             max_output_tokens=max_output_tokens,
+            thinking_enabled=thinking_enabled,
         )
         current = self.capture_sandbox_context()
         if (
@@ -1806,7 +1843,311 @@ class WorkspaceRuntime:
                 "cloudInstanceId",
             )
         }
-        return {"content": content, "provider": safe_provider}
+        return {**completion, "provider": safe_provider}
+
+    def organization_ai_stream_completion(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        temperature: float,
+        on_event: Callable[[str, str], None],
+        read_timeout_seconds: float = 60.0,
+        max_output_tokens: int = 2_048,
+        thinking_enabled: bool = False,
+    ) -> dict[str, Any]:
+        """Generate one answer while forwarding the provider's real stream.
+
+        Deep mode consumes ``reasoning_content`` and ``content`` from the same
+        provider request.  This prevents the former two-call implementation
+        from showing a detached analysis paragraph and then timing out while
+        asking the model to reason over the same context again.
+        """
+
+        captured = self.capture_sandbox_context()
+        provider = self._organization_ai_runtime_secret()
+        base_url = str(provider.get("baseUrl") or "").strip().rstrip("/")
+        endpoint = (
+            base_url
+            if base_url.endswith("/chat/completions")
+            else f"{base_url}/chat/completions"
+        )
+        request_payload: dict[str, Any] = {
+            "model": str(provider["modelName"]),
+            "messages": messages,
+            "max_tokens": max(256, min(8_192, int(max_output_tokens))),
+            "stream": True,
+        }
+        if thinking_enabled:
+            request_payload["thinking"] = {"type": "enabled"}
+        else:
+            request_payload["temperature"] = temperature
+            provider_signature = " ".join(
+                str(provider.get(key) or "").lower()
+                for key in ("provider", "providerLabel", "baseUrl", "modelName")
+            )
+            if "doubao" in provider_signature or "volces" in provider_signature:
+                request_payload["thinking"] = {"type": "disabled"}
+
+        started_at = time.monotonic()
+        reasoning_started_at: float | None = None
+        answer_started_at: float | None = None
+        reasoning_parts: list[str] = []
+        answer_parts: list[str] = []
+        finish_reason = ""
+        usage: dict[str, Any] = {}
+        try:
+            with httpx.Client(
+                timeout=httpx.Timeout(
+                    connect=5.0,
+                    # Streaming traffic resets this idle timeout on every
+                    # chunk; it is not a total-duration limit.
+                    read=min(120.0, max(10.0, float(read_timeout_seconds))),
+                    write=15.0,
+                    pool=5.0,
+                ),
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                with client.stream(
+                    "POST",
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {provider['apiKey']}",
+                        "Content-Type": "application/json",
+                    },
+                    json=request_payload,
+                ) as response:
+                    if response.status_code >= 400:
+                        retryable = response.status_code in {408, 425, 429} or response.status_code >= 500
+                        raise LocalRuntimeError(
+                            503 if retryable else response.status_code,
+                            "organization_ai_failed_retryable" if retryable else "organization_ai_rejected",
+                            "组织模型暂时失败，可以重试" if retryable else f"组织模型拒绝了请求（{response.status_code}）",
+                        )
+                    for line in response.iter_lines():
+                        normalized = str(line or "").strip()
+                        if not normalized.startswith("data:"):
+                            continue
+                        data = normalized[5:].strip()
+                        if not data or data == "[DONE]":
+                            continue
+                        try:
+                            payload = json.loads(data)
+                        except ValueError:
+                            continue
+                        raw_usage = payload.get("usage")
+                        if isinstance(raw_usage, Mapping):
+                            usage = dict(raw_usage)
+                        choices = payload.get("choices")
+                        if not isinstance(choices, list) or not choices:
+                            continue
+                        choice = choices[0] if isinstance(choices[0], Mapping) else {}
+                        delta = choice.get("delta") if isinstance(choice.get("delta"), Mapping) else {}
+                        reasoning_text = str(delta.get("reasoning_content") or "")
+                        answer_text = str(delta.get("content") or "")
+                        if reasoning_text:
+                            if reasoning_started_at is None:
+                                reasoning_started_at = time.monotonic()
+                            reasoning_parts.append(reasoning_text)
+                            on_event("reasoning_delta", reasoning_text)
+                        if answer_text:
+                            if answer_started_at is None:
+                                answer_started_at = time.monotonic()
+                                on_event("answer_started", "")
+                            answer_parts.append(answer_text)
+                            on_event("answer_delta", answer_text)
+                        if choice.get("finish_reason") is not None:
+                            finish_reason = str(choice.get("finish_reason") or "")
+        except LocalRuntimeError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise LocalRuntimeError(
+                504,
+                "organization_ai_timeout",
+                "组织模型长时间没有继续返回内容，可以重试",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise LocalRuntimeError(
+                503,
+                "organization_ai_unreachable",
+                "组织模型暂时无法连接，可以重试",
+            ) from exc
+
+        content = "".join(answer_parts).strip()
+        reasoning_content = "".join(reasoning_parts).strip()
+        if not content:
+            if thinking_enabled and reasoning_content:
+                raise LocalRuntimeError(
+                    503,
+                    "organization_ai_final_content_missing",
+                    "深度思考已经返回，但模型没有形成最终答案，可以重试",
+                )
+            raise LocalRuntimeError(502, "organization_ai_response_empty", "组织模型返回了空回答")
+
+        current = self.capture_sandbox_context()
+        if (
+            current.sandbox_id != captured.sandbox_id
+            or current.organization_id != captured.organization_id
+            or current.request_seq < captured.request_seq
+        ):
+            raise LocalRuntimeError(
+                409,
+                "workspace_context_changed",
+                "回答生成期间工作空间已切换，本次结果未保存",
+            )
+        finished_at = time.monotonic()
+        safe_provider = {
+            key: provider.get(key)
+            for key in (
+                "configId",
+                "provider",
+                "baseUrl",
+                "modelName",
+                "keyFingerprint",
+                "status",
+                "version",
+                "organizationId",
+                "cloudInstanceId",
+            )
+        }
+        return {
+            "content": content,
+            "reasoningContent": reasoning_content if thinking_enabled else "",
+            "finishReason": finish_reason,
+            "usage": usage,
+            "provider": safe_provider,
+            "timing": {
+                "reasoningStartedMs": (
+                    max(0, int((reasoning_started_at - started_at) * 1000))
+                    if reasoning_started_at is not None
+                    else 0
+                ),
+                "answerStartedMs": (
+                    max(0, int((answer_started_at - started_at) * 1000))
+                    if answer_started_at is not None
+                    else 0
+                ),
+                "reasoningMs": (
+                    max(1, int(((answer_started_at or finished_at) - reasoning_started_at) * 1000))
+                    if reasoning_started_at is not None
+                    else 0
+                ),
+                "generationMs": max(1, int((finished_at - started_at) * 1000)),
+            },
+        }
+
+    def stream_public_analysis(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        max_output_tokens: int = 600,
+        read_timeout_seconds: float = 25.0,
+    ) -> Iterator[str]:
+        """Stream a bounded, question-specific analysis narrative.
+
+        The configured Doubao model exposes its reasoning stream before the
+        final answer stream.  Reading that channel makes deep mode visibly
+        different within a few seconds.  The public excerpt is deliberately
+        bounded: rigor comes from the reasoning route, not from making the
+        user wait for a second full answer.
+        """
+
+        captured = self.capture_sandbox_context()
+        provider = self._organization_ai_runtime_secret()
+        base_url = str(provider.get("baseUrl") or "").strip().rstrip("/")
+        endpoint = (
+            base_url
+            if base_url.endswith("/chat/completions")
+            else f"{base_url}/chat/completions"
+        )
+        request_payload = {
+            "model": str(provider["modelName"]),
+            "messages": messages,
+            "max_tokens": max(256, min(1_500, int(max_output_tokens))),
+            "stream": True,
+            "thinking": {"type": "enabled"},
+        }
+        started_at = time.monotonic()
+        emitted_chars = 0
+        try:
+            with httpx.Client(
+                timeout=httpx.Timeout(
+                    connect=5.0,
+                    read=min(45.0, max(5.0, float(read_timeout_seconds))),
+                    write=15.0,
+                    pool=5.0,
+                ),
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                with client.stream(
+                    "POST",
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {provider['apiKey']}",
+                        "Content-Type": "application/json",
+                    },
+                    json=request_payload,
+                ) as response:
+                    if response.status_code >= 400:
+                        raise LocalRuntimeError(
+                            503 if response.status_code >= 500 else response.status_code,
+                            "organization_ai_failed_retryable",
+                            "组织模型暂时无法生成分析，可以直接继续回答",
+                        )
+                    for line in response.iter_lines():
+                        normalized = str(line or "").strip()
+                        if not normalized.startswith("data:"):
+                            continue
+                        data = normalized[5:].strip()
+                        if not data or data == "[DONE]":
+                            continue
+                        try:
+                            payload = json.loads(data)
+                            delta = payload["choices"][0].get("delta") or {}
+                            # Deep mode is meant to expose the provider's
+                            # question-specific reasoning.  Do not mistake the
+                            # subsequent final content for more analysis.
+                            text = str(delta.get("reasoning_content") or "")
+                        except (ValueError, KeyError, IndexError, TypeError):
+                            continue
+                        if text:
+                            emitted_chars += len(text)
+                            yield text
+                        elapsed = time.monotonic() - started_at
+                        # One concise reasoning passage is sufficient.  Stop
+                        # before the provider starts composing a second full
+                        # answer, so deep mode stays close to quick mode in
+                        # total latency.
+                        if emitted_chars >= 140 or (
+                            emitted_chars >= 45 and elapsed >= 8.0
+                        ) or (emitted_chars > 0 and elapsed >= 14.0):
+                            break
+        except LocalRuntimeError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise LocalRuntimeError(
+                504,
+                "organization_ai_analysis_timeout",
+                "公开分析生成超时，可以直接继续回答",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise LocalRuntimeError(
+                503,
+                "organization_ai_unreachable",
+                "组织模型暂时无法连接，可以直接继续回答",
+            ) from exc
+        current = self.capture_sandbox_context()
+        if (
+            current.sandbox_id != captured.sandbox_id
+            or current.organization_id != captured.organization_id
+            or current.request_seq < captured.request_seq
+        ):
+            raise LocalRuntimeError(
+                409,
+                "workspace_context_changed",
+                "分析期间工作空间已切换",
+            )
 
     def private_ai_completion(
         self,

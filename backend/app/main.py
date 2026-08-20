@@ -1,5 +1,8 @@
 import asyncio
+import json
 import os
+import queue
+import threading
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from typing import Annotated, Any
@@ -8,7 +11,7 @@ import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from strict_common.contracts import BUSINESS_CAPABILITIES, CONNECTED_CAPABILITIES
 from strict_common.ids import new_id
@@ -238,6 +241,218 @@ def create_app(config: LocalConfig | None = None) -> FastAPI:
                 BUSINESS_CAPABILITIES - CONNECTED_CAPABILITIES
             ),
         }
+
+    @app.post(
+        "/api/v2/ui/clients/{project_id}/workspace/chat/start-stream",
+        dependencies=[Depends(desktop_authorized)],
+    )
+    def stream_workspace_answer(
+        project_id: str,
+        payload: dict[str, Any],
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key"),
+        ] = None,
+        expected_sandbox_id: Annotated[
+            str | None,
+            Header(alias="X-Yiyu-Sandbox-Id"),
+        ] = None,
+        request_seq: Annotated[
+            str | None,
+            Header(alias="X-Yiyu-Request-Seq"),
+        ] = None,
+    ) -> StreamingResponse:
+        """Stream one real model run: reasoning first, then final answer."""
+
+        path = f"clients/{project_id}/workspace/chat/start"
+        operation_id = idempotency_key or new_id()
+        parsed_request_seq = _request_sequence(request_seq)
+        expected_sandbox = (expected_sandbox_id or "").strip() or None
+        workspace_context = ui_compat.capture_dispatch_workspace(
+            "POST",
+            path,
+            query={},
+            body=payload,
+            idempotency_key=operation_id,
+            expected_sandbox_id=expected_sandbox,
+            request_seq=parsed_request_seq,
+        )
+
+        def event_stream():
+            events: queue.Queue[dict[str, Any]] = queue.Queue()
+
+            def emit(event_type: str, text: str) -> None:
+                events.put({"type": event_type, "text": text})
+
+            def run() -> None:
+                try:
+                    result = ui_compat.dispatch(
+                        "POST",
+                        path,
+                        query={},
+                        body={**payload, "_streamEventCallback": emit},
+                        idempotency_key=operation_id,
+                        workspace_context=workspace_context,
+                        expected_sandbox_id=expected_sandbox,
+                        request_seq=parsed_request_seq,
+                    )
+                    events.put({"type": "done", "result": result})
+                except LocalRuntimeError as exc:
+                    events.put(
+                        {
+                            "type": "error",
+                            "code": exc.code,
+                            "message": exc.message,
+                            "status": exc.status_code,
+                        }
+                    )
+                except Exception:
+                    events.put(
+                        {
+                            "type": "error",
+                            "code": "workspace_chat_stream_interrupted",
+                            "message": "回答生成意外中断，可以重试",
+                            "status": 500,
+                        }
+                    )
+
+            yield json.dumps(
+                {"type": "stage", "stage": "preparing"},
+                ensure_ascii=False,
+            ) + "\n"
+            threading.Thread(target=run, daemon=True).start()
+            while True:
+                try:
+                    event = events.get(timeout=130.0)
+                except queue.Empty:
+                    event = {
+                        "type": "error",
+                        "code": "workspace_chat_stream_timeout",
+                        "message": "模型长时间没有继续返回内容，可以重试",
+                        "status": 504,
+                    }
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+                if event.get("type") in {"done", "error"}:
+                    break
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post(
+        "/api/v2/ui/clients/{project_id}/workspace/chat/plan-stream",
+        dependencies=[Depends(desktop_authorized)],
+    )
+    def stream_workspace_analysis(
+        project_id: str,
+        payload: dict[str, Any],
+        expected_sandbox_id: Annotated[
+            str | None,
+            Header(alias="X-Yiyu-Sandbox-Id"),
+        ] = None,
+        request_seq: Annotated[
+            str | None,
+            Header(alias="X-Yiyu-Request-Seq"),
+        ] = None,
+    ) -> StreamingResponse:
+        """Stream a concise, user-visible reading of the current question."""
+
+        prompt = str(payload.get("prompt") or "").strip()
+        if not prompt:
+            raise LocalRuntimeError(422, "prompt_required", "请输入问题")
+        mode = str(payload.get("creativityMode") or "balanced").strip()
+        mode_text = {
+            "strict": "资料优先：先辨明事实、推断和未知，再决定能回答到哪里。",
+            "creative": "创意优先：以已知项目事实为边界，同时寻找新的解释和方案。",
+        }.get(mode, "兼顾资料：既核对项目事实，也允许进行必要推理。")
+        context = runtime.capture_sandbox_context(
+            expected_sandbox_id=(expected_sandbox_id or "").strip() or None,
+            request_seq=_request_sequence(request_seq),
+        )
+
+        def event_stream():
+            accumulated = ""
+            try:
+                with runtime.prebound_sandbox_context(context):
+                    runtime.require_project_capability(project_id, "read")
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "你正在进行一段展示给用户看的本题分析。"
+                                "直接说你如何理解用户真正要解决的问题、准备从哪些方向判断、"
+                                "需要核对哪些项目资料，以及哪些地方容易误判。"
+                                "像真实分析一样自然展开，不要写成固定步骤、产品说明或最终答案；"
+                                "不必刻意拉长，形成足够严谨的判断路线即可。"
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"回答取向：{mode_text}\n"
+                                "可按问题需要检索当前项目资料、组织共享摘要、客户档案、"
+                                "事实澄清、官网事实、会议纪要、人工纠错和当前对话。\n"
+                                f"本题：{prompt[:4_000]}"
+                            ),
+                        },
+                    ]
+                    for chunk in runtime.stream_public_analysis(messages=messages):
+                        accumulated += chunk
+                        yield json.dumps(
+                            {"type": "delta", "text": chunk},
+                            ensure_ascii=False,
+                        ) + "\n"
+                yield json.dumps(
+                    {
+                        "type": "done",
+                        "plan": {
+                            "narrative": accumulated.strip(),
+                            "intent": "",
+                            "directions": [],
+                            "plannedSources": [],
+                            "cautions": [],
+                        },
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
+            except LocalRuntimeError as exc:
+                yield json.dumps(
+                    {
+                        "type": "error",
+                        "code": exc.code,
+                        "message": str(exc),
+                        "partial": accumulated.strip(),
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
+            except Exception:
+                # A streaming response has already sent its HTTP headers at
+                # this point.  Always close it with a valid NDJSON terminal
+                # event instead of aborting the socket and surfacing an empty
+                # 502 in Electron.
+                yield json.dumps(
+                    {
+                        "type": "error",
+                        "code": "analysis_stream_interrupted",
+                        "message": "分析流暂时中断，已继续生成正式答案",
+                        "partial": accumulated.strip(),
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/api/v2/workspaces/current", dependencies=[Depends(desktop_authorized)])
     def current_workspace() -> dict[str, Any]:
@@ -638,7 +853,8 @@ def create_app(config: LocalConfig | None = None) -> FastAPI:
             else interactive_ai_dispatch
             if request.method == "POST"
             and (
-                ui_path.strip("/").endswith("/workspace/chat/start")
+                ui_path.strip("/").endswith("/workspace/chat/plan")
+                or ui_path.strip("/").endswith("/workspace/chat/start")
                 or ui_path.strip("/").endswith("/documents/ai-action")
             )
             else background_ui_dispatch

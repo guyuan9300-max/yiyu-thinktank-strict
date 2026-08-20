@@ -13,6 +13,7 @@ from ..local_asr.models import SENSE_VOICE_MODEL, model_ready
 from ..local_asr.subprocess_runner import run_local_asr_subprocess
 from ..runtime import LocalRuntimeError
 from ..transcript_semantic_correction import correct_project_transcript
+from ..ui_idempotency import replayable_cloud_mutation, replayable_generated_value
 from .gc04_tasks import _task_ui
 from .project_materials import register_and_process_local_materials
 from .routing import UiDomainRouter, UiRequest
@@ -207,21 +208,51 @@ def delete_task_attachment(
     task = _task(compatibility, task_id)
     client_id = str(task.get("client_id") or "")
     local = _store(compatibility)
-    attachment = next(
-        (item for item in local.task_attachments(task_id) if item["id"] == attachment_id),
-        None,
+    def delete_local() -> dict[str, Any]:
+        attachment = next(
+            (
+                item
+                for item in local.task_attachments(task_id)
+                if item["id"] == attachment_id
+            ),
+            None,
+        )
+        if attachment is None:
+            raise LocalRuntimeError(404, "task_attachment_missing", "任务附件不存在")
+        deleted = local.delete_task_attachment_local(
+            task_id=task_id,
+            attachment_id=attachment_id,
+        )
+        return {"attachment": dict(attachment), "localDelete": dict(deleted)}
+
+    local_receipt = replayable_generated_value(
+        compatibility.runtime,
+        idempotency_key=request.idempotency_key,
+        command_type="task_attachment.local_delete",
+        aggregate_type="source_asset",
+        aggregate_id=attachment_id,
+        input_payload={"taskId": task_id, "attachmentId": attachment_id},
+        generate=delete_local,
     )
-    if attachment is None:
-        raise LocalRuntimeError(404, "task_attachment_missing", "任务附件不存在")
-    local.delete_task_attachment_local(task_id=task_id, attachment_id=attachment_id)
+    attachment = dict(local_receipt.get("attachment") or {})
     cloud_deleted = False
     if not attachment_id.startswith("local-pending:"):
-        compatibility.runtime.cloud_command(
-            "DELETE",
+        cloud_path = (
             f"{_MATERIAL_ROOT}/projects/{quote(client_id, safe='')}/documents/"
-            f"{quote(attachment_id, safe='')}",
-            payload={"expectedVersion": int(attachment.get("version") or 1)},
-            idempotency_key=f"{request.idempotency_key}:metadata",
+            f"{quote(attachment_id, safe='')}"
+        )
+        replayable_cloud_mutation(
+            compatibility.runtime,
+            idempotency_key=request.idempotency_key,
+            command_type="task_attachment.cloud_delete",
+            aggregate_type="knowledge_document",
+            aggregate_id=attachment_id,
+            method="DELETE",
+            path=cloud_path,
+            request_payload={"taskId": task_id, "attachmentId": attachment_id},
+            cloud_payload_factory=lambda: {
+                "expectedVersion": int(attachment.get("version") or 1)
+            },
             refresh_business=False,
         )
         cloud_deleted = True

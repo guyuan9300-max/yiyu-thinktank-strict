@@ -18,7 +18,7 @@
     "build": "npm run build:main && npm run build:renderer && npm run build:python && npm run build:backend-runtime",
     "test:python": "uv run pytest -q",
     "test:main": "tsx --test src/main/*.test.ts",
-    "test:renderer": "tsx --test tests/frontend-entry-contract.test.mjs tests/repository-identity-contract.test.mjs src/renderer/lib/organizationEmployeeFilters.test.ts src/renderer/lib/scopedAsyncGate.test.ts src/shared/*.test.ts src/shared/*.test.mts",
+    "test:renderer": "tsx --test tests/frontend-entry-contract.test.mjs tests/repository-identity-contract.test.mjs tests/markdown-answer-renderer.test.tsx src/renderer/lib/organizationEmployeeFilters.test.ts src/renderer/lib/scopedAsyncGate.test.ts src/shared/*.test.ts src/shared/*.test.mts",
     "test:packaged": "node --test tests/packaged-candidate-contract.test.mjs",
     "test:strict": "npm run test:python && npm run test:main && npm run test:renderer",
     "audit:strict": "uv run python scripts/audit_strict_candidate.py",
@@ -52,7 +52,9 @@
     "react": "^18.3.1",
     "react-activity-calendar": "3.2.0",
     "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
     "recharts": "3.8.1",
+    "remark-gfm": "^4.0.1",
     "tailwindcss": "^3.4.17",
     "tsx": "4.23.1",
     "typescript": "^5.8.2",
@@ -85,6 +87,15 @@
     "mac": {
       "category": "public.app-category.productivity",
       "icon": "build-resources/icon.icns",
+      "electronLanguages": [
+        "zh_CN"
+      ],
+      "extendInfo": {
+        "CFBundleDevelopmentRegion": "zh_CN",
+        "CFBundleLocalizations": [
+          "zh_CN"
+        ]
+      },
       "artifactName": "yiyu-thinktank-strict-${version}-${arch}.${ext}"
     },
     "win": {

@@ -96,6 +96,88 @@ def _provider_client(
     return requests
 
 
+@pytest.mark.parametrize(
+    ("thinking_enabled", "expects_thinking"),
+    [(False, False), (True, True)],
+)
+def test_organization_ai_native_thinking_is_deep_mode_only(
+    monkeypatch: pytest.MonkeyPatch,
+    thinking_enabled: bool,
+    expects_thinking: bool,
+) -> None:
+    endpoint = "https://model.invalid/v1/chat/completions"
+    requests = _provider_client(
+        monkeypatch,
+        {
+            endpoint: _Response(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "最终回答",
+                                "reasoning_content": "不得透传的隐藏推理",
+                            }
+                        }
+                    ]
+                },
+            )
+        },
+    )
+
+    completion = WorkspaceRuntime._invoke_organization_ai(
+        {
+            "baseUrl": "https://model.invalid/v1",
+            "modelName": "deep-capable-model",
+            "apiKey": "secret",
+        },
+        messages=[{"role": "user", "content": "测试"}],
+        temperature=0.2,
+        thinking_enabled=thinking_enabled,
+    )
+
+    assert completion["content"] == "最终回答"
+    assert completion["reasoningContent"] == (
+        "不得透传的隐藏推理" if thinking_enabled else ""
+    )
+    assert ("thinking" in requests[0]["json"]) is expects_thinking
+    if expects_thinking:
+        assert requests[0]["json"]["thinking"] == {"type": "enabled"}
+        assert "temperature" not in requests[0]["json"]
+    else:
+        assert requests[0]["json"]["temperature"] == 0.2
+
+
+def test_doubao_final_answer_explicitly_disables_duplicate_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+    requests = _provider_client(
+        monkeypatch,
+        {
+            endpoint: _Response(
+                200,
+                {"choices": [{"message": {"content": "最终回答"}}]},
+            )
+        },
+    )
+
+    WorkspaceRuntime._invoke_organization_ai(
+        {
+            "provider": "volcengine",
+            "baseUrl": "https://ark.cn-beijing.volces.com/api/v3",
+            "modelName": "doubao-seed-2-1-pro-260628",
+            "apiKey": "secret",
+        },
+        messages=[{"role": "user", "content": "测试"}],
+        temperature=0.2,
+        thinking_enabled=False,
+    )
+
+    assert requests[0]["json"]["thinking"] == {"type": "disabled"}
+    assert requests[0]["json"]["temperature"] == 0.2
+
+
 def test_local_first_selects_local_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

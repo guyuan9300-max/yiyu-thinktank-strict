@@ -325,6 +325,7 @@ function formatTopicDateTime(value?: string | null) {
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+    hourCycle: 'h23',
   }).format(date);
 }
 
@@ -3262,9 +3263,17 @@ export function TopicsManagementView({
                 <div>
                   <label className="mb-2 block text-[12px] font-bold uppercase tracking-widest text-gray-500">推送时间</label>
                   <input
-                    type="time"
+                    type="text"
+                    inputMode="numeric"
+                    pattern="(?:[01]\\d|2[0-3]):[0-5]\\d"
+                    placeholder="09:00"
                     value={tempPref.pushTime}
                     onChange={(event) => setTempPref({ ...tempPref, pushTime: event.target.value })}
+                    onBlur={(event) => {
+                      if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(event.target.value)) {
+                        setTempPref({ ...tempPref, pushTime: '09:00' });
+                      }
+                    }}
                     className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-[13px] outline-none focus:border-[#5B7BFE]"
                   />
                 </div>

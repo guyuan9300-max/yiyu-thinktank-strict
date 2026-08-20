@@ -99,7 +99,7 @@ export function ApprovalCenterModal({ open, onClose, currentUserId }: ApprovalCe
     if (!iso) return '?';
     try {
       const d = new Date(iso);
-      return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+      return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
     } catch {
       return iso.slice(0, 16);
     }

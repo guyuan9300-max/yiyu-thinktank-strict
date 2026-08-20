@@ -75,6 +75,114 @@ def test_answer_export_title_uses_fast_ai_and_has_question_fallback() -> None:
     ) == "提炼这份文件的核心内容"
 
 
+def test_answer_export_replay_reuses_local_material_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Runtime:
+        def __init__(self) -> None:
+            self.cloud_payloads: dict[str, str] = {}
+
+        @staticmethod
+        def workbench_answer(answer_id: str) -> dict[str, str]:
+            assert answer_id == "answer-1"
+            return {
+                "id": answer_id,
+                "projectId": "project-1",
+                "question": "请整理当前结论",
+                "answerMarkdown": "# 当前结论\n\n保持同一份导出。",
+            }
+
+        @staticmethod
+        def private_ai_completion(**_: object) -> dict[str, str]:
+            return {"content": "当前结论整理"}
+
+        def cloud_command(
+            self,
+            method: str,
+            path: str,
+            *,
+            payload: dict,
+            idempotency_key: str,
+            refresh_business: bool = True,
+        ) -> dict:
+            assert method == "POST"
+            assert path.endswith("/materials/register-metadata")
+            serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            previous = self.cloud_payloads.setdefault(idempotency_key, serialized)
+            assert previous == serialized, "同一操作标识的云端元数据发生了漂移"
+            local_source_id = payload["materials"][0]["localSourceId"]
+            return {
+                "documents": [
+                    {
+                        "localSourceId": local_source_id,
+                        "documentId": "document-export-1",
+                    }
+                ]
+            }
+
+    class Store:
+        def __init__(self) -> None:
+            self.receipts: dict[str, dict[str, object]] = {}
+            self.keys: list[str | None] = []
+            self.created = 0
+
+        def import_text(self, **kwargs: object) -> dict[str, object]:
+            key = kwargs.get("idempotency_key")
+            self.keys.append(str(key) if key else None)
+            normalized_key = (
+                str(key)
+                if key
+                else f"generated-local-operation-{self.created + 1}"
+            )
+            if key and normalized_key in self.receipts:
+                return self.receipts[normalized_key]
+            self.created += 1
+            source_id = f"local-export-{self.created}"
+            result: dict[str, object] = {
+                "localSourceId": source_id,
+                "fileName": "当前结论整理.md",
+                "title": "当前结论整理",
+                "contentHash": "a" * 64,
+                "byteSize": 64,
+                "mediaType": "text/markdown",
+                "managedPath": f"/strict/{source_id}.md",
+            }
+            self.receipts[normalized_key] = result
+            return result
+
+        @staticmethod
+        def bind_cloud_documents(**_: object) -> None:
+            return None
+
+    runtime = Runtime()
+    store = Store()
+    compatibility = SimpleNamespace(runtime=runtime)
+    monkeypatch.setattr(
+        workbench_outputs,
+        "LocalProjectMaterialsRepository",
+        lambda _runtime: store,
+    )
+    request = UiRequest(
+        method="POST",
+        path="clients/project-1/knowledge/export-answer",
+        query={},
+        body={"messageIds": ["answer-1"]},
+        idempotency_key="answer-export-retry-1",
+    )
+
+    registry = build_default_registry()
+    first = registry.dispatch(compatibility, request)
+    replay = registry.dispatch(compatibility, request)
+
+    assert replay == first
+    assert store.created == 1
+    assert store.keys == [
+        "answer-export-retry-1:local-answer-export",
+        "answer-export-retry-1:local-answer-export",
+    ]
+    assert list(runtime.cloud_payloads) == ["answer-export-retry-1"]
+
+
 def _grant_project_access(connection, identity: SessionIdentity, project_id: str, now: str) -> None:
     policy_id = f"policy_{project_id}"
     grant_id = f"grant_{project_id}_{identity.membership_id}"
@@ -2435,6 +2543,72 @@ def test_workspace_chat_persists_local_image_reference_without_archiving_binary(
     ]
     assert result["userMessage"]["imageAttachments"][0]["id"] == "chat-image-local-1"
     assert data_url not in json.dumps(manifest)
+
+
+def test_workspace_deep_chat_public_plan_is_question_specific_and_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Runtime:
+        database_path = Path("/tmp/strict-local.db")
+
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] = []
+
+        @staticmethod
+        def require_project_capability(project_id: str, capability: str) -> dict:
+            assert (project_id, capability) == ("project-a", "read")
+            return {"allowed": True}
+
+        def organization_ai_completion(self, **kwargs: object) -> dict:
+            self.messages = list(kwargs["messages"])
+            assert kwargs["thinking_enabled"] is False
+            return {
+                "content": json.dumps(
+                    {
+                        "narrative": "我先判断用户不是泛泛询问增长，而是在确认日慈是否适合采用增长咨询承诺；接着会核对公益行业约束、现有战略定位和可验证证据。",
+                        "intent": "判断日慈增长咨询承诺的适用边界和落地条件",
+                        "directions": ["先确认公益行业约束", "再核对增长承诺的证据"],
+                        "plannedSources": ["《日慈战略资料》", "客户档案中的战略定位"],
+                        "cautions": ["不把建议写成已经发生的事实"],
+                    },
+                    ensure_ascii=False,
+                )
+            }
+
+    runtime = Runtime()
+    monkeypatch.setattr(
+        workbench_outputs,
+        "LocalProjectMaterialsRepository",
+        lambda _runtime: SimpleNamespace(
+            document_text=lambda _document_id: {
+                "projectId": "project-a",
+                "title": "日慈战略资料",
+                "content": "正文不应进入公开计划请求",
+            }
+        ),
+    )
+    result = build_default_registry().dispatch(
+        SimpleNamespace(runtime=runtime),
+        UiRequest(
+            method="POST",
+            path="clients/project-a/workspace/chat/plan",
+            query={},
+            body={
+                "prompt": "为什么公益行业需要增长咨询承诺？",
+                "workingDocumentIds": ["document-a"],
+                "creativityMode": "balanced",
+            },
+            idempotency_key="chat-plan-question-specific",
+        ),
+    )
+    assert result["plan"]["intent"] == "判断日慈增长咨询承诺的适用边界和落地条件"
+    assert "不是泛泛询问增长" in result["plan"]["narrative"]
+    assert result["plan"]["plannedSources"][0] == "《日慈战略资料》"
+    planning_request = json.dumps(runtime.messages, ensure_ascii=False)
+    assert "为什么公益行业需要增长咨询承诺" in planning_request
+    assert "日慈战略资料" in planning_request
+    assert "正文不应进入公开计划请求" not in planning_request
+    assert result["elapsedMs"] >= 1
 
 
 def test_local_chat_image_survives_runtime_restart_without_source_asset(

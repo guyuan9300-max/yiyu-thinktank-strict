@@ -13,6 +13,7 @@ from ..intelligence_capture_local import (
 )
 from ..platform_integrations_local import LocalPlatformOperationRepository
 from ..runtime import LocalRuntimeError
+from ..ui_idempotency import replayable_cloud_mutation
 
 from .routing import UiDomainRouter, UiRequest
 
@@ -1442,22 +1443,33 @@ def _forward_unpinned(compatibility: Any, request: UiRequest, _match: Any) -> An
             query=dict(request.query),
         )
     if request.path == "strategic/thoughts/refresh":
-        return compatibility.runtime.cloud_command(
-            "POST",
-            "/api/v2/workbench/strategic-thoughts/refresh",
-            payload=dict(request.body),
+        return replayable_cloud_mutation(
+            compatibility.runtime,
             idempotency_key=request.idempotency_key,
+            command_type="intelligence.ui.mutation",
+            aggregate_type="strategic_thought",
+            aggregate_id=str(request.body.get("clientId") or "refresh"),
+            method="POST",
+            path="/api/v2/workbench/strategic-thoughts/refresh",
+            request_payload=request.body,
+            cloud_payload_factory=lambda: dict(request.body),
         )
     strategic_action = re.fullmatch(
         r"strategic/thoughts/([^/]+)/(state|review)", request.path
     )
     if strategic_action:
         thought_id, action = strategic_action.groups()
-        return compatibility.runtime.cloud_command(
-            "POST",
-            f"/api/v2/workbench/strategic-thoughts/{thought_id}/{action}",
-            payload=dict(request.body),
+        path = f"/api/v2/workbench/strategic-thoughts/{thought_id}/{action}"
+        return replayable_cloud_mutation(
+            compatibility.runtime,
             idempotency_key=request.idempotency_key,
+            command_type="intelligence.ui.mutation",
+            aggregate_type="strategic_thought",
+            aggregate_id=thought_id,
+            method="POST",
+            path=path,
+            request_payload=request.body,
+            cloud_payload_factory=lambda: dict(request.body),
         )
     if request.method == "GET":
         return compatibility.runtime.cloud_query(
@@ -1469,80 +1481,93 @@ def _forward_unpinned(compatibility: Any, request: UiRequest, _match: Any) -> An
     if local_result is not None:
         return local_result
 
-    payload = dict(request.body)
-    if (
-        request.method == "PUT"
-        and request.path == "intelligence/brand-mirror/strategy-extract"
-        and "expectedVersion" not in payload
-    ):
-        version_view = compatibility.runtime.cloud_query(
-            "/api/v2/intelligence-growth/version",
-            query={
-                "resourcePath": request.path,
-                "clientId": str(payload.get("clientId") or ""),
-            },
-        )
-        payload["expectedVersion"] = int(
-            version_view.get("expectedVersion") or 0
-        )
-    if request.path == "approvals/decide" and "expectedVersion" not in payload:
-        approval_id = str(
-            payload.get("approvalId")
-            or payload.get("proposalId")
-            or payload.get("id")
-            or ""
-        )
-        decision = str(payload.get("decision") or payload.get("action") or "").lower()
-        suffix = "approve" if decision in {"approve", "approved", "accept"} else "reject"
-        if approval_id:
+    def cloud_payload() -> dict[str, Any]:
+        payload = dict(request.body)
+        if (
+            request.method == "PUT"
+            and request.path == "intelligence/brand-mirror/strategy-extract"
+            and "expectedVersion" not in payload
+        ):
             version_view = compatibility.runtime.cloud_query(
                 "/api/v2/intelligence-growth/version",
-                query={"resourcePath": f"approvals/{approval_id}/{suffix}"},
+                query={
+                    "resourcePath": request.path,
+                    "clientId": str(payload.get("clientId") or ""),
+                },
             )
-            if version_view.get("expectedVersion") is not None:
-                payload["expectedVersion"] = version_view["expectedVersion"]
-    if request.path in {"proposals/batch-approve", "proposals/batch-reject"}:
-        raw_ids = (
-            payload.get("proposalIds")
-            or payload.get("ids")
-            or payload.get("selectedIds")
-            or []
-        )
-        proposal_ids = [
-            str(item.get("id") if isinstance(item, dict) else item)
-            for item in raw_ids
-            if str(item.get("id") if isinstance(item, dict) else item)
-        ]
-        if proposal_ids and "itemVersions" not in payload:
-            snapshot = compatibility._snapshot()
-            versions = {
-                str(item.get("intelligenceId")): int(item.get("version") or 0)
-                for item in snapshot.get("intelligence") or []
-                if str(item.get("intelligenceId")) in proposal_ids
-            }
-            payload["itemVersions"] = versions
-    if _needs_version(request.path) and "expectedVersion" not in payload:
-        version_view = compatibility.runtime.cloud_query(
-            "/api/v2/intelligence-growth/version",
-            query={"resourcePath": request.path},
-        )
-        expected_version = version_view.get("expectedVersion")
-        if expected_version is not None:
-            payload["expectedVersion"] = expected_version
-        item_versions = version_view.get("itemVersions")
-        if item_versions and "itemVersions" not in payload:
-            payload["itemVersions"] = item_versions
-
-    return compatibility.runtime.cloud_command(
-        "POST",
-        "/api/v2/intelligence-growth/command",
-        payload={
+            payload["expectedVersion"] = int(
+                version_view.get("expectedVersion") or 0
+            )
+        if request.path == "approvals/decide" and "expectedVersion" not in payload:
+            approval_id = str(
+                payload.get("approvalId")
+                or payload.get("proposalId")
+                or payload.get("id")
+                or ""
+            )
+            decision = str(
+                payload.get("decision") or payload.get("action") or ""
+            ).lower()
+            suffix = (
+                "approve"
+                if decision in {"approve", "approved", "accept"}
+                else "reject"
+            )
+            if approval_id:
+                version_view = compatibility.runtime.cloud_query(
+                    "/api/v2/intelligence-growth/version",
+                    query={"resourcePath": f"approvals/{approval_id}/{suffix}"},
+                )
+                if version_view.get("expectedVersion") is not None:
+                    payload["expectedVersion"] = version_view["expectedVersion"]
+        if request.path in {"proposals/batch-approve", "proposals/batch-reject"}:
+            raw_ids = (
+                payload.get("proposalIds")
+                or payload.get("ids")
+                or payload.get("selectedIds")
+                or []
+            )
+            proposal_ids = [
+                str(item.get("id") if isinstance(item, dict) else item)
+                for item in raw_ids
+                if str(item.get("id") if isinstance(item, dict) else item)
+            ]
+            if proposal_ids and "itemVersions" not in payload:
+                snapshot = compatibility._snapshot()
+                versions = {
+                    str(item.get("intelligenceId")): int(item.get("version") or 0)
+                    for item in snapshot.get("intelligence") or []
+                    if str(item.get("intelligenceId")) in proposal_ids
+                }
+                payload["itemVersions"] = versions
+        if _needs_version(request.path) and "expectedVersion" not in payload:
+            version_view = compatibility.runtime.cloud_query(
+                "/api/v2/intelligence-growth/version",
+                query={"resourcePath": request.path},
+            )
+            expected_version = version_view.get("expectedVersion")
+            if expected_version is not None:
+                payload["expectedVersion"] = expected_version
+            item_versions = version_view.get("itemVersions")
+            if item_versions and "itemVersions" not in payload:
+                payload["itemVersions"] = item_versions
+        return {
             "resourcePath": request.path,
             "method": request.method,
             "query": dict(request.query),
             "payload": payload,
-        },
+        }
+
+    return replayable_cloud_mutation(
+        compatibility.runtime,
         idempotency_key=request.idempotency_key,
+        command_type="intelligence.ui.mutation",
+        aggregate_type="intelligence_resource",
+        aggregate_id=request.path,
+        method="POST",
+        path="/api/v2/intelligence-growth/command",
+        request_payload={"query": dict(request.query), **dict(request.body)},
+        cloud_payload_factory=cloud_payload,
     )
 
 

@@ -104,6 +104,7 @@ function formatBriefingDate(value?: string | null) {
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+    hourCycle: 'h23',
   }).format(date);
 }
 

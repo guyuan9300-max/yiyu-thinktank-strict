@@ -27,6 +27,8 @@ import type {
   AuthState,
   ChatMessage,
   ChatStartResponse,
+  PublicAnalysisPlan,
+  PublicAnalysisPlanResponse,
   ChatThreadDetailResponse,
   ClientDnaModule,
   ClientDnaModulesResponse,
@@ -4951,6 +4953,7 @@ export async function startClientMessage(
   creativityMode?: import('../../shared/types').CreativityMode,
   activeSkillIds?: string[],
   imageInputs?: Array<{ name: string; mimeType: string; dataUrl: string; size: number }>,
+  publicAnalysisPlan?: PublicAnalysisPlan | null,
 ) {
   const workingDocumentIds = Array.isArray(workingDocumentIdsOrOptions) ? workingDocumentIdsOrOptions : [];
   const requestOptions = Array.isArray(workingDocumentIdsOrOptions) ? options : workingDocumentIdsOrOptions;
@@ -4966,9 +4969,191 @@ export async function startClientMessage(
       activeSkillIds: activeSkillIds || [],
       imageInputs: imageInputs || [],
       creativityMode: creativityMode || 'balanced',
+      publicAnalysisPlan: publicAnalysisPlan || null,
     }),
     ...requestOptions,
   });
+}
+
+export type ClientMessageStreamEvent =
+  | { type: 'stage'; stage: 'preparing' | 'reasoning' | 'answering' }
+  | { type: 'reasoning_delta'; text: string }
+  | { type: 'answer_started'; text: string }
+  | { type: 'answer_delta'; text: string };
+
+export async function streamClientMessage(
+  clientId: string,
+  payload: {
+    prompt: string;
+    threadId?: string;
+    searchId?: string;
+    workingDocumentIds?: string[];
+    deepThinking?: boolean;
+    activeSkillId?: string | null;
+    activeSkillIds?: string[];
+    imageInputs?: Array<{ name: string; mimeType: string; dataUrl: string; size: number }>;
+    creativityMode?: import('../../shared/types').CreativityMode;
+  },
+  onEvent?: (event: ClientMessageStreamEvent) => void,
+  options?: RequestInit,
+): Promise<ChatStartResponse> {
+  const method = 'POST';
+  const stableOptions = _stableMutationOptions(method, {
+    method,
+    ...options,
+    body: JSON.stringify({
+      ...payload,
+      workingDocumentIds: payload.workingDocumentIds || [],
+      activeSkillId: payload.activeSkillId || null,
+      activeSkillIds: payload.activeSkillIds || [],
+      imageInputs: payload.imageInputs || [],
+      creativityMode: payload.creativityMode || 'balanced',
+    }),
+  });
+  const response = await fetch(
+    `${baseUrl}/api/v2/ui/clients/${clientId}/workspace/chat/start-stream`,
+    {
+      ...stableOptions,
+      headers: _requestHeaders(method, stableOptions),
+    },
+  );
+  if (!response.ok || !response.body) {
+    const detail = await response.text();
+    throw new Error(normalizeApiErrorDetail(detail) || `HTTP ${response.status}`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result: ChatStartResponse | null = null;
+  const consumeLine = (line: string) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line) as {
+      type?: string;
+      stage?: 'preparing' | 'reasoning' | 'answering';
+      text?: string;
+      result?: ChatStartResponse;
+      message?: string;
+      code?: string;
+    };
+    if (event.type === 'done' && event.result) {
+      result = event.result;
+      return;
+    }
+    if (event.type === 'error') {
+      throw new Error(event.message || '回答生成失败，可以重试');
+    }
+    if (event.type === 'stage' && event.stage) {
+      onEvent?.({ type: 'stage', stage: event.stage });
+    } else if (
+      (event.type === 'reasoning_delta' || event.type === 'answer_started' || event.type === 'answer_delta')
+    ) {
+      onEvent?.({ type: event.type, text: event.text || '' });
+    }
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) consumeLine(line);
+    if (done) break;
+  }
+  if (buffer.trim()) consumeLine(buffer);
+  if (!result) throw new Error('回答流已结束，但没有返回最终结果');
+  return result;
+}
+
+export async function planClientMessage(
+  clientId: string,
+  prompt: string,
+  workingDocumentIds: string[] = [],
+  creativityMode: import('../../shared/types').CreativityMode = 'balanced',
+  options?: RequestInit,
+) {
+  return request<PublicAnalysisPlanResponse>(
+    `/api/v2/ui/clients/${clientId}/workspace/chat/plan`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ prompt, workingDocumentIds, creativityMode }),
+      ...options,
+    },
+  );
+}
+
+export async function streamClientAnalysisPlan(
+  clientId: string,
+  prompt: string,
+  workingDocumentIds: string[] = [],
+  creativityMode: import('../../shared/types').CreativityMode = 'balanced',
+  onUpdate?: (plan: PublicAnalysisPlan) => void,
+  options?: RequestInit,
+): Promise<PublicAnalysisPlanResponse> {
+  const method = 'POST';
+  const stableOptions = _stableMutationOptions(method, {
+    ...options,
+    body: JSON.stringify({ prompt, workingDocumentIds, creativityMode }),
+  });
+  const response = await fetch(
+    `${baseUrl}/api/v2/ui/clients/${clientId}/workspace/chat/plan-stream`,
+    {
+      ...stableOptions,
+      headers: _requestHeaders(method, stableOptions),
+    },
+  );
+  if (!response.ok || !response.body) {
+    const detail = await response.text();
+    throw new Error(normalizeApiErrorDetail(detail) || `HTTP ${response.status}`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let narrative = '';
+  let finalPlan: PublicAnalysisPlan | null = null;
+  const startedAt = Date.now();
+  const notify = () => {
+    const plan: PublicAnalysisPlan = {
+      narrative: narrative.trim(),
+      intent: '',
+      directions: [],
+      plannedSources: [],
+      cautions: [],
+    };
+    onUpdate?.(plan);
+    return plan;
+  };
+  const consumeLine = (line: string) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line) as {
+      type?: string;
+      text?: string;
+      partial?: string;
+      plan?: PublicAnalysisPlan;
+    };
+    if (event.type === 'delta' && event.text) {
+      narrative += event.text;
+      notify();
+    } else if (event.type === 'done' && event.plan) {
+      finalPlan = event.plan;
+      narrative = String(event.plan.narrative || narrative);
+      onUpdate?.(event.plan);
+    } else if (event.type === 'error' && event.partial && !narrative) {
+      narrative = event.partial;
+      notify();
+    }
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) consumeLine(line);
+    if (done) break;
+  }
+  if (buffer.trim()) consumeLine(buffer);
+  return {
+    plan: finalPlan || notify(),
+    elapsedMs: Math.max(1, Date.now() - startedAt),
+  };
 }
 
 // ---------- GC-11: declarative Agent Skills ------------------------
@@ -5244,7 +5429,7 @@ export async function updateDocumentContent(documentId: string, payload: { title
 // P9 / P11：客户工作台 inline 编辑器 AI 助手
 //   action：7 个任务类型
 //   userRequest：用户在 inline 提示框写的具体要求（可空）
-//   creativityMode：creative=完全自由 / balanced=兼顾资料（默认）/ strict=严格依据
+//   creativityMode：creative=创意优先 / balanced=兼顾资料（默认）/ strict=资料优先
 //   activeSkillId：写作风格 skill id（指向 writing_skills 表）
 export type DocumentAiAction =
   // A 类 · 纯文本变换

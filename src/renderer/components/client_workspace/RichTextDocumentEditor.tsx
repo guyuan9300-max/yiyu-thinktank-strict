@@ -914,9 +914,9 @@ function AiPromptPanel({
   }, [state.submitting, onCancel]);
 
   const creativityModes = [
-    { key: 'strict' as DocumentAiCreativityMode, icon: ShieldCheck, shortLabel: '客观', hint: '完全客观 · 严格依据原文,不臆测' },
+    { key: 'strict' as DocumentAiCreativityMode, icon: ShieldCheck, shortLabel: '资料', hint: '资料优先 · 原文不足就明确说明,不臆测' },
     { key: 'balanced' as DocumentAiCreativityMode, icon: Scale, shortLabel: '兼顾', hint: '兼顾资料 · 事实底色 + 自由措辞(默认)' },
-    { key: 'creative' as DocumentAiCreativityMode, icon: Sparkles, shortLabel: '创意', hint: '创意优先 · 不受原文限制,自由发挥' },
+    { key: 'creative' as DocumentAiCreativityMode, icon: Sparkles, shortLabel: '创意', hint: '创意优先 · 保留原文事实边界,自由发挥' },
   ];
   const activeMode = creativityModes.find((m) => m.key === state.creativityMode) ?? creativityModes[1];
 

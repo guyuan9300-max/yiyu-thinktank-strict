@@ -270,6 +270,7 @@ def build_default_registry() -> UiDomainRegistry:
     if len(gc07_sync_router.routes) != len(gc07_sync_allowed):
         raise RuntimeError("GC-07 material sync route registry is incomplete")
     gc14_allowed = {
+        ("POST", r"clients/([^/]+)/workspace/chat/plan"),
         ("POST", r"clients/([^/]+)/workspace/chat/start"),
         ("GET", r"clients/([^/]+)/workspace/chat/messages/([^/]+)"),
         ("GET", r"clients/([^/]+)/workspace/chat/threads/([^/]+)"),

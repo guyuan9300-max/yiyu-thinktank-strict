@@ -86,7 +86,7 @@ export function buildWeeklyReviewDocumentDraft(
   dashboard?: Pick<ReviewDashboard, 'teamReport' | 'orgReport' | 'agentDepartmentDigests' | 'agentDepartmentPlans'> | null,
 ) {
   const scopeLabel = scope === 'work' ? '组织' : '成长';
-  const generatedAt = new Date().toLocaleString('zh-CN', { hour12: false });
+  const generatedAt = new Date().toLocaleString('zh-CN', { hourCycle: 'h23' });
   const completedCount = rows.filter(({ task }) => task.status === 'done').length;
   const reviewedCount = rows.filter(({ note }) => Boolean(note.trim())).length;
   const unfinishedRows = rows.filter(({ task }) => task.status !== 'done');

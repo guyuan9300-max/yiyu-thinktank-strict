@@ -25,34 +25,50 @@ from strict_common.schema import initialize_database, runtime_connection
 from tests.test_gc14_workbench_answer import _repository
 
 
-def _second_member(repository: object, identity: SessionIdentity) -> SessionIdentity:
+def _member(
+    repository: object,
+    identity: SessionIdentity,
+    *,
+    suffix: str,
+    display_name: str,
+) -> SessionIdentity:
     now = utc_now()
+    principal_id = f"principal_gc04_{suffix}"
+    membership_id = f"membership_gc04_{suffix}"
     with runtime_connection(repository.database_path, "cloud") as connection:
         connection.execute(
             "INSERT INTO principals (id,status,identity_version,updated_at,"
             "principal_kind,display_name,version,lifecycle_state,created_at,deleted_at) "
-            "VALUES ('principal_gc04_peer','active',1,?,'person','GC04协作者',"
+            "VALUES (?,'active',1,?,'person',?,"
             "1,'active',?,NULL)",
-            (now, now),
+            (principal_id, now, display_name, now),
         )
         connection.execute(
             "INSERT INTO organization_memberships (id,scope_id,principal_id,role_key,"
             "status,version,record_kind,visibility_scope,lifecycle_state,created_at,"
-            "updated_at,deleted_at) VALUES ('membership_gc04_peer',?,"
-            "'principal_gc04_peer','member','active',1,'membership','organization',"
+            "updated_at,deleted_at) VALUES (?,?,?,'member','active',1,'membership','organization',"
             "'active',?,?,NULL)",
-            (identity.scope_id, now, now),
+            (membership_id, identity.scope_id, principal_id, now, now),
         )
         connection.commit()
     return SessionIdentity(
-        session_id="session_gc04_peer",
-        principal_id="principal_gc04_peer",
-        membership_id="membership_gc04_peer",
+        session_id=f"session_gc04_{suffix}",
+        principal_id=principal_id,
+        membership_id=membership_id,
         organization_id=identity.organization_id,
         cloud_instance_id=identity.cloud_instance_id,
         scope_id=identity.scope_id,
         system_role="member",
         visibility_scope="organization",
+        display_name=display_name,
+    )
+
+
+def _second_member(repository: object, identity: SessionIdentity) -> SessionIdentity:
+    return _member(
+        repository,
+        identity,
+        suffix="peer",
         display_name="GC04协作者",
     )
 
@@ -271,6 +287,106 @@ def test_administrator_does_not_bypass_participant_task_visibility(
         domain.task_detail(admin, task_id=private_task["id"])
 
 
+def test_gc04_owner_gate_return_to_creator_and_resend(tmp_path: Path) -> None:
+    repository, creator, _ = _repository(tmp_path)
+    owner = _member(
+        repository,
+        creator,
+        suffix="owner_gate",
+        display_name="GC04负责人",
+    )
+    collaborator = _member(
+        repository,
+        creator,
+        suffix="watcher_gate",
+        display_name="GC04普通协作者",
+    )
+    domain = GC04TaskRepository(repository)
+    created = _create(
+        domain,
+        creator,
+        "gc04-owner-gate-create",
+        "负责人确认后再通知协作者",
+        ownerMembershipId=owner.membership_id,
+        collaboratorMembershipIds=[collaborator.membership_id],
+        scheduledStartAt="2026-08-20T09:00:00Z",
+        scheduledEndAt="2026-08-20T10:00:00Z",
+    )
+    task_id = str(created["task"]["id"])
+    owner_row = next(
+        item for item in created["task"]["collaborators"] if item["role_key"] == "owner"
+    )
+    staged_row = next(
+        item
+        for item in created["task"]["collaborators"]
+        if item["role_key"] == "collaborator"
+    )
+    assert owner_row["inbox_status"] == "pending"
+    assert owner_row["assignment_state"] == "assigned"
+    assert staged_row["inbox_status"] == "pending"
+    assert staged_row["assignment_state"] == "awaiting_owner"
+    assert [item["role_key"] for item in created["task"]["collaborators"]] == [
+        "owner",
+        "collaborator",
+    ]
+    assert all(item["id"] != task_id for item in domain.board(collaborator)["tasks"])
+
+    returned = domain.handle_inbox(
+        owner,
+        task_id=task_id,
+        action="return",
+        expected_version=int(owner_row["version"]),
+        reason="请发起人补充说明",
+        idempotency_key="gc04-owner-gate-return",
+    )
+    assert returned["restoredOwnerCollaborator"] is None
+    creator_task = next(
+        item for item in domain.board(creator)["tasks"] if item["id"] == task_id
+    )
+    assert creator_task["returned_to_creator"] is True
+    assert _task_ui(creator_task)["status"] == "rejected"
+    assert all(item["id"] != task_id for item in domain.board(owner)["tasks"])
+    assert all(item["id"] != task_id for item in domain.board(collaborator)["tasks"])
+
+    resent = domain.update_task(
+        creator,
+        task_id=task_id,
+        payload={
+            "expectedVersion": int(creator_task["version"]),
+            "title": "负责人确认后再通知协作者（已补充）",
+            "ownerMembershipId": owner.membership_id,
+            "collaboratorMembershipIds": [collaborator.membership_id],
+        },
+        idempotency_key="gc04-owner-gate-resend",
+    )
+    resent_owner = next(
+        item for item in resent["task"]["collaborators"] if item["role_key"] == "owner"
+    )
+    assert resent_owner["inbox_status"] == "pending"
+    assert all(item["id"] != task_id for item in domain.board(collaborator)["tasks"])
+
+    accepted = domain.handle_inbox(
+        owner,
+        task_id=task_id,
+        action="accept",
+        expected_version=int(resent_owner["version"]),
+        reason=None,
+        idempotency_key="gc04-owner-gate-accept",
+    )
+    assert accepted["collaborator"]["inbox_status"] == "accepted"
+    collaborator_board = domain.board(collaborator)
+    collaborator_task = next(
+        item for item in collaborator_board["tasks"] if item["id"] == task_id
+    )
+    assert collaborator_task["viewer_role_key"] == "collaborator"
+    assert collaborator_task["viewer_inbox_status"] == "pending"
+    assert _task_ui(collaborator_task)["status"] == "todo"
+    assert any(
+        item.get("task_id") == task_id
+        for item in collaborator_board["calendarEntries"]
+    )
+
+
 def test_gc04_task_cas_collaboration_calendar_list_lifecycle_and_proposal(
     tmp_path: Path,
 ) -> None:
@@ -323,12 +439,13 @@ def test_gc04_task_cas_collaboration_calendar_list_lifecycle_and_proposal(
     )
     assert pending["inbox_status"] == "pending"
 
-    # 待接收任务本体仍返回给协作收件箱，但不能提前泄漏到常规月历。
+    # 发起人本身就是已接受负责人，因此普通协作者的待阅不阻塞同一任务
+    # 进入列表/月历；“已阅”只确认通知，不创建第二条任务。
     pending_board = domain.board(peer)
     pending_task = next(item for item in pending_board["tasks"] if item["id"] == task_id)
     assert pending_task["viewer_inbox_status"] == "pending"
-    assert all(
-        item.get("task_id") != task_id for item in pending_board["calendarEntries"]
+    assert any(
+        item.get("task_id") == task_id for item in pending_board["calendarEntries"]
     )
 
     accepted = domain.handle_inbox(
@@ -340,7 +457,8 @@ def test_gc04_task_cas_collaboration_calendar_list_lifecycle_and_proposal(
         idempotency_key="gc04-accept",
     )
     assert accepted["collaborator"]["inbox_status"] == "accepted"
-    assert accepted["notificationResult"]["state"] == "not_connected"
+    # 普通协作者点“已阅”只确认本人通知，不再派生第二条通知。
+    assert accepted["notificationResult"]["state"] == "not_requested"
     accepted_board = domain.board(peer)
     assert any(
         item.get("task_id") == task_id for item in accepted_board["calendarEntries"]
@@ -379,8 +497,11 @@ def test_gc04_task_cas_collaboration_calendar_list_lifecycle_and_proposal(
         idempotency_key="gc04-return-owner",
     )
     assert returned["collaborator"]["inbox_status"] == "returned"
-    assert returned["restoredOwnerCollaborator"]["subject_membership_id"] == admin.membership_id
-    assert returned["restoredOwnerCollaborator"]["assignment_state"] == "assigned"
+    assert returned["restoredOwnerCollaborator"] is None
+    creator_copy = next(
+        item for item in domain.board(admin)["tasks"] if item["id"] == task_id
+    )
+    assert creator_copy["returned_to_creator"] is True
 
     completed = domain.update_task(
         admin,
@@ -777,6 +898,40 @@ def test_gc04_local_projection_uses_stable_ids_and_marks_missing_snapshot_stale(
             (task_id,),
         ).fetchone()
         assert tuple(row) == (scope_id, sandbox_id, 3, "current")
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    # A non-admin cold sandbox can receive a visible task before its referenced
+    # client/event-line/member projections.  The cloud task remains usable by
+    # consumers; the local cache row is deferred without inventing a parent or
+    # invalidating the last confirmed snapshot.
+    deferred = projector.apply(
+        {
+            "tasks": [
+                {
+                    "id": "task_gc04_missing_dependency",
+                    "creator_membership_id": "membership_gc04_local",
+                    "client_id": "client_not_projected_yet",
+                    "lifecycle_state": "active",
+                    "version": 1,
+                    "title": "依赖尚未到达的可见任务",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            ]
+        },
+        replace_snapshot=True,
+    )
+    assert deferred["state"] == "pending_retry"
+    assert deferred["deferred"] == {
+        "tasks": ["task_gc04_missing_dependency"]
+    }
+    with runtime_connection(database, "local") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id='task_gc04_missing_dependency'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT projection_state FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()[0] == "current"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     projector.apply({}, replace_snapshot=True)
     with runtime_connection(database, "local") as connection:

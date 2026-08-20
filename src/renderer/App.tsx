@@ -6,6 +6,7 @@ import {
   writeRuntimeUiSessionValue,
 } from './lib/runtimeUiSessionStore';
 import { markClientKnowledgeChanged } from './lib/clientKnowledgeEvents';
+import { MarkdownAnswerDocument } from './components/workbench/MarkdownAnswerDocument';
 import {
   CheckSquare,
   Settings,
@@ -211,6 +212,7 @@ import type {
   ProjectModulePayload,
   ProjectStructureResponse,
   ProposalRecord,
+  PublicAnalysisPlan,
   ReviewDashboard,
   ReviewPerspectiveOption,
   ReviewPerspectiveKey,
@@ -530,6 +532,7 @@ import {
   getClientChatThread,
   deleteClientChatMessagePair,
   startClientMessage,
+  streamClientMessage,
   listAgentSkills,
   createAgentSkill,
   updateAgentSkill,
@@ -1470,7 +1473,7 @@ type StrategicTaskDraftRequest = {
 
 const TASK_TIME_PRESET_OPTIONS = ['09:00', '10:30', '14:00', '18:00', '20:00'] as const;
 const TASK_TIME_HOUR_OPTIONS = Array.from({ length: 24 }, (_, index) => String(index).padStart(2, '0'));
-const TASK_TIME_MINUTE_OPTIONS = Array.from({ length: 12 }, (_, index) => String(index * 5).padStart(2, '0'));
+const TASK_TIME_MINUTE_OPTIONS = Array.from({ length: 60 }, (_, index) => String(index).padStart(2, '0'));
 const PERSONAL_TASK_KEYWORD_RULES = [
   { label: '吃饭社交', pattern: /(吃饭|午饭|午餐|晚饭|晚餐|早餐|约饭|聚餐|喝咖啡|喝茶)/i },
   { label: '家庭事项', pattern: /(家人|父母|孩子|接娃|送娃|家庭|回家|家里)/i },
@@ -2292,6 +2295,18 @@ function mergeDisplayMessages(existingMessages: DisplayChatMessage[], incomingMe
   }
   for (const item of incomingMessages) {
     const existing = messageMap.get(item.id);
+    const existingTotalMs = Number(existing?.timing?.totalMs || 0);
+    const incomingTotalMs = Number(item.timing?.totalMs || 0);
+    const assistantTiming =
+      item.role === 'assistant'
+        ? {
+            ...(existing?.timing || {}),
+            ...(item.timing || {}),
+            ...(Math.max(existingTotalMs, incomingTotalMs) > 0
+              ? { totalMs: Math.max(existingTotalMs, incomingTotalMs) }
+              : {}),
+          }
+        : item.timing;
     messageMap.set(
       item.id,
       existing
@@ -2299,6 +2314,7 @@ function mergeDisplayMessages(existingMessages: DisplayChatMessage[], incomingMe
             ...existing,
             ...item,
             requestPrompt: item.requestPrompt ?? existing.requestPrompt,
+            timing: assistantTiming,
             retrievalSummary:
               item.role === 'assistant'
                 ? {
@@ -2569,104 +2585,7 @@ function parseAnswerBlocks(text: string): AnswerBlock[] {
 }
 
 function AnswerDocument({ text }: { text: string }) {
-  const blocks = useMemo(() => parseAnswerBlocks(text), [text]);
-  if (!blocks.length) return null;
-  const leadParagraphIndex = blocks.findIndex((block, index) => {
-    if (block.type !== 'paragraph') return false;
-    return blocks.slice(0, index).every((item) => item.type === 'title');
-  });
-  return (
-    <div className="space-y-4 text-[#2c315d]">
-      {blocks.map((block, index) => {
-        if (block.type === 'title') {
-          return (
-            <div key={`title-${index}`} className="space-y-2">
-              <h1 className="text-[22px] xl:text-[24px] font-semibold tracking-[-0.02em] text-[#1f275b] leading-[1.3]">
-                {renderInlineEmphasis(block.text)}
-              </h1>
-              <div className="h-px w-16 bg-[#d8defb]" />
-            </div>
-          );
-        }
-        if (block.type === 'heading') {
-          return (
-            <h2 key={`heading-${index}`} className="pt-2 text-[19px] xl:text-[20px] font-semibold text-[#25306a] leading-[1.5] tracking-[-0.01em]">
-              {renderInlineEmphasis(block.text)}
-            </h2>
-          );
-        }
-        if (block.type === 'subheading') {
-          return (
-            <h3 key={`subheading-${index}`} className="pt-1 text-[15px] xl:text-[15.5px] font-semibold text-[#2a356f] leading-7">
-              {renderInlineEmphasis(block.text)}
-            </h3>
-          );
-        }
-        if (block.type === 'list') {
-          const ListTag = block.ordered ? 'ol' : 'ul';
-          return (
-            <ListTag
-              key={`list-${index}`}
-              className={`${block.ordered ? 'list-decimal' : 'list-disc'} pl-6 space-y-2 text-[14.5px] xl:text-[15px] leading-7 text-[#2f376d] marker:text-[#4b63df]`}
-            >
-              {block.items.map((item, itemIndex) => (
-                <li key={`list-item-${index}-${itemIndex}`} className="pl-1">{renderInlineEmphasis(item)}</li>
-              ))}
-            </ListTag>
-          );
-        }
-        if (block.type === 'table') {
-          // R8.14: markdown 表格渲染
-          return (
-            <div key={`table-${index}`} className="overflow-x-auto rounded-xl border border-[#d8defb] bg-white">
-              <table className="w-full text-[13px] xl:text-[14px]">
-                <thead>
-                  <tr className="bg-[#f3f5fc]">
-                    {block.header.map((cell, cellIndex) => (
-                      <th
-                        key={`th-${index}-${cellIndex}`}
-                        className="px-3 py-2 text-left font-semibold text-[#1f275b] border-b border-[#d8defb] whitespace-nowrap"
-                      >
-                        {renderInlineEmphasis(cell)}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {block.rows.map((row, rowIndex) => (
-                    <tr
-                      key={`tr-${index}-${rowIndex}`}
-                      className={rowIndex % 2 === 0 ? 'bg-white' : 'bg-[#fafbff]'}
-                    >
-                      {row.map((cell, cellIndex) => (
-                        <td
-                          key={`td-${index}-${rowIndex}-${cellIndex}`}
-                          className="px-3 py-2 text-[#30376b] border-b border-[#eef0f9] align-top leading-6"
-                        >
-                          {renderInlineEmphasis(cell)}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          );
-        }
-        const isLead = index === leadParagraphIndex;
-        return (
-          <p
-            key={`paragraph-${index}`}
-            className={isLead
-              ? 'text-[15px] xl:text-[15.5px] leading-8 text-[#24305f] font-medium'
-              : 'text-[14.5px] xl:text-[15px] leading-7 text-[#30376b]'}
-          >
-            {renderInlineEmphasis(block.text)}
-	          </p>
-	        );
-	      })}
-	    </div>
-  );
+  return <MarkdownAnswerDocument text={text} />;
 }
 
 /**
@@ -3879,6 +3798,137 @@ const QuickAnswerProgress = React.memo(function QuickAnswerProgress({
   );
 });
 
+const DeepAnswerProgress = React.memo(function DeepAnswerProgress({
+  startedAt,
+  providerLabel,
+  stage,
+  reasoningText,
+  answerText,
+  reasoningElapsedMs,
+}: {
+  startedAt: string;
+  providerLabel: string;
+  stage?: 'preparing' | 'reasoning' | 'answering';
+  reasoningText?: string;
+  answerText?: string;
+  reasoningElapsedMs?: number;
+}) {
+  const [elapsedMs, setElapsedMs] = useState(Math.max(Date.now() - Date.parse(startedAt), 0));
+  useEffect(() => {
+    const anchor = Date.parse(startedAt);
+    const update = () => setElapsedMs(Math.max(Date.now() - anchor, 0));
+    update();
+    const timer = window.setInterval(update, 250);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
+  const normalizedReasoning = String(reasoningText || '').trim();
+  const normalizedAnswer = String(answerText || '').trim();
+  const isAnswering = stage === 'answering';
+  return (
+    <div data-workspace-deep-progress="true" className="space-y-3">
+      <div className="rounded-[22px] border border-indigo-100 bg-white px-4 py-3 shadow-[0_8px_24px_rgba(91,123,254,0.08)]">
+        {isAnswering ? (
+          normalizedReasoning ? (
+            <details className="text-[11px] text-slate-600">
+              <summary className="cursor-pointer select-none font-semibold text-indigo-700">
+                已深度思考 · {formatElapsedLabel(reasoningElapsedMs || elapsedMs)}
+              </summary>
+              <div className="mt-2 max-h-72 overflow-y-auto whitespace-pre-wrap pr-1 text-[12px] leading-6 text-slate-700">
+                {normalizedReasoning}
+              </div>
+            </details>
+          ) : (
+            <p className="text-[11px] font-semibold text-slate-500">模型本轮未返回可展示的思考文本</p>
+          )
+        ) : (
+          <>
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <BrainCircuit size={16} className="shrink-0 text-indigo-600" />
+                <div className="min-w-0">
+                  <p className="text-[13px] font-bold text-slate-800">
+                    {normalizedReasoning ? '正在深度思考' : '正在准备深度思考'}
+                  </p>
+                  <p className="mt-0.5 truncate text-[11px] text-slate-500">
+                    {normalizedReasoning ? `${providerLabel} 正在继续推理` : `正在等待 ${providerLabel} 返回本题思考过程`}
+                  </p>
+                </div>
+              </div>
+              <span className="shrink-0 rounded-full bg-indigo-50 px-2.5 py-1 text-[10px] font-bold text-indigo-700">{formatElapsedLabel(elapsedMs)}</span>
+            </div>
+            {normalizedReasoning ? (
+              <div className="mt-3 max-h-80 overflow-y-auto whitespace-pre-wrap pr-1 text-[12px] leading-6 text-slate-700">
+                {normalizedReasoning}
+                <span className="ml-1 inline-block h-3.5 w-1 animate-pulse rounded-full bg-indigo-500 align-middle" />
+              </div>
+            ) : (
+              <div className="mt-3 flex items-center gap-2 text-[11px] text-slate-500">
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-indigo-500" />
+                正在建立本题上下文…
+              </div>
+            )}
+          </>
+        )}
+      </div>
+      {isAnswering && normalizedAnswer && (
+        <div className="rounded-[22px] border border-blue-100 bg-white px-4 py-4 shadow-[0_8px_24px_rgba(91,123,254,0.08)]">
+          <div className="mb-3 flex items-center justify-between gap-3 text-[11px] font-semibold text-blue-700">
+            <span>正在生成答案</span>
+            <span>{formatElapsedLabel(elapsedMs)}</span>
+          </div>
+          <AnswerDocument text={normalizedAnswer} />
+        </div>
+      )}
+    </div>
+  );
+});
+
+const CompletedAnalysisTrace = React.memo(function CompletedAnalysisTrace({
+  retrievalSummary,
+  reasoningMs,
+}: {
+  retrievalSummary?: Record<string, unknown> | null;
+  reasoningMs?: number;
+}) {
+  const trace = Array.isArray(retrievalSummary?.analysisTrace)
+    ? retrievalSummary.analysisTrace.map((item) => String(item)).filter(Boolean)
+    : [];
+  const providerReasoning = typeof retrievalSummary?.providerReasoningContent === 'string'
+    ? retrievalSummary.providerReasoningContent.trim()
+    : '';
+  const plan = retrievalSummary?.publicAnalysisPlan && typeof retrievalSummary.publicAnalysisPlan === 'object'
+    ? retrievalSummary.publicAnalysisPlan as PublicAnalysisPlan
+    : null;
+  const planNarrative = plan
+    ? String(plan.narrative || '').trim()
+      || [
+        plan.intent,
+        plan.directions?.join('；'),
+        plan.plannedSources?.length ? `核对资料：${plan.plannedSources.join('、')}。` : '',
+        plan.cautions?.length ? `注意：${plan.cautions.join('；')}。` : '',
+      ].filter(Boolean).join('\n\n')
+    : '';
+  if (!providerReasoning && !trace.length && !plan) return null;
+  return (
+    <details className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2 text-[11px] text-slate-600">
+      <summary className="cursor-pointer select-none font-semibold text-indigo-700">
+        已深度思考{reasoningMs ? ` · ${formatElapsedLabel(reasoningMs)}` : ''}
+      </summary>
+      {providerReasoning ? (
+        <div className="mt-2 max-h-72 overflow-y-auto whitespace-pre-wrap pr-1 text-[12px] leading-6 text-slate-700">
+          {providerReasoning}
+        </div>
+      ) : plan ? (
+        <div className="mt-2 whitespace-pre-wrap leading-5">{planNarrative}</div>
+      ) : (
+        <ol className="mt-2 space-y-1 pl-4">
+          {trace.map((item, index) => <li key={`${item}-${index}`}>{index + 1}. {item}</li>)}
+        </ol>
+      )}
+    </details>
+  );
+});
+
 const ThinkingWorkbenchPanel = React.memo(function ThinkingWorkbenchPanel({
   question,
   startedAt,
@@ -4466,7 +4516,7 @@ function formatAuthorizationTimestamp(value?: string | null) {
   if (!value) return '时间未知';
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return '时间未知';
-  return parsed.toLocaleString('zh-CN', { hour12: false });
+  return parsed.toLocaleString('zh-CN', { hourCycle: 'h23' });
 }
 
 function splitTaskDueDateTime(value?: string | null) {
@@ -5636,6 +5686,15 @@ function taskWaitsForOthers(task: Task, userId: string | null | undefined) {
     (item) => item.isOwner && item.userId === task.ownerId,
   );
   return ownerCollaboration?.inboxStatus === 'pending';
+}
+
+function taskReturnedToCreator(task: Task, userId: string | null | undefined) {
+  if (!userId || task.creatorId !== userId) return false;
+  return task.collaborators.some(
+    (item) => item.isOwner
+      && item.inboxStatus === 'returned'
+      && item.assignmentState === 'returned',
+  );
 }
 
 function taskViewerCollaboration(task: Task, userId: string | null | undefined) {
@@ -7457,6 +7516,160 @@ function TaskPropertyRow({ icon, label, children, stacked = false }: TaskPropert
   );
 }
 
+function TaskTime24Input({
+  value,
+  onChange,
+  label,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  label: string;
+}) {
+  const normalizedValue = /^\d{2}:\d{2}$/.test(value) ? value : '00:00';
+  const [hourInput, setHourInput] = useState(normalizedValue.slice(0, 2));
+  const [minuteInput, setMinuteInput] = useState(normalizedValue.slice(3, 5));
+
+  useEffect(() => {
+    setHourInput(normalizedValue.slice(0, 2));
+    setMinuteInput(normalizedValue.slice(3, 5));
+  }, [normalizedValue]);
+
+  const commitTime = (nextHour: string, nextMinute: string) => {
+    if (!/^\d{2}$/.test(nextHour) || !/^\d{2}$/.test(nextMinute)) return;
+    const hour = Number(nextHour);
+    const minute = Number(nextMinute);
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return;
+    onChange(`${nextHour}:${nextMinute}`);
+  };
+
+  return (
+    <div className="flex w-full items-center justify-center rounded-lg border border-gray-200 bg-white px-1 py-1 text-sm tabular-nums text-gray-700 focus-within:border-[#5B7BFE] focus-within:ring-1 focus-within:ring-[#5B7BFE]/15">
+      <div className="grid grid-cols-[1.75rem_0.75rem_1.75rem] items-center justify-center">
+        <input
+          type="text"
+          inputMode="numeric"
+          maxLength={2}
+          aria-label={`${label}小时（24小时制）`}
+          value={hourInput}
+          onChange={(event) => {
+            const nextHour = event.target.value.replace(/\D/g, '').slice(0, 2);
+            setHourInput(nextHour);
+            commitTime(nextHour, minuteInput);
+          }}
+          onBlur={() => {
+            if (!/^\d{2}$/.test(hourInput) || Number(hourInput) > 23) {
+              setHourInput(normalizedValue.slice(0, 2));
+            } else {
+              commitTime(hourInput, minuteInput);
+            }
+          }}
+          className="w-[1.75rem] min-w-0 appearance-none bg-transparent px-0 py-1 text-center text-sm tabular-nums outline-none"
+        />
+        <span className="w-[0.75rem] select-none text-center text-gray-400" aria-hidden>：</span>
+        <input
+          type="text"
+          inputMode="numeric"
+          maxLength={2}
+          aria-label={`${label}分钟`}
+          value={minuteInput}
+          onChange={(event) => {
+            const nextMinute = event.target.value.replace(/\D/g, '').slice(0, 2);
+            setMinuteInput(nextMinute);
+            commitTime(hourInput, nextMinute);
+          }}
+          onBlur={() => {
+            if (!/^\d{2}$/.test(minuteInput) || Number(minuteInput) > 59) {
+              setMinuteInput(normalizedValue.slice(3, 5));
+            } else {
+              commitTime(hourInput, minuteInput);
+            }
+          }}
+          className="w-[1.75rem] min-w-0 appearance-none bg-transparent px-0 py-1 text-center text-sm tabular-nums outline-none"
+        />
+      </div>
+    </div>
+  );
+}
+
+function TaskDateInput({
+  value,
+  onChange,
+  label,
+  min,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  label: string;
+  min?: string;
+}) {
+  const pickerRef = useRef<HTMLInputElement>(null);
+  const displayValue = /^\d{4}-\d{2}-\d{2}$/.test(value) ? value.replace(/-/g, '/') : '';
+  const [dateInput, setDateInput] = useState(displayValue);
+
+  useEffect(() => {
+    setDateInput(displayValue);
+  }, [displayValue]);
+
+  const normalizeDate = (candidate: string) => {
+    const match = candidate.match(/^(\d{4})\/(\d{2})\/(\d{2})$/);
+    if (!match) return null;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const parsed = new Date(year, month - 1, day);
+    if (parsed.getFullYear() !== year || parsed.getMonth() !== month - 1 || parsed.getDate() !== day) return null;
+    const nextValue = `${match[1]}-${match[2]}-${match[3]}`;
+    return min && nextValue < min ? null : nextValue;
+  };
+
+  const openPicker = () => {
+    const picker = pickerRef.current;
+    if (!picker) return;
+    if (typeof picker.showPicker === 'function') picker.showPicker();
+    else picker.click();
+  };
+
+  return (
+    <div className="relative flex w-full items-center rounded-lg border border-gray-200 bg-white px-3 py-1 focus-within:border-[#5B7BFE] focus-within:ring-1 focus-within:ring-[#5B7BFE]/15">
+      <input
+        type="text"
+        inputMode="numeric"
+        maxLength={10}
+        aria-label={`${label}日期`}
+        value={dateInput}
+        placeholder="YYYY/MM/DD"
+        onChange={(event) => setDateInput(event.target.value.replace(/[^\d/]/g, '').slice(0, 10))}
+        onBlur={() => {
+          const nextValue = normalizeDate(dateInput);
+          if (!nextValue) setDateInput(displayValue);
+          else onChange(nextValue);
+        }}
+        className="min-w-0 flex-1 bg-transparent py-1 text-sm tabular-nums text-gray-700 outline-none"
+      />
+      <button
+        type="button"
+        aria-label={`打开${label}日历`}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={openPicker}
+        className="ml-1 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md text-gray-500 hover:bg-gray-100 hover:text-gray-800"
+      >
+        <CalendarIcon size={15} />
+      </button>
+      <input
+        ref={pickerRef}
+        type="date"
+        lang="zh-CN"
+        min={min}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        tabIndex={-1}
+        aria-hidden="true"
+        className="pointer-events-none absolute bottom-0 right-0 h-px w-px opacity-0"
+      />
+    </div>
+  );
+}
+
 type AgentSkillEditorModalProps = {
   targetSkill: AgentSkill | null;
   canShareOrganization: boolean;
@@ -8239,7 +8452,7 @@ export default function App() {
   );
   const feishuSyncPromptLabel = !feishuSyncStatusLoaded
     ? '正在确认飞书同步'
-    : '飞书同步未完全接通';
+    : '飞书待接通';
   const feishuSyncPromptClass = !feishuSyncStatusLoaded
     ? 'border-slate-100 bg-slate-50 text-slate-500 hover:bg-slate-100'
     : 'border-blue-100 bg-blue-50 text-blue-700 hover:bg-blue-100';
@@ -15034,8 +15247,10 @@ export default function App() {
     };
 
     const inboundPendingTasks = tasks.filter((task) => {
-      if (task.status !== 'inbox' || transitioningInboxTaskIds.includes(task.id)) return false;
-      return taskViewerCollaboration(task, currentTaskMembershipId)?.inboxStatus === 'pending';
+      if (transitioningInboxTaskIds.includes(task.id)) return false;
+      const collaboration = taskViewerCollaboration(task, currentTaskMembershipId);
+      return collaboration?.assignmentState === 'assigned'
+        && collaboration.inboxStatus === 'pending';
     });
     const outboundPendingTasks = tasks.filter(
       (task) => task.status !== 'rejected'
@@ -15072,6 +15287,30 @@ export default function App() {
         inboxTimeSort,
       ),
       [inboxCustomEndDate, inboxCustomStartDate, inboxTimeRangeFilter, inboxTimeSort, outboundPendingTasks],
+    );
+    const returnedCreatorTasks = useMemo(
+      () => sortTasksByTimeDirection(
+        tasks.filter((task) => (
+          !transitioningInboxTaskIds.includes(task.id)
+          && taskReturnedToCreator(task, currentTaskMembershipId)
+          && taskMatchesTimeRange(
+            task,
+            inboxTimeRangeFilter,
+            inboxCustomStartDate,
+            inboxCustomEndDate,
+          )
+        )),
+        inboxTimeSort,
+      ),
+      [
+        currentTaskMembershipId,
+        inboxCustomEndDate,
+        inboxCustomStartDate,
+        inboxTimeRangeFilter,
+        inboxTimeSort,
+        tasks,
+        transitioningInboxTaskIds,
+      ],
     );
     const filteredInboundPendingMeetings = useMemo(
       () => inboundPendingMeetings
@@ -15110,6 +15349,7 @@ export default function App() {
         || outboundPendingMeetings.length > 0
       )
       && actionableInboxTasks.length === 0
+      && returnedCreatorTasks.length === 0
       && filteredOutboundPendingTasks.length === 0
       && filteredInboundPendingMeetings.length === 0
       && filteredOutboundPendingMeetings.length === 0
@@ -19757,9 +19997,8 @@ export default function App() {
                   taskViewMode === 'inbox' ? 'bg-white shadow-sm text-[#5B7BFE]' : 'text-gray-500 hover:text-gray-800'
                 }`}
               >
-                <Inbox size={16} className={taskViewMode === 'inbox' ? 'text-[#5B7BFE]' : 'text-gray-400'} />
                 协作收件箱
-                {(inboundPendingTasks.length > 0 || outboundPendingTasks.length > 0) && <span className="absolute top-1.5 right-2 w-2 h-2 bg-rose-500 rounded-full" />}
+                {(inboundPendingTasks.length > 0 || outboundPendingTasks.length > 0 || returnedCreatorTasks.length > 0) && <span className="absolute top-1.5 right-2 w-2 h-2 bg-rose-500 rounded-full" />}
               </button>
                 {[
                   { id: 'list', label: '任务列表' },
@@ -19775,7 +20014,6 @@ export default function App() {
                       taskViewMode === mode.id ? 'bg-white shadow-sm text-[#5B7BFE]' : 'text-gray-500 hover:text-gray-800'
                     }`}
                 >
-                  {mode.id === 'review' && taskViewMode === 'review' && <Sparkles size={14} className="text-amber-500" />}
                   {mode.label}
                 </button>
               ))}
@@ -19789,10 +20027,9 @@ export default function App() {
 	                className={`hidden md:inline-flex h-9 items-center gap-1.5 rounded-xl border px-3 text-[12px] font-semibold transition ${feishuSyncPromptClass}`}
 	                title="前往系统设置里的飞书集成"
 		              >
-		                <CalendarIcon size={14} />
 	                <span>{feishuSyncPromptLabel}</span>
 		                <ArrowRight size={13} />
-		              </button>
+	              </button>
 	            )}
 	            <div className="inline-flex h-[48px] overflow-hidden rounded-2xl bg-[#5B7BFE] text-white shadow-sm">
 	              <button
@@ -20875,7 +21112,7 @@ export default function App() {
                       <div className="flex items-center gap-2 text-left">
                         <ChevronDown size={15} className={`text-blue-500 transition-transform ${inboxSectionOpen.actionable ? '' : '-rotate-90'}`} />
                         <span className="text-[13px] font-semibold text-gray-800">待我处理</span>
-                        <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-bold text-blue-700">{actionableInboxTasks.length + filteredInboundPendingMeetings.length}</span>
+                        <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-bold text-blue-700">{actionableInboxTasks.length + returnedCreatorTasks.length + filteredInboundPendingMeetings.length}</span>
                       </div>
                       {actionableInboxTasks.length + filteredInboundPendingMeetings.length > 0 && (
                         <div className="flex items-center gap-2" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
@@ -20923,6 +21160,30 @@ export default function App() {
                             </div>
                           );
                         })}
+                        {returnedCreatorTasks.map((task) => (
+                          <div key={`returned-${task.id}`} className="relative flex items-start gap-3 rounded-xl bg-rose-50/70 px-5 py-3.5 ring-1 ring-inset ring-rose-200 before:absolute before:bottom-3.5 before:left-0 before:top-3.5 before:w-[3px] before:rounded-r-full before:bg-rose-500/70">
+                            <div className="min-w-0 flex-1">
+                              <div className="mb-2 flex flex-wrap items-center gap-2">
+                                <span className="text-[14px] font-medium tracking-tight text-gray-900">{task.title}</span>
+                                <span className="rounded-full bg-rose-100 px-2 py-[2px] text-[9.5px] font-semibold text-rose-700 ring-1 ring-inset ring-rose-200">负责人已退回</span>
+                              </div>
+                              <p className="mb-2 text-[12px] leading-relaxed text-rose-700/80">{task.desc || '负责人已退回，请修改后重新发送，或删除该任务。'}</p>
+                              <div className="flex flex-wrap gap-1.5 text-[11px] font-medium">
+                                <span className="rounded-full bg-white/80 px-2 py-[2px] text-gray-700 ring-1 ring-inset ring-rose-200">负责人：{task.ownerName}</span>
+                                {task.ddl && <span className="rounded-full bg-white/80 px-2 py-[2px] text-rose-700 ring-1 ring-inset ring-rose-200">{task.ddl}</span>}
+                              </div>
+                            </div>
+                            <div className="flex flex-col gap-2">
+                              <Button onClick={() => openTaskEditor(task)}>修改</Button>
+                              <Button onClick={() => setPendingTaskDelete({
+                                id: task.id,
+                                title: task.title,
+                                clientId: task.clientId,
+                                eventLineId: task.eventLineId,
+                              })}>删除</Button>
+                            </div>
+                          </div>
+                        ))}
                         {filteredInboundPendingMeetings.map((meeting) => {
                           const collaboration = meetingViewerCollaboration(meeting, currentTaskMembershipId);
                           const isOwnerInvite = collaboration?.roleKey === 'owner';
@@ -20944,7 +21205,7 @@ export default function App() {
                             </div>
                           );
                         })}
-                        {actionableInboxTasks.length === 0 && filteredInboundPendingMeetings.length === 0 && (
+                        {actionableInboxTasks.length === 0 && returnedCreatorTasks.length === 0 && filteredInboundPendingMeetings.length === 0 && (
                           <p className="py-6 text-center text-[12px] text-gray-400">当前没有需要你处理的协作事项。</p>
                         )}
                       </div>
@@ -21002,6 +21263,7 @@ export default function App() {
                   </section>
 
                   {actionableInboxTasks.length === 0
+                    && returnedCreatorTasks.length === 0
                     && filteredInboundPendingMeetings.length === 0
                     && filteredOutboundPendingTasks.length === 0
                     && filteredOutboundPendingMeetings.length === 0 && (
@@ -24068,41 +24330,31 @@ export default function App() {
 
                     <TaskPropertyRow icon={<Clock size={16} />} label="开始时间" stacked>
                       <div className="grid w-full min-w-0 grid-cols-[minmax(0,1.35fr)_minmax(0,0.9fr)] gap-2">
-                        <input
-                          type="date"
-                          lang="zh-CN"
+                        <TaskDateInput
+                          label="开始时间"
                           value={editingTask.dueDate}
-                          onChange={(event) => applyEditingTaskStartDateTime(combineTaskDueDateTime(event.target.value, editingTask.dueTime || '09:00'))}
-                          className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
+                          onChange={(value) => applyEditingTaskStartDateTime(combineTaskDueDateTime(value, editingTask.dueTime || '09:00'))}
                         />
-                        <input
-                          type="time"
-                          lang="zh-CN"
-                          step={900}
+                        <TaskTime24Input
+                          label="开始时间"
                           value={editingTask.dueTime || '09:00'}
-                          onChange={(event) => applyEditingTaskStartDateTime(combineTaskDueDateTime(editingTask.dueDate, event.target.value))}
-                          className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
+                          onChange={(value) => applyEditingTaskStartDateTime(combineTaskDueDateTime(editingTask.dueDate, value))}
                         />
                       </div>
                     </TaskPropertyRow>
 
                     <TaskPropertyRow icon={<Clock size={16} />} label="结束时间" stacked>
                       <div className="grid w-full min-w-0 grid-cols-[minmax(0,1.35fr)_minmax(0,0.9fr)] gap-2">
-                        <input
-                          type="date"
-                          lang="zh-CN"
+                        <TaskDateInput
+                          label="结束时间"
                           min={editingTask.dueDate || undefined}
                           value={duePickerEndDate}
-                          onChange={(event) => applyEditingTaskEndDateTime(combineTaskDueDateTime(event.target.value, duePickerEndTime || '10:00'))}
-                          className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
+                          onChange={(value) => applyEditingTaskEndDateTime(combineTaskDueDateTime(value, duePickerEndTime || '10:00'))}
                         />
-                        <input
-                          type="time"
-                          lang="zh-CN"
-                          step={900}
+                        <TaskTime24Input
+                          label="结束时间"
                           value={duePickerEndTime}
-                          onChange={(event) => applyEditingTaskEndDateTime(combineTaskDueDateTime(duePickerEndDate, event.target.value))}
-                          className="w-full min-w-0 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm tabular-nums text-gray-700"
+                          onChange={(value) => applyEditingTaskEndDateTime(combineTaskDueDateTime(duePickerEndDate, value))}
                         />
                       </div>
                     </TaskPropertyRow>
@@ -25783,8 +26035,8 @@ export default function App() {
   const setupModeClientIdRef = useRef<string | null>(null);
   const clientImportDropDepthRef = useRef<{ buffer: number; composer: number; favorites: number }>({ buffer: 0, composer: 0, favorites: 0 });
 
-  // 深度思考沿用现有问答链：模型先核对事实边界、冲突和缺口，再输出结论。
-  // 不展示隐藏思维过程，但请求、来源清单和回答回执会登记该模式。
+  // 深度思考启用组织模型原生推理；等待时展示本题公开分析思路，
+  // 完成后折叠保留供应商在协议中明确返回的 reasoning_content。
   const [deepThinking, setDeepThinking] = useState(false);
 
   useEffect(() => {
@@ -25810,21 +26062,21 @@ export default function App() {
       icon: Sparkles,
       tone: 'ring-purple-300/55 bg-purple-50/60 text-purple-700 hover:bg-purple-50',
       iconTone: 'text-purple-600',
-      description: '完全自由创作，不引用任何客户资料。等同于通用 LLM 窗口',
+      description: '以项目事实为边界，自由联想并提出多种创意；明确区分事实、假设与待核实项',
     },
     balanced: {
       label: '兼顾资料',
       icon: Scale,
       tone: 'ring-blue-300/55 bg-blue-50/60 text-blue-700 hover:bg-blue-50',
       iconTone: 'text-blue-600',
-      description: '基于客户资料的事实底色，但叙事和措辞自由发挥。默认推荐',
+      description: '先以项目资料确定事实底色，再做合理分析与表达；明确区分事实和推断。默认推荐',
     },
     strict: {
-      label: '完全客观',
+      label: '资料优先',
       icon: ShieldCheck,
       tone: 'ring-gray-300/55 bg-gray-50/60 text-gray-700 hover:bg-gray-50',
       iconTone: 'text-gray-600',
-      description: '严格基于资料，所有判断带溯源；不允许文学修辞',
+      description: '优先回答资料直接支持的内容；资料不足就说明缺口，建议单独标为待核实',
     },
   } as const;
   const currentCreativityMeta = creativityMeta[creativityMode];
@@ -27351,6 +27603,16 @@ export default function App() {
             stageLabel: visibleThreadAnalysisRun.stageLabel || 'AI 正在计算，请稍候',
             run: visibleThreadAnalysisRun,
             mode: 'running' as const,
+            deepThinking: Boolean(visibleThreadAnalysisRun.assistantMessage?.deepThinkingRequested ?? pendingQuestionState?.deepThinking),
+            creativityMode: visibleThreadAnalysisRun.assistantMessage?.creativityMode || pendingQuestionState?.creativityMode || 'balanced',
+            publicAnalysisPlan:
+              ((visibleThreadAnalysisRun.assistantMessage?.retrievalSummary as Record<string, unknown> | undefined)?.publicAnalysisPlan as PublicAnalysisPlan | undefined)
+              || pendingQuestionState?.publicAnalysisPlan
+              || null,
+            stage: pendingQuestionState?.stage || 'preparing',
+            reasoningText: pendingQuestionState?.reasoningText || '',
+            answerText: pendingQuestionState?.answerText || '',
+            reasoningElapsedMs: pendingQuestionState?.reasoningElapsedMs || 0,
           };
         }
         if (pendingQuestion) {
@@ -27360,10 +27622,17 @@ export default function App() {
             stageLabel: '问题已发送，正在建立分析任务',
             run: null,
             mode: 'starting' as const,
+            deepThinking: Boolean(pendingQuestionState?.deepThinking),
+            creativityMode: pendingQuestionState?.creativityMode || 'balanced',
+            publicAnalysisPlan: pendingQuestionState?.publicAnalysisPlan || null,
+            stage: pendingQuestionState?.stage || 'preparing',
+            reasoningText: pendingQuestionState?.reasoningText || '',
+            answerText: pendingQuestionState?.answerText || '',
+            reasoningElapsedMs: pendingQuestionState?.reasoningElapsedMs || 0,
           };
         }
         return null;
-      }, [pendingQuestion, pendingStartedAt, visibleThreadAnalysisRun]);
+      }, [pendingQuestion, pendingStartedAt, pendingQuestionState?.deepThinking, pendingQuestionState?.creativityMode, pendingQuestionState?.publicAnalysisPlan, pendingQuestionState?.stage, pendingQuestionState?.reasoningText, pendingQuestionState?.answerText, pendingQuestionState?.reasoningElapsedMs, visibleThreadAnalysisRun]);
       const thinkingPanelVisible = Boolean(transientThinkingPanel);
       const composerBusyMode: 'starting' | 'running' | null = transientThinkingPanel?.mode || null;
 
@@ -28427,6 +28696,12 @@ export default function App() {
       }
       const prompt = resolvedPrompt;
       const createdAt = new Date().toISOString();
+      // 首次提问也必须把真实、稳定的 threadId 放进请求体。请求器可能在
+      // “云端已提交但回包丢失”后自动重试；若让后端每次临时生成 threadId，
+      // 同一 Idempotency-Key 会携带不同业务内容并触发操作标识冲突。
+      const requestedThreadId = currentThreadId || createUiId('chat-thread');
+      // 首次发送期间仍沿用既有草稿槽展示乐观消息；真实 threadId 只用于
+      // 请求合同，回包后再由正式线程替换草稿，避免改变当前等待态体验。
       const draftThreadId = currentThreadId || CLIENT_CHAT_DRAFT_THREAD_ID;
       const tempUserId = `temp_user_${Date.now()}`;
       const userMessage: DisplayChatMessage = {
@@ -28453,7 +28728,12 @@ export default function App() {
         };
         setActiveMessageId(null);
         setIsStartingMessage(true);
-        setClientPendingQuestion(currentClientId, { question: prompt, startedAt: createdAt });
+        setClientPendingQuestion(currentClientId, {
+          question: prompt,
+          startedAt: createdAt,
+          deepThinking,
+          creativityMode,
+        });
       });
       await new Promise<void>((resolve) => {
         window.requestAnimationFrame(() => {
@@ -28473,21 +28753,92 @@ export default function App() {
         const workingDocumentIds = activeWorkingDocuments
           .filter((document) => document.status !== 'failed')
           .map((document) => document.documentId);
-        const started = await startClientMessage(
-          currentClientId,
-          prompt,
-          currentThreadId || undefined,
-          undefined,
-          workingDocumentIds,
-          { signal: controller.signal },
-          deepThinking,
-          null,
-          creativityMode,
-          activeAgentSkillIds,
-          submittedImages,
-        );
+        let streamedReasoning = '';
+        let streamedAnswer = '';
+        let reasoningElapsedMs = 0;
+        const started = deepThinking
+          ? await streamClientMessage(
+              currentClientId,
+              {
+                prompt,
+                threadId: requestedThreadId,
+                workingDocumentIds,
+                deepThinking,
+                activeSkillId: null,
+                activeSkillIds: activeAgentSkillIds,
+                imageInputs: submittedImages,
+                creativityMode,
+              },
+              (event) => {
+                if (currentClientIdRef.current !== submittedClientId) return;
+                if (event.type === 'reasoning_delta') streamedReasoning += event.text;
+                if (event.type === 'answer_delta') streamedAnswer += event.text;
+                if (
+                  reasoningElapsedMs === 0
+                  && (event.type === 'answer_started' || event.type === 'answer_delta')
+                ) {
+                  reasoningElapsedMs = Math.max(1, Date.now() - Date.parse(createdAt));
+                }
+                const stage = event.type === 'answer_started' || event.type === 'answer_delta'
+                  ? 'answering'
+                  : event.type === 'reasoning_delta'
+                    ? 'reasoning'
+                    : event.stage;
+                setClientPendingQuestion(submittedClientId, {
+                  question: prompt,
+                  startedAt: createdAt,
+                  deepThinking,
+                  creativityMode,
+                  stage,
+                  reasoningText: streamedReasoning,
+                  answerText: streamedAnswer,
+                  reasoningElapsedMs,
+                });
+              },
+              { signal: controller.signal },
+            )
+          : await startClientMessage(
+              currentClientId,
+              prompt,
+              requestedThreadId,
+              undefined,
+              workingDocumentIds,
+              { signal: controller.signal },
+              deepThinking,
+              null,
+              creativityMode,
+              activeAgentSkillIds,
+              submittedImages,
+              null,
+            );
         if (currentClientIdRef.current !== submittedClientId) return;
-        upsertAnalysisRun(started.analysisRun);
+        const clientElapsedMs = Math.max(1, Date.now() - Date.parse(createdAt));
+        const answerTotalMs = Math.max(
+          1,
+          clientElapsedMs,
+          Number(started.assistantMessage.timing?.totalMs || 0),
+          Number(started.analysisRun.elapsedMs || 0),
+        );
+        const assistantMessage: DisplayChatMessage = {
+          ...(started.assistantMessage as DisplayChatMessage),
+          timing: {
+            ...(started.assistantMessage.timing || {}),
+            totalMs: answerTotalMs,
+          },
+          retrievalSummary: {
+            ...(started.assistantMessage.retrievalSummary || {}),
+          },
+        };
+        const completedAnalysisRun: ClientAnalysisRun = {
+          ...started.analysisRun,
+          elapsedMs: answerTotalMs,
+          timing: {
+            ...(started.analysisRun.timing || {}),
+            totalMs: answerTotalMs,
+          },
+          assistantMessage,
+        };
+        upsertAnalysisRun(completedAnalysisRun);
         // 原子删队头：analysisRun 已创建，后续状态由该 run 自己收敛。
         if (options?.fromQueue && currentClientId) {
           const q = getWorkspaceQuestionQueue(currentClientId);
@@ -28500,10 +28851,10 @@ export default function App() {
               ...(started.userMessage as DisplayChatMessage),
               imageAttachments: submittedImages.map(({ id, name, mimeType, dataUrl }) => ({ id, name, mimeType, dataUrl })),
             },
-            started.assistantMessage as DisplayChatMessage,
+            assistantMessage,
           ], started.threadId);
           setClientPendingQuestion(currentClientId, null);
-          setActiveMessageId(started.assistantMessage.id);
+          setActiveMessageId(assistantMessage.id);
           setIsStartingMessage(false);
           // 清掉本轮通过"引用回答"加入的工作文档（保留主动 import 进来的）
           setActiveWorkingDocuments((previous) =>
@@ -28528,7 +28879,7 @@ export default function App() {
             `回答已生成，但记忆未写入：${started.memoryUpdate.message}`,
           );
         }
-        beginAnalysisRunPolling(started.analysisRun.id, currentClientId);
+        beginAnalysisRunPolling(completedAnalysisRun.id, currentClientId);
       } catch (error) {
         clearAnalysisRunPollTimer();
         workspaceStartMessageAbortControllerRef.current = null;
@@ -29996,10 +30347,10 @@ export default function App() {
                                       {isHistoricalMockAnswer ? '配置前本地测试' : (msg.llmInvoked ? msg.modelRoute || aiRouteLabel(msg.providerUsed || health?.ai.provider, health?.ai.model, health?.ai.providerLabel) : '背景整理')}
                                       {msg.timing?.totalMs ? ` · 耗时 ${formatElapsedLabel(msg.timing.totalMs)}` : ''}
                                     </span>
-                                    {(msg.retrievalSummary as { multipassUsed?: boolean } | undefined)?.multipassUsed === true && (
+                                    {(msg.deepThinkingRequested || (msg.retrievalSummary as { multipassUsed?: boolean } | undefined)?.multipassUsed === true) && (
                                       <span
                                         className="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-[2px] text-[9px] font-semibold uppercase tracking-[0.14em] text-[#3652c9] ring-1 ring-inset ring-[#5B7BFE]/35"
-                                        title="本条回答由「深度思考」生成：先出大纲再分段写"
+                                        title="本条回答由「深度思考」生成：启用模型原生推理，并核对事实、冲突和证据缺口"
                                       >
                                         <BrainCircuit size={9} strokeWidth={2.4} />
                                         深度思考
@@ -30030,7 +30381,7 @@ export default function App() {
                                     {msg.creativityMode === 'creative' && (
                                       <span
                                         className="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-[2px] text-[9px] font-semibold uppercase tracking-[0.14em] text-purple-700 ring-1 ring-inset ring-purple-300/55"
-                                        title="本条回答用「创意优先」模式生成（不引用客户资料）"
+                                        title="本条回答用「创意优先」模式生成：项目事实仍是边界，并区分创意假设与待核实项"
                                       >
                                         <Sparkles size={9} strokeWidth={2.4} />
                                         创意优先
@@ -30043,6 +30394,15 @@ export default function App() {
                                       >
                                         <Scale size={9} strokeWidth={2.4} />
                                         兼顾资料
+                                      </span>
+                                    )}
+                                    {msg.creativityMode === 'strict' && (
+                                      <span
+                                        className="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-[2px] text-[9px] font-semibold uppercase tracking-[0.14em] text-slate-700 ring-1 ring-inset ring-slate-300/70"
+                                        title="本条回答用「资料优先」模式生成：资料不足会明确说明，建议单独标为待核实"
+                                      >
+                                        <ShieldCheck size={9} strokeWidth={2.4} />
+                                        资料优先
                                       </span>
                                     )}
                                   </span>
@@ -30062,6 +30422,12 @@ export default function App() {
                                 </div>
 
                                 <div className="space-y-4 xl:space-y-5">
+                                  {msg.deepThinkingRequested && (
+                                    <CompletedAnalysisTrace
+                                      retrievalSummary={retrievalSummaryRaw}
+                                      reasoningMs={msg.timing?.reasoningMs}
+                                    />
+                                  )}
                                   {msg.answerMode === 'general_answer' &&
                                     msg.failureReason === 'no_relevant_materials' &&
                                     ((knowledgeStatus?.totalDocuments || workspace?.documents.length || currentClient?.documentCount || 0) > 0) && (
@@ -30708,10 +31074,21 @@ export default function App() {
                     );
                       })}
                       {transientThinkingPanel && (
-                        <QuickAnswerProgress
-                          startedAt={transientThinkingPanel.startedAt}
-                          providerLabel={composerProviderLabel}
-                        />
+                        transientThinkingPanel.deepThinking ? (
+                          <DeepAnswerProgress
+                            startedAt={transientThinkingPanel.startedAt}
+                            providerLabel={composerProviderLabel}
+                            stage={transientThinkingPanel.stage}
+                            reasoningText={transientThinkingPanel.reasoningText}
+                            answerText={transientThinkingPanel.answerText}
+                            reasoningElapsedMs={transientThinkingPanel.reasoningElapsedMs}
+                          />
+                        ) : (
+                          <QuickAnswerProgress
+                            startedAt={transientThinkingPanel.startedAt}
+                            providerLabel={composerProviderLabel}
+                          />
+                        )
                       )}
                       {/* 旧版 ThinkingWorkbenchPanel / AnalysisRunCard 已删除：
                           助手消息现在直接在 chat 列表里渲染，loading 态显示 ChatThinkingHint，
@@ -30989,7 +31366,7 @@ export default function App() {
 	                    <button
 	                      type="button"
 	                      onClick={() => setDeepThinking((previous) => !previous)}
-	                      title={deepThinking ? '已启用深度思考：先核对事实、冲突与缺口' : '启用深度思考'}
+	                      title={deepThinking ? '已启用深度思考：拆解问题、核对证据与冲突，并在回答后保留折叠分析记录' : '启用深度思考；快速思考仍会显示实时耗时'}
 	                      aria-pressed={deepThinking}
 	                      className={`group inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors ring-1 ring-inset ${deepThinking ? 'text-indigo-700 ring-indigo-300 bg-indigo-50' : 'text-gray-500 ring-gray-200 bg-gray-50'}`}
 	                    >
@@ -33293,7 +33670,7 @@ export default function App() {
                                   <div className="min-w-0 flex-1">
                                     <p className="truncate text-[12px] font-bold text-gray-800">{document.fileName}</p>
                                     <p className="mt-1 text-[10px] text-gray-400">
-                                      删除于 {document.deletedAt ? new Date(document.deletedAt).toLocaleString('zh-CN') : '未知时间'}
+                                      删除于 {document.deletedAt ? new Date(document.deletedAt).toLocaleString('zh-CN', { hourCycle: 'h23' }) : '未知时间'}
                                     </p>
                                   </div>
                                   <button
@@ -33814,7 +34191,7 @@ export default function App() {
                           <div className="text-center"><p className="text-[9px] text-slate-400">收藏</p><p className="mt-1 text-[13px] font-bold text-slate-800">{memorySyncStatus.localSummary.counts.favorite}</p></div>
                         </div>
                         <div className="rounded-2xl border border-slate-100 px-4 py-3 text-[10.5px] leading-5 text-slate-600">
-                          <p>同步时间：{memorySyncStatus.lastSyncedAt ? new Date(memorySyncStatus.lastSyncedAt).toLocaleString('zh-CN') : '尚未同步'}</p>
+                          <p>同步时间：{memorySyncStatus.lastSyncedAt ? new Date(memorySyncStatus.lastSyncedAt).toLocaleString('zh-CN', { hourCycle: 'h23' }) : '尚未同步'}</p>
                           <p>一致性：{memorySyncStatus.conflictState === 'none' ? '本机与云端摘要一致' : memorySyncStatus.conflictState === 'different' ? '摘要不同，可重新同步' : '尚未完成云端比对'}</p>
                           <p className="mt-1 text-slate-500">{memorySyncStatus.message}</p>
                         </div>
@@ -37229,7 +37606,7 @@ export default function App() {
                           <div key={log.id} className="border-t border-gray-100 pt-3 pb-1">
                             <div className="flex justify-between items-baseline gap-4">
                               <p className="text-[13px] font-medium text-gray-900 truncate">{log.action}</p>
-                              <span className="text-[10px] text-gray-400 shrink-0">{new Date(log.createdAt).toLocaleString('zh-CN', { hour12: false })}</span>
+                              <span className="text-[10px] text-gray-400 shrink-0">{new Date(log.createdAt).toLocaleString('zh-CN', { hourCycle: 'h23' })}</span>
                             </div>
                             <p className="text-[11px] text-gray-500 mt-0.5 truncate">{log.actorName} · {log.entityType} · {log.entityId}</p>
                           </div>

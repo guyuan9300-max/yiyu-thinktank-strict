@@ -16,6 +16,7 @@ from ..project_materials_local import (
     select_relevant_excerpt,
 )
 from ..runtime import LocalRuntimeError
+from ..ui_idempotency import replayable_cloud_mutation, replayable_generated_value
 from .routing import UiDomainRouter, UiRequest
 
 
@@ -2386,8 +2387,16 @@ def delete_document(
             idempotency_key=request.idempotency_key,
         )
     store = _local_store(compatibility)
-    local = _local_call(
-        lambda: store.delete_document_local(project_id, document_id)
+    local = replayable_generated_value(
+        compatibility.runtime,
+        idempotency_key=request.idempotency_key,
+        command_type="project_materials.document_local_delete",
+        aggregate_type="source_asset",
+        aggregate_id=document_id,
+        input_payload={"projectId": project_id, "documentId": document_id},
+        generate=lambda: _local_call(
+            lambda: store.delete_document_local(project_id, document_id)
+        ),
     )
     cloud_document_id = str(local.get("cloudDocumentId") or "")
     if not cloud_document_id:
@@ -2398,18 +2407,30 @@ def delete_document(
             "message": "本机资料已移入回收状态",
         }
     try:
-        preview = compatibility.runtime.cloud_query(
+        cloud_path = (
             f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
-            f"/documents/{_segment(cloud_document_id)}/reading-preview"
+            f"/documents/{_segment(cloud_document_id)}"
         )
-        cloud = compatibility.runtime.cloud_command(
-            "DELETE",
-            f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
-            f"/documents/{_segment(cloud_document_id)}",
-            payload={
-                "expectedVersion": int(preview.get("aggregateVersion") or 1)
-            },
+
+        def delete_payload() -> dict[str, Any]:
+            preview = compatibility.runtime.cloud_query(
+                f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
+                f"/documents/{_segment(cloud_document_id)}/reading-preview"
+            )
+            return {
+                "expectedVersion": int(preview.get("aggregateVersion") or 1),
+            }
+
+        cloud = replayable_cloud_mutation(
+            compatibility.runtime,
             idempotency_key=request.idempotency_key,
+            command_type="project_materials.document_cloud_delete",
+            aggregate_type="knowledge_document",
+            aggregate_id=cloud_document_id,
+            method="DELETE",
+            path=cloud_path,
+            request_payload={"projectId": project_id, "documentId": document_id},
+            cloud_payload_factory=delete_payload,
         )
         _local_call(
             lambda: store.complete_cloud_delete(
@@ -2655,9 +2676,31 @@ def start_link_import_run(
         lambda: store.link_import_runs(project_id, run_id=run_id)
     )
     if existing:
-        return existing[0]
-    created_at = utc_now()
-    initial = {
+        prior = dict(existing[0])
+        if str(prior.get("status") or "") in {
+            "completed",
+            "failed",
+            "blocked",
+            "cancelled",
+        }:
+            return prior
+        # A process restart can leave a durable run in ``running`` after the
+        # local text or cloud metadata already committed.  Resume the same
+        # deterministic run and the same subordinate idempotency keys rather
+        # than returning a permanently stuck record or creating a new run.
+        url = str(prior.get("sourceUrl") or url).strip()
+        initial = {
+            **prior,
+            "status": "running",
+            "state": "processing",
+            "stage": "fetching",
+            "retryable": True,
+            "pollingEnabled": False,
+            "updatedAt": utc_now(),
+        }
+    else:
+        created_at = utc_now()
+        initial = {
         "runId": run_id,
         "clientId": project_id,
         "sourcePlatform": "",
@@ -2680,7 +2723,7 @@ def start_link_import_run(
         "pollingEnabled": False,
         "createdAt": created_at,
         "updatedAt": created_at,
-    }
+        }
     _local_call(lambda: store.save_link_import_run(project_id, initial))
     if bool(request.body.get("useBrowserCookies")):
         return _local_call(
@@ -3512,26 +3555,52 @@ def update_document_content(
             idempotency_key=request.idempotency_key,
         )
     )
-    try:
+    cloud_path = (
+        f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
+        f"/documents/{_segment(document_id)}/local-metadata"
+    )
+
+    def cloud_payload() -> dict[str, Any]:
         preview = compatibility.runtime.cloud_query(
             f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
             f"/documents/{_segment(document_id)}/reading-preview"
         )
-        cloud = compatibility.runtime.cloud_command(
-            "PATCH",
-            f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
-            f"/documents/{_segment(document_id)}/local-metadata",
-            payload={
+        return {
                 "expectedVersion": int(preview.get("aggregateVersion") or 1),
                 "title": local["title"],
                 "fileName": local["fileName"],
                 "contentHash": local["contentHash"],
                 "byteSize": local["byteSize"],
                 "mediaType": local["mediaType"],
-            },
+        }
+
+    try:
+        cloud = replayable_cloud_mutation(
+            compatibility.runtime,
             idempotency_key=request.idempotency_key,
+            command_type="project_materials.document_metadata_update",
+            aggregate_type="knowledge_document",
+            aggregate_id=document_id,
+            method="PATCH",
+            path=cloud_path,
+            request_payload={
+                "documentId": document_id,
+                "title": str(request.body.get("title") or ""),
+                "content": str(request.body.get("content") or ""),
+            },
+            cloud_payload_factory=cloud_payload,
         )
     except LocalRuntimeError as exc:
+        duplicate = exc.code in {
+            "duplicate_source_asset",
+            "duplicate_document_content",
+            "source_asset_content_duplicate",
+        }
+        version_conflict = exc.status_code == 409 and exc.code in {
+            "version_conflict",
+            "cas_conflict",
+            "aggregate_version_conflict",
+        }
         return {
             **local,
             "localState": "ready",

@@ -8,6 +8,7 @@ import type {
   KnowledgeSearchResult,
   LinkMaterialCookieBrowser,
   LinkMaterialImportRun,
+  PublicAnalysisPlan,
 } from '../../shared/types';
 
 export type WorkspaceDisplayChatMessage = ChatMessage & {
@@ -24,6 +25,13 @@ export type WorkspaceDisplayChatMessage = ChatMessage & {
 export type WorkspacePendingQuestionState = {
   question: string;
   startedAt: string;
+  deepThinking?: boolean;
+  creativityMode?: 'creative' | 'balanced' | 'strict';
+  publicAnalysisPlan?: PublicAnalysisPlan | null;
+  stage?: 'preparing' | 'reasoning' | 'answering';
+  reasoningText?: string;
+  answerText?: string;
+  reasoningElapsedMs?: number;
 };
 
 export type WorkspaceRightPanelEvidenceSnapshot = {

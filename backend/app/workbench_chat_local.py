@@ -6,6 +6,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -3583,10 +3584,12 @@ class LocalWorkbenchChatRepository:
         agent_skills: list[Mapping[str, Any]] | None = None,
         image_context_items: list[Mapping[str, Any]] | None = None,
         deep_thinking: bool = False,
+        stream_event_callback: Any | None = None,
         memory_policy: str = "member_private",
         source_manifest_extra: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        run_started_at = time.monotonic()
         if not project_id:
             raise LocalRuntimeError(422, "project_required", "工作台问答必须选择项目")
         normalized_question = str(question or "").strip()
@@ -3851,12 +3854,27 @@ class LocalWorkbenchChatRepository:
                 raise LocalRuntimeError(404, "project_missing", "当前工作空间没有该项目")
             project_name = str(row["name"] or "")
             context_lines = [f"当前项目：{project_name}。"]
+            # The complete evidence inventory remains in the source manifest.
+            # Deep mode only sends compact, ranked excerpts to the provider so
+            # prompt prefill does not consume most of the interactive wait.
+            private_item_limit = 6_000
+            organization_item_limit = 2_000
+            memory_item_limit = 4_000
+            history_count_limit = 8
+            history_item_limit = 12_000
+            if deep_thinking:
+                private_count = max(1, min(len(private_items), 8))
+                private_item_limit = max(2_500, 24_000 // private_count)
+                organization_item_limit = 800
+                memory_item_limit = 900
+                history_count_limit = 4
+                history_item_limit = 3_000
             if private_items:
                 context_lines.append(
                     "用户本轮明确选择的本机资料正文：\n"
                     + "\n\n".join(
                         f"【{str(item.get('title') or '本机资料')}】\n"
-                        f"{str(item.get('content') or '')[:40_000]}"
+                        f"{str(item.get('content') or '')[:private_item_limit]}"
                         for item in private_items[:8]
                         if str(item.get("content") or "").strip()
                     )
@@ -3865,7 +3883,7 @@ class LocalWorkbenchChatRepository:
                 organization_lines: list[str] = []
                 for item in organization_items:
                     description = str(item.get("sourceDescription") or "组织知识")
-                    summary = str(item.get("summary") or "")[:2_000]
+                    summary = str(item.get("summary") or "")[:organization_item_limit]
                     superseded = (
                         ""
                         if memory_policy == "organization_publishable"
@@ -3888,7 +3906,7 @@ class LocalWorkbenchChatRepository:
                 memory_lines: list[str] = []
                 for item in local_memory_items:
                     title = str(item.get("title") or "已存记忆")
-                    summary = str(item.get("summary") or "")[:4_000]
+                    summary = str(item.get("summary") or "")[:memory_item_limit]
                     superseded = str(item.get("supersededText") or "").strip()
                     if (
                         str(item.get("memoryKind") or "") == "correction"
@@ -3920,21 +3938,47 @@ class LocalWorkbenchChatRepository:
                         for item in agent_skills
                     )
                 )
+            mode_contract = {
+                "strict": (
+                    "本轮采用“资料优先”模式。优先回答资料能够直接支持的事实；"
+                    "把资料事实、基于资料的推断、尚待核实的建议明确分开。"
+                    "资料不足时直接说明不能确认，不得用常识或旧回答补成项目事实；"
+                    "仍可给出建议，但必须显式标注为建议或待核实。"
+                ),
+                "balanced": (
+                    "本轮采用“兼顾资料”模式。先以项目资料确定事实底色，再做合理分析和表达；"
+                    "明确区分已知事实与分析推断，不把推断写成已经发生的项目事实。"
+                ),
+                "creative": (
+                    "本轮采用“创意优先”模式。项目资料仍是事实边界和约束，不得忽略或篡改；"
+                    "可以跨领域联想、提出多种创意方向，并把已知事实、创意假设、建议和待核实项分开。"
+                ),
+            }[mode]
             system_prompt = (
                 "你是益语智库项目工作台 Agent。只把明确提供的本机资料正文、"
                 "组织已发布知识和当前对话当作项目事实；不得补造人物身份、机构关系或数据。"
+                "历史助手回答只用于理解对话指代，不能作为事实证据；用户明确补充的事实仍需与本轮资料边界区分。"
                 "材料没有覆盖时要明确说明缺口。回答直接、准确、可执行。\n"
+                "使用规范 Markdown 输出：标题必须使用 # 到 ###### 的显式标题标记；"
+                "普通正文和有序列表项不得冒充标题；有序列表保持连续编号，子项用缩进后的项目符号；"
+                "表格使用标准 GFM 表格；不要用 Markdown 代码围栏包住整篇回答。\n"
+                + mode_contract
+                + "\n"
                 + "\n".join(context_lines)
             )
             if deep_thinking:
-                system_prompt += "\n先在内部核对事实边界、冲突和缺口，再输出结论；不要输出隐藏思维过程。"
+                system_prompt += (
+                    "\n本轮已开启供应商原生深度思考。请对本题进行必要而不冗长的严谨推理，"
+                    "结合实际资料理解用户意图并形成判断；判断形成后立即输出正式答案，"
+                    "不要为了展示思考而穷举步骤、重复材料或延长推理。"
+                )
             messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
             messages.extend(
                 {
                     "role": "assistant" if str(item.get("role") or "") == "assistant" else "user",
-                    "content": str(item.get("content") or "")[:12_000],
+                    "content": str(item.get("content") or "")[:history_item_limit],
                 }
-                for item in (history_messages or [])[-8:]
+                for item in (history_messages or [])[-history_count_limit:]
                 if str(item.get("content") or "").strip()
             )
             image_items = [dict(item) for item in image_context_items or []]
@@ -3950,22 +3994,70 @@ class LocalWorkbenchChatRepository:
                 messages.append({"role": "user", "content": user_content})
             else:
                 messages.append({"role": "user", "content": normalized_question})
-            completion = self.runtime.organization_ai_completion(
-                messages=messages,
-                temperature=self._temperature(mode),
-            )
+            if callable(stream_event_callback):
+                completion = self.runtime.organization_ai_stream_completion(
+                    messages=messages,
+                    temperature=self._temperature(mode),
+                    on_event=stream_event_callback,
+                    read_timeout_seconds=60.0,
+                    # Reasoning and the answer share this provider budget.
+                    # 4K leaves room for a useful answer without encouraging
+                    # the model to spend minutes on an exhaustive trace.
+                    max_output_tokens=4_096 if deep_thinking else 2_048,
+                    thinking_enabled=deep_thinking,
+                )
+            else:
+                completion = self.runtime.organization_ai_completion(
+                    messages=messages,
+                    temperature=self._temperature(mode),
+                    read_timeout_seconds=60.0 if deep_thinking else 45.0,
+                    max_output_tokens=4_096 if deep_thinking else 2_048,
+                    thinking_enabled=deep_thinking,
+                )
             answer_markdown = str(completion.get("content") or "").strip()
             provider = dict(completion.get("provider") or {})
             provider_id = str(provider.get("configId") or "")
             model_name = str(provider.get("modelName") or "")
             bot_id = builtin_agent_id(context.organization_id, "project_workspace")
             self._project_agent_and_provider(provider=provider, bot_id=bot_id)
+            public_analysis_plan = source_manifest_extra.get("publicAnalysisPlan")
+            if deep_thinking:
+                # Never manufacture a generic three-step trace for deep mode.
+                # The UI must show only reasoning text actually returned by
+                # the provider in this same completion request.
+                analysis_trace = []
+            else:
+                analysis_trace = [
+                    "理解问题",
+                    "检索相关资料",
+                    "生成并核对回答",
+                ]
             source_manifest = {
                 **source_manifest_extra,
                 "operationKey": operation_key,
                 "threadId": thread_id,
                 "mode": mode,
                 "deepThinkingRequested": deep_thinking,
+                "analysisTrace": analysis_trace,
+                "publicAnalysisPlan": (
+                    dict(public_analysis_plan)
+                    if isinstance(public_analysis_plan, Mapping)
+                    else None
+                ),
+                "providerReasoningContent": (
+                    str(completion.get("reasoningContent") or "").strip()
+                    if deep_thinking
+                    else ""
+                ),
+                "providerFinishReason": str(completion.get("finishReason") or ""),
+                "providerUsage": dict(completion.get("usage") or {}),
+                "multipassUsed": bool(
+                    deep_thinking
+                    and int(source_manifest_extra.get("retrievalPassCount") or 1) > 1
+                ),
+                "retrievalPassCount": int(
+                    source_manifest_extra.get("retrievalPassCount") or 1
+                ),
                 "memoryPolicy": memory_policy,
                 "selectedDocuments": source_manifest_extra.get("selectedDocuments") or [],
                 "retrievedDocuments": source_manifest_extra.get("retrievedDocuments") or [],
@@ -4029,6 +4121,10 @@ class LocalWorkbenchChatRepository:
                 "agentKind": "project_workspace",
                 "providerResourceId": provider_id,
                 "modelName": model_name,
+                "timing": {
+                    **dict(completion.get("timing") or {}),
+                    "totalMs": max(1, int((time.monotonic() - run_started_at) * 1000)),
+                },
             }
             created_at = utc_now()
             local_answer = self._persist_pending(

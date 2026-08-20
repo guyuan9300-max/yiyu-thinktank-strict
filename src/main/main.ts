@@ -55,6 +55,10 @@ let backendProcess: ChildProcess | null = null;
 let backendPort = 0;
 let desktopToken = '';
 
+// Keep Chromium/native controls deterministic across colleagues' macOS region
+// settings. Business timestamps remain ISO values; this only fixes the UI
+// locale so a 12-hour system preference cannot silently turn 12:00 into 0:00.
+app.commandLine.appendSwitch('lang', 'zh-CN');
 app.setName(APP_NAME);
 const explicitDataDir = process.env.YIYU_STRICT_DESKTOP_DATA_DIR?.trim();
 app.setPath(

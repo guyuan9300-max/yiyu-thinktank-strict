@@ -15,6 +15,7 @@ from urllib.parse import unquote
 from ..local_asr.engine import transcribe_recording as run_recording_transcription
 from ..local_asr.models import SENSE_VOICE_MODEL, model_ready
 from ..runtime import LocalRuntimeError
+from ..ui_idempotency import replayable_cloud_mutation
 from .gc04_tasks import _task_ui as _strict_task_ui
 from .routing import UiDomainRouter, UiRequest
 
@@ -601,19 +602,25 @@ def _apply_task_relationships(
                 "taskListIds": list_ids,
                 "taskTagIds": body.get("tagIds") or [],
             },
-            idempotency_key=request.idempotency_key,
+            idempotency_key=f"{request.idempotency_key}:classification",
         )
         current = dict(result.get("task") or current)
     event_line_id = _text(body.get("eventLineId"))
     if event_line_id and event_line_id != _text(current.get("eventLineId")):
-        compatibility.runtime.cloud_command(
-            "POST",
-            f"/api/v2/workflow/event-lines/{event_line_id}/tasks/{task_id}",
-            payload={
+        event_path = f"/api/v2/workflow/event-lines/{event_line_id}/tasks/{task_id}"
+        replayable_cloud_mutation(
+            compatibility.runtime,
+            idempotency_key=request.idempotency_key,
+            command_type="workflow.task_event_line_attach",
+            aggregate_type="event_line",
+            aggregate_id=event_line_id,
+            method="POST",
+            path=event_path,
+            request_payload={"taskId": task_id, "eventLineId": event_line_id},
+            cloud_payload_factory=lambda: {
                 "expectedVersion": _event_version(compatibility, event_line_id),
                 "allowReassign": True,
             },
-            idempotency_key=request.idempotency_key,
         )
         current["eventLineId"] = event_line_id
     return current

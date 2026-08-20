@@ -15,7 +15,7 @@ function formatChatTime(value: string) {
   if (!value) return '';
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return '';
-  return parsed.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  return parsed.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 }
 
 export function TopicIntelChatPanel({ messages, draft, loading, onDraftChange, onSend }: TopicIntelChatPanelProps) {

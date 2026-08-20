@@ -66,7 +66,7 @@ export function SmartFileImportModal({
         } else {
           state = await createSmartImportSession({
             clientId, projectEventLineId,
-            title: `智能文件导入 · ${new Date().toLocaleString('zh-CN')}`,
+            title: `智能文件导入 · ${new Date().toLocaleString('zh-CN', { hourCycle: 'h23' })}`,
           });
         }
         if (state.chunks.length === 0) {

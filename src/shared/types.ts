@@ -2694,6 +2694,24 @@ export interface ChatMessage {
   creativityMode?: CreativityMode | null;
 }
 
+/**
+ * A question-specific analysis outline deliberately written for the user.
+ * It is an auditable product artifact, not the provider's hidden reasoning
+ * tokens or an internal chain-of-thought transcript.
+ */
+export interface PublicAnalysisPlan {
+  narrative: string;
+  intent: string;
+  directions: string[];
+  plannedSources: string[];
+  cautions: string[];
+}
+
+export interface PublicAnalysisPlanResponse {
+  plan: PublicAnalysisPlan;
+  elapsedMs: number;
+}
+
 export type CreativityMode = 'creative' | 'balanced' | 'strict';
 
 export interface WritingSkill {
@@ -2964,6 +2982,7 @@ export interface Task {
   collaborators: TaskCollaborator[];
   collaborationSummary: Record<string, number>;
   viewerInboxStatus?: CollaboratorInboxStatus | null;
+  viewerCollaborationRole?: 'owner' | 'collaborator' | null;
   orgContext?: TaskOrgContext | null;
   projectContext?: TaskProjectContext | null;
   memoryHints?: string[];
@@ -3769,6 +3788,7 @@ export interface TaskCollaborator {
   email: string;
   orderIndex: number;
   isOwner: boolean;
+  assignmentState?: 'assigned' | 'awaiting_owner' | 'returned' | string;
   inboxStatus: CollaboratorInboxStatus;
   returnReason?: string | null;
   handledAt?: string | null;

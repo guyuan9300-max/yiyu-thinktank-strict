@@ -542,12 +542,20 @@ def _retained_review_sources(
     task_result = compatibility.runtime.cloud_query("/api/v2/domain/tasks")
     cycle_rows = [item for item in cycles or [] if isinstance(item, Mapping)]
     review_rows = [item for item in reviews or [] if isinstance(item, Mapping)]
+    task_payload = dict(task_result) if isinstance(task_result, Mapping) else {}
     _planning_projector(compatibility).apply_planning_cycles(cycle_rows)
     _planning_projector(compatibility).apply_weekly_reviews(review_rows)
-    projection = task_result.get("projection") if isinstance(task_result, Mapping) else None
+    projection = task_payload.get("projection")
     if isinstance(projection, Mapping):
-        _task_projector(compatibility).apply(projection, replace_snapshot=True)
-    return cycle_rows, review_rows, dict(task_result)
+        # Weekly review consumes the authoritative cloud rows below.  The local
+        # task tables are a disposable cache, so an FK dependency that has not
+        # reached a member's cold sandbox must be observable and retryable, but
+        # must never turn valid cloud data into an unavailable dashboard.
+        task_payload["localProjection"] = _task_projector(compatibility).apply(
+            projection,
+            replace_snapshot=True,
+        )
+    return cycle_rows, review_rows, task_payload
 
 
 def _retained_dashboard(
@@ -627,6 +635,9 @@ def _retained_dashboard(
         ).strip() or None
         if active == "department" and is_department_lead
         else None
+    )
+    dashboard["localProjectionState"] = dict(
+        task_result.get("localProjection") or {"state": "not_requested"}
     )
     generation = dict(dashboard.get("weeklyOverviewGenerationStatus") or {})
     generation["perspective"] = active
