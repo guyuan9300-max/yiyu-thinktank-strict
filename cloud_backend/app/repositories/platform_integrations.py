@@ -81,7 +81,7 @@ class _FeishuExecutionError(Exception):
 PLATFORM_TOOLS: tuple[dict[str, Any], ...] = (
     {
         "tool_name": "feishu",
-        "description": "飞书日历、文档与资料导入",
+        "description": "飞书机器人通知、任务单向投影与文档一次性导入",
         "risk_level": "high",
         "approval_required": True,
         "status": "available_when_configured",
@@ -2028,7 +2028,10 @@ class PlatformIntegrationsRepository:
         result = self._json_text(row["result_json"])
         return result or None
 
-    def feishu_integration(self, identity: SessionIdentity) -> dict[str, Any]:
+    def _feishu_integration_readiness(
+        self,
+        identity: SessionIdentity,
+    ) -> dict[str, Any]:
         configuration = self._feishu_configuration(identity)
         app_id = str(configuration.get("appId") or "")
         has_credentials = bool(configuration.get("hasCredentials"))
@@ -2066,10 +2069,37 @@ class PlatformIntegrationsRepository:
         )
         if ready:
             validation_message = "飞书应用凭据验证成功"
+        return {
+            "configuration": configuration,
+            "appId": app_id,
+            "hasCredentials": has_credentials,
+            "lastValidationStatus": validation_state or "idle",
+            "lastValidationMessage": validation_message,
+            "authorizationReady": ready,
+            "authorizationBlockedReason": blocked_reason,
+            "state": state,
+            "retryable": not ready,
+        }
+
+    def feishu_integration(self, identity: SessionIdentity) -> dict[str, Any]:
+        readiness = self._feishu_integration_readiness(identity)
+        configuration = readiness["configuration"]
+        app_id = str(readiness["appId"])
+        has_credentials = bool(readiness["hasCredentials"])
+        validation_state = str(readiness["lastValidationStatus"])
+        validation_message = str(readiness["lastValidationMessage"])
+        ready = bool(readiness["authorizationReady"])
+        state = str(readiness["state"])
+        blocked_reason = readiness["authorizationBlockedReason"]
         effective_callback_url = self._feishu_oauth_relay_callback_url()
+        with self._connection() as connection:
+            organization = connection.execute(
+                "SELECT name FROM organizations WHERE id=? AND lifecycle_state!='deleted'",
+                (identity.organization_id,),
+            ).fetchone()
         return {
             "organizationId": identity.organization_id,
-            "organizationName": "",
+            "organizationName": str(organization["name"] if organization else ""),
             "appId": app_id,
             "callbackMode": str(
                 configuration.get("callbackMode") or "cloud_relay"
@@ -2095,6 +2125,9 @@ class PlatformIntegrationsRepository:
             "state": state,
             "retryable": not ready,
             "recentAudits": [],
+            "botName": str(configuration.get("botName") or "飞书机器人"),
+            "tenantName": str(configuration.get("tenantName") or ""),
+            "sharedBotLabel": str(configuration.get("sharedBotLabel") or ""),
         }
 
     def save_feishu(
@@ -2103,30 +2136,21 @@ class PlatformIntegrationsRepository:
         payload: Mapping[str, Any],
         idempotency_key: str,
     ) -> dict[str, Any]:
+        if not identity.is_admin:
+            raise RepositoryError(403, "admin_required", "只有组织管理员可以配置飞书机器人")
         app_id = str(payload.get("appId") or "").strip()
         if not app_id:
             raise RepositoryError(422, "feishu_app_id_required", "请填写飞书 App ID")
         app_secret = str(payload.get("appSecret") or "")
         effective = self._feishu_configuration(identity)
-        scope_kind = str(
-            payload.get("scopeKind")
-            or payload.get("scope_kind")
-            or effective.get("defaultWriteScope")
-            or "personal"
-        )
-        if scope_kind not in {"organization", "personal"}:
-            raise RepositoryError(
-                422,
-                "configuration_scope_invalid",
-                "飞书配置作用域必须是 organization 或 personal",
-            )
+        scope_kind = "organization"
         current = self._feishu_configuration_for_scope(
             identity,
             scope_kind=scope_kind,
         )
         current_app_id = str(current.get("appId") or "")
-        callback_mode = str(payload.get("callbackMode") or "cloud_relay")
-        custom_callback_url = str(payload.get("customCallbackUrl") or "")
+        callback_mode = "external_shared_bot"
+        custom_callback_url = ""
         if not app_secret and (
             not current.get("hasCredentials") or current_app_id != app_id
         ):
@@ -3663,7 +3687,10 @@ class PlatformIntegrationsRepository:
                 ),
             }
         try:
-            access_token = self._feishu_member_access_token(identity)
+            access_token = self._feishu_tenant_access_token(
+                identity,
+                self._feishu_configuration(identity),
+            )
             items: list[dict[str, Any]] = []
             failed_items: list[dict[str, Any]] = []
             if action == "search":
@@ -4649,7 +4676,10 @@ class PlatformIntegrationsRepository:
         self,
         identity: SessionIdentity,
     ) -> dict[str, Any]:
-        integration = self.feishu_integration(identity)
+        # Personal delivery state must read only the organization's base
+        # readiness.  The full integration view includes member coverage and
+        # therefore calls back into this method for each member.
+        integration = self._feishu_integration_readiness(identity)
         configuration = self._feishu_member_configuration(identity)
         authorization_state = str(
             configuration.get("authorizationState") or "not_connected"
@@ -5622,6 +5652,219 @@ class PlatformIntegrationsRepository:
             result=succeeded,
         )
 
+    def _identity_for_membership(
+        self,
+        identity: SessionIdentity,
+        membership_id: str,
+    ) -> SessionIdentity | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT m.id AS membership_id,m.principal_id,m.role_key,
+                       m.visibility_scope,p.display_name
+                FROM organization_memberships AS m
+                JOIN principals AS p ON p.id=m.principal_id
+                WHERE m.id=? AND m.scope_id=? AND m.status='active'
+                  AND m.lifecycle_state='active' AND p.status='active'
+                LIMIT 1
+                """,
+                (membership_id, identity.scope_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return SessionIdentity(
+            session_id=identity.session_id,
+            principal_id=str(row["principal_id"]),
+            membership_id=str(row["membership_id"]),
+            organization_id=identity.organization_id,
+            cloud_instance_id=identity.cloud_instance_id,
+            scope_id=identity.scope_id,
+            system_role=str(row["role_key"]),
+            visibility_scope=str(row["visibility_scope"]),
+            display_name=str(row["display_name"]),
+        )
+
+    def deliver_task_notifications(
+        self,
+        identity: SessionIdentity,
+        *,
+        result: Mapping[str, Any],
+        event: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Deliver task notifications after the task authority commits.
+
+        Provider failures are deliberately converted into delivery terminal
+        states and never propagate back into the task transaction.
+        """
+
+        task = result.get("task")
+        if not isinstance(task, Mapping):
+            return {
+                "state": "not_requested",
+                "requestedRecipients": 0,
+                "deliveryCount": 0,
+                "partialSuccess": False,
+                "message": "本次没有可通知任务",
+            }
+        task_id = str(task.get("id") or "")
+        task_version = int(task.get("version") or 1)
+        title = str(task.get("title") or "未命名任务")
+        creator_id = str(task.get("creator_membership_id") or "")
+        collaborators = task.get("collaborators")
+        recipients: set[str] = set()
+        if event == "returned":
+            if creator_id:
+                recipients.add(creator_id)
+        elif isinstance(collaborators, list):
+            for item in collaborators:
+                if not isinstance(item, Mapping):
+                    continue
+                role_key = str(item.get("role_key") or "")
+                assignment_state = str(item.get("assignment_state") or "")
+                # A newly invited owner must receive the invitation before accepting.
+                # Ordinary collaborators remain hidden until the owner has accepted.
+                if role_key == "owner":
+                    if assignment_state not in {"assigned", "awaiting_owner"}:
+                        continue
+                elif assignment_state != "assigned":
+                    continue
+                membership_id = str(item.get("subject_membership_id") or "")
+                if membership_id:
+                    recipients.add(membership_id)
+        action_label = {
+            "created": "新任务",
+            "updated": "任务已更新",
+            "accepted": "任务已接受",
+            "returned": "任务已退回",
+            "transferred": "任务负责人已变更",
+        }.get(event, "任务有新变化")
+        due_at = str(
+            task.get("scheduled_start_at")
+            or task.get("due_date")
+            or ""
+        )
+        message_text = f"【{action_label}】{title}"
+        if due_at:
+            message_text += f"\n时间：{due_at}"
+        message_text += f"\n来自：{identity.display_name}"
+        deliveries: list[dict[str, Any]] = []
+        now = utc_now()
+        for membership_id in sorted(recipients):
+            target = self._identity_for_membership(identity, membership_id)
+            if target is None:
+                deliveries.append(
+                    {"membershipId": membership_id, "status": "blocked", "message": "成员已不可用"}
+                )
+                continue
+            try:
+                profile = self.personal_feishu_delivery_profile(target)
+                if not profile.get("readyForNotifications"):
+                    profile = self.save_personal_feishu_delivery_profile(
+                        target,
+                        mobile="",
+                        idempotency_key=f"{idempotency_key}:resolve:{membership_id}",
+                    )
+                sent = self.send_personal_feishu_text(
+                    target,
+                    text=message_text,
+                    local_type="task",
+                    local_id=task_id,
+                    idempotency_key=(
+                        f"{idempotency_key}:feishu:{event}:{task_version}:{membership_id}"
+                    ),
+                )
+                status = "sent" if sent.get("state") == "succeeded" else (
+                    "failed_retryable" if sent.get("retryable") else "blocked"
+                )
+                delivery = {
+                    "membershipId": membership_id,
+                    "displayName": target.display_name,
+                    "status": status,
+                    "message": str(sent.get("message") or ""),
+                    "remoteId": sent.get("remoteId"),
+                }
+            except Exception as exc:  # provider errors never roll back task facts
+                delivery = {
+                    "membershipId": membership_id,
+                    "displayName": target.display_name,
+                    "status": "failed_retryable",
+                    "message": str(exc) or "飞书通知发送失败，可重试",
+                    "remoteId": None,
+                }
+            deliveries.append(delivery)
+            delivery_id = "notify_" + sha256_text(
+                f"{identity.scope_id}\x1f{task_id}\x1f{event}\x1f{task_version}\x1f{membership_id}\x1ffeishu"
+            )[:30]
+            receipt = canonical_json(
+                {
+                    "event": event,
+                    "taskVersion": task_version,
+                    "providerReceiptHash": (
+                        sha256_text(str(delivery.get("remoteId")))
+                        if delivery.get("remoteId")
+                        else None
+                    ),
+                    "message": delivery.get("message"),
+                }
+            )
+            with self._connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO notification_deliveries (
+                        id,scope_id,external_side_effect_id,channel,remote_receipt,
+                        status,recipient_ref_hash,sent_at,delivered_at,next_retry_at,
+                        version,lifecycle_state,created_at,updated_at,deleted_at
+                    ) VALUES (?,?,NULL,'feishu',?,?,?,?,?,?,1,'active',?,?,NULL)
+                    ON CONFLICT(id) DO UPDATE SET
+                        remote_receipt=excluded.remote_receipt,
+                        status=excluded.status,
+                        sent_at=excluded.sent_at,
+                        delivered_at=excluded.delivered_at,
+                        next_retry_at=excluded.next_retry_at,
+                        version=notification_deliveries.version+1,
+                        lifecycle_state='active',updated_at=excluded.updated_at,
+                        deleted_at=NULL
+                    """,
+                    (
+                        delivery_id,
+                        identity.scope_id,
+                        receipt,
+                        delivery["status"],
+                        sha256_text(f"{identity.scope_id}\x1f{membership_id}"),
+                        now if delivery["status"] == "sent" else None,
+                        now if delivery["status"] == "sent" else None,
+                        now if delivery["status"] == "failed_retryable" else None,
+                        now,
+                        now,
+                    ),
+                )
+                connection.commit()
+        sent_count = sum(item["status"] == "sent" for item in deliveries)
+        failed_count = sum(item["status"] == "failed_retryable" for item in deliveries)
+        if not deliveries:
+            state = "not_requested"
+        elif sent_count == len(deliveries):
+            state = "completed"
+        elif sent_count:
+            state = "partial"
+        elif failed_count:
+            state = "failed_retryable"
+        else:
+            state = "blocked"
+        return {
+            "state": state,
+            "requestedRecipients": len(deliveries),
+            "deliveryCount": sent_count,
+            "partialSuccess": bool(sent_count and sent_count < len(deliveries)),
+            "message": (
+                "飞书通知已发送"
+                if state == "completed"
+                else "任务已生效；部分或全部成员的飞书通知尚未送达"
+            ),
+            "deliveries": deliveries,
+        }
+
     def query(
         self,
         identity: SessionIdentity,
@@ -5685,10 +5928,7 @@ class PlatformIntegrationsRepository:
             )
         if path == "feishu-doc-import/status":
             integration = self.feishu_integration(identity)
-            member = self.personal_feishu_authorization(identity)
-            ready = bool(
-                integration["state"] == "ready" and member.get("linked")
-            )
+            ready = bool(integration["state"] == "ready")
             if integration["state"] != "ready":
                 reason = integration["lastValidationMessage"]
                 blocker_type = (
@@ -5697,28 +5937,22 @@ class PlatformIntegrationsRepository:
                     else "provider_validation_failed"
                 )
                 state = integration["state"]
-            elif not member.get("linked"):
-                reason = (
-                    member.get("lastError")
-                    or "当前成员飞书 OAuth 回调与加密用户令牌权威尚未接通"
-                )
-                blocker_type = "member_authorization_required"
-                state = "blocked"
             else:
                 reason = None
                 blocker_type = None
                 state = "ready"
             return {
                 "ready": ready,
-                "linked": bool(member.get("linked")),
+                "linked": ready,
                 "reason": reason,
                 "organizationId": identity.organization_id,
                 "userId": identity.membership_id,
-                "boundAt": member.get("boundAt"),
+                "boundAt": integration.get("configuredAt"),
                 "state": state,
                 "retryable": not ready,
                 "pollingEnabled": False,
                 "blockerType": blocker_type,
+                "accessMode": "organization_application_one_time_copy",
             }
         if path == "support-requests":
             return {
@@ -5868,10 +6102,19 @@ class PlatformIntegrationsRepository:
                 expected="personal",
                 resource_path=path,
             )
-            raise RepositoryError(
-                409,
-                "feishu_message_strict_executor_not_connected",
-                "飞书消息执行器尚未迁入88表；未发送外部消息",
+            profile = self.personal_feishu_delivery_profile(identity)
+            if not profile.get("readyForNotifications"):
+                profile = self.save_personal_feishu_delivery_profile(
+                    identity,
+                    mobile="",
+                    idempotency_key=f"{command_key}:resolve-recipient",
+                )
+            return self.send_personal_feishu_text(
+                identity,
+                text=str(payload.get("text") or ""),
+                local_type=str(payload.get("localType") or "notification"),
+                local_id=str(payload.get("localId") or new_id()),
+                idempotency_key=command_key,
             )
         if path in {
             "feishu-doc-import/search",
@@ -5907,13 +6150,10 @@ class PlatformIntegrationsRepository:
                 expected="personal",
                 resource_path=path,
             )
-            return self.request_feishu_sync(
-                identity,
-                local_type=str(payload.get("localType") or "document"),
-                local_id=str(payload.get("localId") or ""),
-                remote_type="docx_document",
-                payload=payload,
-                idempotency_key=command_key,
+            raise RepositoryError(
+                410,
+                "feishu_document_reverse_projection_retired",
+                "本地文件不再创建或持续同步飞书云文档；请使用一次性飞书文档导入",
             )
         self._require_scope(
             authorization_scope,
@@ -5924,13 +6164,10 @@ class PlatformIntegrationsRepository:
             return self.save_feishu(identity, payload, command_key)
         sync_task = re.fullmatch(r"feishu-sync/calendar/tasks/([^/]+)", path)
         if sync_task:
-            return self.request_feishu_sync(
-                identity,
-                local_type="task",
-                local_id=sync_task.group(1),
-                remote_type="calendar_event",
-                payload=payload,
-                idempotency_key=command_key,
+            raise RepositoryError(
+                410,
+                "feishu_calendar_projection_retired",
+                "飞书日历与手机系统日历同步已取消；软件任务仍可发送飞书通知",
             )
         if path == "support-requests":
             return self.create_support_request(identity, payload, command_key)

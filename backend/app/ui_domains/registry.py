@@ -129,6 +129,10 @@ def build_default_registry() -> UiDomainRegistry:
         ),
         (
             "POST",
+            r"clients/(?P<project_id>[^/]+)/link-materials/import-runs/(?P<run_id>[^/]+)/retry",
+        ),
+        (
+            "POST",
             r"clients/(?P<project_id>[^/]+)/link-materials/import/start",
         ),
         (

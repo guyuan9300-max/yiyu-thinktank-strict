@@ -73,6 +73,40 @@ def _second_member(repository: object, identity: SessionIdentity) -> SessionIden
     )
 
 
+def _grant_read_only_project_access(
+    repository: object,
+    identity: SessionIdentity,
+    project_id: str,
+) -> None:
+    now = utc_now()
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        policy = connection.execute(
+            "SELECT id FROM policy_versions WHERE scope_id=? "
+            "AND secured_resource_id=? AND lifecycle_state='active' "
+            "ORDER BY version DESC, created_at DESC, id DESC LIMIT 1",
+            (identity.scope_id, project_id),
+        ).fetchone()
+        assert policy is not None
+        connection.execute(
+            "INSERT INTO object_grants (id,scope_id,secured_resource_id,policy_version_id,"
+            "subject_principal_id,subject_membership_id,capability_set_schema_version,"
+            "capability_set,grant_generation,status,grant_source_set_id,created_at,updated_at,"
+            "revoked_at,version,lifecycle_state,deleted_at) VALUES (?,?,?, ?,NULL,?,'1',"
+            "'{\"read\":true,\"write\":false,\"contributeKnowledge\":false}',1,"
+            "'active',NULL,?,?,NULL,1,'active',NULL)",
+            (
+                f"grant_gc04_read_only_{identity.membership_id}",
+                identity.scope_id,
+                project_id,
+                str(policy["id"]),
+                identity.membership_id,
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+
+
 def _create(
     domain: GC04TaskRepository,
     identity: SessionIdentity,
@@ -264,6 +298,69 @@ def test_project_access_does_not_leak_participant_task(
     assert [item["id"] for item in domain.board(peer)["tasks"]] == [
         shared_task["id"]
     ]
+
+
+def test_read_only_project_member_can_reference_project_from_tasks(
+    tmp_path: Path,
+) -> None:
+    repository, admin, seed_payload = _repository(tmp_path)
+    peer = _second_member(repository, admin)
+    domain = GC04TaskRepository(repository)
+    project_id = seed_payload["projectId"]
+
+    with pytest.raises(RepositoryError, match="无法访问该项目"):
+        _create(
+            domain,
+            peer,
+            "gc04-unreadable-project-reference",
+            "不可读项目不能被任务引用",
+            clientId=project_id,
+        )
+
+    unbound = _create(
+        domain,
+        peer,
+        "gc04-read-only-project-unbound",
+        "稍后关联只读项目",
+    )["task"]
+    _grant_read_only_project_access(repository, peer, project_id)
+
+    created = _create(
+        domain,
+        peer,
+        "gc04-read-only-project-create",
+        "创建时关联只读项目",
+        clientId=project_id,
+    )["task"]
+    assert created["client_id"] == project_id
+
+    updated = domain.update_task(
+        peer,
+        task_id=unbound["id"],
+        payload={"expectedVersion": 1, "clientId": project_id},
+        idempotency_key="gc04-read-only-project-update",
+    )["task"]
+    assert updated["client_id"] == project_id
+
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE id=? AND scope_id=?",
+            (updated["id"], peer.scope_id),
+        ).fetchone()
+        assert row is not None
+        domain._revalidate_normalized_patch(  # noqa: SLF001
+            connection,
+            peer,
+            row,
+            {"client_id": project_id},
+        )
+        with pytest.raises(RepositoryError, match="无权执行该项目操作"):
+            repository._require_project_access(  # noqa: SLF001
+                connection,
+                peer,
+                project_id=project_id,
+                capability="project_write",
+            )
 
 
 def test_administrator_does_not_bypass_participant_task_visibility(

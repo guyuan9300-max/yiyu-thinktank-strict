@@ -138,6 +138,20 @@ def _platform(hostname: str) -> str:
     return ""
 
 
+def _link_material_title(title: str, platform: str) -> str:
+    """Give imported public links a stable, human-readable source suffix."""
+    suffix = {"xiaohongshu": "小红书", "bilibili": "B站"}.get(platform)
+    cleaned = str(title or "").strip()
+    if not suffix:
+        return cleaned[:200]
+    # Providers often put their brand in the OpenGraph title. Normalize first
+    # so the visible filename never becomes "…- 小红书-小红书".
+    cleaned = re.sub(r"\s*[-—–]\s*(?:小红书|B站|哔哩哔哩)\s*$", "", cleaned).strip()
+    if not cleaned:
+        cleaned = "哔哩哔哩链接资料" if platform == "bilibili" else "小红书公开笔记"
+    return f"{cleaned}-{suffix}"[:200]
+
+
 def _extract_supported_url(value: str) -> str:
     normalized = value.strip()
     if _BILIBILI_ID.fullmatch(normalized):
@@ -626,7 +640,6 @@ def _download_public_media(
         "extract_flat": False,
         "format": "bestaudio/best",
         "fragment_retries": 2,
-        "max_downloads": 1,
         "max_filesize": _MAX_MEDIA_BYTES,
         "match_filter": match_filter,
         "noplaylist": True,
@@ -902,7 +915,7 @@ def _xiaohongshu_text_material(url: str) -> dict[str, Any] | None:
     return {
         "platform": "xiaohongshu",
         "sourceUrl": final_url,
-        "title": (title or "小红书公开笔记")[:200],
+        "title": _link_material_title(title or "小红书公开笔记", "xiaohongshu"),
         "text": readable[:_MAX_TEXT_CHARS],
         "metadata": {
             "extractionMode": "public_note_text",
@@ -952,15 +965,11 @@ def fetch_link_material(
                 download,
                 data_root=root,
             )
-            title = download.title or (
-                "哔哩哔哩链接资料"
-                if platform == "bilibili"
-                else "小红书链接资料"
-            )
+            title = _link_material_title(download.title, platform)
             return {
                 "platform": platform,
                 "sourceUrl": download.source_url,
-                "title": title[:200],
+                "title": title,
                 "text": readable[:_MAX_TEXT_CHARS].strip(),
                 "metadata": {
                     "extractionMode": "anonymous_public_media",

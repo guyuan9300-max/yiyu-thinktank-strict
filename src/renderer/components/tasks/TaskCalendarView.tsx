@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
+  CalendarRange,
   ChevronLeft,
   ChevronRight,
   Plus,
-  Search,
   MoveVertical,
 } from 'lucide-react';
 
@@ -88,7 +88,10 @@ const DEFAULT_UNLINKED_TASK_COLOR = '#5B7BFE';
 const LOCAL_DRAFT_NOTICE = '任务正在保存，稍后再调整时间。';
 
 // 月视图跨天连续条单车道高度(px)
-const MONTH_MULTIDAY_BAR_HEIGHT = 22;
+const MONTH_MULTIDAY_BAR_HEIGHT = 18;
+// 月视图每个日期格统一只有四个事项展示槽。跨天事项优先占槽，
+// 单天事项补足剩余槽；更多事项通过日期头部的 +N 展开查看。
+const MONTH_DAY_VISIBLE_SLOTS = 4;
 
 // 任务是否跨天(整段 range 覆盖 >1 个自然日)。跨天任务在月视图渲染成连续条而非每格 chip。
 function isMultiDayCalendarTask(task: Task): boolean {
@@ -194,6 +197,25 @@ type WeekTaskDisplayItem =
 
 function formatDateInputValue(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function formatJumpDateValue(date: Date) {
+  return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function parseJumpDateValue(value: string) {
+  const match = value.trim().match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const parsed = new Date(year, month - 1, day);
+  if (
+    parsed.getFullYear() !== year
+    || parsed.getMonth() !== month - 1
+    || parsed.getDate() !== day
+  ) return null;
+  return parsed;
 }
 
 function combineDateAndTime(date: Date, minuteOfDay: number) {
@@ -447,6 +469,20 @@ export function TaskCalendarView({
   onRoleFilterChange,
 }: TaskCalendarViewProps) {
   const [isJumpPickerOpen, setIsJumpPickerOpen] = useState(false);
+  const [jumpDateInput, setJumpDateInput] = useState(() => formatJumpDateValue(selectedDate));
+  const [jumpDateError, setJumpDateError] = useState<string | null>(null);
+  const jumpPickerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!isJumpPickerOpen) return;
+    const handleJumpPickerOutsideClick = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (jumpPickerRef.current?.contains(target)) return;
+      setIsJumpPickerOpen(false);
+    };
+    window.addEventListener('mousedown', handleJumpPickerOutsideClick);
+    return () => window.removeEventListener('mousedown', handleJumpPickerOutsideClick);
+  }, [isJumpPickerOpen]);
   const [draggingTaskId, setDraggingTaskId] = useState<string | null>(null);
   const [dragTargetDay, setDragTargetDay] = useState<number | null>(null);
   const [dragTargetMinute, setDragTargetMinute] = useState<number | null>(null);
@@ -465,15 +501,12 @@ export function TaskCalendarView({
     window.addEventListener('mousedown', handleOutsideClick);
     return () => window.removeEventListener('mousedown', handleOutsideClick);
   }, [expandedAggregateKey]);
-  const [expandedCalendarDayKeys, setExpandedCalendarDayKeys] = useRuntimeUiSessionState<string[]>(`${uiSessionScopeKey}:expanded-days`, []);
-  const expandedCalendarDays = useMemo(() => new Set(expandedCalendarDayKeys), [expandedCalendarDayKeys]);
-  const setExpandedCalendarDays = useCallback((update: Set<string> | ((previous: Set<string>) => Set<string>)) => {
-    setExpandedCalendarDayKeys((previousKeys) => {
-      const previous = new Set(previousKeys);
-      const next = typeof update === 'function' ? update(previous) : update;
-      return Array.from(next);
-    });
-  }, [setExpandedCalendarDayKeys]);
+  // 月历 +N 统一在顶部展开。一次只查看一个日期，避免日期格自身被撑高、
+  // 破坏整月网格；状态仍保留在本次运行会话内，切页面回来不会无故丢失。
+  const [expandedMonthOverflowDateKey, setExpandedMonthOverflowDateKey] = useRuntimeUiSessionState<string | null>(
+    `${uiSessionScopeKey}:month-overflow-date`,
+    null,
+  );
   const dragDropHandledRef = useRef(false);
   const [resizingTaskId, setResizingTaskId] = useState<string | null>(null);
   const [resizePreviewMinutes, setResizePreviewMinutes] = useState<number | null>(null);
@@ -527,8 +560,15 @@ export function TaskCalendarView({
   const weekCreateCleanupRef = useRef<(() => void) | null>(null);
   const weekTimelineScrollRef = useRef<HTMLDivElement | null>(null);
   const weekPagerRef = useRef<HTMLDivElement | null>(null);
+  const calendarRootRef = useRef<HTMLDivElement | null>(null);
   const calendarToolbarRef = useRef<HTMLDivElement | null>(null);
+  const monthWeekdayHeaderRef = useRef<HTMLDivElement | null>(null);
   const [calendarToolbarHeight, setCalendarToolbarHeight] = useState(0);
+  const [pendingMonthWeekAlignment, setPendingMonthWeekAlignment] = useState<{
+    dateKey: string;
+    requestId: number;
+  } | null>(null);
+  const monthWeekAlignmentRequestIdRef = useRef(0);
   const weekPagerIdleTimerRef = useRef<number | null>(null);
   const weekPagerVerticalSyncRef = useRef(false);
   const weekPagerGestureDeadlineRef = useRef(0);
@@ -717,8 +757,9 @@ export function TaskCalendarView({
     roundRight: boolean;  // 真正的结束端 → 右圆角
     continuesLeft: boolean;  // 左端是"上周接续"→ 显示左箭头
     continuesRight: boolean; // 右端是"下周接续"→ 显示右箭头
-    showTitle: boolean;   // 只在起始格显示标题
-    titleSegment: string; // 标题按跨度分段，跨得越宽就能连续显示越多内容
+    showTitle: boolean;   // 仅在任务真实起始格显示标题；跨周续段不重复时间和标题
+    spanCells: number;    // 本周内横跨的日期格数量，用完整跨度承载标题
+    fullTitle: string;
   };
   const monthMultiDayBarsByDateKey = useMemo(() => {
     const result = new Map<string, Array<MonthDayBarSlot | null>>();
@@ -727,7 +768,14 @@ export function TaskCalendarView({
       const weekStart = startOfDayValue(week.days[0].date);
       const weekEndDay = startOfDayValue(week.days[6].date);
       const seen = new Set<string>();
-      const bars: Array<{ task: Task; firstCol: number; lastCol: number; continuesLeft: boolean; continuesRight: boolean }> = [];
+      const bars: Array<{
+        task: Task;
+        firstCol: number;
+        lastCol: number;
+        continuesLeft: boolean;
+        continuesRight: boolean;
+        originalStartAt: number;
+      }> = [];
       week.days.forEach(({ dayTasks }) => {
         dayTasks.forEach((task) => {
           if (seen.has(task.id)) return;
@@ -745,11 +793,19 @@ export function TaskCalendarView({
             lastCol,
             continuesLeft: startDay.getTime() < weekStart.getTime(),
             continuesRight: lastDay.getTime() > weekEndDay.getTime(),
+            originalStartAt: range.startDateTime.getTime(),
           });
         });
       });
-      // 贪心车道分配：按起始列升序、跨度大的优先，放到第一条"上一段已结束"的车道
-      bars.sort((a, b) => a.firstCol - b.firstCol || (b.lastCol - b.firstCol) - (a.lastCol - a.firstCol));
+      // 延续到本周的任务先占上方车道，再按真实开始时间、跨度和稳定 ID 排序。
+      // 例如 22—24 日的任务在 24 日结束时，必须排在 24 日才开始的任务上方。
+      bars.sort((a, b) => (
+        Number(b.continuesLeft) - Number(a.continuesLeft)
+        || a.firstCol - b.firstCol
+        || a.originalStartAt - b.originalStartAt
+        || (b.lastCol - b.firstCol) - (a.lastCol - a.firstCol)
+        || a.task.id.localeCompare(b.task.id)
+      ));
       const laneEndCol: number[] = [];
       const placed: Array<{ bar: (typeof bars)[number]; lane: number }> = [];
       bars.forEach((bar) => {
@@ -764,18 +820,22 @@ export function TaskCalendarView({
         placed.forEach(({ bar, lane }) => {
           if (col < bar.firstCol || col > bar.lastCol) return;
           const fullTitle = `${formatMonthTaskStartTime(bar.task)} ${bar.task.title}`;
-          const segmentWidth = 14;
-          const segmentIndex = col - bar.firstCol;
           slots[lane] = {
             task: bar.task,
             roundLeft: col === bar.firstCol && !bar.continuesLeft,
             roundRight: col === bar.lastCol && !bar.continuesRight,
             continuesLeft: col === bar.firstCol && bar.continuesLeft,
             continuesRight: col === bar.lastCol && bar.continuesRight,
-            showTitle: col === bar.firstCol,
-            titleSegment: fullTitle.slice(segmentIndex * segmentWidth, (segmentIndex + 1) * segmentWidth),
+            // 跨周后的第一格只是续段：保留延续条/箭头，但不重复标题和起始时间。
+            showTitle: col === bar.firstCol && !bar.continuesLeft,
+            spanCells: bar.lastCol - bar.firstCol + 1,
+            fullTitle,
           };
         });
+        // 旧实现把整周最大 laneCount 原样塞给每天，导致没有跨天任务的日期
+        // 也渲染空车道并把单天任务整体下推。这里只移除日期末尾未被覆盖的
+        // 空车道；中间空位仍保留，用来保证真正相交的跨天条块横向连续。
+        while (slots.length > 0 && slots[slots.length - 1] === null) slots.pop();
         result.set(formatDateInputValue(dayObj.date), slots);
       });
     });
@@ -829,14 +889,63 @@ export function TaskCalendarView({
             roundRight: column === bar.lastCol && !bar.continuesRight,
             continuesLeft: column === bar.firstCol && bar.continuesLeft,
             continuesRight: column === bar.lastCol && bar.continuesRight,
-            showTitle: column === bar.firstCol,
+            // 与任务一致，跨周会议续段不重复显示时间和标题。
+            showTitle: column === bar.firstCol && !bar.continuesLeft,
           };
         });
+        while (slots.length > 0 && slots[slots.length - 1] === null) slots.pop();
         result.set(formatDateInputValue(day.date), slots);
       });
     });
     return result;
   }, [meetings, monthTimelineWeeks]);
+
+  type MonthOverflowItem =
+    | { kind: 'task'; task: Task }
+    | { kind: 'meeting'; meeting: GC06Meeting };
+  const expandedMonthOverflow = useMemo(() => {
+    if (!expandedMonthOverflowDateKey) return null;
+    const day = monthTimelineWeeks
+      .flatMap((week) => week.days)
+      .find((item) => formatDateInputValue(item.date) === expandedMonthOverflowDateKey);
+    if (!day) return null;
+
+    const cellChipTasks = day.dayTasks.filter((task) => !isMultiDayCalendarTask(task));
+    const cellBarSlots = monthMultiDayBarsByDateKey.get(expandedMonthOverflowDateKey) || [];
+    const meetingBarSlots = (monthMultiDayMeetingBarsByDateKey.get(expandedMonthOverflowDateKey) || [])
+      .filter((slot): slot is MonthMeetingBarSlot => Boolean(slot));
+    const cellSingleMeetings = (meetingsByDateKey.get(expandedMonthOverflowDateKey) || [])
+      .filter((meeting) => !isMultiDayCalendarMeeting(meeting));
+    const visibleTaskBarSlots = cellBarSlots.slice(0, MONTH_DAY_VISIBLE_SLOTS);
+    const remainingAfterTaskBars = Math.max(0, MONTH_DAY_VISIBLE_SLOTS - visibleTaskBarSlots.length);
+    const visibleMeetingBarCount = Math.min(meetingBarSlots.length, remainingAfterTaskBars);
+    const remainingSingleSlots = Math.max(0, remainingAfterTaskBars - visibleMeetingBarCount);
+    const visibleSingleMeetingCount = Math.min(cellSingleMeetings.length, remainingSingleSlots);
+    const visibleChipTaskCount = Math.max(0, remainingSingleSlots - visibleSingleMeetingCount);
+    const items: MonthOverflowItem[] = [
+      ...cellBarSlots
+        .slice(MONTH_DAY_VISIBLE_SLOTS)
+        .filter((slot): slot is MonthDayBarSlot => Boolean(slot))
+        .map((slot): MonthOverflowItem => ({ kind: 'task', task: slot.task })),
+      ...meetingBarSlots
+        .slice(visibleMeetingBarCount)
+        .map((slot): MonthOverflowItem => ({ kind: 'meeting', meeting: slot.meeting })),
+      ...cellSingleMeetings
+        .slice(visibleSingleMeetingCount)
+        .map((meeting): MonthOverflowItem => ({ kind: 'meeting', meeting })),
+      ...cellChipTasks
+        .slice(visibleChipTaskCount)
+        .map((task): MonthOverflowItem => ({ kind: 'task', task })),
+    ];
+    if (items.length === 0) return null;
+    return { date: day.date, dateKey: expandedMonthOverflowDateKey, items };
+  }, [
+    expandedMonthOverflowDateKey,
+    meetingsByDateKey,
+    monthMultiDayBarsByDateKey,
+    monthMultiDayMeetingBarsByDateKey,
+    monthTimelineWeeks,
+  ]);
 
   const weekStartDate = useMemo(() => startOfWeek(selectedDate), [selectedDate]);
   const weekPages = useMemo(() => {
@@ -1116,9 +1225,25 @@ export function TaskCalendarView({
   const handleDateJump = (value: string) => {
     const nextDate = new Date(value);
     if (Number.isNaN(nextDate.getTime())) return;
+    setExpandedMonthOverflowDateKey(null);
+    monthWeekAlignmentRequestIdRef.current += 1;
+    setPendingMonthWeekAlignment({
+      dateKey: formatDateInputValue(nextDate),
+      requestId: monthWeekAlignmentRequestIdRef.current,
+    });
     onSelectDate(nextDate);
     onAlignCalendarDate(nextDate);
     setIsJumpPickerOpen(false);
+  };
+
+  const handleJumpDateSubmit = () => {
+    const parsed = parseJumpDateValue(jumpDateInput);
+    if (!parsed) {
+      setJumpDateError('请输入有效日期，如 2026/08/21');
+      return;
+    }
+    setJumpDateError(null);
+    handleDateJump(formatDateInputValue(parsed));
   };
 
   const handleShiftPeriod = (delta: number) => {
@@ -1370,8 +1495,71 @@ export function TaskCalendarView({
   };
 
   const handleGoToToday = () => {
+    setExpandedMonthOverflowDateKey(null);
+    monthWeekAlignmentRequestIdRef.current += 1;
+    setPendingMonthWeekAlignment({
+      dateKey: formatDateInputValue(today),
+      requestId: monthWeekAlignmentRequestIdRef.current,
+    });
     onGoToToday();
   };
+
+  // “今天 / 跳到日期”不仅改变选中日期，还要把目标日期所在的整周
+  // 对齐到固定星期头正下方。普通点击日期不触发，避免日常浏览时乱跳。
+  useEffect(() => {
+    if (calendarDisplayMode !== 'month' || !pendingMonthWeekAlignment) return;
+    // +N 顶部展开区属于原日期的临时上下文；先等它真正收起再定位，
+    // 否则它的高度会把星期头和目标周一起向下推。
+    if (expandedMonthOverflow) return;
+
+    let cancelled = false;
+    const requestId = pendingMonthWeekAlignment.requestId;
+    const alignTargetWeek = () => {
+      if (cancelled || requestId !== monthWeekAlignmentRequestIdRef.current) return;
+      const root = calendarRootRef.current;
+      const weekdayHeader = monthWeekdayHeaderRef.current;
+      if (!root || !weekdayHeader) return;
+      const targetDay = root.querySelector<HTMLElement>(
+        `[data-calendar-date="${pendingMonthWeekAlignment.dateKey}"]`,
+      );
+      const targetWeek = targetDay?.closest<HTMLElement>('[data-calendar-week-row="true"]');
+      if (!targetWeek) return;
+
+      let scrollable: HTMLElement | null = root.parentElement;
+      while (scrollable && scrollable !== document.body) {
+        const style = getComputedStyle(scrollable);
+        if (/(auto|scroll)/.test(style.overflowY) && scrollable.scrollHeight > scrollable.clientHeight) break;
+        scrollable = scrollable.parentElement;
+      }
+      if (!scrollable || scrollable === document.body) return;
+
+      const viewportRect = scrollable.getBoundingClientRect();
+      const weekdayRect = weekdayHeader.getBoundingClientRect();
+      const weekRect = targetWeek.getBoundingClientRect();
+      const stickyBottom = Math.max(viewportRect.top, weekdayRect.bottom);
+      const unclampedTop = scrollable.scrollTop + (weekRect.top - stickyBottom);
+      const maxScrollTop = Math.max(0, scrollable.scrollHeight - scrollable.clientHeight);
+      const nextScrollTop = Math.max(0, Math.min(maxScrollTop, unclampedTop));
+      scrollable.scrollTo({ top: nextScrollTop, behavior: 'smooth' });
+      setPendingMonthWeekAlignment((current) => (
+        current?.requestId === requestId ? null : current
+      ));
+    };
+
+    const firstFrame = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(alignTargetWeek);
+    });
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(firstFrame);
+    };
+  }, [
+    calendarDate,
+    calendarDisplayMode,
+    expandedMonthOverflow,
+    monthTimelineWeeks,
+    pendingMonthWeekAlignment,
+  ]);
 
   const handleCreateTaskFromWeekSlot = useCallback(
     (day: Date, startMinute: number) => {
@@ -1521,7 +1709,7 @@ export function TaskCalendarView({
   const periodTitle = calendarDisplayMode === 'week' ? visibleWeekPage.title : formatMonthTitle(activeMonthDate);
 
   return (
-    <div className="grid h-full min-h-0 w-full min-w-0 grid-cols-1 items-stretch gap-6 transition-all xl:grid-cols-[minmax(0,1fr)]">
+    <div ref={calendarRootRef} className="grid h-full min-h-0 w-full min-w-0 grid-cols-1 items-stretch gap-6 transition-all xl:grid-cols-[minmax(0,1fr)]">
       <div className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-visible rounded-2xl border border-gray-100 bg-white">
         <div ref={calendarToolbarRef} className="sticky top-0 z-40 flex flex-col gap-3 rounded-t-2xl border-b border-gray-100 bg-white/95 px-5 py-5 backdrop-blur lg:px-6">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
@@ -1569,7 +1757,7 @@ export function TaskCalendarView({
                   </button>
                 ))}
               </div>
-              <div className="relative flex items-center gap-1.5">
+              <div ref={jumpPickerRef} className="relative flex items-center gap-1.5">
               <button
                 type="button"
                 className="h-9 w-9 rounded-md text-gray-500 ring-1 ring-inset ring-gray-200 hover:text-[#5B7BFE] hover:ring-[#5B7BFE]/30 transition-colors"
@@ -1592,9 +1780,17 @@ export function TaskCalendarView({
                     ? 'ring-[#5B7BFE]/40 bg-[#5B7BFE]/10 text-[#3652c9]'
                     : 'ring-gray-200 bg-white text-gray-700 hover:text-[#5B7BFE] hover:ring-[#5B7BFE]/30'
                 }`}
-                onClick={() => setIsJumpPickerOpen((prev) => !prev)}
+                onClick={() => {
+                  setIsJumpPickerOpen((prev) => {
+                    if (!prev) {
+                      setJumpDateInput(formatJumpDateValue(selectedDate));
+                      setJumpDateError(null);
+                    }
+                    return !prev;
+                  });
+                }}
               >
-                <Search size={14} className="mx-auto" />
+                <CalendarRange size={15} className="mx-auto" />
               </button>
               <button
                 type="button"
@@ -1605,25 +1801,38 @@ export function TaskCalendarView({
               </button>
 
               {isJumpPickerOpen && (
-                <div className="absolute top-11 right-0 z-20 w-[280px] rounded-[24px] border border-gray-200 bg-white p-4 shadow-[0_20px_50px_rgba(15,23,42,0.12)]">
+                <form
+                  className="absolute top-11 right-0 z-20 w-[280px] rounded-[24px] border border-gray-200 bg-white p-4 shadow-[0_20px_50px_rgba(15,23,42,0.12)]"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    handleJumpDateSubmit();
+                  }}
+                >
                   <p className="text-[12px] font-bold text-gray-500 mb-3">跳到任意日期</p>
-                  <input
-                    type="date"
-                    value={formatDateInputValue(selectedDate)}
-                    onChange={(event) => handleDateJump(event.target.value)}
-                    className="w-full bg-gray-50 border border-gray-200 rounded-2xl px-4 py-3 text-[13px] font-bold outline-none"
-                  />
+                  <div className={`flex h-11 items-center rounded-2xl border bg-gray-50 px-3 transition-colors ${jumpDateError ? 'border-rose-300' : 'border-gray-200 focus-within:border-[#5B7BFE]/50'}`}>
+                    <CalendarRange size={15} className="mr-2 shrink-0 text-gray-400" />
+                    <input
+                      autoFocus
+                      type="text"
+                      inputMode="numeric"
+                      aria-label="输入跳转日期"
+                      value={jumpDateInput}
+                      placeholder="YYYY/MM/DD"
+                      className="min-w-0 flex-1 bg-transparent text-[14px] font-semibold tabular-nums text-gray-800 outline-none placeholder:text-gray-300"
+                      onChange={(event) => {
+                        setJumpDateInput(event.target.value);
+                        setJumpDateError(null);
+                      }}
+                    />
+                  </div>
+                  {jumpDateError && <p className="mt-2 text-[11px] font-medium text-rose-600">{jumpDateError}</p>}
                   <button
-                    type="button"
+                    type="submit"
                     className="mt-3 w-full rounded-2xl bg-[#5B7BFE] text-white text-[13px] font-bold h-11 shadow-[0_6px_18px_rgba(91,123,254,0.28)]"
-                    onClick={() => {
-                      handleGoToToday();
-                      setIsJumpPickerOpen(false);
-                    }}
                   >
-                    回到今天
+                    确定
                   </button>
-                </div>
+                </form>
               )}
               </div>
             </div>
@@ -1633,9 +1842,123 @@ export function TaskCalendarView({
 
         {calendarDisplayMode === 'month' ? (
           <div className="flex min-h-0 flex-1 flex-col">
+            {expandedMonthOverflow && (
+              <div
+                className="sticky z-30 flex h-9 shrink-0 items-center gap-3 border-b border-gray-100 bg-slate-50/95 px-5 backdrop-blur lg:px-6"
+                style={{ top: `${calendarToolbarHeight}px` }}
+              >
+                <div className="shrink-0 text-[11px] font-semibold text-slate-500">
+                  {expandedMonthOverflow.date.getMonth() + 1}月{expandedMonthOverflow.date.getDate()}日
+                  <span className="ml-1 text-slate-400">其余 {expandedMonthOverflow.items.length} 项</span>
+                </div>
+                <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto py-0.5">
+                  {expandedMonthOverflow.items.map((item) => {
+                    if (item.kind === 'meeting') {
+                      return (
+                        <div
+                          key={`month-overflow-meeting-${item.meeting.id}`}
+                          role="button"
+                          tabIndex={0}
+                          draggable
+                          title={`${formatMeetingScheduleLabel(item.meeting)} ${item.meeting.title}`}
+                          onDragStart={(event) => {
+                            event.dataTransfer.effectAllowed = 'move';
+                            event.dataTransfer.setData('text/plain', `meeting:${item.meeting.id}`);
+                            dragDropHandledRef.current = false;
+                            setDraggingTaskId(`meeting:${item.meeting.id}`);
+                          }}
+                          onDragEnd={() => {
+                            setDraggingTaskId(null);
+                            setDragTargetDay(null);
+                            dragDropHandledRef.current = false;
+                          }}
+                          onClick={() => onOpenMeetingEditor?.(item.meeting)}
+                          className={`flex h-[18px] max-w-[260px] shrink-0 cursor-grab items-center gap-1 rounded-md border border-violet-200 bg-violet-50 px-2 text-[10px] font-semibold leading-none text-violet-700 active:cursor-grabbing ${draggingTaskId === `meeting:${item.meeting.id}` ? 'opacity-50' : ''}`}
+                        >
+                          <button
+                            type="button"
+                            className={`flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border ${item.meeting.status === 'completed' ? 'border-emerald-500 bg-emerald-500 text-[8px] text-white' : 'border-violet-300 bg-white text-transparent'}`}
+                            onMouseDown={(event) => event.stopPropagation()}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void onToggleMeetingStatus?.(item.meeting);
+                            }}
+                            aria-label={item.meeting.status === 'completed' ? `重开会议${item.meeting.title}` : `完成会议${item.meeting.title}`}
+                          >
+                            ✓
+                          </button>
+                          <span className="truncate">{formatMeetingScheduleLabel(item.meeting)} {item.meeting.title}</span>
+                        </div>
+                      );
+                    }
+                    const isTaskLocalDraft = isLocalDraftTaskId(item.task.id);
+                    return (
+                      <div
+                        key={`month-overflow-task-${item.task.id}`}
+                        role="button"
+                        tabIndex={0}
+                        draggable={!isTaskLocalDraft}
+                        title={`${formatTaskCardScheduleLabel(item.task)} ${item.task.title}`}
+                        onDragStart={(event) => {
+                          if (isTaskLocalDraft) {
+                            event.preventDefault();
+                            onCalendarNotice?.('info', LOCAL_DRAFT_NOTICE);
+                            return;
+                          }
+                          event.dataTransfer.effectAllowed = 'move';
+                          event.dataTransfer.setData('text/plain', item.task.id);
+                          dragDropHandledRef.current = false;
+                          setDraggingTaskId(item.task.id);
+                        }}
+                        onDragEnd={() => {
+                          setDraggingTaskId(null);
+                          setDragTargetDay(null);
+                          dragDropHandledRef.current = false;
+                        }}
+                        onClick={() => {
+                          if (isTaskLocalDraft) {
+                            onCalendarNotice?.('info', LOCAL_DRAFT_NOTICE);
+                            return;
+                          }
+                          onOpenTaskEditor(item.task);
+                        }}
+                        className={`relative flex h-[18px] max-w-[260px] shrink-0 items-center rounded-md border pl-7 pr-2 text-[10px] font-semibold leading-none ${isTaskLocalDraft ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'} ${item.task.status === 'done' ? 'line-through' : ''} ${draggingTaskId === item.task.id ? 'opacity-50' : ''}`}
+                        style={calendarChipStyle(item.task, clientColorById)}
+                      >
+                        <button
+                          type="button"
+                          className={`absolute left-1.5 top-1/2 flex h-3.5 w-3.5 -translate-y-1/2 items-center justify-center rounded-[4px] border ${item.task.status === 'done' ? 'border-[#CBD5E1] bg-[#CBD5E1] text-white' : 'border-current bg-white/85'}`}
+                          onMouseDown={(event) => event.stopPropagation()}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            if (isTaskLocalDraft) {
+                              onCalendarNotice?.('info', LOCAL_DRAFT_NOTICE);
+                              return;
+                            }
+                            void onToggleTaskStatus(item.task.id);
+                          }}
+                          aria-label={item.task.status === 'done' ? `取消完成 ${item.task.title}` : `完成 ${item.task.title}`}
+                        >
+                          {item.task.status === 'done' ? <Check size={10} strokeWidth={3} /> : null}
+                        </button>
+                        <span className="min-w-0 truncate">{formatTaskCardScheduleLabel(item.task)} {item.task.title}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <button
+                  type="button"
+                  className="shrink-0 rounded-md px-2 py-1 text-[10px] font-semibold text-slate-500 hover:bg-slate-200"
+                  onClick={() => setExpandedMonthOverflowDateKey(null)}
+                >
+                  收起
+                </button>
+              </div>
+            )}
             <div
+              ref={monthWeekdayHeaderRef}
               className="sticky z-30 grid grid-cols-7 border-b border-gray-100 bg-white/95 px-5 pt-5 pb-3 text-center text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-400 backdrop-blur lg:px-6"
-              style={{ top: `${calendarToolbarHeight}px` }}
+              style={{ top: `${calendarToolbarHeight + (expandedMonthOverflow ? 36 : 0)}px` }}
             >
               {['周一', '周二', '周三', '周四', '周五', '周六', '周日'].map((day) => (
                 <div key={day}>{day}</div>
@@ -1647,16 +1970,39 @@ export function TaskCalendarView({
               style={{ gridTemplateRows: `repeat(${monthTimelineWeeks.length}, minmax(146px, 1fr))` }}
             >
               {monthTimelineWeeks.map((week) => (
-                <div key={week.key} className="grid min-h-0 w-full grid-cols-7">
-                  {week.days.map(({ date: cellDate, dayTasks }) => {
+                <div key={week.key} data-calendar-week-row="true" data-calendar-week-start={week.key} className="grid min-h-0 w-full grid-cols-7">
+                  {week.days.map(({ date: cellDate, dayTasks }, cellColumn) => {
+                    const cellDateKey = formatDateInputValue(cellDate);
                     const isActiveSelection = isSameDay(cellDate, selectedDate);
                     const isToday = isSameDay(cellDate, today);
                     const isMonthAnchor = cellDate.getDate() === 1;
                     // 跨天任务走"连续条"车道，不再进单格 chip 列表
                     const cellChipTasks = dayTasks.filter((task) => !isMultiDayCalendarTask(task));
-                    const cellBarSlots = monthMultiDayBarsByDateKey.get(formatDateInputValue(cellDate)) || [];
-                    const meetingBarSlots = monthMultiDayMeetingBarsByDateKey.get(formatDateInputValue(cellDate)) || [];
-                    const overflowCount = Math.max(cellChipTasks.length - 4, 0);
+                    const cellBarSlots = monthMultiDayBarsByDateKey.get(cellDateKey) || [];
+                    const meetingBarSlots = monthMultiDayMeetingBarsByDateKey.get(cellDateKey) || [];
+                    const cellSingleMeetings = (meetingsByDateKey.get(cellDateKey) || [])
+                      .filter((meeting) => !isMultiDayCalendarMeeting(meeting));
+                    // 每天统一四个展示槽：跨天任务优先，旧会议投影其次，
+                    // 最后由单天会议/任务补足。空车道只在确实需要保持跨天条
+                    // 横向连续时占位，不再把整周的最大车道数强塞给每一天。
+                    const visibleTaskBarSlots = cellBarSlots.slice(0, MONTH_DAY_VISIBLE_SLOTS);
+                    const remainingAfterTaskBars = Math.max(0, MONTH_DAY_VISIBLE_SLOTS - visibleTaskBarSlots.length);
+                    const compactMeetingBarSlots = meetingBarSlots.filter((slot): slot is MonthMeetingBarSlot => Boolean(slot));
+                    const visibleMeetingBarSlots = compactMeetingBarSlots.slice(0, remainingAfterTaskBars);
+                    const remainingSingleSlots = Math.max(
+                      0,
+                      remainingAfterTaskBars - visibleMeetingBarSlots.length,
+                    );
+                    const visibleSingleMeetings = cellSingleMeetings.slice(0, remainingSingleSlots);
+                    const visibleChipTaskCount = Math.max(0, remainingSingleSlots - visibleSingleMeetings.length);
+                    const hiddenTaskBars = cellBarSlots
+                      .slice(MONTH_DAY_VISIBLE_SLOTS)
+                      .filter((slot): slot is MonthDayBarSlot => Boolean(slot));
+                    const hiddenMeetingBars = compactMeetingBarSlots.slice(visibleMeetingBarSlots.length);
+                    const overflowCount = hiddenTaskBars.length
+                      + hiddenMeetingBars.length
+                      + Math.max(0, cellSingleMeetings.length - visibleSingleMeetings.length)
+                      + Math.max(0, cellChipTasks.length - visibleChipTaskCount);
                     const chinaCalendarMarkers = getChinaCalendarMarkers(cellDate);
                     return (
                       <div
@@ -1703,18 +2049,21 @@ export function TaskCalendarView({
                             void handleTaskDrop(droppedTask, cellDate);
                           }
                         }}
-                        data-calendar-date={formatDateInputValue(cellDate)}
-                        data-day-drop={formatDateInputValue(cellDate)}
-                        className={`relative min-h-[146px] rounded-none border-r border-b border-gray-100 p-2.5 text-left align-top outline-none transition-colors focus:outline-none focus-visible:outline-none cursor-pointer hover:bg-slate-50 ${
+                        data-calendar-date={cellDateKey}
+                        data-day-drop={cellDateKey}
+                        className={`relative min-h-[146px] overflow-visible rounded-none border-r border-b border-gray-100 p-2 text-left align-top outline-none transition-colors focus:outline-none focus-visible:outline-none cursor-pointer hover:bg-slate-50 ${
                           isActiveSelection ? 'bg-blue-50/40' : 'bg-white'
                         } ${
                           dragTargetDay === cellDate.getTime() ? 'bg-blue-100 ring-2 ring-inset ring-[#5B7BFE]/40' : ''
                         }`}
+                        // 日期格只需在同一周内按从左到右建立 7→1 的轻量层级，
+                        // 供跨天标题越过后续日期格；绝不能高于 z-30 的固定表头。
+                        style={{ zIndex: 7 - cellColumn }}
                       >
                         <div className="relative z-10 flex h-full flex-col">
-                          <div className="flex items-start justify-between gap-2">
+                          <div className="flex h-8 shrink-0 items-start justify-between gap-2">
                             <div className="flex items-center gap-2">
-                              <div className={`h-7 min-w-7 rounded-full flex items-center justify-center px-1 text-[13px] font-medium ${
+                              <div className={`flex h-5 min-w-5 items-center justify-center rounded-full px-1 text-[11px] font-medium ${
                                 isToday ? 'bg-rose-500 text-white' : isActiveSelection ? 'bg-[#5B7BFE] text-white' : 'text-gray-700'
                               }`}>
                                 {cellDate.getDate()}
@@ -1725,24 +2074,42 @@ export function TaskCalendarView({
                                 </span>
                               )}
                             </div>
-                            {chinaCalendarMarkers.length > 0 && (
-                              <div className="flex flex-nowrap justify-end gap-1 max-w-[55%] overflow-hidden">
+                            {(chinaCalendarMarkers.length > 0 || overflowCount > 0) && (
+                              <div className="flex max-w-[62%] flex-nowrap items-center justify-end gap-1 overflow-hidden">
                                 {chinaCalendarMarkers.slice(0, 2).map((marker) => (
                                   <span
-                                    key={`${formatDateInputValue(cellDate)}-${marker.kind}-${marker.label}`}
+                                    key={`${cellDateKey}-${marker.kind}-${marker.label}`}
                                     className={`rounded-full border px-1.5 py-0.5 text-[10px] font-semibold leading-none ${calendarMarkerClassName(marker)}`}
                                   >
                                     {marker.label}
                                   </span>
                                 ))}
+                                {overflowCount > 0 && (
+                                  <button
+                                    type="button"
+                                    data-no-month-range-drag="true"
+                                    className="shrink-0 rounded-full border border-[#5B7BFE]/20 bg-[#5B7BFE]/[0.08] px-1.5 py-0.5 text-[10px] font-semibold leading-none text-[#5B7BFE] shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition hover:border-[#5B7BFE]/35 hover:bg-[#5B7BFE]/[0.14]"
+                                    onMouseDown={(event) => event.stopPropagation()}
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      setExpandedMonthOverflowDateKey((current) => (
+                                        current === cellDateKey ? null : cellDateKey
+                                      ));
+                                    }}
+                                  >
+                                    {expandedMonthOverflowDateKey === cellDateKey ? '收起' : `+${overflowCount}`}
+                                  </button>
+                                )}
                               </div>
                             )}
                           </div>
 
-                          {meetingBarSlots.length > 0 && (
-                            <div className="mt-2 flex flex-col gap-1">
-                              {meetingBarSlots.map((slot, lane) => {
-                                if (!slot) return <div key={`meeting-barspace-${lane}`} style={{ height: MONTH_MULTIDAY_BAR_HEIGHT }} aria-hidden="true" />;
+                          {/* 日期头与第一条任务使用独立间隔，避免任务上边框被日期头的视觉层刮到。 */}
+                          <div className="h-1.5 shrink-0" aria-hidden="true" />
+
+                          {visibleMeetingBarSlots.length > 0 && (
+                            <div className="flex flex-col gap-0.5">
+                              {visibleMeetingBarSlots.map((slot, lane) => {
                                 return (
                                   <div
                                     key={`meeting-bar-${lane}-${slot.meeting.id}`}
@@ -1767,7 +2134,7 @@ export function TaskCalendarView({
                                       event.stopPropagation();
                                       onOpenMeetingEditor?.(slot.meeting);
                                     }}
-                                    className={`flex cursor-grab items-center gap-1 overflow-hidden whitespace-nowrap border-y border-violet-200 bg-violet-50 px-2 text-[10px] font-semibold leading-none text-violet-700 shadow-[0_1px_2px_rgba(15,23,42,0.04)] active:cursor-grabbing ${slot.roundLeft ? 'ml-0 rounded-l-md border-l' : '-ml-2.5'} ${slot.roundRight ? 'mr-0 rounded-r-md border-r' : '-mr-2.5'}`}
+                                    className={`flex cursor-grab items-center gap-1 overflow-hidden whitespace-nowrap border-y border-violet-200 bg-violet-50 px-2 text-[10px] font-semibold leading-none text-violet-700 shadow-[0_1px_2px_rgba(15,23,42,0.04)] active:cursor-grabbing ${slot.roundLeft ? 'ml-0 rounded-l-md border-l' : '-ml-2'} ${slot.roundRight ? 'mr-0 rounded-r-md border-r' : '-mr-2'}`}
                                     style={{ height: MONTH_MULTIDAY_BAR_HEIGHT }}
                                   >
                                     {slot.continuesLeft && <ChevronLeft size={10} strokeWidth={2.5} className="shrink-0 opacity-70" aria-hidden="true" />}
@@ -1780,9 +2147,9 @@ export function TaskCalendarView({
                           )}
 
                           {/* 跨天任务连续条：放在可滚动 chip 容器之外，满格出血(-mx-2.5)使相邻格首尾相连；空车道等高占位保持跨格对齐 */}
-                          {cellBarSlots.length > 0 && (
-                            <div className="mt-2 flex flex-col gap-1">
-                            {cellBarSlots.map((slot, lane) => {
+                          {visibleTaskBarSlots.length > 0 && (
+                            <div className={`${visibleMeetingBarSlots.length > 0 ? 'mt-1' : ''} flex flex-col gap-0.5`}>
+                            {visibleTaskBarSlots.map((slot, lane) => {
                               if (!slot) {
                                 return <div key={`barspace-${lane}`} style={{ height: MONTH_MULTIDAY_BAR_HEIGHT }} aria-hidden="true" />;
                               }
@@ -1830,13 +2197,49 @@ export function TaskCalendarView({
                                       onOpenTaskEditor(slot.task);
                                     }
                                   }}
-                                  className={`flex items-center gap-0.5 overflow-hidden whitespace-nowrap border-y px-2 text-[11px] font-semibold leading-none shadow-[0_1px_2px_rgba(15,23,42,0.04)] ${isLocalDraftTaskId(slot.task.id) ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'} ${draggingTaskId === slot.task.id ? 'opacity-50' : ''} ${slot.roundLeft ? 'ml-0 rounded-l-md border-l' : '-ml-2.5'} ${slot.roundRight ? 'mr-0 rounded-r-md border-r' : '-mr-2.5'} ${slot.task.status === 'done' ? 'line-through' : ''}`}
+                                  className={`relative flex items-center gap-0.5 overflow-visible whitespace-nowrap border-y px-2 text-[11px] font-semibold leading-none shadow-[0_1px_2px_rgba(15,23,42,0.04)] ${isLocalDraftTaskId(slot.task.id) ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'} ${draggingTaskId === slot.task.id ? 'opacity-50' : ''} ${slot.roundLeft ? 'ml-0 rounded-l-md border-l' : '-ml-2'} ${slot.roundRight ? 'mr-0 rounded-r-md border-r' : '-mr-2'} ${slot.task.status === 'done' ? 'line-through' : ''}`}
                                   style={{ height: MONTH_MULTIDAY_BAR_HEIGHT, color: barStyle.color, backgroundColor: barStyle.backgroundColor, borderColor: barStyle.borderColor }}
                                 >
                                   {slot.continuesLeft && (
                                     <ChevronLeft size={10} strokeWidth={2.5} className="shrink-0 opacity-70" aria-hidden="true" />
                                   )}
-                                  <span className="min-w-0 flex-1 overflow-hidden text-ellipsis">{slot.titleSegment}</span>
+                                  {slot.showTitle && (
+                                    <>
+                                      {!slot.continuesLeft && (
+                                        <button
+                                          type="button"
+                                          data-no-month-range-drag="true"
+                                          className={`absolute left-1.5 top-1/2 z-40 flex h-3.5 w-3.5 -translate-y-1/2 items-center justify-center rounded-[4px] border transition ${
+                                            slot.task.status === 'done'
+                                              ? 'border-[#CBD5E1] bg-[#CBD5E1] text-white'
+                                              : 'border-current bg-white/85 hover:bg-white'
+                                          }`}
+                                          onMouseDown={(event) => event.stopPropagation()}
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            if (isLocalDraftTaskId(slot.task.id)) {
+                                              onCalendarNotice?.('info', LOCAL_DRAFT_NOTICE);
+                                              return;
+                                            }
+                                            void onToggleTaskStatus(slot.task.id);
+                                          }}
+                                          title={slot.task.status === 'done' ? '取消完成' : '标记完成'}
+                                          aria-label={slot.task.status === 'done' ? `取消完成 ${slot.task.title}` : `完成 ${slot.task.title}`}
+                                        >
+                                          {slot.task.status === 'done' ? <Check size={10} strokeWidth={3} /> : null}
+                                        </button>
+                                      )}
+                                      <span
+                                        className={`pointer-events-none absolute z-30 block overflow-hidden whitespace-nowrap text-ellipsis ${slot.continuesLeft ? 'left-5' : 'left-7'}`}
+                                        style={{
+                                          width: `calc(${slot.spanCells * 100}% + ${(slot.spanCells - 1) * 16}px - ${slot.continuesLeft ? 28 : 36}px)`,
+                                        }}
+                                      >
+                                        {slot.fullTitle}
+                                      </span>
+                                    </>
+                                  )}
+                                  <span className="min-w-0 flex-1" aria-hidden="true" />
                                   {slot.continuesRight && (
                                     <ChevronRight size={10} strokeWidth={2.5} className="ml-auto shrink-0 opacity-70" aria-hidden="true" />
                                   )}
@@ -1846,12 +2249,8 @@ export function TaskCalendarView({
                             </div>
                           )}
 
-                          <div className={`mt-2.5 flex min-h-0 flex-1 flex-col gap-1 ${
-                            expandedCalendarDays.has(formatDateInputValue(cellDate))
-                              ? 'max-h-[260px] overflow-y-auto pr-0.5'
-                              : ''
-                          }`}>
-                            {(meetingsByDateKey.get(formatDateInputValue(cellDate)) || []).filter((meeting) => !isMultiDayCalendarMeeting(meeting)).map((meeting) => (
+                          <div className={`${visibleMeetingBarSlots.length > 0 || visibleTaskBarSlots.length > 0 ? 'mt-1' : ''} flex min-h-0 flex-1 flex-col gap-0.5 overflow-visible`}>
+                            {visibleSingleMeetings.map((meeting) => (
                               <div
                                 key={`meeting-${meeting.id}`}
                                 draggable
@@ -1879,15 +2278,14 @@ export function TaskCalendarView({
                                     onOpenMeetingEditor?.(meeting);
                                   }
                                 }}
-                                className="flex max-w-full items-center gap-1 rounded-md border border-violet-200 bg-violet-50 px-2 py-1 text-left text-[10px] font-semibold text-violet-700 hover:bg-violet-100"
+                                className="mx-px flex h-[18px] max-w-full items-center gap-1 rounded-md border border-violet-200 bg-violet-50 px-1.5 py-0 text-left text-[10px] font-semibold leading-none text-violet-700 hover:bg-violet-100"
                                 title={`${formatMeetingScheduleLabel(meeting)} ${meeting.title}`}
                               >
                                 <button type="button" onClick={(event) => { event.stopPropagation(); void onToggleMeetingStatus?.(meeting); }} className={`flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border ${meeting.status === 'completed' ? 'border-emerald-500 bg-emerald-500 text-[8px] text-white' : 'border-violet-300 bg-white text-transparent'}`} aria-label={meeting.status === 'completed' ? `重开会议${meeting.title}` : `完成会议${meeting.title}`}>✓</button>
                                 <span className={`min-w-0 flex-1 truncate text-left ${meeting.status === 'completed' ? 'text-gray-400 line-through' : ''}`}>{formatMeetingScheduleLabel(meeting)} {meeting.title}</span>
                               </div>
                             ))}
-                            {/* 5/26: 展开时给个 max-h + 内部 scroll, 防止把整行 row 撑高搞乱 month grid. */}
-                            {cellChipTasks.slice(0, expandedCalendarDays.has(formatDateInputValue(cellDate)) ? cellChipTasks.length : 4).map((task) => {
+                            {cellChipTasks.slice(0, visibleChipTaskCount).map((task) => {
                               const timedSegment = buildTaskDayTimedSegment(task, cellDate);
                               const timePrefix = `${formatTaskCardScheduleLabel(task)} `;
                               const isTaskLocalDraft = isLocalDraftTaskId(task.id);
@@ -1927,7 +2325,7 @@ export function TaskCalendarView({
                                     }
                                     dragDropHandledRef.current = false;
                                   }}
-                                  className={`group relative block max-w-full rounded-md border pl-2 pr-1 py-0.5 text-[11px] font-semibold text-left leading-[1.35] ${isTaskLocalDraft ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'} ${
+                                  className={`group relative mx-px block h-[18px] max-w-full rounded-md border py-0 pl-2 pr-1 text-left text-[11px] font-semibold leading-none ${isTaskLocalDraft ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'} ${
                                     task.status === 'done' ? 'line-through' : 'shadow-[0_1px_2px_rgba(15,23,42,0.04)]'
                                   } ${draggingTaskId === task.id ? 'opacity-50' : ''} ${
                                     isTaskOverdue(task, today) && task.status !== 'done' ? 'ring-1 ring-rose-400' : ''
@@ -1982,38 +2380,6 @@ export function TaskCalendarView({
                                 </div>
                               );
                             })}
-                            {overflowCount > 0 && !expandedCalendarDays.has(formatDateInputValue(cellDate)) && (
-                              <button
-                                type="button"
-                                data-no-month-range-drag="true"
-                                className="rounded-md bg-[#FAFAFA] px-2 py-1 text-[10.5px] font-medium text-gray-500 text-left ring-1 ring-inset ring-gray-200 hover:bg-gray-100 transition-colors cursor-pointer"
-                                onMouseDown={(event) => {
-                                  event.stopPropagation();
-                                }}
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  setExpandedCalendarDays((prev) => { const next = new Set(prev); next.add(formatDateInputValue(cellDate)); return next; });
-                                }}
-                              >
-                                + {overflowCount} 条更多
-                              </button>
-                            )}
-                            {expandedCalendarDays.has(formatDateInputValue(cellDate)) && cellChipTasks.length > 4 && (
-                              <button
-                                type="button"
-                                data-no-month-range-drag="true"
-                                className="rounded-md bg-[#FAFAFA] px-2 py-1 text-[10.5px] font-medium text-gray-500 text-left ring-1 ring-inset ring-gray-200 hover:bg-gray-100 transition-colors cursor-pointer"
-                                onMouseDown={(event) => {
-                                  event.stopPropagation();
-                                }}
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  setExpandedCalendarDays((prev) => { const next = new Set(prev); next.delete(formatDateInputValue(cellDate)); return next; });
-                                }}
-                              >
-                                收起
-                              </button>
-                            )}
                             <button
                               type="button"
                               aria-label={`${cellDate.getDate()}日新建任务`}

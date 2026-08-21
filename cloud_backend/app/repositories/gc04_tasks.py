@@ -581,21 +581,25 @@ class GC04TaskRepository:
             raise RepositoryError(422, "task_member_invalid", "任务成员不属于当前组织")
         return found
 
-    def _require_project_capability(
+    def _require_project_reference_access(
         self,
         connection: sqlite3.Connection,
         identity: SessionIdentity,
         *,
         client_id: str | None,
-        write: bool,
     ) -> None:
+        """Allow a task to reference any project the member may read.
+
+        Linking a task to a project does not mutate the project itself.  Project
+        write permission remains required by the project mutation endpoints.
+        """
         if client_id is None:
             return
         self.repository._require_project_access(  # noqa: SLF001
             connection,
             identity,
             project_id=client_id,
-            capability="project_write" if write else "read",
+            capability="read",
         )
 
     @staticmethod
@@ -891,8 +895,8 @@ class GC04TaskRepository:
             client_id=client_id,
             event_line_id=event_line_id,
         )
-        self._require_project_capability(
-            connection, identity, client_id=binding.client_id, write=True
+        self._require_project_reference_access(
+            connection, identity, client_id=binding.client_id
         )
         list_value = payload.get("taskListId") if "taskListId" in payload else payload.get("listId")
         task_list_id = self._validate_list(connection, identity, _text(list_value))
@@ -1017,8 +1021,8 @@ class GC04TaskRepository:
                     client_id=client_id,
                     event_line_id=event_line_id,
                 )
-                self._require_project_capability(
-                    connection, identity, client_id=binding.client_id, write=True
+                self._require_project_reference_access(
+                    connection, identity, client_id=binding.client_id
                 )
                 patch["client_id"] = binding.client_id
                 patch["event_line_id"] = binding.event_line_id
@@ -1100,8 +1104,8 @@ class GC04TaskRepository:
             client_id=client_id,
             event_line_id=event_line_id,
         )
-        self._require_project_capability(
-            connection, identity, client_id=binding.client_id, write=True
+        self._require_project_reference_access(
+            connection, identity, client_id=binding.client_id
         )
         if "task_list_id" in patch:
             self._validate_list(connection, identity, _text(patch["task_list_id"]))

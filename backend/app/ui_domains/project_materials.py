@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import threading
 from collections import defaultdict
+from contextlib import nullcontext
 from time import perf_counter
 from typing import Any, Mapping
 from urllib.parse import quote
@@ -21,6 +23,8 @@ from .routing import UiDomainRouter, UiRequest
 
 
 router = UiDomainRouter("project_materials", pin_workspace=True)
+
+_LinkImportThread = threading.Thread
 
 _CLOUD_ROOT = "/api/v2/domain/project-materials"
 
@@ -2659,6 +2663,305 @@ def cancel_link_import_run(
         "当前设备中不存在该链接导入任务",
     )
 
+
+def _link_import_run(store: Any, project_id: str, run_id: str) -> dict[str, Any] | None:
+    runs = _local_call(lambda: store.link_import_runs(project_id, run_id=run_id))
+    return dict(runs[0]) if runs else None
+
+
+def _save_link_import_run_changes(
+    store: Any,
+    project_id: str,
+    run_id: str,
+    **changes: Any,
+) -> dict[str, Any] | None:
+    current = _link_import_run(store, project_id, run_id)
+    if current is None:
+        return None
+    if str(current.get("status") or "") == "canceled":
+        return current
+    return _local_call(
+        lambda: store.save_link_import_run(
+            project_id,
+            {**current, **changes, "updatedAt": utc_now()},
+        )
+    )
+
+
+def _run_link_import_in_background(
+    *,
+    compatibility: Any,
+    store: Any,
+    project_id: str,
+    run_id: str,
+    url: str,
+    pinned_sandbox: Any,
+) -> None:
+    runtime = compatibility.runtime
+    operation_key = f"link-import:{run_id}"
+    context = (
+        runtime.prebound_sandbox_context(pinned_sandbox)
+        if pinned_sandbox is not None
+        else nullcontext()
+    )
+    last_fetch_progress = -1
+
+    def ensure_active() -> dict[str, Any]:
+        current = _link_import_run(store, project_id, run_id)
+        if current is None:
+            raise LocalRuntimeError(404, "link_import_run_missing", "链接转存任务已不存在")
+        if str(current.get("status") or "") == "canceled":
+            raise LocalRuntimeError(409, "link_import_cancelled", "链接转存已取消")
+        return current
+
+    def update(stage: str, progress: int, **changes: Any) -> None:
+        ensure_active()
+        _save_link_import_run_changes(
+            store,
+            project_id,
+            run_id,
+            status="running",
+            state="processing",
+            stage=stage,
+            progress=max(1, min(99, int(progress))),
+            retryable=True,
+            pollingEnabled=True,
+            error=None,
+            errorCode=None,
+            **changes,
+        )
+
+    def report_fetch_progress(percent: int | None) -> None:
+        nonlocal last_fetch_progress
+        mapped = 12 if percent is None else 10 + int(max(0, min(100, percent)) * 0.42)
+        if mapped <= last_fetch_progress:
+            return
+        last_fetch_progress = mapped
+        update("正在获取公开内容", mapped)
+
+    try:
+        with context:
+            update("正在识别链接", 5)
+            database_path = getattr(runtime, "database_path", None)
+            fetched = fetch_link_material(
+                url,
+                data_root=database_path.parent if database_path is not None else None,
+                progress=report_fetch_progress,
+            )
+            fetched_metadata = dict(fetched.get("metadata") or {})
+            update(
+                "正在生成本机转写文件",
+                56,
+                sourcePlatform=str(fetched.get("platform") or ""),
+                sourceUrl=str(fetched.get("sourceUrl") or url),
+                title=str(fetched.get("title") or ""),
+                mediaCacheStatus=str(fetched_metadata.get("mediaCacheStatus") or "not_downloaded"),
+                metadata=fetched_metadata,
+            )
+            local = _local_call(
+                lambda: store.import_text(
+                    project_id=project_id,
+                    title=str(fetched["title"]),
+                    content=str(fetched["text"]),
+                    idempotency_key=f"{operation_key}:local-text",
+                )
+            )
+            if hasattr(store, "bind_pending_materials"):
+                _local_call(
+                    lambda: store.bind_pending_materials(
+                        project_id=project_id,
+                        local_materials=[local],
+                    )
+                )
+            local_document_id = "local-pending:" + str(local.get("localSourceId") or "")
+            update(
+                "本机文件已生成，正在登记组织云",
+                68,
+                documentId=local_document_id,
+                documentPath=local.get("managedPath"),
+            )
+            registered = runtime.cloud_command(
+                "POST",
+                f"{_CLOUD_ROOT}/projects/{_segment(project_id)}/materials/register-metadata",
+                payload={
+                    "materials": [
+                        {
+                            "localSourceId": local["localSourceId"],
+                            "fileName": local["fileName"],
+                            "contentHash": local["contentHash"],
+                            "byteSize": local["byteSize"],
+                            "mediaType": local["mediaType"],
+                            "sourceKind": "link_import_local_metadata",
+                        }
+                    ]
+                },
+                idempotency_key=f"{operation_key}:metadata",
+            )
+            documents = list(registered.get("documents") or [])
+            if not documents:
+                raise LocalRuntimeError(
+                    502,
+                    "link_import_metadata_result_invalid",
+                    "组织云没有返回链接资料元数据",
+                )
+            _local_call(
+                lambda: store.bind_cloud_documents(
+                    project_id=project_id,
+                    local_materials=[local],
+                    cloud_documents=documents,
+                )
+            )
+            document_id = str(documents[0].get("documentId") or "")
+            update(
+                "正在生成项目共享摘要",
+                82,
+                documentId=document_id,
+                documentPath=local.get("managedPath"),
+            )
+            shared_state = "not_connected"
+            shared_error = None
+            published_document_id = None
+            try:
+                completion = runtime.private_ai_completion(
+                    system_prompt=(
+                        "你是项目资料摘要器。只根据网页正文生成中文项目背景摘要，"
+                        "保留主体、事实、时间、承诺、风险和待办，不补造信息。"
+                    ),
+                    prompt=str(fetched["text"])[:120_000],
+                    creativity_mode="strict",
+                )
+                summary = str(completion.get("content") or "").strip()
+                if not summary:
+                    raise LocalRuntimeError(502, "link_import_summary_empty", "组织模型没有生成可发布摘要")
+                _local_call(
+                    lambda: store.update_ai_summary(
+                        document_id,
+                        summary=summary,
+                        model_name=str(completion.get("modelName") or "organization_default"),
+                    )
+                )
+                published = runtime.cloud_command(
+                    "POST",
+                    f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
+                    f"/documents/{_segment(document_id)}/publish-local-summary",
+                    payload={
+                        "expectedVersion": int(documents[0].get("version") or 1),
+                        "sourceContentHash": local["contentHash"],
+                        "summary": summary[:4000],
+                        "generatorVersion": str(completion.get("modelName") or "organization_default"),
+                    },
+                    idempotency_key=f"{operation_key}:summary",
+                )
+                shared_state = "ready"
+                published_document_id = published.get("documentId")
+            except LocalRuntimeError as exc:
+                shared_state = "failed_retryable" if exc.status_code >= 500 else "blocked"
+                shared_error = exc.message
+            _save_link_import_run_changes(
+                store,
+                project_id,
+                run_id,
+                sourcePlatform=str(fetched.get("platform") or ""),
+                sourceUrl=str(fetched.get("sourceUrl") or url),
+                title=str(fetched.get("title") or ""),
+                status="completed",
+                state="ready" if shared_state == "ready" else "completed_with_warning",
+                stage=(
+                    "转写及共享摘要已完成"
+                    if shared_state == "ready"
+                    else "转写已完成，共享摘要待重试"
+                ),
+                progress=100,
+                documentId=document_id,
+                documentPath=local.get("managedPath"),
+                mediaCacheStatus=str(fetched_metadata.get("mediaCacheStatus") or "not_downloaded"),
+                metadata=fetched_metadata,
+                retryable=shared_state == "failed_retryable",
+                pollingEnabled=False,
+                materialBoundary=registered.get("materialBoundary") or {},
+                sharedKnowledgeState=shared_state,
+                sharedKnowledgeError=shared_error,
+                publishedSummaryDocumentId=published_document_id,
+                error=None,
+                errorCode=None,
+            )
+    except LocalRuntimeError as exc:
+        current = _link_import_run(store, project_id, run_id)
+        if current is None or str(current.get("status") or "") == "canceled":
+            return
+        failure_state = str(
+            getattr(exc, "state", "failed_retryable" if exc.status_code >= 500 else "blocked")
+        )
+        _save_link_import_run_changes(
+            store,
+            project_id,
+            run_id,
+            status="failed",
+            state=failure_state,
+            stage=(
+                "本机内容已生成，组织云登记待重试"
+                if current.get("documentPath")
+                else "链接访问受阻" if failure_state in {"blocked", "not_connected"}
+                else "处理失败，可重试"
+            ),
+            progress=100,
+            error=exc.message,
+            errorCode=exc.code,
+            retryable=bool(getattr(exc, "retryable", exc.status_code >= 500)),
+            pollingEnabled=False,
+            mediaCacheStatus=(
+                str(current.get("mediaCacheStatus") or "not_downloaded")
+                if current.get("documentPath")
+                else "failed"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        current = _link_import_run(store, project_id, run_id)
+        if current is None or str(current.get("status") or "") == "canceled":
+            return
+        _save_link_import_run_changes(
+            store,
+            project_id,
+            run_id,
+            status="failed",
+            state="failed_retryable",
+            stage="本机内容已生成，后续处理待重试" if current.get("documentPath") else "处理意外中断，可重试",
+            progress=100,
+            error=f"{exc.__class__.__name__}：链接转存意外中断",
+            errorCode="link_import_unexpected_failure",
+            retryable=True,
+            pollingEnabled=False,
+        )
+
+
+def _launch_link_import_run(
+    *,
+    compatibility: Any,
+    store: Any,
+    project_id: str,
+    run_id: str,
+    url: str,
+) -> None:
+    runtime = compatibility.runtime
+    pinned_sandbox = (
+        runtime.capture_sandbox_context()
+        if callable(getattr(runtime, "capture_sandbox_context", None))
+        else None
+    )
+    _LinkImportThread(
+        target=_run_link_import_in_background,
+        kwargs={
+            "compatibility": compatibility,
+            "store": store,
+            "project_id": project_id,
+            "run_id": run_id,
+            "url": url,
+            "pinned_sandbox": pinned_sandbox,
+        },
+        name=f"link-import-{run_id[-10:]}",
+        daemon=True,
+    ).start()
+
 @router.post(r"clients/(?P<project_id>[^/]+)/link-materials/import/start")
 def start_link_import_run(
     compatibility: Any,
@@ -2666,7 +2969,10 @@ def start_link_import_run(
     match: Any,
 ) -> dict[str, Any]:
     project_id = match.group("project_id")
+    _require_project_read(compatibility, project_id)
     url = str(request.body.get("url") or "").strip()
+    if not url:
+        raise LocalRuntimeError(422, "link_import_url_required", "请填写需要转存的公开链接")
     run_id = (
         "local-link-"
         + sha256_text(f"{project_id}|{request.idempotency_key}")[:32]
@@ -2676,55 +2982,34 @@ def start_link_import_run(
         lambda: store.link_import_runs(project_id, run_id=run_id)
     )
     if existing:
-        prior = dict(existing[0])
-        if str(prior.get("status") or "") in {
-            "completed",
-            "failed",
-            "blocked",
-            "cancelled",
-        }:
-            return prior
-        # A process restart can leave a durable run in ``running`` after the
-        # local text or cloud metadata already committed.  Resume the same
-        # deterministic run and the same subordinate idempotency keys rather
-        # than returning a permanently stuck record or creating a new run.
-        url = str(prior.get("sourceUrl") or url).strip()
-        initial = {
-            **prior,
-            "status": "running",
-            "state": "processing",
-            "stage": "fetching",
-            "retryable": True,
-            "pollingEnabled": False,
-            "updatedAt": utc_now(),
-        }
+        return dict(existing[0])
     else:
         created_at = utc_now()
         initial = {
-        "runId": run_id,
-        "clientId": project_id,
-        "sourcePlatform": "",
-        "sourceUrl": url,
-        "title": "",
-        "status": "running",
-        "state": "processing",
-        "stage": "fetching",
-        "progress": 10,
-        "documentId": None,
-        "documentPath": None,
-        "mediaCacheStatus": "not_downloaded",
-        "metadata": {
-            "accessMode": "anonymous",
-            "temporaryFilesCleaned": True,
-        },
-        "error": None,
-        "errorCode": None,
-        "retryable": True,
-        "pollingEnabled": False,
-        "createdAt": created_at,
-        "updatedAt": created_at,
+            "runId": run_id,
+            "clientId": project_id,
+            "sourcePlatform": "",
+            "sourceUrl": url,
+            "title": "",
+            "status": "queued",
+            "state": "processing",
+            "stage": "等待本机处理",
+            "progress": 1,
+            "documentId": None,
+            "documentPath": None,
+            "mediaCacheStatus": "not_downloaded",
+            "metadata": {
+                "accessMode": "anonymous",
+                "temporaryFilesCleaned": True,
+            },
+            "error": None,
+            "errorCode": None,
+            "retryable": True,
+            "pollingEnabled": True,
+            "createdAt": created_at,
+            "updatedAt": created_at,
         }
-    _local_call(lambda: store.save_link_import_run(project_id, initial))
+    saved = _local_call(lambda: store.save_link_import_run(project_id, initial))
     if bool(request.body.get("useBrowserCookies")):
         return _local_call(
             lambda: store.save_link_import_run(
@@ -2733,7 +3018,7 @@ def start_link_import_run(
                     **initial,
                     "status": "failed",
                     "state": "blocked",
-                    "stage": "blocked",
+                    "stage": "浏览器登录态未获授权",
                     "progress": 100,
                     "errorCode": "browser_cookie_authorization_required",
                     "error": (
@@ -2741,167 +3026,70 @@ def start_link_import_run(
                         "请先关闭“使用浏览器登录态”导入公开正文"
                     ),
                     "retryable": False,
+                    "pollingEnabled": False,
                     "updatedAt": utc_now(),
                 },
             )
         )
 
-
-    try:
-        database_path = getattr(compatibility.runtime, "database_path", None)
-        fetched = fetch_link_material(
-            url,
-            data_root=database_path.parent if database_path is not None else None,
-        )
-        local = _local_call(
-            lambda: store.import_text(
-                project_id=project_id,
-                title=str(fetched["title"]),
-                content=str(fetched["text"]),
-                idempotency_key=f"{request.idempotency_key}:local-text",
-            )
-        )
-        registered = compatibility.runtime.cloud_command(
-            "POST",
-            f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
-            "/materials/register-metadata",
-            payload={
-                "materials": [
-                    {
-                        "localSourceId": local["localSourceId"],
-                        "fileName": local["fileName"],
-                        "contentHash": local["contentHash"],
-                        "byteSize": local["byteSize"],
-                        "mediaType": local["mediaType"],
-                        "sourceKind": "link_import_local_metadata",
-                    }
-                ]
-            },
-            idempotency_key=f"{request.idempotency_key}:metadata",
-        )
-        documents = list(registered.get("documents") or [])
-        if not documents:
-            raise LocalRuntimeError(
-                502,
-                "link_import_metadata_result_invalid",
-                "组织云没有返回链接资料元数据",
-            )
-        _local_call(
-            lambda: store.bind_cloud_documents(
-                project_id=project_id,
-                local_materials=[local],
-                cloud_documents=documents,
-            )
-        )
-        document_id = str(documents[0].get("documentId") or "")
-        shared_knowledge_state = "not_connected"
-        shared_knowledge_error = None
-        published_summary_document_id = None
-        try:
-            completion = compatibility.runtime.private_ai_completion(
-                system_prompt=(
-                    "你是项目资料摘要器。只根据网页正文生成中文项目背景摘要，"
-                    "保留主体、事实、时间、承诺、风险和待办，不补造信息。"
-                ),
-                prompt=str(fetched["text"])[:120_000],
-                creativity_mode="strict",
-            )
-            summary = str(completion.get("content") or "").strip()
-            if not summary:
-                raise LocalRuntimeError(
-                    502,
-                    "link_import_summary_empty",
-                    "组织模型没有生成可发布摘要",
-                )
-            _local_call(
-                lambda: store.update_ai_summary(
-                    document_id,
-                    summary=summary,
-                    model_name=str(
-                        completion.get("modelName") or "organization_default"
-                    ),
-                )
-            )
-            published = compatibility.runtime.cloud_command(
-                "POST",
-                f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
-                f"/documents/{_segment(document_id)}/publish-local-summary",
-                payload={
-                    "expectedVersion": int(
-                        documents[0].get("version") or 1
-                    ),
-                    "sourceContentHash": local["contentHash"],
-                    "summary": summary[:4000],
-                    "generatorVersion": str(
-                        completion.get("modelName") or "organization_default"
-                    ),
-                },
-                idempotency_key=f"{request.idempotency_key}:summary",
-            )
-            shared_knowledge_state = "ready"
-            published_summary_document_id = published.get("documentId")
-        except LocalRuntimeError as exc:
-            shared_knowledge_state = (
-                "failed_retryable"
-                if exc.status_code >= 500
-                else "blocked"
-            )
-            shared_knowledge_error = exc.message
-        result = {
-            **initial,
-            "sourcePlatform": fetched["platform"],
-            "sourceUrl": fetched["sourceUrl"],
-            "title": fetched["title"],
-            "status": "completed",
-            "state": "ready",
-            "stage": "completed",
-            "progress": 100,
-            "documentId": document_id,
-            "documentPath": local["managedPath"],
-            "mediaCacheStatus": str(
-                (fetched.get("metadata") or {}).get(
-                    "mediaCacheStatus",
-                    "not_downloaded",
-                )
-            ),
-            "metadata": dict(fetched.get("metadata") or {}),
-            "retryable": False,
-            "materialBoundary": registered.get("materialBoundary") or {},
-            "sharedKnowledgeState": shared_knowledge_state,
-            "sharedKnowledgeError": shared_knowledge_error,
-            "publishedSummaryDocumentId": published_summary_document_id,
-            "updatedAt": utc_now(),
-        }
-    except LocalRuntimeError as exc:
-        failure_state = str(
-            getattr(
-                exc,
-                "state",
-                "failed_retryable" if exc.status_code >= 500 else "blocked",
-            )
-        )
-        retryable = bool(
-            getattr(exc, "retryable", exc.status_code >= 500)
-        )
-        result = {
-            **initial,
-            "status": "failed",
-            "state": failure_state,
-            "stage": (
-                "blocked"
-                if failure_state in {"blocked", "not_connected"}
-                else "failed"
-            ),
-            "progress": 100,
-            "error": exc.message,
-            "errorCode": exc.code,
-            "retryable": retryable,
-            "mediaCacheStatus": "failed",
-            "updatedAt": utc_now(),
-        }
-    return _local_call(
-        lambda: store.save_link_import_run(project_id, result)
+    _launch_link_import_run(
+        compatibility=compatibility,
+        store=store,
+        project_id=project_id,
+        run_id=run_id,
+        url=url,
     )
+    return saved
+
+
+@router.post(
+    r"clients/(?P<project_id>[^/]+)/link-materials/import-runs/"
+    r"(?P<run_id>[^/]+)/retry"
+)
+def retry_link_import_run(
+    compatibility: Any,
+    request: UiRequest,
+    match: Any,
+) -> dict[str, Any]:
+    project_id = match.group("project_id")
+    run_id = match.group("run_id")
+    _require_project_read(compatibility, project_id)
+    store = _local_store(compatibility)
+    prior = _link_import_run(store, project_id, run_id)
+    if prior is None:
+        raise LocalRuntimeError(404, "link_import_run_missing", "当前设备中不存在该链接转存任务")
+    if str(prior.get("status") or "") in {"queued", "running"}:
+        return prior
+    if not bool(prior.get("retryable")):
+        raise LocalRuntimeError(409, "link_import_run_not_retryable", "当前链接转存结果不能重试")
+    source_url = str(prior.get("sourceUrl") or "").strip()
+    if not source_url:
+        raise LocalRuntimeError(409, "link_import_source_missing", "原始链接已丢失，不能重试")
+    queued = _local_call(
+        lambda: store.save_link_import_run(
+            project_id,
+            {
+                **prior,
+                "status": "queued",
+                "state": "processing",
+                "stage": "等待重新处理",
+                "progress": 1,
+                "error": None,
+                "errorCode": None,
+                "retryable": True,
+                "pollingEnabled": True,
+                "updatedAt": utc_now(),
+            },
+        )
+    )
+    _launch_link_import_run(
+        compatibility=compatibility,
+        store=store,
+        project_id=project_id,
+        run_id=run_id,
+        url=source_url,
+    )
+    return queued
 
 
 @router.get(r"clients/(?P<project_id>[^/]+)/mobile-link-transfers/pending")

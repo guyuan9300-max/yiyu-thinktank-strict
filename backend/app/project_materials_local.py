@@ -4826,6 +4826,30 @@ class LocalProjectMaterialsRepository:
             )
         state = self._load_project_state(project_id)
         runs = dict(state.get("linkImportRuns") or {})
+        raw_metadata = run.get("metadata")
+        metadata_source = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        allowed_metadata_keys = {
+            "accessMode",
+            "cookieBrowser",
+            "transcriptSource",
+            "logicalFolder",
+            "accessFailureKind",
+            "downloadAttemptCount",
+            "headersApplied",
+            "impersonationApplied",
+            "curlCffiAvailable",
+            "externalDownloader",
+            "ytDlpVersion",
+            "ytDlpErrorTail",
+            "impersonationAvailable",
+            "mediaCacheStatus",
+            "temporaryFilesCleaned",
+        }
+        metadata = {
+            key: value
+            for key, value in metadata_source.items()
+            if key in allowed_metadata_keys
+        }
         normalized = {
             "runId": run_id,
             "clientId": project_id,
@@ -4835,12 +4859,17 @@ class LocalProjectMaterialsRepository:
             "status": str(run.get("status") or "failed"),
             "state": str(run.get("state") or run.get("status") or "failed"),
             "stage": str(run.get("stage") or ""),
-            "progress": int(run.get("progress") or 0),
+            "progress": max(0, min(100, int(run.get("progress") or 0))),
             "documentId": run.get("documentId"),
             "documentPath": run.get("documentPath"),
             "mediaCacheStatus": str(
                 run.get("mediaCacheStatus") or "not_downloaded"
             ),
+            "metadata": metadata,
+            "materialBoundary": dict(run.get("materialBoundary") or {}),
+            "sharedKnowledgeState": run.get("sharedKnowledgeState"),
+            "sharedKnowledgeError": run.get("sharedKnowledgeError"),
+            "publishedSummaryDocumentId": run.get("publishedSummaryDocumentId"),
             "error": run.get("error"),
             "errorCode": run.get("errorCode"),
             "retryable": bool(run.get("retryable")),

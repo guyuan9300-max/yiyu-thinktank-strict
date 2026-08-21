@@ -2030,6 +2030,11 @@ class _FakeRuntime:
             "taskCount": 3,
         }
 
+    def require_project_capability(self, project_id: str, capability: str) -> dict[str, Any]:
+        assert project_id == "project-1"
+        assert capability == "read"
+        return self._project()
+
     def cloud_query(
         self,
         path: str,
@@ -2233,6 +2238,14 @@ def test_link_import_fetches_body_locally_and_registers_only_metadata(
 ) -> None:
     compatibility = _FakeCompatibility()
 
+    class ImmediateThread:
+        def __init__(self, *, target: Any, kwargs: dict[str, Any], **_: Any) -> None:
+            self.target = target
+            self.kwargs = kwargs
+
+        def start(self) -> None:
+            self.target(**self.kwargs)
+
     class FakeStore:
         def __init__(self) -> None:
             self.runs: dict[str, dict[str, Any]] = {}
@@ -2284,6 +2297,9 @@ def test_link_import_fetches_body_locally_and_registers_only_metadata(
         def bind_cloud_documents(self, **_: Any) -> None:
             self.bound = True
 
+        def bind_pending_materials(self, **_: Any) -> None:
+            return None
+
         def update_ai_summary(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
             return {"summaryKind": "ai_summary"}
 
@@ -2293,6 +2309,7 @@ def test_link_import_fetches_body_locally_and_registers_only_metadata(
         "modelName": "test-model",
     }
     monkeypatch.setattr(project_materials_ui, "_local_store", lambda _: store)
+    monkeypatch.setattr(project_materials_ui, "_LinkImportThread", ImmediateThread)
     monkeypatch.setattr(
         project_materials_ui,
         "fetch_link_material",
@@ -2301,6 +2318,7 @@ def test_link_import_fetches_body_locally_and_registers_only_metadata(
             "sourceUrl": "https://www.bilibili.com/video/example",
             "title": "链接资料",
             "text": "LINK_BODY_MUST_STAY_LOCAL",
+            "metadata": {"accessMode": "anonymous"},
         },
     )
     request = UiRequest(
@@ -2312,9 +2330,9 @@ def test_link_import_fetches_body_locally_and_registers_only_metadata(
     )
     created = router.dispatch(compatibility, request)
     replay = router.dispatch(compatibility, request)
-    assert created["status"] == "completed"
-    assert created["documentId"] == "document-text-1"
-    assert replay == created
+    assert created["status"] == "queued"
+    assert replay["status"] == "completed"
+    assert replay["documentId"] == "document-text-1"
     assert store.bound is True
     serialized = json.dumps(
         compatibility.runtime.command_payloads[-1],
@@ -2338,7 +2356,7 @@ def test_link_import_fetches_body_locally_and_registers_only_metadata(
         compatibility,
         UiRequest(
             method="GET",
-            path=f"clients/project-1/link-materials/import-runs/{created['runId']}",
+            path=f"clients/project-1/link-materials/import-runs/{replay['runId']}",
             query={},
             body={},
             idempotency_key="get-link-run",
@@ -2350,15 +2368,15 @@ def test_link_import_fetches_body_locally_and_registers_only_metadata(
             method="POST",
             path=(
                 "clients/project-1/link-materials/import-runs/"
-                f"{created['runId']}/cancel"
+                f"{replay['runId']}/cancel"
             ),
             query={},
             body={},
             idempotency_key="cancel-link-run",
         ),
     )
-    assert listed[0]["runId"] == created["runId"]
-    assert fetched["runId"] == created["runId"]
+    assert listed[0]["runId"] == replay["runId"]
+    assert fetched["runId"] == replay["runId"]
     assert cancelled["status"] == "completed"
     assert compatibility.runtime.calls == cloud_calls_before_local_run_read
 
@@ -2376,7 +2394,7 @@ def test_link_import_fetches_body_locally_and_registers_only_metadata(
         "fetch_link_material",
         blocked_fetch,
     )
-    blocked_run = router.dispatch(
+    blocked_started = router.dispatch(
         compatibility,
         UiRequest(
             method="POST",
@@ -2386,9 +2404,10 @@ def test_link_import_fetches_body_locally_and_registers_only_metadata(
             idempotency_key="link-import-local-blocked",
         ),
     )
+    blocked_run = store.runs[str(blocked_started["runId"])]
     assert blocked_run["status"] == "failed"
     assert blocked_run["state"] == "blocked"
-    assert blocked_run["stage"] == "blocked"
+    assert blocked_run["stage"] == "链接访问受阻"
     assert blocked_run["retryable"] is False
     assert blocked_run["mediaCacheStatus"] == "failed"
 

@@ -12,8 +12,10 @@ from cloud_backend.app.repositories.platform_integrations import (
     FEISHU_CONFIGURATION_KIND,
     PlatformIntegrationsRepository,
 )
+from cloud_backend.app.repositories.gc04_tasks import GC04TaskRepository
 from cloud_backend.app.repository import RepositoryError
 from strict_common.schema import runtime_connection
+from tests.test_gc04_gc05_tasks import _member
 from tests.test_gc14_workbench_answer import _repository
 
 
@@ -206,3 +208,120 @@ def test_cloud_feishu_missing_secret_and_provider_rejection_are_not_fake_success
     assert rejected["enabled"] is False
     assert rejected["lastValidationStatus"] == "failed_retryable"
     assert rejected["authorizationBlockedReason"] == "feishu_tenant_token_rejected"
+
+
+def test_task_notification_to_self_has_exactly_one_recipient(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, identity, _payload = _repository(tmp_path)
+    tasks = GC04TaskRepository(repository)
+    platform = PlatformIntegrationsRepository(repository)
+    created = tasks.create_task(
+        identity,
+        payload={
+            "title": "仅通知当前负责人的隔离验收任务",
+            "priority": "normal",
+            "ownerMembershipId": identity.membership_id,
+            "collaboratorMembershipIds": [],
+        },
+        idempotency_key="feishu-task-self-create",
+    )
+    calls: list[dict[str, str]] = []
+
+    monkeypatch.setattr(
+        platform,
+        "personal_feishu_delivery_profile",
+        lambda _target: {"readyForNotifications": True},
+    )
+
+    def fake_send(target: object, **kwargs: str) -> dict[str, Any]:
+        calls.append(
+            {
+                "membershipId": str(getattr(target, "membership_id")),
+                "idempotencyKey": kwargs["idempotency_key"],
+            }
+        )
+        return {
+            "state": "succeeded",
+            "message": "隔离测试已发送",
+            "remoteId": "isolated-self-message",
+        }
+
+    monkeypatch.setattr(platform, "send_personal_feishu_text", fake_send)
+    result = platform.deliver_task_notifications(
+        identity,
+        result=created,
+        event="created",
+        idempotency_key="feishu-task-self-create",
+    )
+
+    assert result["state"] == "completed"
+    assert result["requestedRecipients"] == 1
+    assert result["deliveryCount"] == 1
+    assert calls == [
+        {
+            "membershipId": identity.membership_id,
+            "idempotencyKey": (
+                "feishu-task-self-create:feishu:created:1:"
+                f"{identity.membership_id}"
+            ),
+        }
+    ]
+
+
+def test_task_notification_holds_collaborators_until_owner_accepts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, creator, _payload = _repository(tmp_path)
+    owner = _member(
+        repository,
+        creator,
+        suffix="feishu_owner_gate",
+        display_name="隔离测试负责人",
+    )
+    collaborator = _member(
+        repository,
+        creator,
+        suffix="feishu_collaborator_gate",
+        display_name="隔离测试协作者",
+    )
+    tasks = GC04TaskRepository(repository)
+    platform = PlatformIntegrationsRepository(repository)
+    created = tasks.create_task(
+        creator,
+        payload={
+            "title": "负责人接收前不通知协作者",
+            "priority": "normal",
+            "ownerMembershipId": owner.membership_id,
+            "collaboratorMembershipIds": [collaborator.membership_id],
+        },
+        idempotency_key="feishu-task-owner-gate",
+    )
+    recipients: list[str] = []
+    monkeypatch.setattr(
+        platform,
+        "personal_feishu_delivery_profile",
+        lambda _target: {"readyForNotifications": True},
+    )
+
+    def fake_send(target: object, **_kwargs: str) -> dict[str, Any]:
+        recipients.append(str(getattr(target, "membership_id")))
+        return {
+            "state": "succeeded",
+            "message": "隔离测试已发送",
+            "remoteId": "isolated-owner-message",
+        }
+
+    monkeypatch.setattr(platform, "send_personal_feishu_text", fake_send)
+    result = platform.deliver_task_notifications(
+        creator,
+        result=created,
+        event="created",
+        idempotency_key="feishu-task-owner-gate",
+    )
+
+    assert result["requestedRecipients"] == 1
+    assert recipients == [owner.membership_id]
+    assert collaborator.membership_id not in recipients

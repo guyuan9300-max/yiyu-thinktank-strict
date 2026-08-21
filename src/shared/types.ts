@@ -1258,12 +1258,19 @@ export interface LinkMaterialImportRun {
   sourceUrl: string;
   title?: string | null;
   status: LinkMaterialImportStatus;
+  state?: string;
   stage: string;
   progress: number;
   documentId?: string | null;
   documentPath?: string | null;
   mediaCacheStatus: LinkMaterialMediaCacheStatus;
   error?: string | null;
+  errorCode?: string | null;
+  retryable?: boolean;
+  pollingEnabled?: boolean;
+  sharedKnowledgeState?: string | null;
+  sharedKnowledgeError?: string | null;
+  publishedSummaryDocumentId?: string | null;
   metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
@@ -5367,6 +5374,22 @@ export interface OrgFeishuIntegration {
   scopeVersions?: {
     organization?: number;
     personal?: number;
+  };
+  expectedVersion?: number;
+  botName?: string | null;
+  tenantName?: string | null;
+  sharedBotLabel?: string | null;
+  notificationCoverage?: {
+    total: number;
+    notifiable: number;
+    awaitingConversation: number;
+    pendingConfirmation: number;
+    failedRetryable: number;
+    members?: Array<{
+      membershipId: string;
+      displayName: string;
+      status: 'notifiable' | 'awaiting_conversation' | 'pending_confirmation' | 'failed_retryable';
+    }>;
   };
   configuredAt?: string | null;
   updatedAt: string;

@@ -180,7 +180,6 @@ import type {
   FeishuMemberAuthorizationStartResult,
   FeishuBotSettings,
   FeishuBotSettingsPayload,
-  FeishuSyncStatusRecord,
   OrgFeishuIntegration,
   OrgFeishuIntegrationPayload,
   FeishuUserBinding,
@@ -360,6 +359,7 @@ import {
   getClientLinkMaterialImportRun,
   listClientLinkMaterialImportRuns,
   cancelClientLinkMaterialImportRun,
+  retryClientLinkMaterialImportRun,
   getActiveBackgroundTasks,
   createEventLine,
   createProjectFlow,
@@ -432,7 +432,6 @@ import {
   getFeishuMemberAuthorization,
   getFeishuDocImportStatus,
   getFeishuBotSettings,
-  getFeishuSyncStatus,
   getOrgFeishuIntegration,
   getOrgAdminClaimStatus,
   getOrgMembershipSummary,
@@ -527,7 +526,6 @@ import {
   searchFeishuDocsForImport,
   syncOrganizationDirectory,
   resolveFeishuDocImportLinks,
-  syncDocumentToFeishuDocx,
   getClientAnalysisRun,
   getClientChatThread,
   deleteClientChatMessagePair,
@@ -8433,12 +8431,8 @@ export default function App() {
   const feishuTransientRetryCountRef = useRef(0);
   const feishuStatusHydrationInFlightRef = useRef(false);
   const feishuTaskSyncReadinessInFlightRef = useRef(false);
-  const feishuSyncStrictStatusLoaded = orgFeishuIntegrationLoaded && feishuMemberAuthorizationLoaded && feishuDeliveryProfileLoaded;
-  const feishuSyncConnectedByState = Boolean(
-    orgFeishuIntegrationState.enabled &&
-    feishuMemberAuthorizationState.linked &&
-    (feishuDeliveryProfileState.readyForNotifications || feishuDeliveryProfileState.deliveryStatus === 'matched'),
-  );
+  const feishuSyncStrictStatusLoaded = orgFeishuIntegrationLoaded;
+  const feishuSyncConnectedByState = Boolean(orgFeishuIntegrationState.enabled);
   const feishuSyncStatusLoaded = feishuSyncStrictStatusLoaded || feishuTaskSyncReadiness.checked || feishuSyncConnectedByState;
   const feishuSyncFullyConnected = feishuSyncConnectedByState || feishuTaskSyncReadiness.fullyConnected;
   const feishuSyncTransientUnavailable = Boolean(
@@ -10952,24 +10946,12 @@ export default function App() {
       return DEFAULT_FEISHU_TASK_SYNC_READINESS;
     }
     try {
-      const [integration, deliveryProfile, memberAuthorization] = await Promise.all([
-        getOrgFeishuIntegration(),
-        getFeishuDeliveryProfile(),
-        getFeishuMemberAuthorization(),
-      ]);
+      const integration = await getOrgFeishuIntegration();
       if (canApply()) {
         setOrgFeishuIntegrationState(integration);
-        setFeishuDeliveryProfileState(deliveryProfile);
-        setFeishuMemberAuthorizationState(memberAuthorization);
         setOrgFeishuIntegrationLoaded(true);
-        setFeishuDeliveryProfileLoaded(true);
-        setFeishuMemberAuthorizationLoaded(true);
       }
-      const fullyConnected = Boolean(
-        integration.enabled &&
-        memberAuthorization.linked &&
-        (deliveryProfile.readyForNotifications || deliveryProfile.deliveryStatus === 'matched'),
-      );
+      const fullyConnected = Boolean(integration.enabled);
       const next: FeishuTaskSyncReadiness = {
         checked: true,
         fullyConnected,
@@ -10979,9 +10961,6 @@ export default function App() {
       console.info('[feishu-sync-readiness]', {
         fullyConnected,
         orgEnabled: integration.enabled,
-        memberLinked: memberAuthorization.linked,
-        readyForNotifications: deliveryProfile.readyForNotifications,
-        deliveryStatus: deliveryProfile.deliveryStatus,
       });
       return next;
     } catch (error) {
@@ -12891,7 +12870,7 @@ export default function App() {
       mobileLinkTransferProcessingRef.current.add(transfer.runId);
       try {
         await claimMobileLinkTransfer(currentClientId, transfer.runId);
-        const localRun = await startClientLinkMaterialImport(
+        let localRun = await startClientLinkMaterialImport(
           currentClientId,
           transfer.sourceUrl,
           {
@@ -12899,6 +12878,15 @@ export default function App() {
             idempotencyKey: `mobile-link-transfer:${transfer.runId}`,
           },
         );
+        const waitDeadline = Date.now() + 12 * 60 * 1000;
+        while (
+          !disposed
+          && ['queued', 'running'].includes(localRun.status)
+          && Date.now() < waitDeadline
+        ) {
+          await new Promise((resolve) => window.setTimeout(resolve, 1500));
+          localRun = await getClientLinkMaterialImportRun(currentClientId, localRun.runId);
+        }
         if (localRun.status === 'completed' && localRun.documentId) {
           await settleMobileLinkTransfer(currentClientId, transfer.runId, {
             status: 'completed',
@@ -19165,6 +19153,64 @@ export default function App() {
       }
     };
 
+    const handleBatchDeleteSelectedRecords = async () => {
+      if (!guardWorkspaceWrite('批量删除任务与会议')) return;
+      if (isBatchBusy || selectedListRecordCount === 0) return;
+      const confirmed = window.confirm(
+        `确认删除已选的 ${selectedListRecordCount} 条任务或会议吗？删除会按正式生命周期规则处理。`,
+      );
+      if (!confirmed) return;
+      setIsBatchBusy(true);
+      const failedTaskIds: string[] = [];
+      const failedMeetingIds: string[] = [];
+      try {
+        const taskResults = await Promise.allSettled(
+          selectedListTasks.map(async (task) => {
+            await deleteTask(task.id);
+            return task.id;
+          }),
+        );
+        taskResults.forEach((result, index) => {
+          if (result.status === 'rejected') failedTaskIds.push(selectedListTasks[index].id);
+        });
+        const meetingResults = await Promise.allSettled(
+          selectedListMeetings.map(async (meeting) => {
+            await gc06Api.updateMeeting(meeting, { status: 'cancelled' });
+            return meeting.id;
+          }),
+        );
+        meetingResults.forEach((result, index) => {
+          if (result.status === 'rejected') failedMeetingIds.push(selectedListMeetings[index].id);
+        });
+        await Promise.all([
+          loadTaskBlock(),
+          gc06Api.listMeetings().then(setCustomerMeetings),
+          loadOrganizationPlanningBlock({
+            organizationId: currentSessionUser?.organizationId ?? null,
+            force: true,
+          }),
+          refreshWorkspace(),
+        ]);
+        void loadSelectedReviewBlock();
+        setSelectedListTaskIds(failedTaskIds);
+        setSelectedListMeetingIds(failedMeetingIds);
+        const deletedCount = selectedListRecordCount - failedTaskIds.length - failedMeetingIds.length;
+        if (failedTaskIds.length + failedMeetingIds.length > 0) {
+          flash('error', `已删除 ${deletedCount} 条，${failedTaskIds.length + failedMeetingIds.length} 条失败并保持选中。`);
+        } else {
+          flash('success', `已删除 ${deletedCount} 条任务或会议。`);
+        }
+      } catch (error) {
+        await Promise.all([
+          loadTaskBlock().catch(() => undefined),
+          gc06Api.listMeetings().then(setCustomerMeetings).catch(() => undefined),
+        ]);
+        flash('error', error instanceof Error ? error.message : '批量删除失败');
+      } finally {
+        setIsBatchBusy(false);
+      }
+    };
+
     const handleBatchRescheduleSelectedTasks = async () => {
       if (!guardWorkspaceWrite('批量调整任务')) return;
       if (isBatchBusy || selectedListRecordCount === 0) return;
@@ -20155,78 +20201,90 @@ export default function App() {
                 <p className="mt-2 text-[11px] leading-5 text-gray-400">打勾表示已完成，去掉勾表示重启任务；卡片左边的红色直线表示事项已经逾期。</p>
                 {isMultiSelectMode && (
                   <div className="relative mt-3 border-t border-blue-100 pt-3 pr-24">
-                    <div className="flex flex-wrap items-center gap-2">
-                    <span className="mr-1 text-[12px] font-bold text-gray-700">已选 {selectedListRecordCount} 条</span>
-                    <button
-                      type="button"
-                      onClick={toggleAllVisibleListRecordSelection}
-                      disabled={isBatchBusy || visibleListRecordCount === 0}
-                      className="rounded-xl border border-gray-200 bg-white px-3 py-1.5 text-[12px] font-bold text-gray-600 transition hover:border-[#C9D6FF] hover:text-[#5B7BFE] disabled:opacity-50"
-                    >
-                      {isAllVisibleListRecordsSelected ? '取消全选' : '全选当前'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleBatchSetSelectedRecordsCompleted(true)}
-                      disabled={isBatchBusy || selectedListRecordCount === 0}
-                      className="rounded-xl bg-emerald-500 px-3 py-1.5 text-[12px] font-bold text-white transition hover:bg-emerald-600 disabled:opacity-50"
-                    >
-                      批量完成
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleBatchSetSelectedRecordsCompleted(false)}
-                      disabled={isBatchBusy || selectedListRecordCount === 0}
-                      className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-[12px] font-bold text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-50"
-                    >
-                      批量重启
-                    </button>
-                    <label className="flex items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-1.5 text-[12px] font-bold text-gray-500">
-                      改日期
-                      <input
-                        type="date"
-                        value={batchDueDate}
-                        onChange={(event) => setBatchDueDate(event.target.value)}
-                        className="bg-transparent text-[12px] font-bold text-gray-800 outline-none"
-                      />
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => void handleBatchRescheduleSelectedTasks()}
-                      disabled={isBatchBusy || selectedListRecordCount === 0 || !batchDueDate}
-                      className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-1.5 text-[12px] font-bold text-[#5B7BFE] transition hover:bg-blue-100 disabled:opacity-50"
-                    >
-                      应用日期
-                    </button>
-                    <label className="flex min-w-[220px] items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-1.5 text-[12px] font-bold text-gray-500">
-                      事件线
-                      <select
-                        value={batchEventLineId}
-                        onChange={(event) => setBatchEventLineId(event.target.value)}
-                        className="min-w-0 flex-1 bg-transparent text-[12px] font-bold text-gray-800 outline-none"
-                      >
-                        <option value="">选择事件线</option>
-                        {batchEventLineOptions.map((line) => (
-                          <option key={line.id} value={line.id}>
-                            {line.name}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => void handleBatchAssignEventLineSelectedTasks()}
-                      disabled={isBatchBusy || selectedListRecordCount === 0 || !batchEventLineId}
-                      className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-[12px] font-bold text-slate-700 transition hover:bg-slate-100 disabled:opacity-50"
-                    >
-                      归入事件线
-                    </button>
-                    {isBatchBusy && (
-                      <span className="inline-flex items-center gap-1.5 text-[12px] font-bold text-gray-400">
-                        <RefreshCw size={13} className="animate-spin" />
-                        处理中
-                      </span>
-                    )}
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="mr-1 text-[12px] font-bold text-gray-700">已选 {selectedListRecordCount} 条</span>
+                        <button
+                          type="button"
+                          onClick={toggleAllVisibleListRecordSelection}
+                          disabled={isBatchBusy || visibleListRecordCount === 0}
+                          className="rounded-xl border border-gray-200 bg-white px-3 py-1.5 text-[12px] font-bold text-gray-600 transition hover:border-[#C9D6FF] hover:text-[#5B7BFE] disabled:opacity-50"
+                        >
+                          {isAllVisibleListRecordsSelected ? '取消全选' : '全选当前'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleBatchSetSelectedRecordsCompleted(true)}
+                          disabled={isBatchBusy || selectedListRecordCount === 0}
+                          className="rounded-xl bg-emerald-500 px-3 py-1.5 text-[12px] font-bold text-white transition hover:bg-emerald-600 disabled:opacity-50"
+                        >
+                          批量完成
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleBatchSetSelectedRecordsCompleted(false)}
+                          disabled={isBatchBusy || selectedListRecordCount === 0}
+                          className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-[12px] font-bold text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-50"
+                        >
+                          批量重启
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleBatchDeleteSelectedRecords()}
+                          disabled={isBatchBusy || selectedListRecordCount === 0}
+                          className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-1.5 text-[12px] font-bold text-rose-600 transition hover:bg-rose-100 disabled:opacity-50"
+                        >
+                          批量删除
+                        </button>
+                        <label className="flex items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-1.5 text-[12px] font-bold text-gray-500">
+                          改日期
+                          <input
+                            type="date"
+                            value={batchDueDate}
+                            onChange={(event) => setBatchDueDate(event.target.value)}
+                            className="bg-transparent text-[12px] font-bold text-gray-800 outline-none"
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => void handleBatchRescheduleSelectedTasks()}
+                          disabled={isBatchBusy || selectedListRecordCount === 0 || !batchDueDate}
+                          className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-1.5 text-[12px] font-bold text-[#5B7BFE] transition hover:bg-blue-100 disabled:opacity-50"
+                        >
+                          应用日期
+                        </button>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <label className="flex min-w-[220px] items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-1.5 text-[12px] font-bold text-gray-500">
+                          事件线
+                          <select
+                            value={batchEventLineId}
+                            onChange={(event) => setBatchEventLineId(event.target.value)}
+                            className="min-w-0 flex-1 bg-transparent text-[12px] font-bold text-gray-800 outline-none"
+                          >
+                            <option value="">选择事件线</option>
+                            {batchEventLineOptions.map((line) => (
+                              <option key={line.id} value={line.id}>
+                                {line.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => void handleBatchAssignEventLineSelectedTasks()}
+                          disabled={isBatchBusy || selectedListRecordCount === 0 || !batchEventLineId}
+                          className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-[12px] font-bold text-slate-700 transition hover:bg-slate-100 disabled:opacity-50"
+                        >
+                          归入事件线
+                        </button>
+                        {isBatchBusy && (
+                          <span className="inline-flex items-center gap-1.5 text-[12px] font-bold text-gray-400">
+                            <RefreshCw size={13} className="animate-spin" />
+                            处理中
+                          </span>
+                        )}
+                      </div>
                     </div>
                     <button
                       type="button"
@@ -25418,77 +25476,12 @@ export default function App() {
     };
     const [filesTabSearchInput, setFilesTabSearchInput] = useRuntimeUiSessionState(`${workspaceUiSessionScope}:${workspaceClientUiKey}:file-search`, '');
     const [retryingProjectMaterialIds, setRetryingProjectMaterialIds] = useState<string[]>([]);
-    const [feishuDocumentSyncStatusById, setFeishuDocumentSyncStatusById] = useState<Record<string, FeishuSyncStatusRecord | null>>({});
-    const [feishuDocumentSyncingById, setFeishuDocumentSyncingById] = useState<Record<string, boolean>>({});
-    useEffect(() => {
-      setFeishuDocumentSyncStatusById({});
-      setFeishuDocumentSyncingById({});
-    }, [workspacesState?.activeSandboxId]);
-    const visibleFeishuDocuments = useMemo(() => {
-      if (workspaceRightTab !== 'files') return [];
-      return (workspace?.documents || [])
-        .filter((doc) => Boolean(doc.id))
-        .slice(0, 40)
-        .map((doc) => ({
-          id: doc.id,
-          originalSourcePath: doc.originalSourcePath || '',
-        }));
-    }, [workspaceRightTab, workspace?.documents]);
-    const visibleFeishuDocumentIdsKey = useMemo(() => {
-      return visibleFeishuDocuments
-        .map((doc) => doc.id)
-        .join('|');
-    }, [visibleFeishuDocuments]);
-    useEffect(() => {
-      if (!visibleFeishuDocumentIdsKey) return undefined;
-      let cancelled = false;
-      const documentIds = visibleFeishuDocuments.map((doc) => doc.id).filter(Boolean);
-      const documentById = new Map(visibleFeishuDocuments.map((doc) => [doc.id, doc]));
-      const idsToFetch = documentIds.filter((id) => {
-        const current = feishuDocumentSyncStatusById[id];
-        if (!(id in feishuDocumentSyncStatusById)) return true;
-        const source = (documentById.get(id)?.originalSourcePath || '').replace(/\\/g, '/');
-        const importedFromFeishu = source.includes('/_imports/feishu/');
-        if (!importedFromFeishu) return false;
-        const status = current?.status || 'idle';
-        return !['synced', 'imported_missing_mapping'].includes(status);
-      });
-      if (idsToFetch.length === 0) return undefined;
-      void Promise.allSettled(
-        idsToFetch.map(async (documentId) => {
-          try {
-            const record = await getFeishuSyncStatus({
-              localType: 'document',
-              localId: documentId,
-              remoteType: 'docx_document',
-            });
-            return { documentId, record };
-          } catch {
-            return { documentId, record: null };
-          }
-        }),
-      ).then((results) => {
-        if (cancelled) return;
-        setFeishuDocumentSyncStatusById((prev) => {
-          const next = { ...prev };
-          for (const result of results) {
-            if (result.status !== 'fulfilled') continue;
-            next[result.value.documentId] = result.value.record;
-          }
-          return next;
-        });
-      });
-      return () => {
-        cancelled = true;
-      };
-    }, [visibleFeishuDocumentIdsKey, visibleFeishuDocuments, feishuDocumentSyncStatusById]);
-    const openFeishuMemberAuthorizationSettings = () => {
+    const openFeishuOrganizationSettings = () => {
       setActiveTab('settings');
       setSettingsSection('overview');
       void loadSettingsBlock().catch((error) => {
         flash('error', error instanceof Error ? error.message : '系统设置加载失败');
       });
-      void loadFeishuMemberAuthorizationBlock().catch(() => undefined);
     };
     const [filesTabSearchResult, setFilesTabSearchResult] = useState<KnowledgeSearchResult | null>(null);
     const [isFilesTabSearching, setIsFilesTabSearching] = useState(false);
@@ -25808,9 +25801,8 @@ export default function App() {
     );
     // P-A 透明度:填表字段「有数据/缺数据」明细的展开开关
     const [fillDetailOpen, setFillDetailOpen] = useState(false);
-    // Q2 右上角链接转写卡:该客户的链接任务列表(进行中/排队/最近),轮询刷新。
+    // Q2 链接转写队列：只用于正在处理的进度与排队状态；已完成资料直接在文件列表查看。
     const [clientLinkMaterialRuns, setClientLinkMaterialRuns] = useState<LinkMaterialImportRun[]>([]);
-    const [linkCardCancelingId, setLinkCardCancelingId] = useState<string | null>(null);
     // Q2 上下文面板:点「链接转资料」工具时,在工具栏下方有界区域展开链接配置(不全屏、不常驻撑大工具栏)。
     const [linkPanelOpen, setLinkPanelOpen] = useState(false);
     const setTemplateFillDialog = (
@@ -26798,6 +26790,11 @@ export default function App() {
 	          setClientLinkMaterialRun(run);
 	          setLatestClientLinkMaterialRun(run);
 	          if (run.status === 'completed') {
+            writeRuntimeUiSessionValue(
+              ['workspace-knowledge-presentation', currentActiveSandboxId() || 'local', currentClientId].join(':'),
+              null,
+            );
+            markClientKnowledgeChanged(currentClientId, 'material_imported');
             await refreshWorkspace(currentClientId);
             // 转写完成后直接用内嵌智能编辑器打开(而非系统 Word);失败再退回系统打开
             let openedInEditor = false;
@@ -26868,6 +26865,11 @@ export default function App() {
 	          if (['queued', 'running'].includes(run.status)) {
 	            timeoutId = window.setTimeout(poll, 2000);
 	          } else if (run.status === 'completed') {
+	            writeRuntimeUiSessionValue(
+	              ['workspace-knowledge-presentation', currentActiveSandboxId() || 'local', currentClientId].join(':'),
+	              null,
+	            );
+	            markClientKnowledgeChanged(currentClientId, 'material_imported');
 	            await refreshWorkspace(currentClientId);
 	          }
 	        } catch {
@@ -28025,24 +28027,7 @@ export default function App() {
       try {
         const result = await importFeishuDocsToClient(currentClientId, selectedItems);
         setFeishuImportResult(result);
-        const importedSyncStatusById: Record<string, FeishuSyncStatusRecord> = {};
-        for (const item of result.items) {
-          if (item.status !== 'imported' || !item.documentId) continue;
-          importedSyncStatusById[item.documentId] = {
-            localType: 'document',
-            localId: item.documentId,
-            remoteType: 'docx_document',
-            remoteId: item.token,
-            remoteUrl: item.remoteUrl,
-            status: 'synced',
-            message: '已与飞书文档建立一一对应关系。',
-            lastSyncedAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            details: { importedFromFeishu: true },
-          };
-        }
         await refreshWorkspace(currentClientId);
-        setFeishuDocumentSyncStatusById((prev) => ({ ...prev, ...importedSyncStatusById }));
         if (result.importedCount > 0) {
           flash('success', `已接收 ${result.importedCount} 份飞书文档，后台正在解析`);
         } else {
@@ -28335,36 +28320,15 @@ export default function App() {
 	      }
 	    };
 
-	    const handleCancelLinkMaterialRun = async (runId: string) => {
+	    const handleRetryLinkMaterialRun = async (runId: string) => {
 	      if (!currentClientId) return;
-	      setLinkCardCancelingId(runId);
 	      try {
-	        await cancelClientLinkMaterialImportRun(currentClientId, runId);
-	        const runs = await listClientLinkMaterialImportRuns(currentClientId, 20);
-	        setClientLinkMaterialRuns(runs);
+	        const run = await retryClientLinkMaterialImportRun(currentClientId, runId);
+	        setClientLinkMaterialRun(run);
+	        setLatestClientLinkMaterialRun(run);
+	        flash('info', '已重新加入链接转存队列，可继续做别的事');
 	      } catch (error) {
-	        flash('error', error instanceof Error ? error.message : '取消失败');
-	      } finally {
-	        setLinkCardCancelingId(null);
-	      }
-	    };
-
-	    // 链接转写卡:点完成项 → 用智能编辑器打开(复用既有逻辑)。
-	    const openLinkMaterialRunInEditor = async (run: LinkMaterialImportRun) => {
-	      if (!currentClientId || !run.documentId) return;
-	      try {
-	        const doc = await getDocumentText(run.documentId);
-	        const docTitle = run.title || doc.title || '链接转写';
-	        markDocumentAsUsed({ documentId: run.documentId, title: docTitle, path: run.documentPath || '' });
-	        setClientWorkspaceInlineEditor({
-	          clientId: currentClientId,
-	          title: docTitle,
-	          content: doc.content || '',
-	          titleEdited: true,
-	          sourceDocumentId: run.documentId,
-	        });
-	      } catch (error) {
-	        flash('error', error instanceof Error ? `打开失败：${error.message}` : '打开失败');
+	        flash('error', error instanceof Error ? error.message : '重新处理失败');
 	      }
 	    };
 
@@ -28386,21 +28350,29 @@ export default function App() {
 	      const ytDlpErrorTail = metadata.ytDlpErrorTail ? String(metadata.ytDlpErrorTail) : '';
 	      const impersonationAvailable = metadata.impersonationAvailable;
 	      const isActiveRun = ['queued', 'running'].includes(run.status);
+	      const completedWithWarning = run.status === 'completed' && run.state === 'completed_with_warning';
 	      const toneClass =
-	        run.status === 'completed'
+	        completedWithWarning
+	          ? 'border-amber-100 bg-amber-50/65 text-amber-800'
+	          : run.status === 'completed'
 	          ? 'border-emerald-100 bg-emerald-50/60 text-emerald-800'
 	          : run.status === 'failed'
 	            ? 'border-rose-100 bg-rose-50/65 text-rose-700'
 	            : 'border-blue-100 bg-blue-50/65 text-[#3652c9]';
 	      const title =
-	        run.status === 'completed'
+	        completedWithWarning
+	          ? '链接转写已完成，共享摘要待重试'
+	          : run.status === 'completed'
 	          ? '最近一次链接转资料已完成'
 	          : run.status === 'failed'
 	            ? '最近一次链接转资料失败'
 	            : '链接转资料处理中';
+	      const hasLocalDocument = Boolean(run.documentPath);
 	      const rawDetail =
 	        run.status === 'failed'
-	          ? (run.error || '处理失败，请重新打开链接转资料查看原因。')
+	          ? (hasLocalDocument
+	              ? `本机转写文件已生成；${run.error || '组织云登记待重试'}`
+	              : (run.error || '处理失败，请重新打开链接转资料查看原因。'))
 	          : run.status === 'completed'
 	            ? `已保存到：${logicalFolder}`
 	            : run.stage;
@@ -28469,6 +28441,15 @@ export default function App() {
 	          )}
 	          {run.status === 'failed' && nextStep && variant !== 'compact' && (
 	            <p className="mt-1 text-[10px] font-semibold leading-4 opacity-80">{nextStep}</p>
+	          )}
+	          {run.retryable && !isActiveRun && variant !== 'compact' && (
+	            <button
+	              type="button"
+	              className="mt-2 rounded-lg border border-current/20 bg-white/70 px-2 py-1 text-[10px] font-bold"
+	              onClick={() => void handleRetryLinkMaterialRun(run.runId)}
+	            >
+	              重新处理
+	            </button>
 	          )}
 	          <p className="mt-1 truncate text-[10px] opacity-75">
 	            {accessMode === 'browser_cookie'
@@ -29520,24 +29501,24 @@ export default function App() {
             <div className="flex-1 overflow-y-auto px-6 py-5">
               {isFeishuImportLoading && !feishuImportStatus ? (
                 <div className="rounded-2xl border border-blue-100 bg-blue-50 px-4 py-3 text-[13px] font-semibold text-blue-700">
-                  正在检查飞书授权状态…
+                  正在检查组织飞书应用…
                 </div>
               ) : feishuImportStatus && !feishuImportStatus.ready ? (
                 <div className="rounded-2xl border border-amber-100 bg-amber-50 px-4 py-4">
                   <div className="flex items-start gap-3">
                     <AlertTriangle size={18} className="mt-0.5 text-amber-600" />
                     <div className="min-w-0 flex-1">
-                      <p className="text-[13px] font-bold text-amber-800">需要先绑定飞书身份</p>
-                      <p className="mt-1 text-[12px] leading-5 text-amber-700">{feishuImportStatus.reason || '读取飞书文档前需要完成成员飞书授权。'}</p>
+                      <p className="text-[13px] font-bold text-amber-800">组织飞书应用尚未接通</p>
+                      <p className="mt-1 text-[12px] leading-5 text-amber-700">{feishuImportStatus.reason || '请由组织管理员先配置飞书机器人；导入后将形成独立资料，不再持续同步飞书原文。'}</p>
                       <button
                         type="button"
                         className="mt-3 rounded-xl bg-amber-600 px-3 py-2 text-[12px] font-bold text-white shadow-sm transition hover:bg-amber-700"
                         onClick={() => {
                           setIsFeishuImportOpen(false);
-                          openFeishuMemberAuthorizationSettings();
+                          openFeishuOrganizationSettings();
                         }}
                       >
-                        去系统设置绑定飞书
+                        去系统设置配置飞书
                       </button>
                     </div>
                   </div>
@@ -32690,53 +32671,6 @@ export default function App() {
                       <p className="mt-1 text-[9px] leading-4 text-slate-400">
                         仅读取公开网页；不会读取浏览器 Cookie。
                       </p>
-                      {clientLinkMaterialRuns.length > 0 && (
-                        <ul className="mt-1.5 space-y-1">
-                          {clientLinkMaterialRuns.slice(0, 8).map((run) => (
-                            <li key={run.runId} className="rounded-lg bg-white/70 px-2 py-1">
-                              <div className="flex items-center gap-1.5">
-                                <span className="min-w-0 flex-1 truncate text-[10px] font-medium text-slate-700" title={run.title || run.sourceUrl}>
-                                  {run.title || run.stage || run.sourceUrl}
-                                </span>
-                                {run.status === 'running' && (
-                                  <span className="shrink-0 text-[9px] font-bold tabular-nums text-[#7C5BFE]">{Math.round(run.progress)}%</span>
-                                )}
-                                {run.status === 'queued' && <span className="shrink-0 text-[9px] text-amber-600">排队中</span>}
-                                {run.status === 'completed' && (
-                                  <button
-                                    type="button"
-                                    onClick={() => void openLinkMaterialRunInEditor(run)}
-                                    className="shrink-0 text-[9px] font-bold text-[#5B7BFE] hover:underline"
-                                  >
-                                    打开
-                                  </button>
-                                )}
-                                {run.status === 'failed' && <span className="shrink-0 text-[9px] text-rose-500">失败</span>}
-                                {run.status === 'canceled' && <span className="shrink-0 text-[9px] text-slate-400">已取消</span>}
-                                {run.status === 'queued' && (
-                                  <button
-                                    type="button"
-                                    disabled={linkCardCancelingId === run.runId}
-                                    onClick={() => void handleCancelLinkMaterialRun(run.runId)}
-                                    className="shrink-0 px-1 text-[11px] leading-none text-slate-400 transition hover:text-rose-500 disabled:opacity-40"
-                                    title="取消排队"
-                                  >
-                                    ✕
-                                  </button>
-                                )}
-                              </div>
-                              {run.status === 'running' && (
-                                <div className="mt-1 h-1 overflow-hidden rounded-full bg-violet-100">
-                                  <div className="h-full rounded-full bg-[#7C5BFE] transition-all duration-500" style={{ width: `${Math.min(Math.max(run.progress, 6), 100)}%` }} />
-                                </div>
-                              )}
-                              {run.status === 'failed' && run.error && (
-                                <p className="mt-0.5 truncate text-[9px] text-rose-400" title={run.error}>{run.error}</p>
-                              )}
-                            </li>
-                          ))}
-                        </ul>
-                      )}
                     </div>
                     )}
                   </>
@@ -32910,104 +32844,6 @@ export default function App() {
 
             {/* Tab: 文件（仅显示用户用过的，搜索结果跳引证 tab） */}
             {workspaceRightTab === 'files' && (() => {
-              const isFeishuDocxSyncableDocument = (params: { path?: string; kind?: string; source?: string; title?: string }) => {
-                const kind = (params.kind || '').toLowerCase();
-                const source = (params.source || '').toLowerCase();
-                const name = `${params.path || ''} ${params.title || ''}`.toLowerCase();
-                const extensionMatched = /\.(docx?|md|markdown|txt)$/i.test(name);
-                const kindMatched = ['doc', 'docx', 'md', 'markdown', 'txt', 'manual_text_doc'].includes(kind);
-                const sourceMatched = [
-                  'manual_text_doc',
-                  'workspace_native',
-                  'answer_export_doc',
-                  'answer_memory_doc',
-                  'link_material_import',
-                  'auto_repair',
-                  'consultation_knowledge_memory',
-                  'internet_enrichment',
-                  'readiness_action',
-                ].includes(source);
-                return extensionMatched || kindMatched || sourceMatched;
-              };
-              const localFeishuDocumentStatus = (
-                documentId: string,
-                status: FeishuSyncStatusRecord['status'],
-                message: string,
-                details: Record<string, unknown> = {},
-              ): FeishuSyncStatusRecord => ({
-                localType: 'document',
-                localId: documentId,
-                remoteType: 'docx_document',
-                status,
-                message,
-                updatedAt: new Date().toISOString(),
-                details,
-              });
-              const handleCreateFeishuDocument = async (params: { documentId: string; fileLabel: string; path: string; title: string }) => {
-                const { documentId, fileLabel, path, title } = params;
-                if (!documentId) return;
-                if (!currentClientId) {
-                  flash('error', '请先选择客户或项目');
-                  return;
-                }
-                if (!feishuMemberAuthorizationState.linked) {
-                  setFeishuDocumentSyncStatusById((prev) => ({
-                    ...prev,
-                    [documentId]: localFeishuDocumentStatus(
-                      documentId,
-                      'queued',
-                      '当前成员尚未绑定飞书身份。绑定后再创建，才能保证你能打开和编辑飞书文档。',
-                      { blockedReason: 'member_authorization_required' },
-                    ),
-                  }));
-                  flash(
-                    'info',
-                    feishuMemberAuthorizationState.readyForAuthorization
-                      ? '请先完成成员飞书授权，绑定后再创建飞书文档。'
-                      : (feishuMemberAuthorizationState.blockedReason || '请先确认组织飞书应用已配置，再完成成员飞书授权。'),
-                  );
-                  openFeishuMemberAuthorizationSettings();
-                  return;
-                }
-                setFeishuDocumentSyncingById((prev) => ({ ...prev, [documentId]: true }));
-                setFeishuDocumentSyncStatusById((prev) => ({
-                  ...prev,
-                  [documentId]: localFeishuDocumentStatus(documentId, 'syncing', '正在创建飞书文档。'),
-                }));
-                try {
-                  const documentText = await getDocumentText(documentId);
-                  const record = await syncDocumentToFeishuDocx({
-                    localType: 'document',
-                    localId: documentId,
-                    title: documentText.title || title || fileLabel,
-                    content: documentText.content || '',
-                    clientId: currentClientId,
-                    triggerSource: 'manual_document_created',
-                    notifyOnCreate: false,
-                  });
-                  setFeishuDocumentSyncStatusById((prev) => ({ ...prev, [documentId]: record }));
-                  if (record.status === 'synced') {
-                    markDocumentAsUsed({ documentId, title: fileLabel, path });
-                    flash('success', '已创建飞书文档，可从文件卡片打开。');
-                  } else if (record.status === 'queued' && record.details?.blockedReason === 'member_authorization_required') {
-                    flash('info', record.message || '请先绑定飞书身份，再创建飞书文档。');
-                    openFeishuMemberAuthorizationSettings();
-                  } else if (record.status === 'failed' || record.status === 'failed_retryable') {
-                    flash('error', record.message || '飞书文档创建失败，可稍后重试。');
-                  } else {
-                    flash('info', record.message || '飞书同步状态已更新。');
-                  }
-                } catch (error) {
-                  const message = error instanceof Error ? error.message : '创建飞书文档失败';
-                  setFeishuDocumentSyncStatusById((prev) => ({
-                    ...prev,
-                    [documentId]: localFeishuDocumentStatus(documentId, 'failed', message),
-                  }));
-                  flash('error', `创建飞书文档失败：${message}`);
-                } finally {
-                  setFeishuDocumentSyncingById((prev) => ({ ...prev, [documentId]: false }));
-                }
-              };
               const renderFileCard = (params: {
                 key: string;
                 documentId: string;
@@ -33047,83 +32883,6 @@ export default function App() {
                 const isReferenced = Boolean(
                   documentId && activeWorkingDocuments.some((doc) => doc.documentId === documentId),
                 );
-                const feishuSyncStatus = documentId ? feishuDocumentSyncStatusById[documentId] : null;
-                const isCreatingFeishuDoc = Boolean(documentId && feishuDocumentSyncingById[documentId]);
-                const feishuStatus = isCreatingFeishuDoc ? 'syncing' : (feishuSyncStatus?.status || 'idle');
-                const feishuBlockedReason = feishuSyncStatus?.details?.blockedReason;
-                const isPendingFeishuBinding = feishuStatus === 'queued' && feishuBlockedReason === 'member_authorization_required';
-                const importedFromFeishu = Boolean(
-                  feishuSyncStatus?.details?.importedFromFeishu
-                  || (originalSourcePath || '').replace(/\\/g, '/').includes('/_imports/feishu/'),
-                );
-                const isFeishuSyncable = Boolean(documentId) && isFeishuDocxSyncableDocument({ path, kind, source, title: fileLabel });
-                const renderFeishuDocxAction = () => {
-                  if (!isFeishuSyncable) return null;
-                  const remoteUrl = feishuSyncStatus?.remoteUrl || '';
-                  const isSynced = feishuStatus === 'synced';
-                  const isOpenableRemote = isSynced && Boolean(remoteUrl);
-                  const isRetry = feishuStatus === 'failed' || feishuStatus === 'failed_retryable';
-                  const isDisabled =
-                    feishuStatus === 'syncing'
-                    || (feishuStatus === 'queued' && !isPendingFeishuBinding)
-                    || feishuStatus === 'imported_missing_mapping'
-                    || (isRetry && importedFromFeishu)
-                    || feishuStatus === 'not_configured'
-                    || (isSynced && !remoteUrl);
-                  const statusDotClassName = (() => {
-                    if (isSynced) return 'bg-emerald-500';
-                    if (feishuStatus === 'imported_missing_mapping') return 'bg-amber-500';
-                    if (feishuStatus === 'failed' || feishuStatus === 'failed_retryable') return 'bg-rose-500';
-                    if (feishuStatus === 'queued' || feishuStatus === 'syncing') return 'bg-amber-500';
-                    if (feishuStatus === 'not_configured') return 'bg-slate-400';
-                    return '';
-                  })();
-                  const titleText = (() => {
-                    if (isOpenableRemote) return '打开其飞书文档';
-                    if (isSynced) return '已创建飞书文档，但缺少可打开链接';
-                    if (feishuStatus === 'imported_missing_mapping') return feishuSyncStatus?.message || '这份文档来自飞书，但缺少原文链接映射';
-                    if (feishuStatus === 'syncing') return '正在创建飞书文档';
-                    if (isPendingFeishuBinding) return '待绑定飞书后创建；点击去系统设置完成授权';
-                    if (feishuStatus === 'queued') return feishuSyncStatus?.message || '飞书同步排队中';
-                    if (feishuStatus === 'not_configured') return feishuSyncStatus?.message || '组织尚未配置飞书应用';
-                    if (isRetry && importedFromFeishu) return feishuSyncStatus?.message || '这份文档来自飞书，正在等待映射修复';
-                    if (isRetry) return feishuSyncStatus?.message ? `重试创建飞书文档：${feishuSyncStatus.message}` : '重试创建飞书文档';
-                    if (feishuStatus === 'skipped') return feishuSyncStatus?.message || '创建飞书文档';
-                    return '创建飞书文档';
-                  })();
-                  return (
-                    <button
-                      type="button"
-                      disabled={isDisabled}
-                      onClick={() => {
-                        if (isOpenableRemote) {
-                          markDocumentAsUsed({ documentId, title: fileLabel, path });
-                          void window.yiyuWorkbench.openExternalUrl(remoteUrl);
-                          return;
-                        }
-                        if (!importedFromFeishu) {
-                          void handleCreateFeishuDocument({ documentId, fileLabel, path, title });
-                        }
-                      }}
-                      className={`relative rounded-lg p-1.5 transition-colors ${
-                        isDisabled
-                          ? 'text-slate-300 cursor-not-allowed'
-                          : isOpenableRemote
-                            ? 'text-emerald-600 hover:text-emerald-700 hover:bg-emerald-50'
-                            : isRetry
-                              ? 'text-rose-500 hover:text-rose-600 hover:bg-rose-50'
-                              : 'text-slate-500 hover:text-[#5B7BFE] hover:bg-blue-50'
-                      }`}
-                      title={titleText}
-                      aria-label={isOpenableRemote ? '打开其飞书文档' : importedFromFeishu ? '飞书导入文档映射待修复' : '创建飞书文档'}
-                    >
-                      {isOpenableRemote ? <ExternalLink size={16} /> : importedFromFeishu ? <ExternalLink size={16} /> : isRetry ? <RefreshCw size={16} /> : <UploadCloud size={16} />}
-                      {statusDotClassName && (
-                        <span className={`absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full ring-1 ring-white ${statusDotClassName}`} />
-                      )}
-                    </button>
-                  );
-                };
                 return (
                   <div key={key} className="bg-white border border-gray-200 rounded-xl overflow-hidden hover:shadow-sm transition-shadow">
                     <div className="flex items-start gap-3 px-3 pt-2.5 pb-1.5">
@@ -33217,7 +32976,6 @@ export default function App() {
                       </div>
                     )}
                     <div className="flex items-center gap-1 px-3 pt-1.5 pb-2.5">
-                      {renderFeishuDocxAction()}
                       <button
                         type="button"
                         onClick={() => attachDocumentReferenceToComposer({ documentId, fileLabel, path })}
@@ -36706,7 +36464,7 @@ export default function App() {
 	            {renderFoldable({
 	              key: 'feishu',
 		              eyebrow: 'FEISHU · 飞书集成',
-		              title: '飞书自建应用 · 身份绑定',
+	              title: '飞书机器人配置',
 		              detailsRef: feishuIntegrationSettingsRef,
 		              statusChip: feishuSettingsStatusChip,
               children: (
@@ -36723,6 +36481,7 @@ export default function App() {
                   saveBusy={isSavingOrgFeishuIntegration}
                   savePhoneBusy={isSavingFeishuDeliveryProfile}
                   rememberedInputs={localInputMemoryState.feishuIntegration}
+                  canManage={canManageSensitiveSettings}
                   onSaveIntegration={handleSaveOrgFeishuIntegration}
                   onSaveRememberedInputs={handleSaveFeishuInputMemory}
                   onSaveDeliveryProfile={handleSaveFeishuDeliveryProfile}

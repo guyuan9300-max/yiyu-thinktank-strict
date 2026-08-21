@@ -5597,6 +5597,13 @@ export async function cancelClientLinkMaterialImportRun(clientId: string, runId:
   );
 }
 
+export async function retryClientLinkMaterialImportRun(clientId: string, runId: string) {
+  return request<LinkMaterialImportRun>(
+    `/api/v2/ui/clients/${clientId}/link-materials/import-runs/${runId}/retry`,
+    { method: 'POST', body: '{}' },
+  );
+}
+
 export interface ActiveBackgroundTask {
   kind: string;
   label: string;

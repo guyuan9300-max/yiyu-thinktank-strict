@@ -5,6 +5,7 @@ from typing import Annotated, Any
 from fastapi import Body, Depends, FastAPI, Header, status
 
 from ..repositories.gc04_tasks import GC04TaskRepository
+from ..repositories.platform_integrations import PlatformIntegrationsRepository
 from ..repositories.task_planning_agent import TaskPlanningAgentRepository
 from ..repository import CloudRepository, SessionIdentity
 
@@ -18,8 +19,33 @@ def register_gc04_task_routes(
 
     domain = GC04TaskRepository(repository)
     task_planning = TaskPlanningAgentRepository(repository)
+    platform_integrations = PlatformIntegrationsRepository(repository)
     Identity = Annotated[SessionIdentity, Depends(identity_dependency)]
     IdempotencyKey = Annotated[str, Header(alias="Idempotency-Key")]
+
+    def finish_with_feishu_notification(
+        identity: SessionIdentity,
+        result: dict[str, Any],
+        *,
+        event: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        try:
+            notification = platform_integrations.deliver_task_notifications(
+                identity,
+                result=result,
+                event=event,
+                idempotency_key=idempotency_key,
+            )
+        except Exception:  # Task facts already committed; provider work must not falsify that result.
+            notification = {
+                "state": "failed_retryable",
+                "requestedRecipients": 0,
+                "deliveryCount": 0,
+                "partialSuccess": False,
+                "message": "任务已生效；飞书通知暂未送达，可稍后重试",
+            }
+        return {**result, "notificationResult": notification}
 
     @app.get("/api/v2/domain/tasks")
     def task_board(identity: Identity) -> dict[str, Any]:
@@ -86,8 +112,11 @@ def register_gc04_task_routes(
         identity: Identity,
         idempotency_key: IdempotencyKey,
     ) -> dict[str, Any]:
-        return domain.create_task(
+        result = domain.create_task(
             identity, payload=payload, idempotency_key=idempotency_key
+        )
+        return finish_with_feishu_notification(
+            identity, result, event="created", idempotency_key=idempotency_key
         )
 
     @app.post("/api/v2/domain/tasks/lists", status_code=status.HTTP_201_CREATED)
@@ -176,11 +205,14 @@ def register_gc04_task_routes(
         identity: Identity,
         idempotency_key: IdempotencyKey,
     ) -> dict[str, Any]:
-        return domain.update_task(
+        result = domain.update_task(
             identity,
             task_id=task_id,
             payload=payload,
             idempotency_key=idempotency_key,
+        )
+        return finish_with_feishu_notification(
+            identity, result, event="updated", idempotency_key=idempotency_key
         )
 
     @app.delete("/api/v2/domain/tasks/{task_id}")
@@ -205,12 +237,18 @@ def register_gc04_task_routes(
         identity: Identity,
         idempotency_key: IdempotencyKey,
     ) -> dict[str, Any]:
-        return domain.handle_inbox(
+        result = domain.handle_inbox(
             identity,
             task_id=task_id,
             action=action,
             expected_version=int(payload.get("expectedVersion") or 0),
             reason=payload.get("reason"),
+            idempotency_key=idempotency_key,
+        )
+        return finish_with_feishu_notification(
+            identity,
+            result,
+            event="accepted" if action == "accept" else "returned",
             idempotency_key=idempotency_key,
         )
 
@@ -221,12 +259,15 @@ def register_gc04_task_routes(
         identity: Identity,
         idempotency_key: IdempotencyKey,
     ) -> dict[str, Any]:
-        return domain.transfer_task(
+        result = domain.transfer_task(
             identity,
             task_id=task_id,
             target_membership_id=str(payload.get("targetMembershipId") or ""),
             expected_owner_version=int(payload.get("expectedOwnerVersion") or 0),
             idempotency_key=idempotency_key,
+        )
+        return finish_with_feishu_notification(
+            identity, result, event="transferred", idempotency_key=idempotency_key
         )
 
     @app.post("/api/v2/domain/tasks/{task_id}/agent-proposals")
