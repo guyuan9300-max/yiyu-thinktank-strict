@@ -27,6 +27,10 @@ const apiSource = fs.readFileSync(
   path.join(root, 'src', 'renderer', 'lib', 'api.ts'),
   'utf8',
 );
+const taskMediaPanelSource = fs.readFileSync(
+  path.join(root, 'src', 'renderer', 'components', 'tasks', 'TaskMediaPanel.tsx'),
+  'utf8',
+);
 const uiCompatSource = fs.readFileSync(
   path.join(root, 'backend', 'app', 'ui_compat.py'),
   'utf8',
@@ -106,6 +110,10 @@ test('all renderer mutations carry one stable idempotency key across retries', (
   assert.match(
     apiSource,
     /async function requestForm[\s\S]+const stableOptions = _stableMutationOptions\(method, options\)/,
+  );
+  assert.match(
+    apiSource,
+    /const headers = new Headers\(_requestHeaders\(method, stableOptions\) \|\| \{\}\);/,
   );
 });
 
@@ -234,11 +242,38 @@ test('task entry points use membership identity and never force a synthetic inbo
   assert.equal(appSource.includes('ownerId: currentSessionUser?.id'), false);
 });
 
-test('customer meetings retain task editor people and join inbox, plan, list and calendar surfaces', () => {
+test('new task attachments remain pending until the authoritative task exists, then bind to it', () => {
   assert.match(
     appSource,
-    /recordMode: event\.target\.checked \? 'customer_meeting' : 'task'[\s\S]{0,260}collaborators: previous\.collaborators\.length/,
+    /const pendingTaskAttachmentsSnapshot = \[\.\.\.pendingTaskAttachments\]/,
   );
+  assert.match(
+    appSource,
+    /if \(!editingTask\.id\) \{\s*queuePendingTaskAttachments\(fileList\);\s*return;\s*\}[\s\S]{0,180}uploadAttachmentsToTask\(\s*editingTask\.id,\s*fileList/,
+  );
+
+  const createIndex = appSource.indexOf(
+    'savedTask = await createTask(payload, { sandboxId: saveSandboxId });',
+  );
+  const bindIndex = appSource.indexOf(
+    'await uploadAttachmentsToTask(savedTask.id, pendingTaskAttachmentsSnapshot, {',
+  );
+  assert.ok(createIndex >= 0, 'new task must be created through the strict task command');
+  assert.ok(bindIndex > createIndex, 'pending files may bind only after the task has a stable authority id');
+  assert.match(
+    appSource,
+    /const taskWithUploadedAttachments = await uploadAttachmentsToTask\([\s\S]{0,700}savedTask = taskWithUploadedAttachments;[\s\S]{0,240}upsertLocalTask\(taskWithUploadedAttachments, savedTask\.id/,
+  );
+  assert.match(
+    taskMediaPanelSource,
+    /recording\.pending \? '将随任务一并保存' : '播放录音'/,
+  );
+  assert.equal(taskMediaPanelSource.includes('>待保存</span>'), false);
+  assert.equal(appSource.includes('>待保存</span>'), false);
+});
+
+test('legacy customer meetings retain people and join inbox, plan, list and calendar surfaces', () => {
+  assert.ok(appSource.includes("recordMode: 'customer_meeting'"));
   assert.match(appSource, /collaboratorMembershipIds: selectedTaskCollaborators\.map/);
   assert.match(appSource, /planningCycleId: editingTask\.planLinkSource === 'manager'/);
   assert.ok(appSource.includes('filteredInboundPendingMeetings'));
@@ -252,11 +287,24 @@ test('workbench exposes project knowledge source counts and material boundary', 
   assert.ok(appSource.includes('本机私有'));
   assert.ok(appSource.includes('组织云只返回已发布摘要和关系，不下载源文件正文'));
   assert.ok(appSource.includes('本机私有资料不会上传组织云'));
-  assert.ok(appSource.includes('整理资料 · 从本机正文生成并发布组织共享摘要'));
-  assert.ok(appSource.includes('生成并发布共享摘要'));
+  assert.equal(appSource.includes('整理资料 · 从本机正文生成并发布组织共享摘要'), false);
   assert.match(appSource, /onClick:\s*\(\) => void handlePreviewDocumentAutoRepair\(\)/);
   assert.ok(appSource.includes('源文件和正文始终留在本机，只向当前组织发布摘要与来源校验信息'));
   assert.ok(uiCompatSource.includes('"knowledgeContext": knowledge_context'));
+});
+
+test('task transcript can only be summarized into bounded task details', () => {
+  assert.ok(appSource.includes('重新校正'));
+  assert.ok(appSource.includes('readOnly'));
+  assert.equal(appSource.includes('保存修正版'), false);
+  assert.ok(appSource.includes('提炼纪要并写入任务详情'));
+  assert.ok(appSource.includes('【录音纪要】'));
+  assert.equal(appSource.includes('查看原始转写'), false);
+  assert.equal(appSource.includes('原始转写已保留'), false);
+  assert.match(appSource, /const descriptionLimit = 20_000/);
+  assert.match(appSource, /const minutesHardLimit = Math\.min\(1_800, availableLength\)/);
+  assert.equal(appSource.includes('插入任务文字'), false);
+  assert.equal(appSource.includes('生成会议纪要'), false);
 });
 
 test('workbench explains text correction and clears a stale selection immediately', () => {

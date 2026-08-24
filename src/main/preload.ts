@@ -80,6 +80,8 @@ contextBridge.exposeInMainWorld('yiyuWorkbench', {
     buffer: ArrayBuffer;
     extension?: string;
     sessionId?: string;
+    scopeId?: string;
+    suggestedBaseName?: string;
   }) => ipcRenderer.invoke('strict:save-recording-blob', payload),
   readRecordingFile: (absolutePath: string) =>
     ipcRenderer.invoke('strict:read-recording-file', absolutePath),

@@ -575,14 +575,13 @@ import {
   updateTaskTag,
   updateTask,
   uploadTaskAttachment,
-  uploadTaskAttachmentFromMarkdown,
   deleteTaskAttachment,
   getLocalAsrModelStatus,
   getTranscriptionPreference,
   listRecentAudioTranscriptionJobs,
   retryTaskAudioTranscription,
   getTaskAudioTranscript,
-  updateTaskAudioTranscript,
+  recorrectTaskAudioTranscript,
   summarizeRecordingMeetingMinutes,
   updateTopicsSettings,
   upsertDna,
@@ -9390,6 +9389,13 @@ export default function App() {
   }, [workspacesState?.activeSandboxId]);
 
   const recordingSession = useRecordingSession({
+    ensureAsrReady: async () => {
+      setTaskRecordingError(null);
+      const modelStatus = await getLocalAsrModelStatus();
+      const ready = Boolean(modelStatus.installed && modelStatus.state === 'ready');
+      setLocalAsrModelInstalled(ready);
+      return ready;
+    },
     onTranscribed: async ({ binding }) => {
       flash(
         'success',
@@ -12796,7 +12802,7 @@ export default function App() {
         || document.parseStatus === 'not_requested'
         || (
           document.parseStatus === 'ready'
-          && (!document.wikiStatus || ['not_requested', 'queued'].includes(document.wikiStatus))
+          && (!document.wikiStatus || document.wikiStatus === 'not_requested')
         )
         || (
           document.parseStatus === 'ready'
@@ -14357,10 +14363,7 @@ export default function App() {
       title: string;
       originalText: string;
       currentText: string;
-      draft: string;
       version: number;
-      minutesPreview: string;
-      minutesTitle: string;
     } | null>(null);
     const [audioTranscriptBusy, setAudioTranscriptBusy] = useState(false);
     useEffect(() => {
@@ -15839,6 +15842,9 @@ export default function App() {
         processingStage: null,
         transcriptAttachmentId: null,
         transcriptPath: null,
+        isTranscriptProjection: false,
+        createdAt: null,
+        updatedAt: null,
       })),
       [pendingTaskAttachments],
     );
@@ -15857,6 +15863,10 @@ export default function App() {
           processingStage: attachment.processingStage || null,
           transcriptAttachmentId: attachment.transcriptAttachmentId || null,
           transcriptPath: attachment.transcriptPath || null,
+          isTranscriptProjection: Boolean(attachment.isTranscriptProjection),
+          cloudMetadataState: attachment.cloudMetadataState || null,
+          createdAt: attachment.createdAt || null,
+          updatedAt: attachment.updatedAt || attachment.createdAt || null,
         }))),
         ...pendingTaskAttachmentChips,
       ],
@@ -15934,10 +15944,7 @@ export default function App() {
           title,
           originalText: record.originalText,
           currentText: record.currentText,
-          draft: record.currentText,
           version: record.version,
-          minutesPreview: '',
-          minutesTitle: '',
         });
       } catch (error) {
         flash('error', error instanceof Error ? error.message : '读取转写稿失败');
@@ -15946,70 +15953,67 @@ export default function App() {
       }
     };
 
-    const handleSaveAudioTranscript = async () => {
-      if (!editingTask.id || !audioTranscriptEditor || !guardWorkspaceWrite('保存转写修正版')) return;
+    const handleRecorrectAudioTranscript = async () => {
+      if (!editingTask.id || !audioTranscriptEditor || !guardWorkspaceWrite('重新校正录音转写')) return;
       setAudioTranscriptBusy(true);
       try {
-        const record = await updateTaskAudioTranscript(
+        const record = await recorrectTaskAudioTranscript(
           editingTask.id,
           audioTranscriptEditor.sourceAttachmentId,
-          audioTranscriptEditor.draft,
         );
         setAudioTranscriptEditor((prev) => prev ? {
           ...prev,
           currentText: record.currentText,
-          draft: record.currentText,
           version: record.version,
         } : prev);
         await loadTaskBlock();
-        flash('success', '修正版已保存，原始转写仍保留');
+        flash(
+          record.changed ? 'success' : 'info',
+          record.changed
+            ? '重新校正完成'
+            : '重新检查完成，本轮未发现可以确定改正的内容',
+        );
       } catch (error) {
-        flash('error', error instanceof Error ? error.message : '保存修正版失败');
+        flash('error', error instanceof Error ? error.message : '重新校正失败');
       } finally {
         setAudioTranscriptBusy(false);
       }
     };
 
-    const handleGenerateAudioMinutesPreview = async () => {
+    const handleGenerateAudioMinutesToTaskDescription = async () => {
       if (!audioTranscriptEditor) return;
+      const descriptionLimit = 20_000;
+      const sectionHeading = '【录音纪要】';
+      const existingDescription = editingTask.desc.trimEnd();
+      const separator = existingDescription ? `\n\n${sectionHeading}\n` : `${sectionHeading}\n`;
+      const availableLength = descriptionLimit - existingDescription.length - separator.length;
+      if (availableLength < 120) {
+        flash('error', '任务详情剩余空间不足，请先精简现有内容');
+        return;
+      }
       setAudioTranscriptBusy(true);
       try {
         const result = await summarizeRecordingMeetingMinutes({
-          transcript: audioTranscriptEditor.draft,
-          dialogueText: audioTranscriptEditor.draft,
+          transcript: audioTranscriptEditor.currentText,
+          dialogueText: audioTranscriptEditor.currentText,
           taskTitleHint: editingTask.title,
         });
         if (!result.success || !result.minutesMd.trim()) {
-          throw new Error(result.errorMessage || '未生成有效会议纪要');
+          throw new Error(result.errorMessage || '未生成有效录音纪要');
         }
-        setAudioTranscriptEditor((prev) => prev ? {
+        const minutesHardLimit = Math.min(1_800, availableLength);
+        const rawMinutes = result.minutesMd.trim();
+        const minutes = rawMinutes.length <= minutesHardLimit
+          ? rawMinutes
+          : `${rawMinutes.slice(0, Math.max(0, minutesHardLimit - 1)).trimEnd()}…`;
+        setEditingTask((prev) => ({
           ...prev,
-          minutesPreview: result.minutesMd.trim(),
-          minutesTitle: result.title.trim() || `${editingTask.title || '录音'}会议纪要`,
-        } : prev);
-      } catch (error) {
-        flash('error', error instanceof Error ? error.message : '生成会议纪要失败');
-      } finally {
-        setAudioTranscriptBusy(false);
-      }
-    };
-
-    const handleArchiveAudioMinutes = async () => {
-      if (!editingTask.id || !audioTranscriptEditor?.minutesPreview || !guardWorkspaceWrite('归档会议纪要')) return;
-      setAudioTranscriptBusy(true);
-      try {
-        await uploadTaskAttachmentFromMarkdown(editingTask.id, {
-          title: audioTranscriptEditor.minutesTitle || `${editingTask.title || '录音'}会议纪要`,
-          markdown: audioTranscriptEditor.minutesPreview,
-          clientId: editingTask.clientId,
-          eventLineId: editingTask.eventLineId,
-          taskTitle: editingTask.title,
-        });
-        await loadTaskBlock();
+          desc: `${prev.desc.trimEnd()}${prev.desc.trimEnd() ? `\n\n${sectionHeading}\n` : `${sectionHeading}\n`}${minutes}`,
+        }));
         setAudioTranscriptEditor(null);
-        flash('success', '会议纪要已归档');
+        flash('success', '录音纪要已提炼并写入任务详情，保存任务后生效');
       } catch (error) {
-        flash('error', error instanceof Error ? error.message : '归档会议纪要失败');
+        flash('error', error instanceof Error ? error.message : '提炼录音纪要失败');
       } finally {
         setAudioTranscriptBusy(false);
       }
@@ -17001,7 +17005,8 @@ export default function App() {
       files: File[],
       options: { clientId?: string | null; eventLineId?: string | null; taskTitle?: string | null; showProgress?: boolean },
     ) => {
-      if (files.length === 0) return;
+      if (files.length === 0) return null;
+      let latestTask: Task | null = null;
       const showProgress = options.showProgress !== false;
       if (showProgress) {
         setIsTaskAttachmentBusy(true);
@@ -17022,8 +17027,9 @@ export default function App() {
               percent: Math.max(0, Math.min(100, Math.round((index / files.length) * 100))),
             });
           }
-          await uploadTaskAttachment(taskId, {
+          latestTask = await uploadTaskAttachment(taskId, {
             file,
+            originalPath: window.yiyuWorkbench?.getDroppedFilePath(file) || undefined,
             clientId: options.clientId || undefined,
             eventLineId: options.eventLineId || undefined,
             taskTitle: options.taskTitle || undefined,
@@ -17054,6 +17060,7 @@ export default function App() {
           setTaskAttachmentUploadProgress(null);
         }
       }
+      return latestTask;
     };
 
     const queuePendingTaskAttachments = (files: File[]) => {
@@ -17077,9 +17084,9 @@ export default function App() {
         return next;
       });
       if (addedCount > 0) {
-        flash('success', `已暂存 ${addedCount} 个附件，保存任务后会自动归档到客户工作台。`);
+        flash('success', `已选择 ${addedCount} 个附件，将随任务一并保存。`);
       } else {
-        flash('info', '这些附件已经在待保存列表里了。');
+        flash('info', '这些附件已经在当前任务中。');
       }
     };
 
@@ -17098,26 +17105,23 @@ export default function App() {
         queuePendingTaskAttachments(fileList);
         return;
       }
-      await uploadAttachmentsToTask(
+      const updatedTask = await uploadAttachmentsToTask(
         editingTask.id,
         fileList,
         { clientId: editingTask.clientId, eventLineId: editingTask.eventLineId, taskTitle: editingTask.title },
       );
-      setTasks((prev: Task[]) => prev.map((t: Task) => {
-        if (t.id !== editingTask.id) return t;
-        const newAtts = fileList.map((f, i) => ({
-          id: `pending_${Date.now()}_${i}`,
-          title: f.name,
-          kind: f.name.split('.').pop() || 'bin',
-          path: '',
-          source: 'task_attachment',
-          sizeBytes: f.size,
-          createdAt: new Date().toISOString(),
-        }));
-        return { ...t, attachments: [...(t.attachments || []), ...newAtts] } as Task;
-      }));
-      flash('success', `已上传 ${fileList.length} 个附件`);
-      void loadTaskBlock();
+      if (updatedTask) {
+        upsertLocalTask(updatedTask, editingTask.id);
+      }
+      const pendingCloudCount = (updatedTask?.attachments || []).filter(
+        (item) => item.cloudMetadataState && item.cloudMetadataState !== 'ready',
+      ).length;
+      flash(
+        pendingCloudCount > 0 ? 'info' : 'success',
+        pendingCloudCount > 0
+          ? `已保存 ${fileList.length} 个附件到任务，项目工作台待同步`
+          : `已上传 ${fileList.length} 个附件`,
+      );
     };
 
     const handleTaskAttachmentDrop = (event: React.DragEvent<HTMLDivElement>) => {
@@ -17574,12 +17578,16 @@ export default function App() {
 
           if (!isEditingTaskPersonal && pendingTaskAttachmentsSnapshot.length > 0) {
             try {
-              await uploadAttachmentsToTask(savedTask.id, pendingTaskAttachmentsSnapshot, {
+              const taskWithUploadedAttachments = await uploadAttachmentsToTask(savedTask.id, pendingTaskAttachmentsSnapshot, {
                 clientId: savedTask.clientId || draftSnapshot.clientId || undefined,
                 eventLineId: savedTask.eventLineId || draftSnapshot.eventLineId || undefined,
                 taskTitle: savedTask.title || draftSnapshot.title,
                 showProgress: false,
               });
+              if (taskWithUploadedAttachments) {
+                savedTask = taskWithUploadedAttachments;
+                upsertLocalTask(taskWithUploadedAttachments, savedTask.id, { sandboxId: saveSandboxId });
+              }
               if (currentClientId && currentClientId === (savedTask.clientId || draftSnapshot.clientId)) {
                 await refreshWorkspace(savedTask.clientId || draftSnapshot.clientId);
               }
@@ -23444,6 +23452,7 @@ export default function App() {
                   <textarea
                     value={editingTask.desc}
                     onChange={(event) => setEditingTask((prev) => ({ ...prev, desc: event.target.value }))}
+                    maxLength={20000}
                     placeholder={editingTask.recordMode === 'customer_meeting' ? '添加会议议程、背景和预期结果...' : '添加任务描述，背景、目的、预期结果...'}
                     className="min-h-[120px] w-full flex-1 resize-none border-none text-[15px] leading-relaxed text-gray-600 outline-none placeholder:text-gray-400"
                   />
@@ -23462,6 +23471,11 @@ export default function App() {
                           uploadProgress={taskAttachmentUploadProgress}
                           notice={taskRecordingError}
                           onOpenAsrSettings={openAudioTranscriptionSettings}
+                          onOpenAttachment={(attachment) => handleOpenAttachmentChip({
+                            title: attachment.title,
+                            pending: Boolean(attachment.pending),
+                            path: attachment.path || '',
+                          })}
                           onRevealAttachment={(attachment) => void handleRevealAttachmentChip(attachment)}
                           onRevealTranscript={(attachment) => void handleRevealTaskTranscript(attachment)}
                           onTranscribe={(attachment) => void handleRetryAudioTranscription(attachment.id)}
@@ -23770,16 +23784,13 @@ export default function App() {
                             <span
                               key={attachment.id}
                               onDoubleClick={() => handleOpenAttachmentChip(attachment)}
-                              title={attachment.pending ? `${attachment.title}（保存后才能打开）` : `双击用系统应用打开：${attachment.title}`}
+                              title={attachment.pending ? `${attachment.title}（将随任务一并保存）` : `双击用系统应用打开：${attachment.title}`}
                               className={`group/attachment inline-flex items-center gap-1 rounded-lg border border-gray-200 bg-gray-50 px-2 py-1 text-[11px] text-gray-600 ${
                                 attachment.pending ? '' : 'cursor-pointer hover:border-blue-200 hover:bg-blue-50'
                               }`}
                             >
                               <Paperclip size={10} className="text-gray-400 shrink-0" />
                               <span className="truncate max-w-[180px]">{attachment.title}</span>
-                              {attachment.pending && (
-                                <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">待保存</span>
-                              )}
                               {!attachment.pending && attachment.isAudio && (
                                 <>
                                   {(attachment.processingStatus === 'queued' || attachment.processingStatus === 'processing') && (
@@ -24041,7 +24052,7 @@ export default function App() {
                         className="fixed inset-0 z-[140] flex items-center justify-center bg-slate-950/30 p-4"
                         role="dialog"
                         aria-modal="true"
-                        aria-label="查看和修正录音转写"
+                        aria-label="查看录音转写"
                         onMouseDown={(event) => {
                           if (event.currentTarget === event.target && !audioTranscriptBusy) {
                             setAudioTranscriptEditor(null);
@@ -24055,7 +24066,7 @@ export default function App() {
                                 {audioTranscriptEditor.title}
                               </h3>
                               <p className="mt-1 text-xs text-slate-500">
-                                原始转写已保留 · 当前第 {audioTranscriptEditor.version} 版
+                                当前第 {audioTranscriptEditor.version} 版
                               </p>
                             </div>
                             <button
@@ -24073,50 +24084,12 @@ export default function App() {
                             <div>
                               <label className="mb-2 block text-xs font-bold text-slate-600">转写稿</label>
                               <textarea
-                                value={audioTranscriptEditor.draft}
-                                onChange={(event) => setAudioTranscriptEditor((prev) => prev ? {
-                                  ...prev,
-                                  draft: event.target.value,
-                                } : prev)}
-                                className="min-h-[260px] w-full resize-y rounded-lg border border-slate-200 px-3 py-3 text-sm leading-7 text-slate-700 outline-none focus:border-blue-400"
-                                disabled={audioTranscriptBusy}
+                                value={audioTranscriptEditor.currentText}
+                                readOnly
+                                className="min-h-[260px] w-full resize-y rounded-lg border border-slate-200 bg-slate-50 px-3 py-3 text-sm leading-7 text-slate-700 outline-none"
                               />
                             </div>
 
-                            {audioTranscriptEditor.currentText !== audioTranscriptEditor.originalText && (
-                              <details className="border-t border-slate-100 pt-3">
-                                <summary className="cursor-pointer text-xs font-bold text-slate-500">查看原始转写</summary>
-                                <pre className="mt-3 whitespace-pre-wrap break-words text-xs leading-6 text-slate-500">
-                                  {audioTranscriptEditor.originalText}
-                                </pre>
-                              </details>
-                            )}
-
-                            {audioTranscriptEditor.minutesPreview && (
-                              <div className="border-t border-slate-100 pt-4">
-                                <div className="grid gap-3">
-                                  <label className="text-xs font-bold text-slate-600">会议纪要预览</label>
-                                  <input
-                                    value={audioTranscriptEditor.minutesTitle}
-                                    onChange={(event) => setAudioTranscriptEditor((prev) => prev ? {
-                                      ...prev,
-                                      minutesTitle: event.target.value,
-                                    } : prev)}
-                                    className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-400"
-                                    disabled={audioTranscriptBusy}
-                                  />
-                                  <textarea
-                                    value={audioTranscriptEditor.minutesPreview}
-                                    onChange={(event) => setAudioTranscriptEditor((prev) => prev ? {
-                                      ...prev,
-                                      minutesPreview: event.target.value,
-                                    } : prev)}
-                                    className="min-h-[180px] w-full resize-y rounded-lg border border-slate-200 px-3 py-3 text-sm leading-7 text-slate-700 outline-none focus:border-blue-400"
-                                    disabled={audioTranscriptBusy}
-                                  />
-                                </div>
-                              </div>
-                            )}
                           </div>
 
                           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-5 py-4">
@@ -24131,48 +24104,20 @@ export default function App() {
                             <div className="flex flex-wrap justify-end gap-2">
                               <button
                                 type="button"
-                                className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-bold text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-                                disabled={audioTranscriptBusy || !audioTranscriptEditor.draft.trim()}
-                                onClick={() => {
-                                  const text = audioTranscriptEditor.draft.trim();
-                                  if (!text) return;
-                                  setPendingTaskArchiveText((prev) => prev.trim() ? `${prev.trim()}\n\n${text}` : text);
-                                  setAudioTranscriptEditor(null);
-                                }}
+                                className="rounded-lg border border-blue-200 px-3 py-2 text-xs font-bold text-blue-700 hover:bg-blue-50 disabled:opacity-50"
+                                disabled={audioTranscriptBusy || !audioTranscriptEditor.currentText.trim()}
+                                onClick={() => void handleRecorrectAudioTranscript()}
                               >
-                                插入任务文字
+                                {audioTranscriptBusy ? '处理中…' : '重新校正'}
                               </button>
                               <button
                                 type="button"
-                                className="rounded-lg border border-blue-200 px-3 py-2 text-xs font-bold text-blue-700 hover:bg-blue-50 disabled:opacity-50"
-                                disabled={
-                                  audioTranscriptBusy
-                                  || !audioTranscriptEditor.draft.trim()
-                                  || audioTranscriptEditor.draft === audioTranscriptEditor.currentText
-                                }
-                                onClick={() => void handleSaveAudioTranscript()}
+                                className="rounded-lg bg-slate-900 px-3 py-2 text-xs font-bold text-white hover:bg-slate-800 disabled:opacity-50"
+                                disabled={audioTranscriptBusy || !audioTranscriptEditor.currentText.trim()}
+                                onClick={() => void handleGenerateAudioMinutesToTaskDescription()}
                               >
-                                保存修正版
+                                {audioTranscriptBusy ? '处理中…' : '提炼纪要并写入任务详情'}
                               </button>
-                              {!audioTranscriptEditor.minutesPreview ? (
-                                <button
-                                  type="button"
-                                  className="rounded-lg bg-slate-900 px-3 py-2 text-xs font-bold text-white hover:bg-slate-800 disabled:opacity-50"
-                                  disabled={audioTranscriptBusy || !audioTranscriptEditor.draft.trim()}
-                                  onClick={() => void handleGenerateAudioMinutesPreview()}
-                                >
-                                  生成会议纪要
-                                </button>
-                              ) : (
-                                <button
-                                  type="button"
-                                  className="rounded-lg bg-slate-900 px-3 py-2 text-xs font-bold text-white hover:bg-slate-800 disabled:opacity-50"
-                                  disabled={audioTranscriptBusy || !audioTranscriptEditor.minutesPreview.trim()}
-                                  onClick={() => void handleArchiveAudioMinutes()}
-                                >
-                                  确认归档纪要
-                                </button>
-                              )}
                             </div>
                           </div>
                         </div>
@@ -27663,6 +27608,16 @@ export default function App() {
       void loadSettingsBlock().catch((error) => {
         flash('error', error instanceof Error ? error.message : '系统设置加载失败');
       });
+    };
+
+    const openAsrSettingsFromWorkspace = () => {
+      openAiSettingsFromWorkspace();
+      window.setTimeout(() => {
+        const details = document.getElementById('audio-transcription-settings') as HTMLDetailsElement | null;
+        if (!details) return;
+        details.open = true;
+        details.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 180);
     };
 
     const clientDnaDisplayLabel = 'DNA';
@@ -32858,6 +32813,8 @@ export default function App() {
                   processingErrorCode?: string | null;
                   processingMessage?: string | null;
                   processingRetryable?: boolean;
+                  mediaType?: string | null;
+                  transcriptionStatus?: string | null;
                 }) => {
                 const {
                   key,
@@ -32873,7 +32830,11 @@ export default function App() {
                   processingErrorCode,
                   processingMessage,
                   processingRetryable,
+                  mediaType,
+                  transcriptionStatus,
                 } = params;
+                const isAudio = Boolean(mediaType?.startsWith('audio/'));
+                const displayedProcessingStatus = isAudio ? transcriptionStatus : parseStatus;
                 const canOpen = Boolean(path) && hasOpenableFile(path);
                 const basename = path ? (path.split(/[/\\]/).pop() || '') : '';
                 // Managed files use stable opaque names on disk.  The imported
@@ -32891,28 +32852,38 @@ export default function App() {
                         {fileLabel}
                       </p>
                     </div>
-                    {parseStatus && parseStatus !== 'not_requested' && (
+                    {(isAudio || (parseStatus && parseStatus !== 'not_requested')) && (
                       <div className="px-3 pb-1">
                         <div className="flex items-center gap-1.5 text-[10px] font-medium">
                           <span className={`h-1.5 w-1.5 rounded-full ${
-                            parseStatus === 'ready'
+                            displayedProcessingStatus === 'ready'
                               ? 'bg-emerald-500'
-                              : parseStatus === 'failed_retryable'
+                              : displayedProcessingStatus === 'failed_retryable'
                                 ? 'bg-rose-500'
-                                : parseStatus === 'blocked'
+                                : displayedProcessingStatus === 'blocked'
                                   ? 'bg-amber-500'
                                   : 'bg-blue-500'
                           }`} />
                           <span className={
-                            parseStatus === 'ready'
+                            displayedProcessingStatus === 'ready'
                               ? 'text-emerald-700'
-                              : parseStatus === 'failed_retryable'
+                              : displayedProcessingStatus === 'failed_retryable'
                                 ? 'text-rose-700'
-                                : parseStatus === 'blocked'
+                                : displayedProcessingStatus === 'blocked'
                                   ? 'text-amber-700'
                                   : 'text-blue-700'
                           }>
-                            {parseStatus === 'ready'
+                            {isAudio
+                              ? (transcriptionStatus === 'ready'
+                                  ? '录音原件 · 转写已生成'
+                                  : transcriptionStatus === 'queued' || transcriptionStatus === 'processing'
+                                    ? '录音原件 · 正在转写'
+                                    : transcriptionStatus === 'blocked'
+                                      ? '录音原件 · 等待配置 ASR'
+                                      : transcriptionStatus === 'failed_retryable'
+                                        ? '录音原件 · 转写失败，可在关联任务重试'
+                                        : '录音原件')
+                              : parseStatus === 'ready'
                               ? (wikiStatus === 'ready'
                                   ? '正文已解析 · 本地知识已构建'
                                   : wikiStatus === 'failed_retryable'
@@ -32941,7 +32912,9 @@ export default function App() {
                           {['local_ocr_not_configured', 'local_asr_not_connected'].includes(processingErrorCode || '') && (
                             <button
                               type="button"
-                              onClick={openAiSettingsFromWorkspace}
+                              onClick={processingErrorCode === 'local_asr_not_connected'
+                                ? openAsrSettingsFromWorkspace
+                                : openAiSettingsFromWorkspace}
                               className="ml-auto rounded-md px-1.5 py-0.5 font-bold text-blue-600 hover:bg-blue-50"
                             >
                               {processingErrorCode === 'local_asr_not_connected' ? '去配置 ASR' : '去配置 OCR'}
@@ -33014,7 +32987,10 @@ export default function App() {
                         const isDirectlyEditable = /\.(?:docx|txt|md|markdown|csv|tsv|xml|html?|mht|mhtml|ya?ml)$/i.test(lowered);
                         // 本机生成/导出的 Markdown、文本和 docx 本来就能直接读取，
                         // 不应因异步知识加工尚未把 parseStatus 推到 ready 而丢失智能编辑入口。
-                        if (!isSmartEditorReadable || !documentId || (!isDirectlyEditable && parseStatus !== 'ready')) return null;
+                        // 可提取正文的容器格式（如 .pages）按点击即时读取。
+                        // 后台知识加工状态不应错误地决定智能编辑入口是否存在；
+                        // 提取失败时由打开动作返回准确原因即可。
+                        if (!isSmartEditorReadable || !documentId) return null;
                         // 智能编辑器已经打开时锁住此按钮,避免覆盖当前正在编辑的内容
                         const editorBusy = clientWorkspaceInlineEditor !== null;
                         return (
@@ -33239,6 +33215,8 @@ export default function App() {
                           processingErrorCode: doc.processingErrorCode,
                           processingMessage: doc.processingMessage,
                           processingRetryable: doc.processingRetryable,
+                          mediaType: doc.mediaType,
+                          transcriptionStatus: doc.transcriptionStatus,
                           lastTouchedAt: Math.max(
                             usedAtMap.get(doc.id) || 0,
                             parseImportedMs(doc.importedAt),
@@ -33447,7 +33425,7 @@ export default function App() {
                       </div>
                     </div>
                   ), document.body)}
-                  {pendingDeleteDocument && (
+                  {pendingDeleteDocument && createPortal((
                     <div
                       className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/40 px-6"
                       onMouseDown={(e) => { backdropMouseDownRef.current = (e.target === e.currentTarget); }}
@@ -33492,7 +33470,7 @@ export default function App() {
                         </div>
                       </div>
                     </div>
-                  )}
+                  ), document.body)}
                 </div>
               );
             })()}
@@ -37861,7 +37839,7 @@ export default function App() {
 	      ? '尚未登录组织'
 	      : workspaceRuntimeStatus === 'sync_degraded'
 	        ? '组织连接暂时失败，可重试'
-	        : `${sidebarVisibleClientCount} 客户`)
+	        : `${sidebarVisibleClientCount} 项目`)
 	    : hasActiveOrganizationWorkspace
 	      ? (activeWorkspaceRecord?.requiresLogin ? '需重新登录该组织' : '正在恢复登录信息')
 	      : '没有活动组织工作空间';
@@ -37999,7 +37977,7 @@ export default function App() {
                   : recordingSession.status === 'stopping'
                     ? '收尾'
                     : recordingSession.status === 'requesting_mic'
-                      ? '请求麦克风'
+                      ? (recordingSession.preflightMessage || '检测录音环境')
                       : 'REC'}
             </span>
             <span className="text-[12px] font-mono tabular-nums">

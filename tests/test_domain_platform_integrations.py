@@ -549,7 +549,44 @@ def test_private_ai_platform_actions_execute_and_keep_private_input_out_of_db(
             "tasks.suggest_tags",
         }
         assert len({str(row["sandbox_id"]) for row in rows}) == 1
-        assert all(private_marker not in str(row["payload_json"]) for row in rows)
+    assert all(private_marker not in str(row["payload_json"]) for row in rows)
+
+
+def test_meeting_minutes_accept_plain_markdown_model_output(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, headers = _local(tmp_path)
+
+    def complete(*, system_prompt: str, prompt: str, creativity_mode: str):
+        assert "会议纪要助手" in system_prompt
+        assert "既有任务详情" in prompt
+        assert creativity_mode == "strict"
+        return {
+            "content": "## 讨论结论\n- 保留既有任务详情。\n\n## 行动项\n- 跟进资料。",
+            "modelName": "plain-markdown-test",
+            "sourceScope": "member_local_private_request",
+            "persistedToOrganizationCloud": False,
+        }
+
+    monkeypatch.setattr(client.app.state.runtime, "private_ai_completion", complete)
+    with client:
+        response = client.post(
+            "/api/v2/ui/recordings/summarize-meeting-minutes",
+            headers={**headers, "Idempotency-Key": "plain-minutes-1"},
+            json={
+                "transcript": "这是一段录音转写，讨论了既有任务详情和后续资料。",
+                "taskTitleHint": "既有任务详情",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["state"] == "completed"
+    assert payload["title"] == "讨论结论"
+    assert payload["minutesMd"].startswith("## 讨论结论")
+    assert "跟进资料" in payload["minutesMd"]
 
 
 def test_private_ai_platform_failures_are_classified_and_idempotent(

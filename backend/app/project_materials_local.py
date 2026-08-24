@@ -46,6 +46,81 @@ _ACTIVE_MATERIAL_BATCHES: set[tuple[str, str, str]] = set()
 _ACTIVE_MATERIAL_BATCHES_LOCK = threading.Lock()
 
 
+def _current_project_document_projection(
+    documents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return one visible current transcript for each recording source."""
+
+    def normalized_title_stem(item: Mapping[str, Any]) -> str:
+        stem = Path(str(item.get("title") or item.get("path") or "")).stem
+        return re.sub(r"\s+", "", stem).casefold()
+
+    audio_by_task_and_stem: dict[tuple[str, str], dict[str, Any]] = {}
+    audio_by_stem: dict[str, list[dict[str, Any]]] = {}
+    for item in documents:
+        media_type = str(item.get("mediaType") or "").casefold()
+        suffix = Path(
+            str(item.get("title") or item.get("path") or "")
+        ).suffix.casefold()
+        if not media_type.startswith("audio/") and suffix not in AUDIO_EXTENSIONS:
+            continue
+        stem = normalized_title_stem(item)
+        task_id = str(item.get("taskId") or "")
+        audio_by_stem.setdefault(stem, []).append(item)
+        if task_id:
+            audio_by_task_and_stem[(task_id, stem)] = item
+
+    newest_transcript_by_source: dict[str, dict[str, Any]] = {}
+    visible: list[dict[str, Any]] = []
+    for item in documents:
+        media_type = str(item.get("mediaType") or "")
+        normalized_stem = normalized_title_stem(item)
+        is_transcript_projection = (
+            not media_type.startswith("audio/")
+            and normalized_stem.endswith("-录音转写")
+        )
+        item["isTranscriptProjection"] = is_transcript_projection
+        if not is_transcript_projection:
+            visible.append(item)
+            continue
+        recording_stem = normalized_stem.removesuffix("-录音转写")
+        task_id = str(item.get("taskId") or "")
+        recording = (
+            audio_by_task_and_stem.get((task_id, recording_stem))
+            if task_id
+            else None
+        )
+        if recording is None:
+            candidates = audio_by_stem.get(recording_stem, [])
+            if len(candidates) == 1:
+                recording = candidates[0]
+        if recording is not None:
+            recording_identity = str(
+                recording.get("localSourceId") or recording.get("id") or ""
+            )
+            projection_key = f"recording::{recording_identity}"
+            item["recordingSourceId"] = recording_identity
+        else:
+            # Ambiguous same-name recordings remain separate rather than
+            # risking that one recording hides another recording's text.
+            projection_key = f"{task_id}::{normalized_stem}"
+        previous = newest_transcript_by_source.get(projection_key)
+        current_time = str(item.get("importedAt") or "")
+        previous_time = (
+            str(previous.get("importedAt") or "")
+            if previous is not None
+            else ""
+        )
+        if previous is None or current_time >= previous_time:
+            newest_transcript_by_source[projection_key] = item
+    visible.extend(newest_transcript_by_source.values())
+    return sorted(
+        visible,
+        key=lambda item: str(item.get("importedAt") or ""),
+        reverse=True,
+    )
+
+
 def _bounded_project_lease(value: Any) -> str:
     """Defensively reject a cloud projection lease beyond the 24h contract."""
     now = datetime.now(timezone.utc)
@@ -818,12 +893,34 @@ class LocalProjectMaterialsRepository:
             local = by_source.get(source_id)
             if not local or not document_id:
                 continue
+            relation_overlay: dict[str, Any] = {}
             for existing_id, existing in list(documents.items()):
                 if (
                     existing_id != document_id
                     and isinstance(existing, Mapping)
                     and str(existing.get("localSourceId") or "") == source_id
                 ):
+                    # A cloud metadata receipt replaces the temporary
+                    # ``local-pending`` key, but it must not erase the local
+                    # task/meeting relation or device-side ASR state carried
+                    # by that pending entry.
+                    relation_overlay.update(
+                        {
+                            key: existing.get(key)
+                            for key in (
+                                "taskId",
+                                "meetingId",
+                                "sourceKind",
+                                "transcriptionStatus",
+                                "transcriptionError",
+                                "transcriptionProgress",
+                                "transcriptionStage",
+                                "transcriptObjectId",
+                                "originalTranscriptObjectId",
+                            )
+                            if existing.get(key) is not None
+                        }
+                    )
                     documents.pop(existing_id, None)
             documents[document_id] = {
                 "documentId": document_id,
@@ -849,6 +946,7 @@ class LocalProjectMaterialsRepository:
                 ),
                 "version": int(cloud.get("version") or 1),
                 "updatedAt": local.get("updatedAt") or utc_now(),
+                **relation_overlay,
             }
         state["documents"] = documents
         self._write_project_state(project_id, state)
@@ -1070,6 +1168,22 @@ class LocalProjectMaterialsRepository:
         documents = dict(state.get("documents") or {})
         entry = documents.get(document_id)
         if not isinstance(entry, Mapping):
+            # Callers that have just imported a derived transcript know its
+            # stable localSourceId before the organization-cloud document id is
+            # settled.  Accepting either identity keeps the task relation on
+            # the same source instead of creating a second attachment path.
+            matched = next(
+                (
+                    (candidate_id, candidate)
+                    for candidate_id, candidate in documents.items()
+                    if isinstance(candidate, Mapping)
+                    and str(candidate.get("localSourceId") or "") == document_id
+                ),
+                None,
+            )
+            if matched is not None:
+                document_id, entry = str(matched[0]), matched[1]
+        if not isinstance(entry, Mapping):
             raise LocalRuntimeError(404, "task_attachment_missing", "任务附件不存在")
         normalized = {**dict(entry), "taskId": task_id, "sourceKind": "task_attachment"}
         documents[document_id] = normalized
@@ -1087,7 +1201,12 @@ class LocalProjectMaterialsRepository:
                 "AND lifecycle_state!='deleted'",
                 (task_id, scope_id),
             ).fetchone()
-            if task is None or str(task["client_id"] or "") != project_id:
+            # The cloud task is authoritative and has already been checked by
+            # the caller.  A readable cloud task can legitimately arrive
+            # before its local task projection.  Only reject a *present* local
+            # task that contradicts the verified project; absence is not a
+            # project mismatch.
+            if task is not None and str(task["client_id"] or "") != project_id:
                 raise LocalRuntimeError(409, "task_attachment_project_mismatch", "任务附件与项目归属不一致")
             connection.execute(
                 "UPDATE source_assets SET source_kind='task_attachment',"
@@ -1106,20 +1225,65 @@ class LocalProjectMaterialsRepository:
                 "AND lifecycle_state!='deleted'",
                 (task_id, scope_id),
             ).fetchone()
-        if task is None or not str(task["client_id"] or ""):
+            source = connection.execute(
+                "SELECT client_id FROM source_assets WHERE scope_id=? "
+                "AND source_locator_nonlocal=? AND lifecycle_state='active' "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (scope_id, f"task:{task_id}"),
+            ).fetchone()
+        project_id = str(task["client_id"] or "") if task is not None else ""
+        if not project_id and source is not None:
+            project_id = str(source["client_id"] or "")
+        if not project_id:
             return []
-        state = self._load_project_state(str(task["client_id"]))
+        state = self._load_project_state(project_id)
         result: list[dict[str, Any]] = []
-        for document_id, raw in dict(state.get("documents") or {}).items():
-            if not isinstance(raw, Mapping) or str(raw.get("taskId") or "") != task_id:
-                continue
-            path = str(raw.get("managedPath") or "")
+        task_documents = [
+            (str(document_id), raw)
+            for document_id, raw in dict(state.get("documents") or {}).items()
+            if isinstance(raw, Mapping)
+            and str(raw.get("taskId") or "") == task_id
+        ]
+        audio_suffixes = {
+            ".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".webm", ".mp4", ".mov"
+        }
+
+        def is_audio_document(raw: Mapping[str, Any]) -> bool:
             media_type = str(raw.get("mediaType") or "application/octet-stream")
-            is_audio = media_type.startswith("audio/") or Path(
+            return media_type.startswith("audio/") or Path(
+                str(raw.get("fileName") or raw.get("managedPath") or "")
+            ).suffix.lower() in audio_suffixes
+
+        recording_stems = {
+            Path(str(raw.get("fileName") or raw.get("managedPath") or "")).stem
+            .strip()
+            .casefold()
+            for _, raw in task_documents
+            if is_audio_document(raw)
+        }
+        for document_id, raw in task_documents:
+            managed_path = str(raw.get("managedPath") or "")
+            original_path = str(raw.get("originalSourcePath") or "")
+            # The task editor must present the user's real source file as the
+            # attachment location.  The managed copy is only a rebuildable
+            # parsing cache and must not masquerade as the attachment itself.
+            path = (
+                original_path
+                if original_path and Path(original_path).is_file()
+                else managed_path
+            )
+            media_type = str(raw.get("mediaType") or "application/octet-stream")
+            is_audio = is_audio_document(raw)
+            document_stem = Path(
                 str(raw.get("fileName") or path)
-            ).suffix.lower() in {
-                ".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".webm", ".mp4", ".mov"
-            }
+            ).stem.strip().casefold()
+            is_transcript_projection = (
+                not is_audio
+                and any(
+                    document_stem == f"{recording_stem}-录音转写"
+                    for recording_stem in recording_stems
+                )
+            )
             transcript_path = ""
             transcript_object_id = str(raw.get("transcriptObjectId") or "")
             if transcript_object_id:
@@ -1135,7 +1299,7 @@ class LocalProjectMaterialsRepository:
                 {
                     "id": str(document_id),
                     "taskId": task_id,
-                    "clientId": str(task["client_id"] or ""),
+                    "clientId": project_id,
                     "title": str(raw.get("title") or raw.get("fileName") or "任务附件"),
                     "fileName": str(raw.get("fileName") or "任务附件"),
                     "mediaType": media_type,
@@ -1145,6 +1309,7 @@ class LocalProjectMaterialsRepository:
                     "localAvailable": bool(path and Path(path).is_file()),
                     "sourceScope": "local_private",
                     "source": "task_attachment",
+                    "cloudMetadataState": str(raw.get("cloudMetadataState") or "ready"),
                     "isAudio": is_audio,
                     "processingStatus": (
                         str(raw.get("transcriptionStatus") or "not_requested")
@@ -1156,6 +1321,7 @@ class LocalProjectMaterialsRepository:
                     "processingStage": raw.get("transcriptionStage"),
                     "transcriptAttachmentId": raw.get("transcriptObjectId"),
                     "transcriptPath": transcript_path or None,
+                    "isTranscriptProjection": is_transcript_projection,
                     "version": int(raw.get("version") or 1),
                     "createdAt": raw.get("updatedAt"),
                     "updatedAt": raw.get("updatedAt"),
@@ -1177,7 +1343,15 @@ class LocalProjectMaterialsRepository:
                 "AND lifecycle_state!='deleted'",
                 (task_id, scope_id),
             ).fetchone()
+            source = connection.execute(
+                "SELECT client_id FROM source_assets WHERE scope_id=? "
+                "AND source_locator_nonlocal=? AND lifecycle_state='active' "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (scope_id, f"task:{task_id}"),
+            ).fetchone()
         project_id = str(task["client_id"] or "") if task is not None else ""
+        if not project_id and source is not None:
+            project_id = str(source["client_id"] or "")
         if not project_id:
             raise LocalRuntimeError(404, "task_missing", "任务不存在或没有项目归属")
         state = self._load_project_state(project_id)
@@ -1245,7 +1419,7 @@ class LocalProjectMaterialsRepository:
             raise LocalRuntimeError(409, "task_transcript_version_conflict", "转写稿已变化，请刷新后重试")
         if preserve_original and not entry.get("originalTranscriptObjectId"):
             original_object_id = f"task-transcript-original-{transcript_key}"
-            self._write_object(
+            self._upsert_object(
                 sandbox_id=context.sandbox_id,
                 object_id=original_object_id,
                 storage_key=(
@@ -1257,7 +1431,7 @@ class LocalProjectMaterialsRepository:
                 expected_version=0,
             )
             entry["originalTranscriptObjectId"] = original_object_id
-        stored = self._write_object(
+        stored = self._upsert_object(
             sandbox_id=context.sandbox_id,
             object_id=current_object_id,
             storage_key=storage_key,
@@ -1324,10 +1498,10 @@ class LocalProjectMaterialsRepository:
         with self.runtime._connection() as connection:
             scope_id = self.runtime._local_object_scope_id(connection, context.sandbox_id)
             row = connection.execute(
-                "SELECT client_id FROM source_assets WHERE id=? AND scope_id=? "
-                "AND source_kind='task_attachment' AND source_locator_nonlocal=? "
-                "AND lifecycle_state='active'",
-                (attachment_id, scope_id, f"task:{task_id}"),
+                "SELECT client_id FROM source_assets WHERE scope_id=? "
+                "AND source_locator_nonlocal=? AND lifecycle_state='active' "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (scope_id, f"task:{task_id}"),
             ).fetchone()
         if row is None:
             raise LocalRuntimeError(404, "task_attachment_missing", "任务附件不存在")
@@ -1760,7 +1934,11 @@ class LocalProjectMaterialsRepository:
                         ELSE source_assets.version
                     END,
                     content_hash=excluded.content_hash,
-                    source_kind='local_original',
+                    source_kind=CASE
+                        WHEN COALESCE(source_assets.source_locator_nonlocal, '') != ''
+                        THEN source_assets.source_kind
+                        ELSE 'local_original'
+                    END,
                     display_name=excluded.display_name,
                     media_type=excluded.media_type,
                     byte_size=excluded.byte_size,
@@ -3290,17 +3468,35 @@ class LocalProjectMaterialsRepository:
     ) -> dict[str, Any]:
         state = self._load_project_state(project_id)
         requested = {str(value) for value in document_ids if str(value)}
+        audio_suffixes = {
+            ".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".webm", ".mp4", ".mov"
+        }
+
+        def is_audio_document(raw: Any) -> bool:
+            if not isinstance(raw, Mapping):
+                return False
+            media_type = str(raw.get("mediaType") or "")
+            suffix = Path(
+                str(raw.get("fileName") or raw.get("managedPath") or "")
+            ).suffix.lower()
+            return media_type.startswith("audio/") or suffix in audio_suffixes
+
         selected = [
             str(document_id)
-            for document_id in dict(state.get("documents") or {})
-            if not requested or str(document_id) in requested
+            for document_id, raw in dict(state.get("documents") or {}).items()
+            if (not requested or str(document_id) in requested)
+            and not is_audio_document(raw)
         ]
-        # Queue the whole batch first.  This makes every waiting file visible
-        # to the UI before the first OCR/Office extraction starts and gives the
-        # progress endpoint a truthful denominator for the complete run.
+        # Queue only documents whose *text extraction* actually needs to run.
+        # A ready text body may still need Wiki/retrieval/shared-summary work,
+        # but that downstream work must never create another extraction
+        # attempt or reappear in the UI as "parsing".  Reuse a durable queued
+        # attempt when resuming an interrupted batch instead of inserting a
+        # duplicate row for the same source.
         batch_started_at = utc_now()
         context = self._context()
-        queued: list[tuple[str, str, int]] = []
+        work_items: list[tuple[str, str]] = []
+        queued: list[tuple[str, str, int, str | None]] = []
         for document_id in selected:
             _, document_state, entry = self._document_entry(document_id)
             if str(document_state.get("projectId") or "") != project_id:
@@ -3313,11 +3509,26 @@ class LocalProjectMaterialsRepository:
                 source_id,
                 processor_kind="local_text_extraction",
             )
+            work_items.append((document_id, source_id))
+            current_status = str((current or {}).get("status") or "not_requested")
+            if not force and current_status in {"ready", "blocked", "processing"}:
+                continue
+            if current_status == "queued":
+                queued.append(
+                    (
+                        document_id,
+                        source_id,
+                        int((current or {}).get("attempt_no") or 1),
+                        str((current or {}).get("id") or "") or None,
+                    )
+                )
+                continue
             queued.append(
                 (
                     document_id,
                     source_id,
                     int((current or {}).get("attempt_no") or 0) + 1,
+                    None,
                 )
             )
         if queued:
@@ -3327,28 +3538,41 @@ class LocalProjectMaterialsRepository:
                     context.sandbox_id,
                 )
                 connection.execute("BEGIN IMMEDIATE")
-                for _, source_id, attempt_no in queued:
-                    connection.execute(
-                        """
-                        INSERT INTO processing_attempts (
-                            id, scope_id, operation_id, source_asset_id,
-                            recording_id, attempt_no, status, error_code,
-                            processor_kind, provider_resource_id,
-                            error_message_safe, next_retry_at, started_at,
-                            finished_at, authority_role, origin_instance_id
-                        ) VALUES (?, ?, NULL, ?, NULL, ?, 'queued', NULL,
-                                  'local_text_extraction', NULL, NULL, NULL, ?,
-                                  NULL, 'local', ?)
-                        """,
-                        (
-                            new_id(),
-                            scope_id,
-                            source_id,
-                            attempt_no,
-                            batch_started_at,
-                            context.sandbox_id,
-                        ),
-                    )
+                for _, source_id, attempt_no, queued_attempt_id in queued:
+                    if queued_attempt_id:
+                        connection.execute(
+                            """
+                            UPDATE processing_attempts
+                            SET started_at=?, error_code=NULL,
+                                error_message_safe=NULL, next_retry_at=NULL,
+                                finished_at=NULL
+                            WHERE id=? AND scope_id=?
+                              AND authority_role='local' AND status='queued'
+                            """,
+                            (batch_started_at, queued_attempt_id, scope_id),
+                        )
+                    else:
+                        connection.execute(
+                            """
+                            INSERT INTO processing_attempts (
+                                id, scope_id, operation_id, source_asset_id,
+                                recording_id, attempt_no, status, error_code,
+                                processor_kind, provider_resource_id,
+                                error_message_safe, next_retry_at, started_at,
+                                finished_at, authority_role, origin_instance_id
+                            ) VALUES (?, ?, NULL, ?, NULL, ?, 'queued', NULL,
+                                      'local_text_extraction', NULL, NULL, NULL, ?,
+                                      NULL, 'local', ?)
+                            """,
+                            (
+                                new_id(),
+                                scope_id,
+                                source_id,
+                                attempt_no,
+                                batch_started_at,
+                                context.sandbox_id,
+                            ),
+                        )
                 connection.commit()
 
         # Finish one file end-to-end before moving to the next.  A file only
@@ -3361,7 +3585,7 @@ class LocalProjectMaterialsRepository:
             _ACTIVE_MATERIAL_BATCHES.add(batch_key)
         items: list[dict[str, Any]] = []
         try:
-            for document_id, _, _ in queued:
+            for document_id, _ in work_items:
                 parsed = self.process_document(
                     project_id=project_id,
                     document_id=document_id,
@@ -5118,6 +5342,29 @@ class LocalProjectMaterialsRepository:
                 "local_document_source_missing",
                 "当前设备的资料源文件不存在或已移除",
             )
+        # Finder-imported files keep their real location as the user-facing
+        # source of truth.  Prefer that original when it is still present and
+        # matches the registered content.  The managed copy is only a
+        # rebuildable local projection; it must not replace or masquerade as
+        # the original file selected by the user.
+        original_value = str(
+            entry.get("originalSourcePath")
+            or row.get("local_original_path")
+            or ""
+        ).strip()
+        if original_value:
+            original_path = Path(original_value).expanduser()
+            try:
+                original_data = original_path.read_bytes()
+            except OSError:
+                original_data = b""
+            if (
+                original_data
+                and len(original_data) == int(row["byte_size"])
+                and hashlib.sha256(original_data).hexdigest()
+                == str(row["content_hash"])
+            ):
+                return original_path, dict(row)
         path = self._managed_path(str(row["storage_key"]))
         try:
             data = path.read_bytes()
@@ -6402,6 +6649,11 @@ class LocalProjectMaterialsRepository:
                     "cloudMetadataState": (
                         entry.get("cloudMetadataState") or "ready"
                     ),
+                    "mediaType": entry.get("mediaType") or "application/octet-stream",
+                    "localSourceId": entry.get("localSourceId"),
+                    "taskId": entry.get("taskId"),
+                    "transcriptionStatus": entry.get("transcriptionStatus"),
+                    "transcriptObjectId": entry.get("transcriptObjectId"),
                     "sharedSummaryState": (
                         "ready"
                         if str(entry.get("sharedSummaryState") or "") == "ready"
@@ -6416,11 +6668,10 @@ class LocalProjectMaterialsRepository:
                     **processing,
                 }
             )
-        return sorted(
-            result,
-            key=lambda item: str(item.get("importedAt") or ""),
-            reverse=True,
-        )
+        # A new transcription creates a new derived version while the old
+        # version remains auditable.  The workbench is a current projection,
+        # so expose only the newest transcript for each recording source.
+        return _current_project_document_projection(result)
 
     def duplicate_document_groups(self, project_id: str) -> dict[str, Any]:
         """Derive duplicate candidates from current-device source files only."""

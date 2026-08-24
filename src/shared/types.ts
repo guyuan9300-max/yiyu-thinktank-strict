@@ -991,6 +991,11 @@ export interface DocumentRecord {
   sharedSummaryState?: 'not_requested' | 'ready' | 'blocked' | 'failed_retryable' | string;
   sharedSummaryMessage?: string | null;
   sharedSummaryUpdatedAt?: string | null;
+  mediaType?: string | null;
+  taskId?: string | null;
+  transcriptionStatus?: 'not_requested' | 'queued' | 'processing' | 'ready' | 'blocked' | 'failed_retryable' | string | null;
+  transcriptObjectId?: string | null;
+  isTranscriptProjection?: boolean;
 }
 
 export interface KnowledgeStatus {
@@ -3016,6 +3021,7 @@ export interface TaskAttachment {
   source: string;
   sizeBytes: number;
   createdAt: string;
+  updatedAt?: string | null;
   isAudio?: boolean;
   processingStatus?:
     | 'not_requested'
@@ -3033,6 +3039,8 @@ export interface TaskAttachment {
   transcriptAttachmentId?: string | null;
   transcriptDocumentId?: string | null;
   transcriptPath?: string | null;
+  isTranscriptProjection?: boolean;
+  cloudMetadataState?: 'pending' | 'ready' | 'failed_retryable' | string | null;
 }
 
 export type TaskAttachmentRecord = TaskAttachment;
@@ -9010,6 +9018,8 @@ declare global {
         buffer: ArrayBuffer;
         extension?: string;
         sessionId?: string;
+        scopeId?: string;
+        suggestedBaseName?: string;
       }): Promise<{ absolutePath: string; sizeBytes: number; sessionId: string }>;
       readRecordingFile(absolutePath: string): Promise<{ buffer: Uint8Array; sizeBytes: number; name: string }>;
       setRecordingActive(payload: { active: boolean; taskTitle?: string }): Promise<{ active: boolean }>;

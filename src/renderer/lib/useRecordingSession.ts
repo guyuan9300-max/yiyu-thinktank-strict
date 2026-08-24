@@ -8,7 +8,8 @@
  * - 一次只允许一个录音 session（同应用全局）
  * - 录音不随某个模态卸载销毁：调用 hook 的组件必须是 App 顶层
  * - 录满 4 小时自动停止
- * - 录音文件落到 Electron userData/recordings/{sessionId}.webm
+ * - 开始录音前必须依次通过：本机 ASR、麦克风权限、真实声音信号
+ * - 录音文件按任务稳定目录落地，并使用任务标题生成可读文件名
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -35,6 +36,8 @@ export interface RecordingSessionApi {
   elapsedSeconds: number;
   binding: RecordingBinding | null;
   errorMessage: string | null;
+  /** 录音真正开始前的检查进度；检查期间不会计时或生成文件。 */
+  preflightMessage: string | null;
   /** 实时输入音量（0-1），由麦克风 RMS 计算；非录音中始终为 0。 */
   audioLevel: number;
   start: (binding: RecordingBinding) => Promise<{ started: boolean; reason?: string }>;
@@ -53,11 +56,16 @@ export interface TranscribedPayload {
 interface UseRecordingSessionOptions {
   onTranscribed: (payload: TranscribedPayload) => void | Promise<void>;
   onError: (message: string) => void;
+  /** 每次点击录音时重新确认本机 ASR，而不是依赖页面加载时的旧状态。 */
+  ensureAsrReady: () => Promise<boolean>;
   /** 最长录音时长（秒），默认 4h。到点自动 stop。 */
   maxDurationSeconds?: number;
 }
 
 const DEFAULT_MAX_DURATION_SECONDS = 4 * 60 * 60; // 4h
+const MICROPHONE_PROBE_DURATION_MS = 10_000;
+const MICROPHONE_MIN_RMS = 0.0005;
+const MICROPHONE_MIN_PEAK = 0.004;
 
 function pickRecorderMimeType(): { mimeType: string; extension: string } {
   const candidates: Array<{ mimeType: string; extension: string }> = [
@@ -75,12 +83,18 @@ function pickRecorderMimeType(): { mimeType: string; extension: string } {
 }
 
 export function useRecordingSession(options: UseRecordingSessionOptions): RecordingSessionApi {
-  const { onTranscribed, onError, maxDurationSeconds = DEFAULT_MAX_DURATION_SECONDS } = options;
+  const {
+    onTranscribed,
+    onError,
+    ensureAsrReady,
+    maxDurationSeconds = DEFAULT_MAX_DURATION_SECONDS,
+  } = options;
 
   const [status, setStatus] = useState<RecordingStatus>('idle');
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [binding, setBinding] = useState<RecordingBinding | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [preflightMessage, setPreflightMessage] = useState<string | null>(null);
   const [audioLevel, setAudioLevel] = useState(0);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -102,8 +116,10 @@ export function useRecordingSession(options: UseRecordingSessionOptions): Record
   // 保存最新的 onTranscribed / onError —— MediaRecorder.onstop 回调里要拿到最新的
   const onTranscribedRef = useRef(onTranscribed);
   const onErrorRef = useRef(onError);
+  const ensureAsrReadyRef = useRef(ensureAsrReady);
   useEffect(() => { onTranscribedRef.current = onTranscribed; }, [onTranscribed]);
   useEffect(() => { onErrorRef.current = onError; }, [onError]);
+  useEffect(() => { ensureAsrReadyRef.current = ensureAsrReady; }, [ensureAsrReady]);
 
   const clearTimers = useCallback(() => {
     if (tickerRef.current !== null) {
@@ -200,8 +216,56 @@ export function useRecordingSession(options: UseRecordingSessionOptions): Record
     extensionRef.current = 'webm';
     setBinding(null);
     setElapsedSeconds(0);
+    setPreflightMessage(null);
     setStatus('idle');
   }, [clearTimers, releaseStream]);
+
+  const probeMicrophoneSignal = useCallback(async (stream: MediaStream): Promise<boolean> => {
+    const AudioCtor = window.AudioContext
+      ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtor) return false;
+
+    let context: AudioContext | null = null;
+    try {
+      context = new AudioCtor();
+      if (context.state === 'suspended') {
+        await context.resume();
+      }
+      const source = context.createMediaStreamSource(stream);
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0;
+      source.connect(analyser);
+      const samples = new Float32Array(analyser.fftSize);
+      const startedAt = performance.now();
+      let voicedFrames = 0;
+
+      while (performance.now() - startedAt < MICROPHONE_PROBE_DURATION_MS) {
+        analyser.getFloatTimeDomainData(samples);
+        let sumSquares = 0;
+        let framePeak = 0;
+        for (let i = 0; i < samples.length; i += 1) {
+          const value = Math.abs(samples[i]);
+          sumSquares += value * value;
+          if (value > framePeak) framePeak = value;
+        }
+        const rms = Math.sqrt(sumSquares / samples.length);
+        if (rms >= MICROPHONE_MIN_RMS || framePeak >= MICROPHONE_MIN_PEAK) {
+          voicedFrames += 1;
+          if (voicedFrames >= 2) return true;
+        }
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 45));
+      }
+      return false;
+    } catch (error) {
+      console.warn('[recording] microphone signal probe failed', error);
+      return false;
+    } finally {
+      if (context) {
+        try { await context.close(); } catch { /* swallow */ }
+      }
+    }
+  }, []);
 
   // 卸载兜底（虽然 hook 在 App 顶层不会卸载，但 dev 热重载会触发）
   useEffect(() => {
@@ -224,26 +288,52 @@ export function useRecordingSession(options: UseRecordingSessionOptions): Record
       return { started: false, reason: '客户会议录音缺少关联项目' };
     }
     setErrorMessage(null);
+    setBinding(nextBinding);
+    setElapsedSeconds(0);
+    setStatus('requesting_mic');
 
-    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-      const msg = '当前环境不支持麦克风录音';
-      setErrorMessage(msg);
+    const failPreflight = (message: string, stream?: MediaStream) => {
+      if (stream) stream.getTracks().forEach((track) => track.stop());
+      setPreflightMessage(null);
+      setErrorMessage(message);
       setStatus('error');
-      onErrorRef.current(msg);
-      return { started: false, reason: msg };
+      onErrorRef.current(message);
+      return { started: false, reason: message };
+    };
+
+    setPreflightMessage('正在检查本机 ASR');
+    try {
+      if (!(await ensureAsrReadyRef.current())) {
+        return failPreflight('本机 ASR 尚未安装。请先前往系统设置配置 ASR，再开始录音。');
+      }
+    } catch {
+      return failPreflight('无法确认本机 ASR 状态，请稍后重试。');
     }
 
-    setStatus('requesting_mic');
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      return failPreflight('当前环境不支持麦克风录音');
+    }
+
+    setPreflightMessage('正在检查麦克风权限');
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const friendly = `麦克风获取失败：${msg}`;
-      setErrorMessage(friendly);
-      setStatus('error');
-      onErrorRef.current(friendly);
-      return { started: false, reason: friendly };
+      return failPreflight(`麦克风获取失败：${msg}`);
+    }
+
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length === 0 || audioTracks.every((track) => track.readyState !== 'live' || !track.enabled)) {
+      return failPreflight('没有可用的麦克风输入，请检查系统输入设备和麦克风权限。', stream);
+    }
+
+    setPreflightMessage('请说一句话，正在检测麦克风声音');
+    if (!(await probeMicrophoneSignal(stream))) {
+      return failPreflight(
+        '持续 10 秒没有检测到麦克风声音。请检查系统输入设备、静音状态或麦克风权限后重试。',
+        stream,
+      );
     }
 
     const { mimeType, extension } = pickRecorderMimeType();
@@ -310,6 +400,7 @@ export function useRecordingSession(options: UseRecordingSessionOptions): Record
     startLevelMeter(stream);
 
     setBinding(nextBinding);
+    setPreflightMessage(null);
     setStatus('recording');
     setElapsedSeconds(0);
 
@@ -326,7 +417,7 @@ export function useRecordingSession(options: UseRecordingSessionOptions): Record
     }, Math.max(maxDurationSeconds, 60) * 1000);
 
     return { started: true };
-  }, [status, maxDurationSeconds, releaseStream]);
+  }, [status, maxDurationSeconds, probeMicrophoneSignal, releaseStream, startLevelMeter]);
 
   const stop = useCallback<RecordingSessionApi['stop']>(async () => {
     const recorder = recorderRef.current;
@@ -396,6 +487,8 @@ export function useRecordingSession(options: UseRecordingSessionOptions): Record
         buffer,
         extension,
         sessionId,
+        scopeId: currentBinding.taskId || currentBinding.meetingId || sessionId,
+        suggestedBaseName: currentBinding.taskTitle,
       });
       absolutePath = saved.absolutePath;
       sizeBytes = saved.sizeBytes;
@@ -457,6 +550,7 @@ export function useRecordingSession(options: UseRecordingSessionOptions): Record
     elapsedSeconds,
     binding,
     errorMessage,
+    preflightMessage,
     audioLevel,
     start,
     stop,

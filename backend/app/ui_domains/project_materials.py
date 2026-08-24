@@ -29,6 +29,17 @@ _LinkImportThread = threading.Thread
 _CLOUD_ROOT = "/api/v2/domain/project-materials"
 
 
+def _knowledge_queue_documents(
+    documents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Exclude audio originals handled by the dedicated ASR task chain."""
+    return [
+        item
+        for item in documents
+        if not str(item.get("mediaType") or "").startswith("audio/")
+    ]
+
+
 def _segment(value: str) -> str:
     return quote(str(value), safe="")
 
@@ -447,8 +458,24 @@ def _client_with_local_folders(
     if not hasattr(compatibility.runtime, "database_path"):
         return client
     store = _local_store(compatibility)
-    _local_call(lambda: store.ensure_project_projection(project))
-    folders = store.folders(client["id"])
+    try:
+        _local_call(lambda: store.ensure_project_projection(project))
+        folders = store.folders(client["id"])
+    except LocalRuntimeError as exc:
+        # The organization cloud is authoritative for the project list.  A
+        # damaged or missing rebuildable local material index must not hide
+        # every readable cloud project from the workbench.
+        if exc.code not in {
+            "local_project_state_corrupt",
+            "local_project_state_missing",
+            "local_project_state_mismatch",
+        }:
+            raise
+        return {
+            **client,
+            "folderCount": 0,
+            "folderCapabilityState": "local_recovery_required",
+        }
     return {
         **client,
         "folderCount": len(folders),
@@ -524,6 +551,7 @@ def client_workspace(
     store = _local_store(compatibility)
     _local_call(lambda: store.ensure_project_projection(project))
     documents = _local_call(lambda: store.documents(project_id))
+    queue_documents = _knowledge_queue_documents(documents)
     folders = _local_call(lambda: store.folders(project_id))
     # Meetings are formal cloud-authoritative GC-06/GC-08 objects.  Never
     # merge the retained local-project-state meeting JSON into this view.
@@ -562,15 +590,15 @@ def client_workspace(
             str(item.get("parseStatus") or "") == "ready"
             and str(item.get("wikiStatus") or "") in {"queued", "processing"}
         )
-        for item in documents
+        for item in queue_documents
     )
     failed_jobs = sum(
         str(item.get("parseStatus") or "") == "failed_retryable"
-        for item in documents
+        for item in queue_documents
     )
     ready_documents = sum(
         str(item.get("parseStatus") or "") == "ready"
-        for item in documents
+        for item in queue_documents
     )
     local_wiki = _local_call(lambda: store.local_wiki_status(project_id))
     knowledge_presentation = _local_call(
@@ -687,7 +715,7 @@ def client_workspace(
             "parsedDocuments": ready_documents,
             "blockedDocuments": sum(
                 str(item.get("parseStatus") or "") == "blocked"
-                for item in documents
+                for item in queue_documents
             ),
         },
         "knowledgeJobs": [],
@@ -763,10 +791,11 @@ def local_knowledge_progress(
     _require_project_read(compatibility, project_id)
     store = _local_store(compatibility)
     documents = _local_call(lambda: store.documents(project_id))
+    queue_documents = _knowledge_queue_documents(documents)
     local_wiki = _local_call(lambda: store.local_wiki_status(project_id))
     pending = [
         item
-        for item in documents
+        for item in queue_documents
         if str(item.get("parseStatus") or "")
         in {"queued", "processing"}
         or (
@@ -777,24 +806,24 @@ def local_knowledge_progress(
     ]
     running = [
         item
-        for item in documents
+        for item in queue_documents
         if str(item.get("parseStatus") or "") == "processing"
         or str(item.get("wikiStatus") or "") == "processing"
     ]
     blocked = [
         item
-        for item in documents
+        for item in queue_documents
         if str(item.get("parseStatus") or "") == "blocked"
     ]
     failed = [
         item
-        for item in documents
+        for item in queue_documents
         if str(item.get("parseStatus") or "") == "failed_retryable"
         or str(item.get("wikiStatus") or "") == "failed_retryable"
     ]
     ready = [
         item
-        for item in documents
+        for item in queue_documents
         if str(item.get("parseStatus") or "") == "ready"
         and str(item.get("wikiStatus") or "") == "ready"
     ]
@@ -812,7 +841,7 @@ def local_knowledge_progress(
     batch_documents = (
         [
             item
-            for item in documents
+            for item in queue_documents
             if str(item.get("processingBatchStartedAt") or "")
             == active_batch_started_at
         ]
@@ -895,7 +924,7 @@ def local_knowledge_progress(
         "knowledgeStatus": {
             "totalDocuments": len(documents),
             "totalChunks": int(local_wiki.get("chunkCount") or 0),
-            "ocrReadyRate": round(len(ready) * 100 / max(1, len(documents)), 1),
+            "ocrReadyRate": round(len(ready) * 100 / max(1, len(queue_documents)), 1),
             "vectorizedDocuments": int(
                 local_wiki.get("vectorReadyCount") or 0
             ),

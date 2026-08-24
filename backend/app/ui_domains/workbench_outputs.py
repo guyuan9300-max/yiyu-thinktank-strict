@@ -1562,7 +1562,16 @@ def sync_project(
                             "contentHash": item.get("contentHash"),
                             "byteSize": int(item.get("byteSize") or 0),
                             "mediaType": item.get("mediaType"),
-                            "sourceKind": "local_private_metadata",
+                            **(
+                                {
+                                    "relationKind": "task",
+                                    "relationId": item.get("taskId"),
+                                }
+                                if str(item.get("taskId") or "")
+                                else {
+                                    "sourceKind": "local_private_metadata",
+                                }
+                            ),
                         }
                         for item in pending_materials
                     ]

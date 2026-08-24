@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import mimetypes
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
@@ -38,6 +39,22 @@ def _task(compatibility: Any, task_id: str) -> dict[str, Any]:
     return task
 
 
+def _task_project_id(task: dict[str, Any]) -> str:
+    """Read the canonical project relation from either cloud receipt shape."""
+    return str(task.get("clientId") or task.get("client_id") or "").strip()
+
+
+def _task_project_name(task: dict[str, Any]) -> str:
+    for key in ("clientName", "client_name", "projectName", "project_name"):
+        value = str(task.get(key) or "").strip()
+        if value:
+            return value
+    client = task.get("client")
+    if isinstance(client, dict):
+        return str(client.get("name") or client.get("title") or "").strip()
+    return ""
+
+
 def _save_uploaded_file(compatibility: Any, uploaded: Any) -> Path:
     stream = getattr(uploaded, "file", None)
     if stream is None or not callable(getattr(stream, "read", None)):
@@ -51,9 +68,46 @@ def _save_uploaded_file(compatibility: Any, uploaded: Any) -> Path:
     root = compatibility.runtime.database_path.parent / "imports" / "task-attachments"
     root.mkdir(parents=True, exist_ok=True)
     suffix = Path(name).suffix[:16]
-    temporary = root / f".{new_id()}{suffix}"
+    # The shared project importer deliberately rejects dotfiles such as
+    # .DS_Store.  A real user attachment must not become a hidden file merely
+    # because this bridge stages it before importing.
+    temporary = root / f"task-attachment-{new_id()}{suffix}"
     temporary.write_bytes(raw)
     return temporary
+
+
+def _uploaded_original_path(request: UiRequest) -> Path | None:
+    """Return the real Finder source when the desktop bridge supplied it.
+
+    Browser uploads do not expose a local path and continue through the
+    bounded staging fallback.  Electron uploads do expose the path through
+    ``webUtils.getPathForFile``; keeping that path is what lets “打开位置”
+    reveal the user's original file instead of an internal managed copy.
+    """
+
+    raw_path = str(request.body.get("originalPath") or "").strip()
+    uploaded = request.body.get("file")
+    original_name = str(getattr(uploaded, "filename", "") or "").strip()
+    if not raw_path or not original_name:
+        return None
+    try:
+        source = Path(raw_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not source.is_file():
+        return None
+    normalized_source_name = unicodedata.normalize("NFC", source.name)
+    normalized_upload_name = unicodedata.normalize("NFC", Path(original_name).name)
+    if normalized_source_name != normalized_upload_name:
+        return None
+    upload_size = getattr(uploaded, "size", None)
+    if isinstance(upload_size, int) and upload_size >= 0:
+        try:
+            if source.stat().st_size != upload_size:
+                return None
+        except OSError:
+            return None
+    return source
 
 
 def _register(
@@ -64,7 +118,7 @@ def _register(
     task: dict[str, Any],
     local: dict[str, Any],
 ) -> dict[str, Any]:
-    client_id = str(task.get("client_id") or task.get("clientId") or "")
+    client_id = _task_project_id(task)
     if not client_id:
         raise LocalRuntimeError(
             422,
@@ -106,14 +160,22 @@ def _register(
             document_id=str(document["documentId"]),
             task_id=task_id,
         )
-    except LocalRuntimeError:
+    except LocalRuntimeError as exc:
         pending_id = f"local-pending:{local['localSourceId']}"
-        store.bind_task_attachment(
+        pending = store.bind_task_attachment(
             project_id=client_id,
             document_id=pending_id,
             task_id=task_id,
         )
-        raise
+        # The task attachment is a device-local fact first; organization-cloud
+        # metadata is an asynchronous consumer.  A consumer outage must not
+        # make the editor pretend the attachment was lost.
+        return {
+            **pending,
+            "cloudMetadataState": "failed_retryable",
+            "syncMessage": "已保存到任务，项目工作台同步待重试",
+            "syncError": {"code": exc.code, "message": exc.message},
+        }
 
 
 @router.post(r"tasks/(?P<task_id>[^/]+)/attachments")
@@ -122,15 +184,23 @@ def upload_task_attachment(
 ) -> dict[str, Any]:
     task_id = unquote(match.group("task_id"))
     task = _task(compatibility, task_id)
-    client_id = str(task.get("client_id") or "")
+    client_id = _task_project_id(task)
     if not client_id:
         raise LocalRuntimeError(422, "task_attachment_project_required", "任务附件必须先关联项目")
-    temporary = _save_uploaded_file(compatibility, request.body.get("file"))
+    original_source = _uploaded_original_path(request)
+    temporary = (
+        None
+        if original_source is not None
+        else _save_uploaded_file(compatibility, request.body.get("file"))
+    )
+    import_source = original_source or temporary
+    if import_source is None:  # pragma: no cover - guarded by helpers above
+        raise LocalRuntimeError(422, "attachment_file_required", "请选择要上传的附件")
     try:
         imported = _store(compatibility).import_paths(
             project_id=client_id,
             mode="file",
-            paths=[temporary],
+            paths=[import_source],
             idempotency_key=f"{request.idempotency_key}:local",
         )
         local = dict((imported.get("materials") or [])[0])
@@ -144,11 +214,17 @@ def upload_task_attachment(
             or local.get("mediaType")
             or "application/octet-stream"
         )
+        # A staging path is an implementation detail, never the user's
+        # original file.  Do not persist a soon-to-be-deleted path as the
+        # source shown by “打开位置”.
+        if original_source is None:
+            local["originalSourcePath"] = None
         _register(
             compatibility, request, task_id=task_id, task=task, local=local
         )
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return _task_ui(compatibility, _task(compatibility, task_id))
 
 
@@ -158,7 +234,7 @@ def upload_task_markdown(
 ) -> dict[str, Any]:
     task_id = unquote(match.group("task_id"))
     task = _task(compatibility, task_id)
-    client_id = str(task.get("client_id") or "")
+    client_id = _task_project_id(task)
     if not client_id:
         raise LocalRuntimeError(422, "task_attachment_project_required", "任务附件必须先关联项目")
     local = _store(compatibility).import_text(
@@ -177,7 +253,7 @@ def archive_task_recording(
 ) -> dict[str, Any]:
     task_id = unquote(match.group("task_id"))
     task = _task(compatibility, task_id)
-    client_id = str(task.get("client_id") or "")
+    client_id = _task_project_id(task)
     if not client_id:
         raise LocalRuntimeError(422, "task_attachment_project_required", "任务录音必须先关联项目")
     raw_path = str(request.body.get("audioPath") or "").strip()
@@ -206,10 +282,11 @@ def delete_task_attachment(
     task_id = unquote(match.group("task_id"))
     attachment_id = unquote(match.group("attachment_id"))
     task = _task(compatibility, task_id)
-    client_id = str(task.get("client_id") or "")
+    client_id = _task_project_id(task)
     local = _store(compatibility)
+
     def delete_local() -> dict[str, Any]:
-        attachment = next(
+        local_attachment = next(
             (
                 item
                 for item in local.task_attachments(task_id)
@@ -217,13 +294,31 @@ def delete_task_attachment(
             ),
             None,
         )
-        if attachment is None:
-            raise LocalRuntimeError(404, "task_attachment_missing", "任务附件不存在")
-        deleted = local.delete_task_attachment_local(
-            task_id=task_id,
-            attachment_id=attachment_id,
+        cloud_attachment = next(
+            (
+                dict(item)
+                for item in task.get("attachments") or []
+                if isinstance(item, dict)
+                and str(item.get("id") or "") == attachment_id
+            ),
+            None,
         )
-        return {"attachment": dict(attachment), "localDelete": dict(deleted)}
+        attachment = dict(local_attachment or cloud_attachment or {
+            "id": attachment_id,
+            "version": 1,
+        })
+        if local_attachment is None:
+            deleted = {"deleted": True, "alreadyMissing": True}
+        else:
+            deleted = local.delete_task_attachment_local(
+                task_id=task_id,
+                attachment_id=attachment_id,
+            )
+        return {
+            "attachment": attachment,
+            "cloudPresent": cloud_attachment is not None,
+            "localDelete": dict(deleted),
+        }
 
     local_receipt = replayable_generated_value(
         compatibility.runtime,
@@ -236,7 +331,10 @@ def delete_task_attachment(
     )
     attachment = dict(local_receipt.get("attachment") or {})
     cloud_deleted = False
-    if not attachment_id.startswith("local-pending:"):
+    if (
+        not attachment_id.startswith("local-pending:")
+        and bool(local_receipt.get("cloudPresent"))
+    ):
         cloud_path = (
             f"{_MATERIAL_ROOT}/projects/{quote(client_id, safe='')}/documents/"
             f"{quote(attachment_id, safe='')}"
@@ -278,7 +376,7 @@ def retry_task_transcription(compatibility: Any, request: UiRequest, match: Any)
     if not attachment.get("localAvailable"):
         raise LocalRuntimeError(409, "task_audio_local_file_missing", "当前设备没有该录音原件")
     task = _task(compatibility, task_id)
-    project_id = str(task.get("client_id") or "")
+    project_id = _task_project_id(task)
     if str(attachment.get("processingStatus") or "") in {"queued", "processing"}:
         return _task_ui(compatibility, _task(compatibility, task_id))
     model_root = runtime.database_path.parent / "models"
@@ -324,6 +422,7 @@ def retry_task_transcription(compatibility: Any, request: UiRequest, match: Any)
                 text = correct_project_transcript(
                     runtime,
                     project_id=project_id,
+                    project_name=_task_project_name(task),
                     title=str(attachment.get("title") or "任务录音"),
                     transcript=text,
                     progress_callback=report,
@@ -355,7 +454,10 @@ def retry_task_transcription(compatibility: Any, request: UiRequest, match: Any)
                 )
                 store.bind_task_attachment(
                     project_id=project_id,
-                    document_id=str(settled["documentIds"][0]),
+                    # The cloud document id may be replaced while metadata is
+                    # settling; localSourceId is already stable and is now an
+                    # accepted identity for the same source.
+                    document_id=str(material["localSourceId"]),
                     task_id=task_id,
                 )
         except Exception as exc:  # noqa: BLE001
@@ -384,17 +486,86 @@ def get_task_transcript(compatibility: Any, request: UiRequest, match: Any) -> d
     )
 
 
-@router.put(r"tasks/(?P<task_id>[^/]+)/attachments/(?P<attachment_id>[^/]+)/transcript")
-def update_task_transcript(compatibility: Any, request: UiRequest, match: Any) -> dict[str, Any]:
+@router.post(r"tasks/(?P<task_id>[^/]+)/attachments/(?P<attachment_id>[^/]+)/recorrect-transcript")
+def recorrect_task_transcript(compatibility: Any, request: UiRequest, match: Any) -> dict[str, Any]:
     task_id = unquote(match.group("task_id"))
     attachment_id = unquote(match.group("attachment_id"))
-    current = _store(compatibility).task_transcript(
-        task_id=task_id, attachment_id=attachment_id
+    runtime = compatibility.runtime
+    pinned_sandbox = runtime.capture_sandbox_context()
+    pinned_context = pinned_sandbox.workspace_context
+    if pinned_context is None:
+        raise LocalRuntimeError(409, "workspace_not_ready", "当前组织工作空间尚未就绪")
+    store = LocalProjectMaterialsRepository(runtime, context_provider=lambda: pinned_context)
+    attachment = next(
+        (item for item in store.task_attachments(task_id) if item["id"] == attachment_id),
+        None,
     )
-    return _store(compatibility).save_task_transcript(
+    if attachment is None or not attachment.get("isAudio"):
+        raise LocalRuntimeError(404, "task_audio_attachment_missing", "任务录音不存在")
+    task = _task(compatibility, task_id)
+    project_id = _task_project_id(task)
+    if not project_id:
+        raise LocalRuntimeError(422, "task_attachment_project_required", "任务录音必须先关联项目")
+    current = store.task_transcript(task_id=task_id, attachment_id=attachment_id)
+
+    def report(percent: int, stage: str) -> None:
+        store.set_task_transcription_state(
+            task_id=task_id,
+            attachment_id=attachment_id,
+            status="processing",
+            progress=percent,
+            stage=stage,
+        )
+
+    with runtime.prebound_sandbox_context(pinned_sandbox):
+        report(82, "重新检查项目专名与语境")
+        corrected = correct_project_transcript(
+            runtime,
+            project_id=project_id,
+            project_name=_task_project_name(task),
+            title=str(attachment.get("title") or "任务录音"),
+            transcript=str(current["currentText"]),
+            progress_callback=report,
+        ).strip()
+    if corrected == str(current["currentText"]).strip():
+        store.set_task_transcription_state(
+            task_id=task_id,
+            attachment_id=attachment_id,
+            status="ready",
+            progress=100,
+            stage="重新校正完成，未发现确定改项",
+        )
+        return {**current, "changed": False}
+
+    transcript = store.save_task_transcript(
         task_id=task_id,
         attachment_id=attachment_id,
-        text=str(request.body.get("text") or ""),
+        text=corrected,
         preserve_original=False,
-        expected_version=int(request.body.get("expectedVersion") or current["version"]),
+        expected_version=int(current["version"]),
     )
+    operation_key = (
+        f"task-transcript-recorrect:{task_id}:{attachment_id}:"
+        f"{transcript.get('version') or 1}"
+    )
+    material = store.import_text(
+        project_id=project_id,
+        title=f"{Path(str(attachment.get('title') or '任务录音')).stem}-录音转写",
+        content=corrected,
+        idempotency_key=operation_key,
+    )
+    register_and_process_local_materials(
+        runtime=runtime,
+        store=store,
+        project_id=project_id,
+        local_materials=[material],
+        relation_kind="task",
+        relation_id=task_id,
+        idempotency_key=operation_key,
+    )
+    store.bind_task_attachment(
+        project_id=project_id,
+        document_id=str(material["localSourceId"]),
+        task_id=task_id,
+    )
+    return {**transcript, "changed": True}

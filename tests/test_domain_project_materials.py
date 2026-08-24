@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from backend.app import link_material_fetcher
 from backend.app.project_materials_local import (
     LocalProjectMaterialsRepository,
+    _current_project_document_projection,
 )
 from backend.app.runtime import LocalRuntimeError, WorkspaceRuntime
 from backend.app.secret_store import MemorySecretStore
@@ -1392,6 +1393,8 @@ def test_local_import_and_smart_import_use_strict_storage_objects(
         if item["documentId"] == "cloud-text-document"
     )
     assert local_candidate["deepRead"] is False
+
+
     summarized = store.update_ai_summary(
         "cloud-text-document",
         summary="AI 仅根据当前设备正文形成的深度摘要。",
@@ -1589,6 +1592,47 @@ def test_local_import_and_smart_import_use_strict_storage_objects(
     assert all(row["lifecycle_state"] == "active" for row in rows)
     assert storage_commands == storage_audits == storage_outbox
     assert storage_commands >= len(rows)
+
+
+def test_workbench_exposes_only_latest_transcript_projection_per_task() -> None:
+    documents = _current_project_document_projection([
+        {
+            "id": "audio-document",
+            "localSourceId": "audio-source",
+            "title": "项目访谈.wav",
+            "mediaType": "audio/wav",
+            "taskId": "task-transcript",
+            "importedAt": "2026-08-24T09:59:00+00:00",
+        },
+        {
+            "id": "transcript-document-v1",
+            "title": "项目访谈-录音转写.md",
+            "mediaType": "text/markdown",
+            "taskId": "task-transcript",
+            "importedAt": "2026-08-24T10:00:00+00:00",
+        },
+        {
+            "id": "transcript-document-orphan",
+            "title": "项目访谈-录音转写.md",
+            "mediaType": "text/markdown",
+            "taskId": None,
+            "importedAt": "2026-08-24T10:00:30+00:00",
+        },
+        {
+            "id": "transcript-document-v2",
+            "title": "项目访谈-录音转写.md",
+            "mediaType": "text/markdown",
+            "taskId": "task-transcript",
+            "importedAt": "2026-08-24T10:01:00+00:00",
+        },
+    ])
+    transcript_documents = [
+        item for item in documents if item.get("isTranscriptProjection")
+    ]
+    assert [item["id"] for item in transcript_documents] == [
+        "transcript-document-v2"
+    ]
+    assert transcript_documents[0]["recordingSourceId"] == "audio-source"
 
 
 def test_local_import_receipts_reuse_sources_after_cloud_failure_and_restart(
@@ -2992,3 +3036,55 @@ def test_local_pdf_text_and_scanned_pdf_state_are_explicit(
     scanned = store.document_text("pdf-scanned")
     assert scanned["kind"] == "pdf_ocr"
     assert scanned["content"] == "OCR_TEXT_SENTINEL"
+def test_project_list_keeps_cloud_projects_visible_when_local_state_is_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CorruptLocalStore:
+        def ensure_project_projection(self, _project: Mapping[str, Any]) -> None:
+            raise LocalRuntimeError(
+                409,
+                "local_project_state_corrupt",
+                "本机项目资料状态校验失败",
+            )
+
+    class Runtime:
+        database_path = Path("strict-local.db")
+
+        def cloud_query(self, path: str, query: Any = None) -> dict[str, Any]:
+            del query
+            assert path.endswith("/projects")
+            return {
+                "projects": [
+                    {
+                        "projectId": "project-cloud-authority",
+                        "name": "组织云项目",
+                        "version": 1,
+                        "lifecycleState": "active",
+                    }
+                ]
+            }
+
+        def reconcile_project_projections(self, project_ids: list[str]) -> None:
+            assert project_ids == ["project-cloud-authority"]
+
+    monkeypatch.setattr(
+        project_materials_ui,
+        "_local_store",
+        lambda _compatibility: CorruptLocalStore(),
+    )
+    listed = router.dispatch(
+        SimpleNamespace(runtime=Runtime()),
+        UiRequest(
+            method="GET",
+            path="clients",
+            query={},
+            body={},
+            idempotency_key="project-list-local-state-corrupt",
+        ),
+    )
+
+    assert len(listed) == 1
+    assert listed[0]["id"] == "project-cloud-authority"
+    assert listed[0]["name"] == "组织云项目"
+    assert listed[0]["folderCount"] == 0
+    assert listed[0]["folderCapabilityState"] == "local_recovery_required"

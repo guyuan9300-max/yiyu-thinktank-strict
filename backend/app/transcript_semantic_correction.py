@@ -32,10 +32,18 @@ def _strings(value: Any, *, limit: int) -> list[str]:
     return result
 
 
-def _project_context(runtime: Any, project_id: str) -> dict[str, Any]:
-    profiles = runtime.cloud_query(
-        "/api/v2/domain/task-planning/project-keyword-profiles"
-    )
+def _project_context(
+    runtime: Any,
+    project_id: str,
+    *,
+    project_name: str = "",
+) -> dict[str, Any]:
+    try:
+        profiles = runtime.cloud_query(
+            "/api/v2/domain/task-planning/project-keyword-profiles"
+        )
+    except Exception:  # noqa: BLE001 - the task receipt name still provides context
+        profiles = []
     profile = next(
         (
             dict(item)
@@ -69,12 +77,22 @@ def _project_context(runtime: Any, project_id: str) -> dict[str, Any]:
         if len(highlights) >= 6:
             break
 
+    resolved_project_name = (
+        str(project_name or "").strip()
+        or str(profile.get("clientName") or "").strip()
+    )
+    canonical_terms = _strings(categories.get("identityTerms"), limit=10)
+    canonical_terms += _strings(profile.get("supplements"), limit=20)
+    if resolved_project_name and resolved_project_name.casefold() not in {
+        item.casefold() for item in canonical_terms
+    }:
+        canonical_terms.insert(0, resolved_project_name)
+
     return {
-        "projectName": str(profile.get("clientName") or "").strip(),
+        "projectName": resolved_project_name,
         # These are the only terms strong enough to support direct spelling
         # repair.  Supplements are explicit member input.
-        "canonicalTerms": _strings(categories.get("identityTerms"), limit=10)
-        + _strings(profile.get("supplements"), limit=20),
+        "canonicalTerms": canonical_terms,
         # The remaining layers explain the setting but are never a replacement
         # dictionary.  This prevents a nearby person or funder being forced into
         # an uncertain utterance merely because it exists in the dossier.
@@ -142,6 +160,7 @@ def correct_project_transcript(
     project_id: str,
     title: str,
     transcript: str,
+    project_name: str = "",
     progress_callback: ProgressCallback | None = None,
 ) -> str:
     """Return a conservative local correction, or the original on any failure."""
@@ -149,8 +168,16 @@ def correct_project_transcript(
     if not project_id or len(transcript.strip()) < 8:
         return transcript
     try:
-        context = _project_context(runtime, project_id)
-        if not context["canonicalTerms"] and not context["domainHints"]:
+        context = _project_context(
+            runtime,
+            project_id,
+            project_name=project_name,
+        )
+        if (
+            not context["projectName"]
+            and not context["canonicalTerms"]
+            and not context["domainHints"]
+        ):
             return transcript
         parts = _chunks(transcript)
         corrected: list[str] = []
@@ -178,7 +205,9 @@ def correct_project_transcript(
                 system_prompt=(
                     "你是保守的中文录音转写校对器。只修正由同一句语法语义、相邻句和项目上下文"
                     "共同强证实的错别字、同音专名和明显断句；不得润色、概括、补充事实或把不确定"
-                    "词强行绑定到某个人物/机构。无法确定就原样保留。尤其不能仅因候选姓名存在，"
+                    "词强行绑定到某个人物/机构。项目正式名称是最高优先规范词；若当前片段出现与"
+                    "正式名称高度同音、且语境明确指向当前项目的错写，必须校正为正式名称。无法"
+                    "确定就原样保留。尤其不能仅因候选姓名存在，"
                     "就把含混语音替换为该姓名。逐行输出，行数、顺序和说话人前缀必须完全不变；"
                     "只输出校正后的正文。"
                 ),

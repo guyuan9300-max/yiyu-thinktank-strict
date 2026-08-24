@@ -759,11 +759,11 @@ async function requestForm<T>(path: string, formData: FormData, options?: FormRe
     return new Promise<T>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open(method, `${baseUrl}${path}`);
-      const headers = new Headers(stableOptions.headers || {});
-      const desktopToken = window.yiyuWorkbench.desktopToken?.trim();
-      if (desktopToken) {
-        headers.set('X-Yiyu-Desktop-Token', desktopToken);
-      }
+      // Progress-aware uploads must carry exactly the same desktop token and
+      // workspace request context as the fetch path below.  Omitting the
+      // sandbox header made uploads after a workspace switch occasionally
+      // execute against the previously pinned organization.
+      const headers = new Headers(_requestHeaders(method, stableOptions) || {});
       headers.forEach((value, key) => {
         xhr.setRequestHeader(key, value);
       });
@@ -6355,6 +6355,7 @@ export async function uploadTaskAttachment(
   taskId: string,
   payload: {
     file: File;
+    originalPath?: string | null;
     clientId?: string | null;
     eventLineId?: string | null;
     taskTitle?: string | null;
@@ -6366,6 +6367,7 @@ export async function uploadTaskAttachment(
 ) {
   const formData = new FormData();
   formData.append('file', payload.file);
+  if (payload.originalPath) formData.append('originalPath', payload.originalPath);
   if (payload.clientId) formData.append('clientId', payload.clientId);
   if (payload.eventLineId) formData.append('eventLineId', payload.eventLineId);
   if (payload.taskTitle) formData.append('taskTitle', payload.taskTitle);
@@ -6489,11 +6491,13 @@ export async function getTaskAudioTranscript(taskId: string, attachmentId: strin
   return request<AudioTranscriptRecord>(`/api/v2/ui/tasks/${taskId}/attachments/${attachmentId}/transcript`);
 }
 
-export async function updateTaskAudioTranscript(taskId: string, attachmentId: string, text: string) {
-  return request<AudioTranscriptRecord>(`/api/v2/ui/tasks/${taskId}/attachments/${attachmentId}/transcript`, {
-    method: 'PUT',
-    body: JSON.stringify({ text }),
-  });
+export async function recorrectTaskAudioTranscript(taskId: string, attachmentId: string) {
+  return request<AudioTranscriptRecord & { changed: boolean }>(
+    `/api/v2/ui/tasks/${taskId}/attachments/${attachmentId}/recorrect-transcript`,
+    {
+      method: 'POST',
+    },
+  );
 }
 
 // 删附件：syncKnowledge=true 时连带删除数据中心里的文档行 + 物理文件。

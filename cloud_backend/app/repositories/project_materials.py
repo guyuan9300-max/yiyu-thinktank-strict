@@ -3073,8 +3073,8 @@ class GC07ProjectMaterialsRepository:
                 row = connection.execute(
                     "SELECT * FROM source_assets WHERE id=? AND scope_id=? "
                     "AND client_id=? AND record_kind='asset' "
-                    "AND source_kind='local_private_metadata' "
-                    "AND lifecycle_state='active'",
+                    "AND source_kind IN ('local_private_metadata',"
+                    "'task_attachment_metadata','meeting_attachment_metadata')",
                     (document_id, identity.scope_id, project_id),
                 ).fetchone()
                 if row is None:
@@ -3082,6 +3082,32 @@ class GC07ProjectMaterialsRepository:
                 if str(row["created_by_membership_id"] or "") != identity.membership_id:
                     raise RepositoryError(403, "material_metadata_owner_required", "只能管理本人设备登记的资料元数据")
                 current_version = int(row["version"] or 1)
+                if str(row["lifecycle_state"] or "") == "deleted":
+                    result = {
+                        "documentId": document_id,
+                        "projectId": project_id,
+                        "deleted": True,
+                        "alreadyDeleted": True,
+                        "aggregateVersion": current_version,
+                        "lifecycleState": "deleted",
+                    }
+                    self._record_command(
+                        connection,
+                        identity,
+                        idempotency_key=idempotency_key,
+                        payload_hash=payload_hash,
+                        command_type="source_asset.metadata_delete_replayed",
+                        aggregate_type="source_asset",
+                        aggregate_id=document_id,
+                        aggregate_version=current_version,
+                        expected_aggregate_version=int(expected_version),
+                        result=result,
+                        target_resource_id=document_id,
+                    )
+                    connection.commit()
+                    return result
+                if str(row["lifecycle_state"] or "") != "active":
+                    raise RepositoryError(409, "material_metadata_state_conflict", "资料当前状态不可删除")
                 if int(expected_version) != current_version:
                     raise RepositoryError(409, "material_metadata_version_conflict", "资料元数据已更新，请刷新后重试")
                 now = utc_now()

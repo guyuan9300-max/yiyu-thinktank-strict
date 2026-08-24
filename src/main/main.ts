@@ -1021,13 +1021,31 @@ ipcMain.handle(
   'strict:save-recording-blob',
   async (
     _event,
-    payload: { buffer: ArrayBuffer; extension?: string; sessionId?: string },
+    payload: {
+      buffer: ArrayBuffer;
+      extension?: string;
+      sessionId?: string;
+      scopeId?: string;
+      suggestedBaseName?: string;
+    },
   ) => {
     const sessionId = payload.sessionId || randomBytes(12).toString('hex');
     const extension = (payload.extension || 'webm').replace(/[^a-z0-9]/gi, '');
-    const directory = path.join(app.getPath('userData'), 'recordings');
+    const scopeId = (payload.scopeId || sessionId).replace(/[^a-z0-9._-]/gi, '').slice(0, 96) || sessionId;
+    const normalizedBaseName = (payload.suggestedBaseName || '任务录音')
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .replace(/^[.\s]+|[.\s]+$/g, '');
+    // 文件名只承载任务识别所需的短标题；任务、工作台和转写投影均以
+    // 这个实际文件名为准，避免 UUID、日期后缀和三套显示名称漂移。
+    const suggestedBaseName = Array.from(normalizedBaseName || '任务录音')
+      .slice(0, 48)
+      .join('')
+      .replace(/[.\s]+$/g, '')
+      || '任务录音';
+    const directory = path.join(app.getPath('userData'), 'recordings', scopeId);
     mkdirSync(directory, { recursive: true });
-    const absolutePath = path.join(directory, `${sessionId}.${extension}`);
+    const absolutePath = path.join(directory, `${suggestedBaseName}.${extension}`);
     const bytes = Buffer.from(payload.buffer);
     await writeFile(absolutePath, bytes);
     return { absolutePath, sizeBytes: bytes.byteLength, sessionId };

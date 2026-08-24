@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -333,22 +334,59 @@ def _parse_healthcheck_output(content: str, model_name: str) -> dict[str, Any]:
 
 
 def _parse_meeting_minutes_output(content: str, model_name: str) -> dict[str, Any]:
-    parsed = _model_json(content)
-    if not isinstance(parsed, dict):
-        raise LocalRuntimeError(502, "meeting_minutes_invalid", "会议纪要结果必须是对象")
-    title = str(parsed.get("title") or "").strip()
-    minutes = str(
-        parsed.get("minutesMd")
-        or parsed.get("minutes_md")
-        or parsed.get("minutes")
-        or ""
-    ).strip()
-    if not title or not minutes:
-        raise LocalRuntimeError(
-            502,
-            "meeting_minutes_incomplete",
-            "组织模型未返回完整的会议标题和纪要",
+    normalized = content.strip()
+    if not normalized:
+        raise LocalRuntimeError(502, "ai_response_empty", "组织模型返回了空结果")
+
+    # Meeting minutes are read-only prose that will still be reviewed in the
+    # task editor.  Do not make a slightly imperfect JSON wrapper a reason to
+    # discard otherwise usable minutes.  Other business-write parsers remain
+    # strict; this tolerance is deliberately local to the minutes operation.
+    try:
+        parsed = _model_json(normalized)
+    except LocalRuntimeError:
+        parsed = None
+
+    title = ""
+    minutes = ""
+    if isinstance(parsed, dict):
+        candidate = parsed
+        for key in ("data", "result", "output"):
+            nested = candidate.get(key)
+            if isinstance(nested, dict):
+                candidate = nested
+                break
+        title = str(candidate.get("title") or candidate.get("subject") or "").strip()
+        minutes = str(
+            candidate.get("minutesMd")
+            or candidate.get("minutes_md")
+            or candidate.get("minutes")
+            or candidate.get("markdown")
+            or candidate.get("content")
+            or candidate.get("text")
+            or ""
+        ).strip()
+    elif isinstance(parsed, str):
+        minutes = parsed.strip()
+
+    if not minutes:
+        minutes = normalized
+        if minutes.startswith("```") and minutes.endswith("```"):
+            lines = minutes.splitlines()
+            if len(lines) >= 3:
+                minutes = "\n".join(lines[1:-1]).strip()
+    if not minutes:
+        raise LocalRuntimeError(502, "meeting_minutes_incomplete", "组织模型未生成有效纪要")
+    if not title:
+        first_heading = next(
+            (
+                re.sub(r"^#{1,6}\s*", "", line).strip()
+                for line in minutes.splitlines()
+                if re.match(r"^#{1,6}\s+\S", line.strip())
+            ),
+            "",
         )
+        title = first_heading or "录音纪要"
     return {
         "title": title[:200],
         "minutesMd": minutes,
@@ -2385,10 +2423,12 @@ def summarize_recording(
             "numSpeakers": int(request.body.get("numSpeakers") or 0),
         },
         system_prompt=(
-            "你是益语智库的会议纪要助手。只能依据用户提供的转写内容，"
-            "不得补写未出现的事实。返回严格 JSON 对象："
-            '{"title":"会议标题","minutesMd":"Markdown 纪要"}。'
-            "纪要应区分讨论要点、明确结论、行动项和待确认事项。"
+            "你是益语智库的会议纪要助手，当前处理任务录音。只能依据用户提供的转写内容，"
+            "不得补写未出现的事实。直接返回 Markdown 纪要，不要返回 JSON，"
+            "不要附加说明或代码围栏。"
+            "纪要将直接写入任务详情，应紧扣当前任务，压缩口语、重复和无关寒暄，"
+            "优先提炼讨论要点、明确结论、行动项和待确认事项；没有的类别不要硬凑。"
+            "正文控制在 1200 个中文字符以内，不要复述整篇转写。"
         ),
         prompt=(
             (f"任务标题提示：{title_hint}\n" if title_hint else "")
