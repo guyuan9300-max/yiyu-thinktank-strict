@@ -1,6 +1,17 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
-import { constants as fsConstants, createWriteStream, mkdirSync } from 'node:fs';
+import {
+  appendFileSync,
+  constants as fsConstants,
+  createWriteStream,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs';
 import {
   access,
   chmod,
@@ -10,7 +21,7 @@ import {
 } from 'node:fs/promises';
 import { createServer, isIP } from 'node:net';
 import path from 'node:path';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import {
   app,
   BrowserWindow,
@@ -44,6 +55,7 @@ import type {
 
 const APP_NAME = '益语智库AI（新版）';
 const DATA_DIR_NAME = 'YiyuThinkTankStrictV1';
+const APP_BUNDLE_ID = 'com.yiyu.thinktank.strict';
 
 let mainWindow: BrowserWindow | null = null;
 let preMiniWindowState: {
@@ -65,6 +77,80 @@ app.setPath(
   'userData',
   explicitDataDir || path.join(app.getPath('appData'), DATA_DIR_NAME),
 );
+
+function readBundleIdentity(bundlePath: string): { bundleId: string; version: string } | null {
+  const plistPath = path.join(bundlePath, 'Contents', 'Info.plist');
+  if (!existsSync(plistPath)) return null;
+  try {
+    const read = (key: string) => execFileSync(
+      '/usr/libexec/PlistBuddy',
+      ['-c', `Print :${key}`, plistPath],
+      { encoding: 'utf8', timeout: 3_000 },
+    ).trim();
+    const bundleId = read('CFBundleIdentifier');
+    const version = read('CFBundleShortVersionString');
+    return bundleId && version ? { bundleId, version } : null;
+  } catch {
+    return null;
+  }
+}
+
+function compareReleaseVersions(left: string, right: string): number {
+  const parse = (value: string) => value.split('.').map((part) => Number(part) || 0);
+  const a = parse(left);
+  const b = parse(right);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const delta = (a[index] || 0) - (b[index] || 0);
+    if (delta !== 0) return delta;
+  }
+  return 0;
+}
+
+/**
+ * Finder can leave an old bundle in ~/Applications while a DMG replaces the
+ * canonical /Applications bundle. Once the canonical new bundle is genuinely
+ * running, remove only an older/equal bundle with this exact bundle id and turn
+ * its former path into a redirect. Old Dock entries then open the new bundle.
+ */
+function convergeDuplicateMacInstallations(): void {
+  if (!app.isPackaged || process.platform !== 'darwin') return;
+  const currentBundlePath = path.resolve(path.dirname(process.execPath), '..', '..');
+  const canonicalBundlePath = path.join('/Applications', `${APP_NAME}.app`);
+  if (currentBundlePath !== canonicalBundlePath) return;
+
+  const currentIdentity = readBundleIdentity(currentBundlePath);
+  if (!currentIdentity || currentIdentity.bundleId !== APP_BUNDLE_ID) return;
+  const legacyBundlePath = path.join(app.getPath('home'), 'Applications', `${APP_NAME}.app`);
+  if (!existsSync(legacyBundlePath)) return;
+  const logPath = path.join(app.getPath('userData'), 'runtime', 'logs', 'install-convergence.log');
+
+  try {
+    const stat = lstatSync(legacyBundlePath);
+    if (stat.isSymbolicLink()) {
+      const target = path.resolve(path.dirname(legacyBundlePath), readlinkSync(legacyBundlePath));
+      if (realpathSync(target) === realpathSync(currentBundlePath)) return;
+    }
+    const legacyIdentity = readBundleIdentity(legacyBundlePath);
+    if (!legacyIdentity || legacyIdentity.bundleId !== APP_BUNDLE_ID) return;
+    if (compareReleaseVersions(legacyIdentity.version, currentIdentity.version) > 0) return;
+
+    rmSync(legacyBundlePath, { recursive: true, force: true });
+    symlinkSync(currentBundlePath, legacyBundlePath, 'dir');
+    mkdirSync(path.dirname(logPath), { recursive: true });
+    appendFileSync(
+      logPath,
+      `[${new Date().toISOString()}] running=${currentIdentity.version} removed=${legacyIdentity.version} redirected=${legacyBundlePath}\n`,
+      'utf8',
+    );
+  } catch (error) {
+    mkdirSync(path.dirname(logPath), { recursive: true });
+    appendFileSync(
+      logPath,
+      `[${new Date().toISOString()}] convergence-failed ${error instanceof Error ? error.message : String(error)}\n`,
+      'utf8',
+    );
+  }
+}
 
 function runUpdateCommand(
   command: string,
@@ -970,6 +1056,7 @@ app.on('second-instance', () => {
 
 app.whenReady().then(async () => {
   try {
+    convergeDuplicateMacInstallations();
     await startBackend();
     createWindow();
   } catch (error) {

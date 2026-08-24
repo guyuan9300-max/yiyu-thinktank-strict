@@ -146,7 +146,7 @@ export function AboutAppSettingsPanel({ desktopAppInfo }: Props): React.ReactEle
     : '—';
   const installHint = desktopAppInfo?.platform === 'win32'
     ? '请先关闭旧软件，再将新版安装到原目录。'
-    : '请先关闭旧软件，再将应用拖入“应用程序”并选择替换。';
+    : '安装盘已经打开。请双击“安装或更新益语智库AI”，再点击“安装并打开”。';
 
   return (
     <div className="mx-auto w-full max-w-3xl space-y-6">
@@ -182,8 +182,9 @@ export function AboutAppSettingsPanel({ desktopAppInfo }: Props): React.ReactEle
         <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">UPDATES</p>
         <h3 className="mt-2 text-[18px] font-light tracking-tight text-gray-900">软件更新</h3>
         <p className="mt-1.5 text-[12px] leading-6 text-gray-500">
-          软件启动后会检查官网发布的新版本，联网使用期间也会定期重试。发现更新时会通知你；也可以点击“检查更新”查看更新内容并下载安装包。
-          安装前请关闭旧软件：Windows 请将新版安装到原目录；macOS 请将应用拖入“应用程序”并选择替换。
+          软件启动后会检查官网发布的新版本，联网使用期间也会定期重试。发现更新后点击“下载最新版”，软件会从官网下载安装包并打开。
+          双击其中的“安装或更新益语智库AI”，再点击“安装并打开”；安装程序会自动退出旧版、原位替换并重新打开新版，
+          无需拖拽，也无需手动删除旧版。
         </p>
 
         <div className="mt-5 space-y-3">
@@ -201,7 +202,7 @@ export function AboutAppSettingsPanel({ desktopAppInfo }: Props): React.ReactEle
           {updateState.kind === 'official-push-opened' && (
             <div className="flex items-start gap-2 rounded-md bg-emerald-50 px-3 py-2 text-[12px] text-emerald-700">
               <CheckCircle2 size={14} className="mt-[2px] shrink-0" />
-              <span>版本 {updateState.version || ''} 的安装包已下载并打开。{installHint}</span>
+              <span>版本 {updateState.version || ''} 已完成下载。{installHint}</span>
             </div>
           )}
           {updateState.kind === 'official-push' && (
@@ -254,7 +255,7 @@ export function AboutAppSettingsPanel({ desktopAppInfo }: Props): React.ReactEle
                 disabled={updateState.installing}
                 className="inline-flex items-center gap-2 rounded-md bg-[#5B7BFE] px-4 py-2 text-[13px] font-medium text-white hover:bg-[#4A6AEF] disabled:opacity-60"
               >
-                <Download size={14} />{updateState.installing ? '正在准备…' : '下载安装包'}
+                <Download size={14} />{updateState.installing ? '正在准备…' : '下载最新版'}
               </button>
               <button
                 type="button"
