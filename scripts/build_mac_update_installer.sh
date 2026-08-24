@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PAYLOAD_APP="${1:-$ROOT_DIR/dist/mac-arm64/益语智库AI（新版）.app}"
 REQUESTED_OUTPUT_DMG="${2:-}"
-IDENTITY="${MAC_CODESIGN_IDENTITY:-Developer ID Application: yuan gu (VR65362RL7)}"
+IDENTITY="${MAC_CODESIGN_IDENTITY:-$(bash "$ROOT_DIR/scripts/resolve_mac_codesign_identity.sh")}"
 SOURCE_DIR="$ROOT_DIR/build-resources/mac-update-installer"
 
 if [[ ! -d "$PAYLOAD_APP" ]]; then

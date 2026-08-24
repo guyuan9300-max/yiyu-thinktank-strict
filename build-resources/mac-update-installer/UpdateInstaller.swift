@@ -151,7 +151,7 @@ private func alert(title: String, message: String, button: String = "确定") ->
     return panel.runModal()
 }
 
-private func install(nonInteractive: Bool) throws -> URL {
+private func install(nonInteractive: Bool, verificationTarget: URL? = nil) throws -> URL {
     guard let resources = Bundle.main.resourceURL else {
         throw InstallFailure.message("安装程序缺少资源目录。")
     }
@@ -169,7 +169,17 @@ private func install(nonInteractive: Bool) throws -> URL {
     let dockMatches = dockApplicationURLs().filter {
         identity(at: $0)?.bundleID == productBundleID
     }
-    let target = existingProductURL(from: dockMatches + known)
+    if let verificationTarget {
+        guard verificationTarget.lastPathComponent == "\(productName).app" else {
+            throw InstallFailure.message("隔离覆盖验证目标名称不正确。")
+        }
+        if FileManager.default.fileExists(atPath: verificationTarget.path),
+           identity(at: verificationTarget)?.bundleID != productBundleID {
+            throw InstallFailure.message("隔离覆盖验证目标不是本软件。")
+        }
+    }
+    let target = verificationTarget
+        ?? existingProductURL(from: dockMatches + known)
         ?? home.appendingPathComponent("Applications/\(productName).app")
 
     if !nonInteractive {
@@ -187,7 +197,9 @@ private func install(nonInteractive: Bool) throws -> URL {
     stopRunningProduct()
     try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
     try replaceProduct(payload: payload, target: target, expectedVersion: payloadIdentity.version)
-    NSWorkspace.shared.open(target)
+    if verificationTarget == nil {
+        NSWorkspace.shared.open(target)
+    }
     return target
 }
 
@@ -195,8 +207,11 @@ let application = NSApplication.shared
 application.setActivationPolicy(.regular)
 application.activate(ignoringOtherApps: true)
 let nonInteractive = CommandLine.arguments.contains("--noninteractive")
+let verificationTarget = CommandLine.arguments
+    .first(where: { $0.hasPrefix("--verification-target=") })
+    .map { URL(fileURLWithPath: String($0.dropFirst("--verification-target=".count))) }
 do {
-    _ = try install(nonInteractive: nonInteractive)
+    _ = try install(nonInteractive: nonInteractive, verificationTarget: verificationTarget)
     if !nonInteractive {
         _ = alert(title: "更新完成", message: "已更新至新版，\(productName) 正在重新打开。")
     }

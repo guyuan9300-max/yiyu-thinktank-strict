@@ -29,9 +29,10 @@
     "verify:strict-maintenance": "node --test tests/repository-identity-contract.test.mjs && npm run audit:artifacts && npm run audit:strict && npm run build:main && npm run build:renderer",
     "verify:strict-sync": "npm run audit:artifacts && npm run audit:strict && npm run test:strict && npm run build:main && npm run build:renderer && npm run build:python",
     "package:mac-local": "electron-builder --dir --mac dir --arm64 -c.electronDist=node_modules/electron/dist -c.mac.identity=null -c.mac.hardenedRuntime=false -c.mac.gatekeeperAssess=false -c.mac.forceCodeSigning=false -c.mac.notarize=false",
-    "package:mac-signed": "electron-builder --mac zip --arm64 -c.electronDist=node_modules/electron/dist -c.mac.identity='yuan gu (VR65362RL7)' -c.mac.notarize=false && bash scripts/build_mac_update_installer.sh 'dist/mac-arm64/益语智库AI（新版）.app'",
+    "package:mac-signed": "bash scripts/package_mac_signed.sh",
     "dist:mac-local": "npm run build && npm run package:mac-local",
     "dist:mac-signed": "npm run build && npm run package:mac-signed",
+    "release:mac-signed": "bash scripts/release_mac_signed.sh",
     "start": "electron ."
   },
   "dependencies": {},
