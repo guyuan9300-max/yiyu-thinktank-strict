@@ -7,6 +7,7 @@ module deliberately has no dependency on the cloud service package.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -243,6 +244,179 @@ class LocalProjectMaterialsRepository:
             else file_name
         )
         return file_name, current_path.with_name(managed_name).as_posix()
+
+    @staticmethod
+    def _file_matches_fingerprint(
+        path: Path,
+        *,
+        content_hash: str,
+        byte_size: int,
+    ) -> bool:
+        """Match one renamed file without treating its name as identity."""
+        try:
+            if not path.is_file() or path.stat().st_size != byte_size:
+                return False
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+            return digest.hexdigest() == content_hash
+        except OSError:
+            return False
+
+    @classmethod
+    def _find_single_renamed_file(
+        cls,
+        missing_path: Path,
+        *,
+        content_hash: str,
+        byte_size: int,
+    ) -> Path | None:
+        """Find an exact renamed sibling, but never guess among duplicates."""
+        if not content_hash or byte_size < 0 or not missing_path.parent.is_dir():
+            return None
+        suffix = missing_path.suffix.casefold()
+        candidates: list[Path] = []
+        try:
+            for candidate in missing_path.parent.iterdir():
+                if candidate.name.startswith("."):
+                    continue
+                if suffix and candidate.suffix.casefold() != suffix:
+                    continue
+                if cls._file_matches_fingerprint(
+                    candidate,
+                    content_hash=content_hash,
+                    byte_size=byte_size,
+                ):
+                    candidates.append(candidate)
+                    if len(candidates) > 1:
+                        return None
+        except OSError:
+            return None
+        return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
+    def _display_name_from_managed_path(path: Path, source_id: str) -> str:
+        prefix = f"{source_id}-"
+        return path.name[len(prefix) :] if path.name.startswith(prefix) else path.name
+
+    @staticmethod
+    def _mark_metadata_update(entry: dict[str, Any], document_id: str) -> None:
+        cloud_id = str(entry.get("cloudDocumentId") or "").strip()
+        if not cloud_id and not document_id.startswith("local-pending:"):
+            cloud_id = document_id
+            entry["cloudDocumentId"] = document_id
+        if cloud_id:
+            entry["cloudMetadataState"] = "pending_update"
+            entry["cloudMetadataOperation"] = "update"
+
+    def _reconcile_document_rename(
+        self,
+        *,
+        document_id: str,
+        entry: dict[str, Any],
+        source_manifest: dict[str, Any],
+        sandbox_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        """Reconcile Finder renames while retaining one source/document ID."""
+        source_id = str(entry.get("localSourceId") or "").strip()
+        if not source_id:
+            return entry, source_manifest, False
+        storage_key = str(source_manifest.get("storage_key") or "")
+        managed_path = self._managed_path(storage_key)
+        raw_original = str(
+            entry.get("originalSourcePath")
+            or source_manifest.get("local_original_path")
+            or ""
+        ).strip()
+        if not managed_path.is_file() and not raw_original:
+            renamed = self._find_single_renamed_file(
+                managed_path,
+                content_hash=str(source_manifest.get("content_hash") or ""),
+                byte_size=int(source_manifest.get("byte_size") or 0),
+            )
+            if renamed is not None:
+                try:
+                    renamed_key = renamed.resolve().relative_to(self.data_root).as_posix()
+                except ValueError:
+                    renamed_key = ""
+                if renamed_key:
+                    self.runtime.local_storage_object_put(
+                        sandbox_id=sandbox_id,
+                        object_id=source_id,
+                        storage_key=renamed_key,
+                        content_hash=str(source_manifest.get("content_hash") or ""),
+                        media_type=str(source_manifest.get("media_type") or "application/octet-stream"),
+                        byte_size=int(source_manifest.get("byte_size") or 0),
+                        expected_version=int(source_manifest.get("version") or 0),
+                    )
+                    refreshed = self.runtime.local_storage_object_get(
+                        sandbox_id=sandbox_id,
+                        object_id=source_id,
+                    )
+                    if refreshed is not None:
+                        source_manifest = dict(refreshed)
+                    file_name = self._display_name_from_managed_path(renamed, source_id)
+                    entry.update(
+                        {
+                            "fileName": file_name,
+                            "title": Path(file_name).stem,
+                            "managedPath": str(renamed),
+                            "localSourceVersion": int(source_manifest.get("version") or 0),
+                            "updatedAt": utc_now(),
+                        }
+                    )
+                    self._mark_metadata_update(entry, document_id)
+                    return entry, source_manifest, True
+        elif raw_original:
+            original_path = Path(raw_original).expanduser()
+            if not original_path.is_file():
+                original_hash = str(
+                    entry.get("originalContentHash")
+                    or source_manifest.get("content_hash")
+                    or ""
+                )
+                original_size = int(
+                    entry.get("originalByteSize")
+                    or source_manifest.get("byte_size")
+                    or 0
+                )
+                renamed = self._find_single_renamed_file(
+                    original_path,
+                    content_hash=original_hash,
+                    byte_size=original_size,
+                )
+                if renamed is not None:
+                    self.runtime.local_storage_object_put(
+                        sandbox_id=sandbox_id,
+                        object_id=source_id,
+                        storage_key=storage_key,
+                        content_hash=str(source_manifest.get("content_hash") or ""),
+                        media_type=str(source_manifest.get("media_type") or "application/octet-stream"),
+                        byte_size=int(source_manifest.get("byte_size") or 0),
+                        expected_version=int(source_manifest.get("version") or 0),
+                        original_path=str(renamed),
+                    )
+                    refreshed = self.runtime.local_storage_object_get(
+                        sandbox_id=sandbox_id,
+                        object_id=source_id,
+                    )
+                    if refreshed is not None:
+                        source_manifest = dict(refreshed)
+                    entry.update(
+                        {
+                            "fileName": renamed.name,
+                            "title": renamed.stem,
+                            "originalSourcePath": str(renamed),
+                            "originalContentHash": original_hash,
+                            "originalByteSize": original_size,
+                            "localSourceVersion": int(source_manifest.get("version") or 0),
+                            "updatedAt": utc_now(),
+                        }
+                    )
+                    self._mark_metadata_update(entry, document_id)
+                    return entry, source_manifest, True
+        return entry, source_manifest, False
 
     @classmethod
     def _document_editable_in_place(
@@ -938,6 +1112,8 @@ class LocalProjectMaterialsRepository:
                 "byteSize": int(local.get("byteSize") or 0),
                 "managedPath": local.get("managedPath"),
                 "originalSourcePath": local.get("originalSourcePath"),
+                "originalContentHash": local.get("originalContentHash"),
+                "originalByteSize": local.get("originalByteSize"),
                 "folderId": None,
                 "cloudMetadataState": (
                     "pending"
@@ -4489,6 +4665,27 @@ class LocalProjectMaterialsRepository:
             and str(item.get("cloudMetadataState") or "") != "ready"
         ]
 
+    def complete_cloud_metadata_update(
+        self,
+        *,
+        project_id: str,
+        document_id: str,
+        version: int,
+    ) -> None:
+        state = self._load_project_state(project_id)
+        documents = dict(state.get("documents") or {})
+        raw = documents.get(document_id)
+        if not isinstance(raw, Mapping):
+            return
+        entry = dict(raw)
+        entry["cloudMetadataState"] = "ready"
+        entry.pop("cloudMetadataOperation", None)
+        entry["version"] = int(version or entry.get("version") or 1)
+        entry["updatedAt"] = utc_now()
+        documents[document_id] = entry
+        state["documents"] = documents
+        self._write_project_state(project_id, state)
+
     def delete_document_local(
         self,
         project_id: str,
@@ -5408,6 +5605,252 @@ class LocalProjectMaterialsRepository:
         return "\n\n".join(paragraphs)
 
     @staticmethod
+    def _markdown_table_cell(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, datetime):
+            rendered = value.strftime("%Y/%m/%d %H:%M")
+        else:
+            rendered = str(value)
+        return (
+            rendered.replace("\\", "\\\\")
+            .replace("|", "&#124;")
+            .replace("\r\n", "<br>")
+            .replace("\r", "<br>")
+            .replace("\n", "<br>")
+            .strip()
+        )
+
+    @classmethod
+    def _xlsx_editor_markdown(cls, path: Path) -> str:
+        """Keep worksheet rows and columns intact for the smart editor."""
+
+        try:
+            import openpyxl
+        except ImportError as exc:
+            raise LocalRuntimeError(
+                503,
+                "xlsx_editor_not_connected",
+                "表格编辑组件尚未安装，请重新安装当前版本",
+            ) from exc
+        try:
+            workbook = openpyxl.load_workbook(
+                path,
+                read_only=True,
+                data_only=False,
+            )
+        except Exception as exc:
+            raise LocalRuntimeError(
+                415,
+                "local_document_format_invalid",
+                "Excel 文档结构无效，无法读取",
+            ) from exc
+
+        sections: list[str] = []
+        try:
+            visible_sheets = [
+                sheet
+                for sheet in workbook.worksheets
+                if str(getattr(sheet, "sheet_state", "visible")) == "visible"
+            ]
+            for sheet in visible_sheets:
+                # Feishu's XLSX export can contain a complete sheetData section
+                # while incorrectly declaring the worksheet dimension as A1.
+                # Read-only openpyxl trusts that declaration and would expose only
+                # the first cell. Recalculate from the actual worksheet XML before
+                # iterating so the smart editor receives every exported cell.
+                reset_dimensions = getattr(sheet, "reset_dimensions", None)
+                if callable(reset_dimensions):
+                    reset_dimensions()
+                rows: list[list[Any]] = []
+                max_columns = 0
+                truncated = False
+                for row_index, raw_row in enumerate(
+                    sheet.iter_rows(values_only=True),
+                    start=1,
+                ):
+                    if row_index > 10_000:
+                        truncated = True
+                        break
+                    values = list(raw_row[:256])
+                    while values and values[-1] is None:
+                        values.pop()
+                    if not values or not any(value is not None for value in values):
+                        continue
+                    max_columns = max(max_columns, len(values))
+                    rows.append(values)
+                if not rows or max_columns <= 0:
+                    continue
+
+                normalized_rows = [
+                    values + [None] * (max_columns - len(values))
+                    for values in rows
+                ]
+                if len(normalized_rows) > 1:
+                    headers = [
+                        cls._markdown_table_cell(value) or f"第{index + 1}列"
+                        for index, value in enumerate(normalized_rows[0])
+                    ]
+                    data_rows = normalized_rows[1:]
+                else:
+                    headers = [f"第{index + 1}列" for index in range(max_columns)]
+                    data_rows = normalized_rows
+
+                sections.append(f"## 工作表：{sheet.title}")
+                sections.append("| " + " | ".join(headers) + " |")
+                sections.append("| " + " | ".join(["---"] * max_columns) + " |")
+                sections.extend(
+                    "| "
+                    + " | ".join(
+                        cls._markdown_table_cell(value) for value in values
+                    )
+                    + " |"
+                    for values in data_rows
+                )
+                if truncated:
+                    sections.append("\n> 表格超过 10000 行，智能编辑仅展示前 10000 行。")
+        finally:
+            workbook.close()
+
+        return "\n".join(sections).strip()
+
+    @staticmethod
+    def _docx_paragraph_markdown(paragraph: Any, document: Any) -> tuple[str, list[str]]:
+        try:
+            from docx.oxml.ns import qn
+        except ImportError as exc:
+            raise LocalRuntimeError(
+                503,
+                "docx_editor_not_connected",
+                "Word 编辑组件尚未安装，请重新安装当前版本",
+            ) from exc
+
+        parts: list[str] = []
+        images: list[str] = []
+        for run in paragraph.runs:
+            if run.text:
+                parts.append(str(run.text))
+            for blip in run._element.xpath(".//a:blip"):
+                relationship_id = str(blip.get(qn("r:embed")) or "")
+                image_part = document.part.related_parts.get(relationship_id)
+                if image_part is None:
+                    continue
+                media_type = str(
+                    getattr(image_part, "content_type", "image/png")
+                    or "image/png"
+                )
+                encoded = base64.b64encode(image_part.blob).decode("ascii")
+                images.append(f"![文档图片](data:{media_type};base64,{encoded})")
+        text = "".join(parts).strip() or str(paragraph.text or "").strip()
+        return text, images
+
+    @classmethod
+    def _docx_editor_markdown(cls, path: Path) -> str:
+        """Render Word paragraphs, tables and embedded images for editing."""
+
+        try:
+            from docx import Document
+            from docx.oxml.table import CT_Tbl
+            from docx.oxml.text.paragraph import CT_P
+            from docx.table import Table
+            from docx.text.paragraph import Paragraph
+        except ImportError as exc:
+            raise LocalRuntimeError(
+                503,
+                "docx_editor_not_connected",
+                "Word 编辑组件尚未安装，请重新安装当前版本",
+            ) from exc
+        try:
+            document = Document(path)
+        except Exception as exc:
+            raise LocalRuntimeError(
+                415,
+                "local_document_format_invalid",
+                "Word 文档结构无效，无法读取",
+            ) from exc
+
+        sections: list[str] = []
+        for child in document.element.body.iterchildren():
+            if isinstance(child, CT_P):
+                paragraph = Paragraph(child, document)
+                text, images = cls._docx_paragraph_markdown(paragraph, document)
+                if text:
+                    style_name = str(
+                        getattr(getattr(paragraph, "style", None), "name", "")
+                        or ""
+                    )
+                    heading = re.match(r"^Heading\s+([1-4])$", style_name)
+                    has_numbering = (
+                        paragraph._p.pPr is not None
+                        and paragraph._p.pPr.numPr is not None
+                    )
+                    if heading:
+                        text = f"{'#' * int(heading.group(1))} {text}"
+                    elif has_numbering:
+                        text = f"- {text}"
+                    sections.append(text)
+                sections.extend(images)
+                continue
+            if not isinstance(child, CT_Tbl):
+                continue
+            table = Table(child, document)
+            rows: list[list[str]] = []
+            table_images: list[str] = []
+            # ``python-docx`` exposes a horizontally merged cell once for every
+            # grid position it spans. Keep the rectangular grid, but emit
+            # merged continuations as empty cells instead of repeating text.
+            seen_table_cells: set[Any] = set()
+            for row in table.rows:
+                values: list[str] = []
+                for cell in row.cells:
+                    cell_identity = cell._tc
+                    if cell_identity in seen_table_cells:
+                        values.append("")
+                        continue
+                    seen_table_cells.add(cell_identity)
+                    cell_values: list[str] = []
+                    for paragraph in cell.paragraphs:
+                        text, images = cls._docx_paragraph_markdown(paragraph, document)
+                        if text:
+                            cell_values.append(text)
+                        table_images.extend(images)
+                    # Preserve visible nested-table values as line-separated
+                    # cell content instead of silently dropping them.
+                    for nested_table in cell.tables:
+                        for nested_row in nested_table.rows:
+                            nested_values = [
+                                str(nested_cell.text or "").strip()
+                                for nested_cell in nested_row.cells
+                            ]
+                            nested_text = " / ".join(
+                                value for value in nested_values if value
+                            )
+                            if nested_text:
+                                cell_values.append(nested_text)
+                    values.append(cls._markdown_table_cell("\n".join(cell_values)))
+                rows.append(values)
+            if rows:
+                width = max(len(row) for row in rows)
+                normalized = [row + [""] * (width - len(row)) for row in rows]
+                # Empty Word headers are valid and may represent a heading that
+                # spans columns. Do not invent labels absent from the source.
+                headers = normalized[0]
+                # Keep every Markdown table row contiguous.  Separating rows
+                # with blank paragraphs makes MDXEditor treat them as ordinary
+                # text, so Word tables would lose their grid in smart editing.
+                table_lines = [
+                    "| " + " | ".join(headers) + " |",
+                    "| " + " | ".join(["---"] * width) + " |",
+                    *(
+                        "| " + " | ".join(row) + " |"
+                        for row in normalized[1:]
+                    ),
+                ]
+                sections.append("\n".join(table_lines))
+            sections.extend(table_images)
+        return "\n\n".join(section for section in sections if section.strip()).strip()
+
+    @staticmethod
     def _add_docx_markdown_runs(paragraph: Any, text: str) -> None:
         pattern = re.compile(r"(\*\*(.+?)\*\*|`([^`]+)`)")
         cursor = 0
@@ -5423,6 +5866,23 @@ class LocalProjectMaterialsRepository:
             cursor = match.end()
         if cursor < len(text):
             paragraph.add_run(text[cursor:])
+
+    @classmethod
+    def _set_docx_table_cell_markdown(cls, cell: Any, value: str) -> None:
+        """Restore escaped Markdown table content into a real Word cell."""
+
+        normalized = (
+            str(value or "")
+            .replace("&#124;", "|")
+            .replace("&vert;", "|")
+        )
+        parts = re.split(r"<br\s*/?>", normalized, flags=re.IGNORECASE)
+        first = cell.paragraphs[0]
+        first.clear()
+        cls._add_docx_markdown_runs(first, parts[0] if parts else "")
+        for part in parts[1:]:
+            extra = cell.add_paragraph()
+            cls._add_docx_markdown_runs(extra, part)
 
     @classmethod
     def _render_markdown_into_docx(
@@ -5459,6 +5919,29 @@ class LocalProjectMaterialsRepository:
                 index += 1
                 continue
 
+            image = re.fullmatch(
+                r"!\[[^\]]*\]\(data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)\)",
+                line,
+            )
+            if image:
+                try:
+                    from docx.shared import Inches
+
+                    image_data = base64.b64decode(
+                        "".join(image.group(2).split()),
+                        validate=True,
+                    )
+                    image_paragraph = paragraph("Normal")
+                    image_paragraph.add_run().add_picture(
+                        BytesIO(image_data),
+                        width=Inches(6.0),
+                    )
+                except Exception:
+                    fallback = paragraph("Normal")
+                    fallback.add_run("[图片无法保存]")
+                index += 1
+                continue
+
             if (
                 line.startswith("|")
                 and index + 1 < len(lines)
@@ -5491,16 +5974,17 @@ class LocalProjectMaterialsRepository:
                 if "Table Grid" in style_names:
                     table.style = "Table Grid"
                 for column, value in enumerate(headers):
-                    cell_paragraph = table.rows[0].cells[column].paragraphs[0]
-                    cls._add_docx_markdown_runs(cell_paragraph, value)
-                    for run in cell_paragraph.runs:
-                        run.bold = True
+                    cell = table.rows[0].cells[column]
+                    cls._set_docx_table_cell_markdown(cell, value)
+                    for cell_paragraph in cell.paragraphs:
+                        for run in cell_paragraph.runs:
+                            run.bold = True
                 for row_index, values in enumerate(table_rows, start=1):
                     for column, value in enumerate(values):
-                        cell_paragraph = table.rows[row_index].cells[
-                            column
-                        ].paragraphs[0]
-                        cls._add_docx_markdown_runs(cell_paragraph, value)
+                        cls._set_docx_table_cell_markdown(
+                            table.rows[row_index].cells[column],
+                            value,
+                        )
                 continue
 
             heading = re.match(r"^(#{1,4})\s+(.+)$", line)
@@ -5822,13 +6306,27 @@ class LocalProjectMaterialsRepository:
             path=path,
             media_type=media_type,
         )
-        if cached is not None and str(cached.get("content") or "").strip():
+        suffix = path.suffix.lower()
+        editor_cache_kind = {
+            ".docx": "docx_editor_v3",
+            ".xlsx": "xlsx_editor_v2",
+            ".xlsm": "xlsx_editor_v2",
+        }.get(suffix)
+        cache_matches_editor = editor_cache_kind is None or (
+            cached is not None
+            and str(cached.get("kind") or "") == editor_cache_kind
+        )
+        if (
+            cached is not None
+            and str(cached.get("content") or "").strip()
+            and cache_matches_editor
+        ):
             return {
                 "documentId": document_id,
                 "projectId": project_id,
                 "content": str(cached["content"]),
                 "kind": str(cached.get("kind") or "text"),
-                "title": entry.get("title") or entry.get("fileName") or path.name,
+                "title": self._document_display_title(entry, path),
                 "fileName": entry.get("fileName") or path.name,
                 "path": str(path),
                 "sourceScope": "local_private",
@@ -5838,10 +6336,12 @@ class LocalProjectMaterialsRepository:
                 "storageVersion": int(row["version"]),
                 "editableInPlace": editable_in_place,
             }
-        suffix = path.suffix.lower()
         if suffix == ".docx":
-            content = self._docx_text(path)
-            kind = "docx"
+            content = self._docx_editor_markdown(path)
+            kind = "docx_editor_v3"
+        elif suffix in {".xlsx", ".xlsm"}:
+            content = self._xlsx_editor_markdown(path)
+            kind = "xlsx_editor_v2"
         elif suffix == ".pdf" or media_type == "application/pdf":
             try:
                 from pypdf import PdfReader
@@ -5968,7 +6468,7 @@ class LocalProjectMaterialsRepository:
             "projectId": project_id,
             "content": content,
             "kind": kind,
-            "title": entry.get("title") or entry.get("fileName") or path.name,
+            "title": self._document_display_title(entry, path),
             "fileName": entry.get("fileName") or path.name,
             "path": str(path),
             "sourceScope": "local_private",
@@ -6553,6 +7053,46 @@ class LocalProjectMaterialsRepository:
             key=lambda item: (item["sortOrder"], str(item["label"])),
         )
 
+    @staticmethod
+    def _document_display_title(entry: Mapping[str, Any], path: Path) -> str:
+        file_name = str(entry.get("fileName") or path.name).strip() or path.name
+        file_stem = Path(file_name).stem
+        title = str(entry.get("title") or file_stem).strip() or file_stem
+        title = Path(title).stem
+        # External one-time imports encode their origin in the physical file
+        # name.  Older projections often kept a clean provider title without
+        # the suffix, so the workbench must derive the same visible suffix from
+        # the sole local source instead of trusting stale display metadata.
+        normalized_stems = {
+            re.sub(r"[_\s]+", " ", file_stem).strip(),
+            re.sub(r"[_\s]+", " ", path.stem).strip(),
+        }
+        source_suffix = ""
+        if any(
+            re.search(r"(?:^|[-—–\s])飞书$", stem)
+            for stem in normalized_stems
+        ):
+            source_suffix = "飞书"
+        elif any(
+            re.search(r"(?:^|[-—–\s])小红书$", stem)
+            for stem in normalized_stems
+        ):
+            source_suffix = "小红书"
+        elif any(
+            re.search(r"(?:^|[-—–\s])(?:B站|哔哩哔哩)$", stem)
+            for stem in normalized_stems
+        ):
+            source_suffix = "B站"
+        if not source_suffix:
+            return title
+        suffix_pattern = (
+            r"(?:[-—–_\s]+)(?:B站|哔哩哔哩)$"
+            if source_suffix == "B站"
+            else rf"(?:[-—–_\s]+){re.escape(source_suffix)}$"
+        )
+        base_title = re.sub(suffix_pattern, "", title).rstrip(" -—–_")
+        return f"{base_title or title}-{source_suffix}"
+
     def documents(self, project_id: str) -> list[dict[str, Any]]:
         """Return only files that physically exist in the current sandbox.
 
@@ -6584,6 +7124,21 @@ class LocalProjectMaterialsRepository:
             processing_states,
             strict=True,
         ):
+            source_id = str(entry.get("localSourceId") or "").strip()
+            source_manifest = source_manifests.get(source_id)
+            if source_manifest is not None:
+                entry, source_manifest, reconciled = self._reconcile_document_rename(
+                    document_id=document_id,
+                    entry=entry,
+                    source_manifest=dict(source_manifest),
+                    sandbox_id=sandbox_id,
+                )
+                if reconciled:
+                    state_documents = dict(state.get("documents") or {})
+                    state_documents[document_id] = entry
+                    state["documents"] = state_documents
+                    state = self._write_project_state(project_id, state)
+                    source_manifests[source_id] = source_manifest
             display_name = str(
                 entry.get("fileName") or entry.get("title") or ""
             ).strip()
@@ -6594,7 +7149,6 @@ class LocalProjectMaterialsRepository:
                 # and arbitrary binaries. Keep their audit rows intact, but do
                 # not expose them as usable project material.
                 continue
-            source_id = str(entry.get("localSourceId") or "").strip()
             source_manifest = source_manifests.get(source_id)
             if (
                 source_manifest is None
@@ -6627,11 +7181,7 @@ class LocalProjectMaterialsRepository:
                     "id": str(document_id),
                     "clientId": project_id,
                     "folderId": entry.get("folderId"),
-                    "title": (
-                        entry.get("title")
-                        or entry.get("fileName")
-                        or managed_path.name
-                    ),
+                    "title": self._document_display_title(entry, managed_path),
                     "path": str(open_path),
                     "managedPath": str(managed_path),
                     "originalSourcePath": (
@@ -7938,6 +8488,8 @@ class LocalProjectMaterialsRepository:
             "fileName": source.name,
             "managedPath": str(target),
             "originalSourcePath": str(source),
+            "originalContentHash": digest.hexdigest(),
+            "originalByteSize": byte_size,
             "mediaType": media_type,
             "byteSize": byte_size,
             "contentHash": digest.hexdigest(),
@@ -8101,6 +8653,160 @@ class LocalProjectMaterialsRepository:
                 result=result,
             )
             return result
+
+    def import_bytes(
+        self,
+        *,
+        project_id: str,
+        title: str,
+        file_name: str,
+        media_type: str,
+        data: bytes,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Store one provider-exported Office file as the sole local source."""
+
+        allowed_media_types = {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        }
+        expected_suffix = allowed_media_types.get(media_type)
+        if expected_suffix is None:
+            raise LocalRuntimeError(
+                415,
+                "provider_office_media_type_unsupported",
+                "飞书导出的文件格式不受支持",
+            )
+        if not data:
+            raise LocalRuntimeError(422, "provider_office_file_empty", "飞书导出的文件为空")
+        if len(data) > 64 * 1024 * 1024:
+            raise LocalRuntimeError(
+                422,
+                "provider_office_file_too_large",
+                "飞书导出文件不能超过 64 MiB",
+            )
+        if not data.startswith(b"PK"):
+            raise LocalRuntimeError(
+                415,
+                "provider_office_file_invalid",
+                "飞书导出的 Office 文件结构无效",
+            )
+        normalized_title = title.strip() or "飞书文档"
+        normalized_name = self._safe_name(file_name.strip() or normalized_title)
+        name_stem = Path(normalized_name).stem
+        # Feishu imports are one-time external projections.  Keep their real
+        # provider title, but make the origin unambiguous in the local file
+        # name just like Xiaohongshu/Bilibili link transfers do.
+        if not name_stem.endswith("-飞书"):
+            name_stem = f"{name_stem}-飞书"
+        normalized_name = f"{name_stem}{expected_suffix}"
+        normalized_title = name_stem
+        content_hash = hashlib.sha256(data).hexdigest()
+        context = self._context()
+        operation_key = idempotency_key or new_id()
+        request_fingerprint = hashlib.sha256(
+            canonical_json(
+                {
+                    "projectId": project_id,
+                    "fileName": normalized_name,
+                    "mediaType": media_type,
+                    "contentHash": content_hash,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        receipt_id, receipt_key = self._import_operation_identity(
+            context.sandbox_id,
+            operation_key,
+        )
+        with self.runtime.local_storage_object_lock(
+            sandbox_id=context.sandbox_id,
+            object_id=receipt_id,
+        ):
+            receipt = self._load_import_operation(
+                sandbox_id=context.sandbox_id,
+                object_id=receipt_id,
+                storage_key=receipt_key,
+                request_fingerprint=request_fingerprint,
+            )
+            if receipt is not None:
+                return receipt
+            result = self._prepare_binary_import(
+                sandbox_id=context.sandbox_id,
+                project_id=project_id,
+                normalized_title=normalized_title,
+                file_name=normalized_name,
+                media_type=media_type,
+                data=data,
+            )
+            self._write_import_operation(
+                sandbox_id=context.sandbox_id,
+                object_id=receipt_id,
+                storage_key=receipt_key,
+                project_id=project_id,
+                operation_kind="provider_office",
+                request_fingerprint=request_fingerprint,
+                result=result,
+            )
+            return result
+
+    def _prepare_binary_import(
+        self,
+        *,
+        sandbox_id: str,
+        project_id: str,
+        normalized_title: str,
+        file_name: str,
+        media_type: str,
+        data: bytes,
+    ) -> dict[str, Any]:
+        source_id = new_id()
+        prefix = (
+            "local-project-materials/"
+            f"{self._stable_segment(sandbox_id)}/"
+            f"{self._stable_segment(project_id)}/"
+        )
+        source = self._upsert_object(
+            sandbox_id=sandbox_id,
+            object_id=source_id,
+            storage_key=f"{prefix}{source_id}-{file_name}",
+            media_type=media_type,
+            data=data,
+        )
+        now = str(source["updatedAt"])
+        summary_id = new_id()
+        summary_payload = {
+            "schema": "yiyu.project-local-private-knowledge.v1",
+            "sourceScope": "local_private",
+            "projectId": project_id,
+            "sourceId": source_id,
+            "contentHash": source["contentHash"],
+            "summary": "",
+            "summaryKind": "metadata_only",
+            "sourceDescription": "飞书官方导出的一次性 Office 项目资料",
+            "updatedAt": now,
+            "fileName": file_name,
+        }
+        summary = self._upsert_object(
+            sandbox_id=sandbox_id,
+            object_id=summary_id,
+            storage_key=f"{prefix}{source_id}.summary.json",
+            media_type=self.SUMMARY_MEDIA_TYPE,
+            data=canonical_json(summary_payload).encode("utf-8"),
+        )
+        return {
+            "localSourceId": source_id,
+            "localSummaryId": summary_id,
+            "fileName": file_name,
+            "title": normalized_title,
+            "managedPath": source["path"],
+            "originalSourcePath": None,
+            "mediaType": media_type,
+            "byteSize": len(data),
+            "contentHash": source["contentHash"],
+            "summaryKind": "metadata_only",
+            "summaryPath": summary["path"],
+            "updatedAt": now,
+        }
 
     def _prepare_text_import(
         self,

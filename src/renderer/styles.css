@@ -336,6 +336,44 @@ textarea {
   color: rgb(209 213 219) !important;
 }
 
+/* 智能编辑中的表格保留可读列宽；列数超出编辑区时，只让表格自身横向滚动。
+   MDXEditor 的类名带构建哈希，因此使用稳定的类名前缀匹配。 */
+.mdx-placeholder-light [class*='_tableEditor_'] {
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  height: auto !important;
+  table-layout: auto !important;
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgb(148 163 184 / 0.72) rgb(241 245 249 / 0.9);
+  padding-bottom: 0.35rem;
+}
+
+.mdx-placeholder-light [class*='_tableEditor_'] > tbody > tr > td:not([data-tool-cell='true']),
+.mdx-placeholder-light [class*='_tableEditor_'] > tbody > tr > th:not([data-tool-cell='true']) {
+  min-width: 9rem;
+  max-width: 24rem;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.mdx-placeholder-light [class*='_tableEditor_']::-webkit-scrollbar {
+  height: 0.5rem;
+}
+
+.mdx-placeholder-light [class*='_tableEditor_']::-webkit-scrollbar-track {
+  background: rgb(241 245 249 / 0.9);
+  border-radius: 999px;
+}
+
+.mdx-placeholder-light [class*='_tableEditor_']::-webkit-scrollbar-thumb {
+  background: rgb(148 163 184 / 0.72);
+  border-radius: 999px;
+}
+
 /* 事件线归档筛选是 renderer-session 状态；跨页面保留，重启恢复默认。 */
 .event-lines-panel:has(.event-lines-hide-archived-toggle:checked)
   .event-line-card[data-event-line-status='archived'] {

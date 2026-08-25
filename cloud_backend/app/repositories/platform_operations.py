@@ -263,10 +263,27 @@ class PlatformOperationRepository:
                     identity, provider, resource_kind, remote_id
                 )
                 row = connection.execute(
-                    "SELECT version FROM provider_resources WHERE id=? AND scope_id=?",
+                    "SELECT version,status,retention_state,verified_at FROM provider_resources "
+                    "WHERE id=? AND scope_id=?",
                     (provider_resource_id, identity.scope_id),
                 ).fetchone()
                 version = int(row["version"] or 1) + 1 if row else 1
+                preserve_stable_resource = bool(
+                    row
+                    and str(row["status"] or "") == "succeeded"
+                    and outcome in {"blocked", "failed_retryable", "failed"}
+                )
+                resource_status = str(row["status"]) if preserve_stable_resource else outcome
+                resource_retention = (
+                    str(row["retention_state"])
+                    if preserve_stable_resource
+                    else (retention_state or outcome)
+                )
+                resource_verified_at = (
+                    row["verified_at"]
+                    if preserve_stable_resource
+                    else (now if outcome == "succeeded" else None)
+                )
                 connection.execute(
                     "INSERT INTO provider_resources (id,scope_id,provider,resource_kind,"
                     "remote_id,retention_state,owner_kind,owner_principal_id,"
@@ -285,13 +302,13 @@ class PlatformOperationRepository:
                         provider,
                         resource_kind,
                         remote_id,
-                        retention_state or outcome,
+                        resource_retention,
                         owner_kind,
                         identity.principal_id if owner_kind == "principal" else None,
                         identity.membership_id if owner_kind == "membership" else None,
                         resource_kind,
-                        outcome,
-                        now if outcome == "succeeded" else None,
+                        resource_status,
+                        resource_verified_at,
                         version,
                         now,
                         now,

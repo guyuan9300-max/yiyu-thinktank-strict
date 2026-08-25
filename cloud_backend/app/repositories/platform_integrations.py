@@ -7,15 +7,19 @@ provider-specific credential table or plaintext receipt is introduced here.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
 import secrets
 import threading
+import time
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote, urlencode, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -53,6 +57,7 @@ FEISHU_CONTACT_LOOKUP_URL = (
 FEISHU_MESSAGE_CREATE_URL = (
     "https://open.feishu.cn/open-apis/im/v1/messages"
 )
+FEISHU_TASK_V2_API_ROOT = "https://open.feishu.cn/open-apis/task/v2/tasks"
 FEISHU_API_ROOT = "https://open.feishu.cn/open-apis"
 FEISHU_MEMBER_DOCUMENT_SCOPES = (
     "offline_access",
@@ -785,9 +790,24 @@ class PlatformIntegrationsRepository:
                 "飞书接口请求超时，请稍后重试",
             ) from exc
         except httpx.HTTPStatusError as exc:
+            provider_message = ""
+            try:
+                provider_body = exc.response.json()
+                if isinstance(provider_body, Mapping):
+                    provider_message = str(
+                        provider_body.get("msg")
+                        or provider_body.get("message")
+                        or ""
+                    ).strip()
+            except (TypeError, ValueError):
+                provider_message = ""
             raise _FeishuExecutionError(
                 "feishu_request_http_error",
-                f"飞书接口返回 HTTP {exc.response.status_code}，请稍后重试",
+                (
+                    f"飞书接口返回 HTTP {exc.response.status_code}：{provider_message}"
+                    if provider_message
+                    else f"飞书接口返回 HTTP {exc.response.status_code}，请稍后重试"
+                ),
             ) from exc
         except (httpx.HTTPError, TypeError, ValueError) as exc:
             raise _FeishuExecutionError(
@@ -814,6 +834,55 @@ class PlatformIntegrationsRepository:
                 f"飞书拒绝了请求（code={provider_code}），请检查授权与权限后重试",
             )
         return result
+
+    def _feishu_provider_bytes(
+        self,
+        url: str,
+        *,
+        access_token: str,
+        timeout_seconds: float = 45.0,
+        maximum_bytes: int = 64 * 1024 * 1024,
+    ) -> tuple[bytes, Mapping[str, Any]]:
+        factory = self.feishu_http_client_factory or FEISHU_HTTP_CLIENT_FACTORY
+        try:
+            with factory(
+                timeout=httpx.Timeout(timeout_seconds, connect=5.0),
+                trust_env=False,
+                follow_redirects=True,
+            ) as client:
+                response = client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                response.raise_for_status()
+                data = bytes(response.content)
+                headers = dict(response.headers)
+        except httpx.TimeoutException as exc:
+            raise _FeishuExecutionError(
+                "feishu_export_download_timeout",
+                "飞书导出文件下载超时，请稍后重试",
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise _FeishuExecutionError(
+                "feishu_export_download_http_error",
+                f"飞书导出文件下载返回 HTTP {exc.response.status_code}",
+            ) from exc
+        except (httpx.HTTPError, TypeError, ValueError) as exc:
+            raise _FeishuExecutionError(
+                "feishu_export_download_failed",
+                "飞书导出文件下载失败，请稍后重试",
+            ) from exc
+        if not data:
+            raise _FeishuExecutionError(
+                "feishu_export_file_empty",
+                "飞书导出的文件为空，本次未导入",
+            )
+        if len(data) > maximum_bytes:
+            raise _FeishuExecutionError(
+                "feishu_export_file_too_large",
+                "飞书导出文件超过 64 MiB，本次未导入",
+            )
+        return data, headers
 
     def _feishu_oauth_relay_json(
         self,
@@ -1553,7 +1622,6 @@ class PlatformIntegrationsRepository:
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> dict[str, Any]:
-        result_json = canonical_json(dict(result))
         now = utc_now()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -3425,7 +3493,7 @@ class PlatformIntegrationsRepository:
         ):
             return None
         match = re.search(
-            r"/(docx|docs|wiki)/([A-Za-z0-9_-]+)",
+            r"/(docx|docs|wiki|sheets)/([A-Za-z0-9_-]+)",
             parsed.path or "",
         )
         if match is None:
@@ -3438,9 +3506,11 @@ class PlatformIntegrationsRepository:
                 if raw_type == "docx"
                 else "doc"
                 if raw_type == "docs"
+                else "sheet"
+                if raw_type == "sheets"
                 else "wiki"
             ),
-            "title": "飞书文档",
+            "title": "",
             "url": link,
             "ownerName": None,
             "updatedAt": None,
@@ -3474,19 +3544,21 @@ class PlatformIntegrationsRepository:
             "docs": "doc",
             "document": "docx",
             "wiki_node": "wiki",
+            "sheets": "sheet",
+            "spreadsheet": "sheet",
         }.get(raw_type, raw_type)
-        if not token or normalized_type not in {"docx", "doc", "wiki"}:
+        if not token or normalized_type not in {"docx", "doc", "wiki", "sheet"}:
             return None
         title = str(
             raw.get("title")
             or raw.get("name")
             or raw.get("document_title")
-            or "飞书文档"
+            or ""
         ).strip()
         return {
             "token": token,
             "type": normalized_type,
-            "title": title or "飞书文档",
+            "title": title,
             "url": str(raw.get("url") or raw.get("link") or ""),
             "ownerName": (
                 str(
@@ -3586,45 +3658,186 @@ class PlatformIntegrationsRepository:
                 )
             result.update(resolved)
             result["url"] = str(candidate.get("url") or result.get("url") or "")
+        if str(result.get("type") or "") == "docx":
+            payload = self._feishu_provider_json(
+                "GET",
+                f"{FEISHU_API_ROOT}/docx/v1/documents/{quote(str(result.get('token') or ''))}",
+                access_token=access_token,
+            )
+            data = payload.get("data")
+            document = (
+                data.get("document")
+                if isinstance(data, Mapping) and isinstance(data.get("document"), Mapping)
+                else None
+            )
+            title = str((document or {}).get("title") or "").strip()
+            if title:
+                result["title"] = title
+        if str(result.get("type") or "") == "sheet":
+            payload = self._feishu_provider_json(
+                "GET",
+                f"{FEISHU_API_ROOT}/sheets/v3/spreadsheets/{quote(str(result.get('token') or ''))}",
+                access_token=access_token,
+            )
+            data = payload.get("data")
+            spreadsheet = (
+                data.get("spreadsheet")
+                if isinstance(data, Mapping)
+                and isinstance(data.get("spreadsheet"), Mapping)
+                else data if isinstance(data, Mapping) else {}
+            )
+            title = str((spreadsheet or {}).get("title") or "").strip()
+            if title:
+                result["title"] = title
+        if not str(result.get("title") or "").strip():
+            raise _FeishuExecutionError(
+                "feishu_document_title_missing",
+                "飞书没有返回文档标题，未将该链接作为可导入文档",
+            )
         return result
 
-    def _fetch_feishu_document_text(
+    @staticmethod
+    def _normalize_feishu_document_error(
+        exc: _FeishuExecutionError,
+    ) -> _FeishuExecutionError:
+        normalized = f"{exc.code} {exc.message}".lower()
+        if any(
+            marker in normalized
+            for marker in (
+                "http 403",
+                "permission",
+                "forbidden",
+                "access denied",
+                "权限",
+                "授权",
+            )
+        ):
+            return _FeishuExecutionError(
+                "feishu_document_not_accessible",
+                "该文档仅个人可见或未向组织开放，组织飞书应用无法读取；请调整为组织可见或互联网可见后重试",
+            )
+        return exc
+
+    @staticmethod
+    def _feishu_export_result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            return {}
+        result = data.get("result")
+        return result if isinstance(result, Mapping) else data
+
+    def _fetch_feishu_document_artifact(
         self,
         access_token: str,
         candidate: Mapping[str, Any],
     ) -> dict[str, Any]:
-        resolved = self._resolve_feishu_candidate(
-            access_token,
-            candidate,
-        )
-        if str(resolved.get("type") or "") != "docx":
+        try:
+            resolved = self._resolve_feishu_candidate(
+                access_token,
+                candidate,
+            )
+        except _FeishuExecutionError as exc:
+            normalized_error = self._normalize_feishu_document_error(exc)
+            if normalized_error is not exc:
+                raise normalized_error from exc
+            raise
+        resource_type = str(resolved.get("type") or "")
+        if resource_type not in {"doc", "docx", "sheet"}:
             raise _FeishuExecutionError(
                 "feishu_document_type_unsupported",
-                "严格新版当前只支持导入飞书新版文档（Docx）",
+                "该飞书资源暂不支持导出为 Office 文件",
             )
         token = str(resolved.get("token") or "")
-        payload = self._feishu_provider_json(
-            "GET",
-            f"{FEISHU_API_ROOT}/docx/v1/documents/{quote(token)}/raw_content",
-            access_token=access_token,
-        )
-        data = payload.get("data")
-        content = (
-            str(data.get("content") or "")
-            if isinstance(data, Mapping)
+        extension = "xlsx" if resource_type == "sheet" else "docx"
+        try:
+            created = self._feishu_provider_json(
+                "POST",
+                f"{FEISHU_API_ROOT}/drive/v1/export_tasks",
+                access_token=access_token,
+                payload={
+                    "file_extension": extension,
+                    "token": token,
+                    "type": resource_type,
+                },
+            )
+        except _FeishuExecutionError as exc:
+            normalized_error = self._normalize_feishu_document_error(exc)
+            if normalized_error is not exc:
+                raise normalized_error from exc
+            raise
+        created_data = created.get("data")
+        ticket = str(
+            (created_data or {}).get("ticket")
+            if isinstance(created_data, Mapping)
             else ""
         ).strip()
-        if not content:
+        if not ticket:
             raise _FeishuExecutionError(
-                "feishu_document_content_empty",
-                "飞书文档没有返回可导入的正文",
+                "feishu_export_ticket_missing",
+                "飞书没有返回导出任务标识，本次未导入",
             )
-        if len(content.encode("utf-8")) > 4 * 1024 * 1024:
+        export_result: Mapping[str, Any] = {}
+        for attempt in range(60):
+            status_payload = self._feishu_provider_json(
+                "GET",
+                f"{FEISHU_API_ROOT}/drive/v1/export_tasks/{quote(ticket)}",
+                access_token=access_token,
+                params={"token": token},
+            )
+            export_result = self._feishu_export_result(status_payload)
+            file_token = str(export_result.get("file_token") or "").strip()
+            if file_token:
+                break
+            job_error = str(
+                export_result.get("job_error_msg")
+                or export_result.get("error_msg")
+                or ""
+            ).strip()
+            if job_error:
+                raise _FeishuExecutionError(
+                    "feishu_export_failed",
+                    f"飞书未能导出该文件：{job_error}",
+                )
+            if attempt < 59:
+                time.sleep(0.5)
+        file_token = str(export_result.get("file_token") or "").strip()
+        if not file_token:
             raise _FeishuExecutionError(
-                "feishu_document_too_large",
-                "飞书文档正文超过 4 MiB，本次未导入",
+                "feishu_export_timeout",
+                "飞书导出文件准备超时，请稍后重试",
             )
-        return {**resolved, "content": content}
+        data, _headers = self._feishu_provider_bytes(
+            f"{FEISHU_API_ROOT}/drive/v1/export_tasks/file/{quote(file_token)}/download",
+            access_token=access_token,
+        )
+        if not data.startswith(b"PK"):
+            raise _FeishuExecutionError(
+                "feishu_export_format_invalid",
+                f"飞书返回的 {extension.upper()} 文件格式无效，本次未导入",
+            )
+        title = str(resolved.get("title") or "飞书文档").strip()
+        safe_title = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", title).strip(" .")
+        file_name = safe_title or "飞书文档"
+        if not file_name.lower().endswith(f".{extension}"):
+            file_name = f"{file_name}.{extension}"
+        media_type = (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if extension == "xlsx"
+            else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        content_hash = hashlib.sha256(data).hexdigest()
+        return {
+            **resolved,
+            "artifact": {
+                "fileName": file_name,
+                "mediaType": media_type,
+                "format": extension,
+                "contentBase64": base64.b64encode(data).decode("ascii"),
+                "byteSize": len(data),
+                "contentHash": content_hash,
+                "fidelityState": "provider_export",
+            },
+        }
 
     def request_feishu_import(
         self,
@@ -3634,11 +3847,11 @@ class PlatformIntegrationsRepository:
         payload: Mapping[str, Any],
         idempotency_key: str,
     ) -> dict[str, Any]:
-        if action not in {"search", "resolve_links", "fetch"}:
+        if action not in {"resolve_links", "fetch"}:
             raise RepositoryError(
-                422,
+                410 if action == "search" else 422,
                 "feishu_import_action_invalid",
-                "不支持的飞书文档导入动作",
+                "飞书文档改为通过链接一次性导入，不再提供关键词搜索",
             )
         requested_count = (
             len(payload.get("links") or payload.get("items") or [])
@@ -3693,40 +3906,38 @@ class PlatformIntegrationsRepository:
             )
             items: list[dict[str, Any]] = []
             failed_items: list[dict[str, Any]] = []
-            if action == "search":
-                query = str(payload.get("query") or "").strip()
-                if not query:
-                    raise RepositoryError(
-                        422,
-                        "feishu_search_query_required",
-                        "请输入要搜索的飞书文档关键词",
-                    )
-                search_payload = self._feishu_provider_json(
-                    "POST",
-                    FEISHU_DOCUMENT_SEARCH_URL,
-                    access_token=access_token,
-                    payload={
-                        "query": query,
-                        "page_size": requested_count,
-                    },
-                )
-                items = self._extract_feishu_document_candidates(
-                    search_payload,
-                    source="search",
-                )[:requested_count]
-            elif action == "resolve_links":
+            if action == "resolve_links":
                 seen: set[tuple[str, str]] = set()
                 for raw_link in list(payload.get("links") or [])[:50]:
                     candidate = self._parse_feishu_document_link(raw_link)
                     if candidate is None:
+                        failed_items.append(
+                            {
+                                "url": str(raw_link or "").strip(),
+                                "status": "failed",
+                                "errorCode": "feishu_document_link_invalid",
+                                "message": "该链接不是可识别的飞书新版文档或知识库链接",
+                            }
+                        )
                         continue
                     try:
+                        # 候选区只做标题和资源类型解析；Office 导出是耗时操作，
+                        # 统一在用户确认导入后执行，避免解析多条链接时重复下载。
                         candidate = self._resolve_feishu_candidate(
                             access_token,
                             candidate,
                         )
-                    except _FeishuExecutionError:
-                        pass
+                    except _FeishuExecutionError as exc:
+                        normalized_error = self._normalize_feishu_document_error(exc)
+                        failed_items.append(
+                            {
+                                **candidate,
+                                "status": "failed",
+                                "errorCode": normalized_error.code,
+                                "message": normalized_error.message,
+                            }
+                        )
+                        continue
                     key = (
                         str(candidate.get("type") or ""),
                         str(candidate.get("token") or ""),
@@ -3742,9 +3953,7 @@ class PlatformIntegrationsRepository:
                     candidate = {
                         "token": str(raw_item.get("token") or "").strip(),
                         "type": str(raw_item.get("type") or "").strip(),
-                        "title": str(
-                            raw_item.get("title") or "飞书文档"
-                        ).strip(),
+                        "title": str(raw_item.get("title") or "").strip(),
                         "url": str(raw_item.get("url") or "").strip(),
                         "source": "link",
                     }
@@ -3752,7 +3961,7 @@ class PlatformIntegrationsRepository:
                         continue
                     try:
                         items.append(
-                            self._fetch_feishu_document_text(
+                            self._fetch_feishu_document_artifact(
                                 access_token,
                                 candidate,
                             )
@@ -3779,15 +3988,7 @@ class PlatformIntegrationsRepository:
                 provider="feishu",
                 resource_kind="document_import",
                 remote_id=f"failed:{new_id()}",
-                outcome=(
-                    "blocked"
-                    if exc.code
-                    in {
-                        "feishu_member_authorization_required",
-                        "feishu_member_refresh_token_missing",
-                    }
-                    else "failed_retryable"
-                ),
+                outcome="failed_retryable",
                 error_code=exc.code,
                 error_message=exc.message,
                 owner_kind="membership",
@@ -3797,18 +3998,14 @@ class PlatformIntegrationsRepository:
                 "items": [],
                 "requestedCount": requested_count,
                 "pollingEnabled": False,
-                "blockerType": (
-                    "member_authorization_required"
-                    if attempt["state"] == "blocked"
-                    else "provider_request_failed"
-                ),
+                "blockerType": "provider_request_failed",
             }
         safe_item_receipts = [
             {
                 "tokenHash": sha256_text(str(item.get("token") or "")),
                 "type": str(item.get("type") or ""),
                 "contentHash": (
-                    sha256_text(str(item.get("content") or ""))
+                    str((item.get("artifact") or {}).get("contentHash") or "")
                     if action == "fetch"
                     else None
                 ),
@@ -3822,11 +4019,6 @@ class PlatformIntegrationsRepository:
             aggregate_id=new_id(),
             payload={
                 "requestedCount": requested_count,
-                "queryHash": (
-                    sha256_text(str(payload.get("query") or ""))
-                    if action == "search"
-                    else None
-                ),
                 "itemReceipts": safe_item_receipts,
                 "failedCount": len(failed_items),
             },
@@ -3843,15 +4035,16 @@ class PlatformIntegrationsRepository:
             },
             owner_kind="membership",
         )
-        message = (
-            ""
-            if items
-            else (
-                "没有找到可导入的飞书文档"
-                if action != "fetch"
-                else "所选飞书文档均未能读取"
-            )
-        )
+        if action == "resolve_links" and items:
+            message = f"识别到 {len(items)} 份飞书文档"
+            if failed_items:
+                message += f"，另有 {len(failed_items)} 条链接无法读取"
+        elif items:
+            message = ""
+        elif failed_items:
+            message = str(failed_items[0].get("message") or "所选飞书文档均未能读取")
+        else:
+            message = "没有找到可导入的飞书文档" if action != "fetch" else "所选飞书文档均未能读取"
         return {
             **attempt,
             "items": items,
@@ -5366,21 +5559,25 @@ class PlatformIntegrationsRepository:
             try:
                 row = connection.execute(
                     """
-                    SELECT c.command_id, c.scope_id, c.aggregate_type,
+                    SELECT c.id AS command_id, c.scope_id, c.aggregate_type,
                            c.aggregate_id, c.command_type,
                            c.actor_principal_id, c.idempotency_key,
-                           r.provider_resource_id
-                    FROM command_envelopes AS c
-                    JOIN external_provider_resources AS r
+                           c.payload_hash, c.payload_object_manifest_id,
+                           m.receipt AS current_receipt,
+                           r.id AS provider_resource_id
+                    FROM commands AS c
+                    JOIN object_manifests AS m
+                      ON m.id = c.payload_object_manifest_id
+                     AND m.scope_id = c.scope_id
+                    JOIN provider_resources AS r
                       ON r.scope_id = c.scope_id
-                     AND r.organization_id = c.organization_id
                      AND r.provider = 'feishu'
                      AND r.resource_kind = 'member_message_delivery'
                      AND r.remote_id = c.aggregate_id
-                    WHERE c.operation_id = ? AND c.organization_id = ?
+                    WHERE c.operation_id = ? AND c.scope_id = ?
                     LIMIT 1
                     """,
-                    (operation_id, identity.organization_id),
+                    (operation_id, identity.scope_id),
                 ).fetchone()
                 if row is None:
                     raise RepositoryError(
@@ -5388,118 +5585,291 @@ class PlatformIntegrationsRepository:
                         "feishu_message_operation_missing",
                         "飞书消息操作回执不存在",
                     )
+                try:
+                    current_envelope = json.loads(str(row["current_receipt"] or "{}"))
+                except (TypeError, ValueError):
+                    current_envelope = {}
+                current_payload = (
+                    current_envelope.get("payload")
+                    if isinstance(current_envelope, Mapping)
+                    else {}
+                )
+                if not isinstance(current_payload, Mapping):
+                    current_payload = {}
+                receipt = canonical_json(
+                    {"payload": dict(current_payload), "result": dict(result)}
+                )
+                receipt_hash = sha256_text(receipt)
+                final_state = "committed" if outcome == "succeeded" else "failed"
+                next_retry_at = now if outcome != "succeeded" else None
+                connection.execute(
+                    """
+                    UPDATE object_manifests
+                    SET content_hash = ?, receipt = ?, byte_size = ?,
+                        availability_state = 'ready', receipt_hash = ?,
+                        verified_at = ?
+                    WHERE id = ? AND scope_id = ?
+                    """,
+                    (
+                        receipt_hash,
+                        receipt,
+                        len(receipt.encode("utf-8")),
+                        receipt_hash,
+                        now,
+                        row["payload_object_manifest_id"],
+                        row["scope_id"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE commands
+                    SET status = ?, settled_at = ?
+                    WHERE id = ? AND scope_id = ?
+                    """,
+                    (final_state, now, row["command_id"], row["scope_id"]),
+                )
                 connection.execute(
                     """
                     UPDATE operation_attempts
-                    SET transport_state = ?, error_code = ?,
-                        error_message = ?
+                    SET transport_state = ?, receipt_hash = ?,
+                        next_retry_at = ?, finished_at = ?
                     WHERE command_id = ? AND scope_id = ?
                     """,
                     (
                         outcome,
-                        error_code,
-                        error_message,
+                        receipt_hash,
+                        next_retry_at,
+                        now,
                         row["command_id"],
                         row["scope_id"],
                     ),
                 )
                 connection.execute(
                     """
-                    UPDATE delivery_outbox
-                    SET status = ?, updated_at = ?
-                    WHERE scope_id = ? AND operation_id = ?
+                    UPDATE idempotency_records
+                    SET result_hash = ?, status = 'completed'
+                    WHERE scope_id = ? AND idempotency_key = ?
+                      AND result_object_manifest_id = ?
                     """,
                     (
-                        "delivered" if outcome == "succeeded" else "failed",
-                        now,
+                        receipt_hash,
                         row["scope_id"],
-                        operation_id,
+                        row["idempotency_key"],
+                        row["payload_object_manifest_id"],
                     ),
                 )
                 connection.execute(
                     """
-                    UPDATE external_provider_resources
-                    SET retention_state = ?, version = version + 1,
-                        updated_at = ?
-                    WHERE provider_resource_id = ?
+                    UPDATE provider_resources
+                    SET retention_state = ?, status = ?, verified_at = ?,
+                        version = version + 1, updated_at = ?
+                    WHERE id = ? AND scope_id = ?
                     """,
                     (
                         "delivered"
                         if outcome == "succeeded"
                         else "failed_retryable",
+                        outcome,
+                        now if outcome == "succeeded" else None,
                         now,
                         row["provider_resource_id"],
+                        row["scope_id"],
                     ),
                 )
+                effect_id = "effect_" + sha256_text(
+                    f"{row['scope_id']}|{operation_id}|feishu.personal_message.send"
+                )[:30]
                 connection.execute(
                     """
                     INSERT INTO external_side_effects (
-                        effect_id, scope_id, organization_id, operation_id,
+                        id, scope_id, operation_id,
                         provider_resource_id, effect_kind, outcome,
-                        receipt_hash, created_at
-                    ) VALUES (?, ?, ?, ?, ?,
-                              'feishu.personal_message.send', ?, ?, ?)
+                        request_hash, remote_receipt_hash,
+                        executed_by_instance_id, attempted_at, settled_at,
+                        version, lifecycle_state, created_at, updated_at, deleted_at
+                    ) VALUES (?, ?, ?, ?, 'feishu.personal_message.send', ?, ?, ?,
+                              ?, ?, ?, 1, 'active', ?, ?, NULL)
+                    ON CONFLICT(id) DO UPDATE SET
+                        outcome=excluded.outcome,
+                        request_hash=excluded.request_hash,
+                        remote_receipt_hash=excluded.remote_receipt_hash,
+                        executed_by_instance_id=excluded.executed_by_instance_id,
+                        attempted_at=excluded.attempted_at,
+                        settled_at=excluded.settled_at,
+                        version=external_side_effects.version+1,
+                        lifecycle_state='active',updated_at=excluded.updated_at,
+                        deleted_at=NULL
                     """,
                     (
-                        new_id(),
+                        effect_id,
                         row["scope_id"],
-                        identity.organization_id,
                         operation_id,
                         row["provider_resource_id"],
                         outcome,
-                        sha256_text(result_json),
+                        row["payload_hash"],
+                        receipt_hash,
+                        identity.cloud_instance_id,
+                        now,
+                        now,
+                        now,
                         now,
                     ),
                 )
-                connection.execute(
-                    """
-                    UPDATE command_idempotency
-                    SET result_json = ?, result_hash = ?
-                    WHERE scope_id = ? AND actor_principal_id = ?
-                      AND command_type = ? AND idempotency_key = ?
-                    """,
-                    (
-                        result_json,
-                        sha256_text(result_json),
-                        row["scope_id"],
-                        row["actor_principal_id"],
-                        row["command_type"],
-                        row["idempotency_key"],
-                    ),
-                )
                 if outcome != "succeeded":
+                    dead_letter_id = "dead_" + sha256_text(
+                        f"{row['scope_id']}|{operation_id}|feishu.personal_message.send"
+                    )[:32]
                     connection.execute(
                         """
-                        INSERT INTO operation_dead_letters (
-                            dead_letter_id, scope_id, organization_id,
-                            operation_id, aggregate_type, aggregate_id,
-                            error_code, error_message, status,
-                            created_at, resolved_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, NULL)
+                        INSERT INTO dead_letters (
+                            id, scope_id, operation_id, aggregate_id, error_code,
+                            status, aggregate_type, safe_message, retry_after,
+                            taken_over_by, created_at, resolved_at, version,
+                            lifecycle_state, updated_at, deleted_at,
+                            authority_role, origin_instance_id
+                        ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, NULL, ?, NULL,
+                                  1, 'active', ?, NULL, 'cloud', ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            error_code=excluded.error_code,
+                            status='open',safe_message=excluded.safe_message,
+                            retry_after=excluded.retry_after,resolved_at=NULL,
+                            version=dead_letters.version+1,
+                            lifecycle_state='active',updated_at=excluded.updated_at,
+                            deleted_at=NULL
                         """,
                         (
-                            new_id(),
+                            dead_letter_id,
                             row["scope_id"],
-                            identity.organization_id,
                             operation_id,
-                            row["aggregate_type"],
                             row["aggregate_id"],
                             error_code or "feishu_message_send_failed",
+                            row["aggregate_type"],
                             error_message or "飞书消息发送失败",
                             now,
+                            now,
+                            now,
+                            identity.cloud_instance_id,
                         ),
                     )
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
-        return dict(result)
+        return {**dict(result), "externalSideEffectId": effect_id}
+
+    @staticmethod
+    def _task_datetime(value: Any) -> datetime | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsed = datetime.combine(date.fromisoformat(raw[:10]), datetime.min.time())
+            except ValueError:
+                return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        return parsed.astimezone(ZoneInfo("Asia/Shanghai"))
+
+    @classmethod
+    def _task_time_text(cls, task: Mapping[str, Any]) -> str:
+        start = cls._task_datetime(
+            task.get("scheduled_start_at") or task.get("scheduledStartAt") or task.get("due_date")
+        )
+        end = cls._task_datetime(task.get("scheduled_end_at") or task.get("scheduledEndAt"))
+        if start is None:
+            return "未设置"
+        if end is None:
+            return start.strftime("%Y-%m-%d %H:%M")
+        if start.date() == end.date():
+            return f"{start:%Y-%m-%d %H:%M}—{end:%H:%M}"
+        return f"{start:%Y-%m-%d %H:%M}—{end:%Y-%m-%d %H:%M}"
+
+    @classmethod
+    def _task_notification_card(
+        cls,
+        *,
+        task: Mapping[str, Any],
+        action_label: str,
+        sender_name: str,
+        recipient_role: str,
+        event: str,
+        field_changes: Mapping[str, Mapping[str, str]] | None = None,
+        role_change: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        template = {
+            "created": "blue",
+            "updated": "wathet",
+            "completed": "green",
+            "reopened": "orange",
+            "accepted": "green",
+            "returned": "red",
+            "transferred": "orange",
+            "deleted": "red",
+        }.get(event, "blue")
+        priority_text = {
+            "high": "高",
+            "normal": "普通",
+            "low": "低",
+        }.get(str(task.get("priority") or "normal"), "普通")
+        changes = field_changes or {}
+
+        def line(label: str, current: str, key: str) -> str:
+            change = changes.get(key)
+            if event == "updated" and isinstance(change, Mapping):
+                return (
+                    f"• **{label}（修改）：** {str(change.get('old') or '未设置')}"
+                    f" → **{str(change.get('new') or current)}**"
+                )
+            return f"• **{label}：** {current}"
+
+        detail_lines = [line("任务名称", str(task.get("title") or "未命名任务"), "title")]
+        if event == "updated" and isinstance(role_change, Mapping):
+            detail_lines.append(
+                f"• **你的身份（修改）：** {str(role_change.get('old') or '未参与')}"
+                f" → **{str(role_change.get('new') or recipient_role)}**"
+            )
+        else:
+            detail_lines.append(f"• **你的身份：** {recipient_role}")
+        detail_lines.extend(
+            [
+                line("时间", cls._task_time_text(task), "time"),
+                line("优先级", priority_text, "priority"),
+            ]
+        )
+        detail_lines.append(f"• **操作者：** {sender_name}")
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": template,
+                "title": {"tag": "plain_text", "content": action_label},
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": "\n".join(detail_lines),
+                    },
+                },
+                {"tag": "hr"},
+                {
+                    "tag": "note",
+                    "elements": [
+                        {"tag": "plain_text", "content": "请回到益语智库查看或处理任务"}
+                    ],
+                },
+            ],
+        }
 
     def send_personal_feishu_text(
         self,
         identity: SessionIdentity,
         *,
         text: str,
+        card: Mapping[str, Any] | None = None,
         local_type: str,
         local_id: str,
         idempotency_key: str,
@@ -5525,6 +5895,7 @@ class PlatformIntegrationsRepository:
             "localType": local_type,
             "localId": local_id,
             "contentHash": sha256_text(normalized_text),
+            "cardHash": sha256_text(canonical_json(dict(card))) if card else None,
             "byteSize": len(normalized_text.encode("utf-8")),
         }
         if not profile.get("readyForNotifications"):
@@ -5589,6 +5960,15 @@ class PlatformIntegrationsRepository:
                 identity,
                 organization_configuration,
             )
+            message_content = (
+                canonical_json(dict(card))
+                if card
+                else json.dumps(
+                    {"text": normalized_text},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
             provider_result = self._feishu_provider_json(
                 "POST",
                 FEISHU_MESSAGE_CREATE_URL,
@@ -5596,12 +5976,8 @@ class PlatformIntegrationsRepository:
                 params={"receive_id_type": "open_id"},
                 payload={
                     "receive_id": str(profile["receiveId"]),
-                    "msg_type": "text",
-                    "content": json.dumps(
-                        {"text": normalized_text},
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
+                    "msg_type": "interactive" if card else "text",
+                    "content": message_content,
                 },
             )
             data = provider_result.get("data")
@@ -5684,6 +6060,312 @@ class PlatformIntegrationsRepository:
             display_name=str(row["display_name"]),
         )
 
+    def _project_task_to_feishu(
+        self,
+        identity: SessionIdentity,
+        *,
+        task: Mapping[str, Any],
+        member_open_ids: list[str],
+        idempotency_key: str,
+        event: str,
+    ) -> dict[str, Any]:
+        """Project the committed software task one way to Feishu Task v2."""
+
+        task_id = str(task.get("id") or "").strip()
+        if not task_id:
+            return {"state": "not_requested", "message": "缺少任务标识"}
+        normalized_event = str(event or "updated").strip().lower()
+        if normalized_event not in {
+            "created", "updated", "completed", "reopened", "accepted",
+            "returned", "transferred", "deleted",
+        }:
+            normalized_event = "updated"
+        command_type = "feishu.sync.task_v2_task"
+        with self._connection() as connection:
+            mapping = connection.execute(
+                """
+                SELECT remote_id,remote_receipt
+                FROM feishu_mappings
+                WHERE scope_id=? AND mapping_kind='task_v2_task'
+                  AND local_resource_id=? AND status='active'
+                  AND lifecycle_state='active' AND deleted_at IS NULL
+                ORDER BY updated_at DESC,id DESC LIMIT 1
+                """,
+                (identity.scope_id, task_id),
+            ).fetchone()
+        remote_id = str(mapping["remote_id"] or "").strip() if mapping else ""
+        try:
+            mapping_receipt = json.loads(str(mapping["remote_receipt"] or "{}")) if mapping else {}
+        except (TypeError, ValueError):
+            mapping_receipt = {}
+        remote_url = str(
+            mapping_receipt.get("remoteUrl")
+            if isinstance(mapping_receipt, Mapping)
+            else ""
+        ).strip()
+        if normalized_event != "created" and not remote_id:
+            message = "飞书任务投影映射缺失，本次变化不能降级为新建任务"
+            return self._record_command(
+                identity,
+                command_type=command_type,
+                aggregate_type="task",
+                aggregate_id=task_id,
+                payload={"taskVersion": int(task.get("version") or 1), "event": normalized_event},
+                idempotency_key=idempotency_key,
+                provider="feishu",
+                resource_kind="task_v2_task",
+                remote_id=f"missing:{task_id}",
+                outcome="failed_retryable",
+                error_code="feishu_task_projection_mapping_missing",
+                error_message=message,
+                result_details={"state": "failed_retryable", "retryable": True, "message": message},
+            )
+        safe_request = {
+            "taskVersion": int(task.get("version") or 1),
+            "event": normalized_event,
+            "memberCount": len(member_open_ids),
+            "titleHash": sha256_text(str(task.get("title") or "")),
+        }
+        try:
+            configuration = self._feishu_configuration(identity)
+            tenant_token = self._feishu_tenant_access_token(identity, configuration)
+            if normalized_event == "deleted":
+                self._feishu_provider_json(
+                    "DELETE",
+                    f"{FEISHU_TASK_V2_API_ROOT}/{quote(remote_id)}",
+                    access_token=tenant_token,
+                    params={"user_id_type": "open_id"},
+                )
+                provider_receipt = {"remoteId": remote_id, "remoteUrl": remote_url}
+            elif normalized_event in {"completed", "reopened"}:
+                completed_at = (
+                    str(int(datetime.now(timezone.utc).timestamp() * 1000))
+                    if normalized_event == "completed"
+                    else "0"
+                )
+                provider_result = self._feishu_provider_json(
+                    "PATCH",
+                    f"{FEISHU_TASK_V2_API_ROOT}/{quote(remote_id)}",
+                    access_token=tenant_token,
+                    params={"user_id_type": "open_id"},
+                    payload={
+                        "task": {"completed_at": completed_at},
+                        "update_fields": ["completed_at"],
+                    },
+                )
+                data = provider_result.get("data")
+                remote_task = (
+                    data.get("task")
+                    if isinstance(data, Mapping) and isinstance(data.get("task"), Mapping)
+                    else {}
+                )
+                provider_receipt = {
+                    "remoteId": remote_id,
+                    "remoteUrl": str(remote_task.get("url") or remote_url or ""),
+                }
+            else:
+                start = self._task_datetime(
+                    task.get("scheduled_start_at") or task.get("scheduledStartAt") or task.get("due_date")
+                )
+                end = self._task_datetime(task.get("scheduled_end_at") or task.get("scheduledEndAt"))
+                task_payload: dict[str, Any] = {
+                    "summary": str(task.get("title") or "未命名任务")[:3000],
+                    "description": str(task.get("description") or "")[:3000],
+                }
+                if start is not None:
+                    task_payload["start"] = {"timestamp": int(start.timestamp() * 1000), "is_all_day": False}
+                if end is not None:
+                    task_payload["due"] = {"timestamp": int(end.timestamp() * 1000), "is_all_day": False}
+                elif start is not None:
+                    task_payload["due"] = {"timestamp": int(start.timestamp() * 1000), "is_all_day": False}
+                if remote_id:
+                    current_result = self._feishu_provider_json(
+                        "GET",
+                        f"{FEISHU_TASK_V2_API_ROOT}/{quote(remote_id)}",
+                        access_token=tenant_token,
+                        params={"user_id_type": "open_id"},
+                    )
+                    current_data = current_result.get("data")
+                    current_task = (
+                        current_data.get("task")
+                        if isinstance(current_data, Mapping)
+                        and isinstance(current_data.get("task"), Mapping)
+                        else {}
+                    )
+                    current_assignees = {
+                        str(member.get("id") or "").strip()
+                        for member in (current_task.get("members") or [])
+                        if isinstance(member, Mapping)
+                        and str(member.get("type") or "") == "user"
+                        and str(member.get("role") or "") == "assignee"
+                        and str(member.get("id") or "").strip()
+                    }
+                    desired_assignees = {
+                        str(open_id).strip()
+                        for open_id in member_open_ids
+                        if str(open_id).strip()
+                    }
+                    update_fields = [key for key in task_payload]
+                    provider_result = self._feishu_provider_json(
+                        "PATCH",
+                        f"{FEISHU_TASK_V2_API_ROOT}/{quote(remote_id)}",
+                        access_token=tenant_token,
+                        params={"user_id_type": "open_id"},
+                        payload={"task": task_payload, "update_fields": update_fields},
+                    )
+                    to_add = sorted(desired_assignees - current_assignees)
+                    to_remove = sorted(current_assignees - desired_assignees)
+                    if to_add:
+                        provider_result = self._feishu_provider_json(
+                            "POST",
+                            f"{FEISHU_TASK_V2_API_ROOT}/{quote(remote_id)}/add_members",
+                            access_token=tenant_token,
+                            params={"user_id_type": "open_id"},
+                            payload={
+                                "members": [
+                                    {"id": open_id, "type": "user", "role": "assignee"}
+                                    for open_id in to_add
+                                ],
+                                "client_token": sha256_text(
+                                    f"{idempotency_key}|add_members"
+                                )[:32],
+                            },
+                        )
+                    if to_remove:
+                        provider_result = self._feishu_provider_json(
+                            "POST",
+                            f"{FEISHU_TASK_V2_API_ROOT}/{quote(remote_id)}/remove_members",
+                            access_token=tenant_token,
+                            params={"user_id_type": "open_id"},
+                            payload={
+                                "members": [
+                                    {"id": open_id, "type": "user", "role": "assignee"}
+                                    for open_id in to_remove
+                                ]
+                            },
+                        )
+                else:
+                    task_payload["members"] = [
+                        {"id": open_id, "type": "user", "role": "assignee"}
+                        for open_id in sorted(set(member_open_ids))
+                    ]
+                    task_payload["client_token"] = sha256_text(idempotency_key)[:32]
+                    provider_result = self._feishu_provider_json(
+                        "POST",
+                        FEISHU_TASK_V2_API_ROOT,
+                        access_token=tenant_token,
+                        params={"user_id_type": "open_id"},
+                        payload=task_payload,
+                    )
+                data = provider_result.get("data")
+                remote_task = (
+                    data.get("task")
+                    if isinstance(data, Mapping) and isinstance(data.get("task"), Mapping)
+                    else None
+                )
+                resolved_remote_id = str((remote_task or {}).get("guid") or remote_id or "").strip()
+                if not resolved_remote_id:
+                    raise _FeishuExecutionError(
+                        "feishu_task_receipt_invalid",
+                        "飞书任务没有返回有效回执",
+                    )
+                provider_receipt = {
+                    "remoteId": resolved_remote_id,
+                    "remoteUrl": (remote_task or {}).get("url") or remote_url,
+                }
+                remote_id = resolved_remote_id
+        except _FeishuExecutionError as exc:
+            return self._record_command(
+                identity,
+                command_type=command_type,
+                aggregate_type="task",
+                aggregate_id=task_id,
+                payload=safe_request,
+                idempotency_key=idempotency_key,
+                provider="feishu",
+                resource_kind="task_v2_task",
+                remote_id=remote_id or f"failed:{task_id}",
+                outcome="failed_retryable",
+                error_code=exc.code,
+                error_message=exc.message,
+                result_details={
+                    "state": "failed_retryable", "retryable": True,
+                    "message": exc.message, "remoteId": remote_id or None,
+                    "remoteUrl": remote_url or None,
+                },
+            )
+        result = self._record_command(
+            identity,
+            command_type=command_type,
+            aggregate_type="task",
+            aggregate_id=task_id,
+            payload=safe_request,
+            idempotency_key=idempotency_key,
+            provider="feishu",
+            resource_kind="task_v2_task",
+            remote_id=remote_id,
+            outcome="succeeded",
+            retention_state="deleted" if normalized_event == "deleted" else "active",
+            result_details={
+                "state": "completed",
+                "status": "deleted" if normalized_event == "deleted" else "synced",
+                "remoteId": remote_id,
+                "remoteUrl": provider_receipt.get("remoteUrl"),
+                "message": (
+                    "飞书任务投影已删除"
+                    if normalized_event == "deleted"
+                    else "飞书任务已完成"
+                    if normalized_event == "completed"
+                    else "飞书任务已重启"
+                    if normalized_event == "reopened"
+                    else "任务已单向投影到飞书"
+                ),
+                "retryable": False,
+            },
+        )
+        if normalized_event == "deleted":
+            now = utc_now()
+            with self._connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE feishu_mappings
+                    SET status='revoked',revoked_at=?,version=version+1,
+                        lifecycle_state='deleted',updated_at=?,deleted_at=?
+                    WHERE scope_id=? AND mapping_kind='task_v2_task'
+                      AND local_resource_id=? AND remote_id=?
+                      AND lifecycle_state='active'
+                    """,
+                    (now, now, now, identity.scope_id, task_id, remote_id),
+                )
+                connection.commit()
+        else:
+            self._record_feishu_mapping(
+                identity,
+                result=result,
+                local_type="task",
+                local_id=task_id,
+                remote_type="task_v2_task",
+                remote_id=remote_id,
+                remote_receipt={"remoteUrl": provider_receipt.get("remoteUrl")},
+                bound_membership_id=None,
+            )
+        return result
+
+    def delete_task_projection(
+        self,
+        identity: SessionIdentity,
+        *,
+        task: Mapping[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self._project_task_to_feishu(
+            identity,
+            task=task,
+            member_open_ids=[],
+            idempotency_key=idempotency_key,
+            event="deleted",
+        )
+
     def deliver_task_notifications(
         self,
         identity: SessionIdentity,
@@ -5712,10 +6394,12 @@ class PlatformIntegrationsRepository:
         title = str(task.get("title") or "未命名任务")
         creator_id = str(task.get("creator_membership_id") or "")
         collaborators = task.get("collaborators")
+        recipient_roles: dict[str, str] = {}
         recipients: set[str] = set()
         if event == "returned":
             if creator_id:
                 recipients.add(creator_id)
+                recipient_roles[creator_id] = "发起人"
         elif isinstance(collaborators, list):
             for item in collaborators:
                 if not isinstance(item, Mapping):
@@ -5732,23 +6416,32 @@ class PlatformIntegrationsRepository:
                 membership_id = str(item.get("subject_membership_id") or "")
                 if membership_id:
                     recipients.add(membership_id)
+                    recipient_roles[membership_id] = (
+                        "负责人" if role_key == "owner" else "协作者"
+                    )
         action_label = {
-            "created": "新任务",
-            "updated": "任务已更新",
+            "created": "任务已创建",
+            "updated": "任务已修改",
+            "completed": "任务已完成",
+            "reopened": "任务已重启",
             "accepted": "任务已接受",
             "returned": "任务已退回",
             "transferred": "任务负责人已变更",
+            "deleted": "任务已删除",
         }.get(event, "任务有新变化")
-        due_at = str(
-            task.get("scheduled_start_at")
-            or task.get("due_date")
-            or ""
-        )
+        change_items = result.get("notificationChanges")
+        if not isinstance(change_items, list):
+            change_items = []
+        field_changes = result.get("notificationFieldChanges")
+        if not isinstance(field_changes, Mapping):
+            field_changes = {}
+        role_changes = result.get("notificationRoleChanges")
+        if not isinstance(role_changes, Mapping):
+            role_changes = {}
         message_text = f"【{action_label}】{title}"
-        if due_at:
-            message_text += f"\n时间：{due_at}"
-        message_text += f"\n来自：{identity.display_name}"
+        message_text += f"\n时间：{self._task_time_text(task)}"
         deliveries: list[dict[str, Any]] = []
+        projection_open_ids: list[str] = []
         now = utc_now()
         for membership_id in sorted(recipients):
             target = self._identity_for_membership(identity, membership_id)
@@ -5765,9 +6458,28 @@ class PlatformIntegrationsRepository:
                         mobile="",
                         idempotency_key=f"{idempotency_key}:resolve:{membership_id}",
                     )
+                if profile.get("deliveryStatus") == "matched" and profile.get("receiveId"):
+                    projection_open_ids.append(str(profile["receiveId"]))
+                recipient_role = recipient_roles.get(membership_id, "协作者")
+                role_change = role_changes.get(membership_id)
+                if not isinstance(role_change, Mapping):
+                    role_change = None
+                recipient_message = (
+                    f"{message_text}\n你的身份：{recipient_role}"
+                    f"\n操作者：{identity.display_name}"
+                )
                 sent = self.send_personal_feishu_text(
                     target,
-                    text=message_text,
+                    text=recipient_message,
+                    card=self._task_notification_card(
+                        task=task,
+                        action_label=action_label,
+                        sender_name=identity.display_name,
+                        recipient_role=recipient_role,
+                        event=event,
+                        field_changes=field_changes,
+                        role_change=role_change,
+                    ),
                     local_type="task",
                     local_id=task_id,
                     idempotency_key=(
@@ -5783,6 +6495,7 @@ class PlatformIntegrationsRepository:
                     "status": status,
                     "message": str(sent.get("message") or ""),
                     "remoteId": sent.get("remoteId"),
+                    "externalSideEffectId": sent.get("externalSideEffectId"),
                 }
             except Exception as exc:  # provider errors never roll back task facts
                 delivery = {
@@ -5791,6 +6504,7 @@ class PlatformIntegrationsRepository:
                     "status": "failed_retryable",
                     "message": str(exc) or "飞书通知发送失败，可重试",
                     "remoteId": None,
+                    "externalSideEffectId": None,
                 }
             deliveries.append(delivery)
             delivery_id = "notify_" + sha256_text(
@@ -5815,7 +6529,7 @@ class PlatformIntegrationsRepository:
                         id,scope_id,external_side_effect_id,channel,remote_receipt,
                         status,recipient_ref_hash,sent_at,delivered_at,next_retry_at,
                         version,lifecycle_state,created_at,updated_at,deleted_at
-                    ) VALUES (?,?,NULL,'feishu',?,?,?,?,?,?,1,'active',?,?,NULL)
+                    ) VALUES (?,?,?,'feishu',?,?,?,?,?,?,1,'active',?,?,NULL)
                     ON CONFLICT(id) DO UPDATE SET
                         remote_receipt=excluded.remote_receipt,
                         status=excluded.status,
@@ -5829,6 +6543,7 @@ class PlatformIntegrationsRepository:
                     (
                         delivery_id,
                         identity.scope_id,
+                        delivery.get("externalSideEffectId"),
                         receipt,
                         delivery["status"],
                         sha256_text(f"{identity.scope_id}\x1f{membership_id}"),
@@ -5840,6 +6555,54 @@ class PlatformIntegrationsRepository:
                     ),
                 )
                 connection.commit()
+        # Assignment creates the Feishu projection immediately. Acceptance is
+        # only a software-side state confirmation and must not touch the
+        # already-created projection. A return removes that projection while
+        # preserving the returned software task for its initiator to revise.
+        if event == "accepted":
+            projection = {
+                "state": "not_requested",
+                "retryable": False,
+                "message": "负责人已接受；飞书任务投影保持不变",
+            }
+        elif event == "returned":
+            try:
+                projection = self.delete_task_projection(
+                    identity,
+                    task=task,
+                    idempotency_key=f"{idempotency_key}:task-v2:return:{task_version}",
+                )
+            except Exception as exc:  # projection is always best-effort
+                projection = {
+                    "state": "failed_retryable",
+                    "retryable": True,
+                    "message": str(exc) or "飞书任务投影删除失败，可重试",
+                }
+        # Feishu Task v2 can only assign members that belong to the tenant
+        # behind this app. External members still receive the robot DM, but
+        # must never trigger an unassigned task or make a successful software
+        # task/notification look failed.
+        elif projection_open_ids or event != "created":
+            try:
+                projection = self._project_task_to_feishu(
+                    identity,
+                    task=task,
+                    member_open_ids=projection_open_ids,
+                    idempotency_key=f"{idempotency_key}:task-v2:{event}:{task_version}",
+                    event=event,
+                )
+            except Exception as exc:  # projection is always best-effort
+                projection = {
+                    "state": "failed_retryable",
+                    "retryable": True,
+                    "message": str(exc) or "飞书任务投影失败，可重试",
+                }
+        else:
+            projection = {
+                "state": "not_requested",
+                "retryable": False,
+                "message": "暂无可投影的同企业飞书成员",
+            }
         sent_count = sum(item["status"] == "sent" for item in deliveries)
         failed_count = sum(item["status"] == "failed_retryable" for item in deliveries)
         if not deliveries:
@@ -5863,6 +6626,7 @@ class PlatformIntegrationsRepository:
                 else "任务已生效；部分或全部成员的飞书通知尚未送达"
             ),
             "deliveries": deliveries,
+            "taskProjection": projection,
         }
 
     def query(

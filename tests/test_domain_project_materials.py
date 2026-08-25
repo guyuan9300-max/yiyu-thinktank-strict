@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -2566,13 +2569,20 @@ def test_document_text_prefers_local_body_without_cloud_probe(
     assert result["sourceScope"] == "local_private"
 
 
-def test_feishu_document_import_preflights_authorities_without_fake_import(
+def test_feishu_document_import_uses_organization_application_without_member_oauth(
 ) -> None:
-    member_linked = False
-    expected_code = "feishu_member_authorization_required"
     class Runtime:
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict[str, str] | None]] = []
+
+        def require_project_capability(
+            self,
+            project_id: str,
+            capability: str,
+        ) -> dict[str, Any]:
+            assert project_id == "project-1"
+            assert capability == "read"
+            return {"projectId": project_id}
 
         def cloud_query(
             self,
@@ -2590,48 +2600,67 @@ def test_feishu_document_import_preflights_authorities_without_fake_import(
                 "authorizationScope": "organization",
             }:
                 return {"resource": {"state": "ready"}}
-            if query == {
-                "resourcePath": "me/feishu-authorization",
-                "authorizationScope": "personal",
-            }:
-                return {
-                    "resource": {
-                        "linked": member_linked,
-                        "blockedReason": (
-                            None
-                            if member_linked
-                            else "oauth_grant_authority_not_connected"
-                        ),
-                    }
-                }
             raise AssertionError(query)
 
-    compatibility = SimpleNamespace(runtime=Runtime())
-    with pytest.raises(LocalRuntimeError) as blocked:
-        router.dispatch(
-            compatibility,
-            UiRequest(
-                method="POST",
-                path="clients/project-1/feishu-doc-import/import",
-                query={},
-                body={
-                    "items": [
+        def cloud_command(
+            self,
+            method: str,
+            path: str,
+            *,
+            payload: dict[str, Any],
+            idempotency_key: str,
+            refresh_business: bool = True,
+        ) -> dict[str, Any]:
+            del method, idempotency_key, refresh_business
+            self.calls.append((path, payload))
+            assert path == "/api/v2/platform-integrations/command"
+            assert payload["resourcePath"] == "feishu-doc-import/fetch"
+            return {
+                "result": {
+                    "state": "ready",
+                    "items": [],
+                    "failedItems": [
                         {
                             "token": "doc-token-1",
                             "type": "docx",
                             "title": "成员飞书原文",
                             "url": "https://example.feishu.cn/docx/doc-token-1",
-                            "content": "RAW_FEISHU_BODY_MUST_NOT_REACH_CLOUD",
+                            "message": "该文档仅个人可见或未向组织开放",
                         }
-                    ]
-                },
-                idempotency_key="feishu-document-import-1",
-            ),
-        )
-    assert blocked.value.code == expected_code
-    assert all(
-        call[0].endswith("/projects/project-1")
-        or call[0] == "/api/v2/platform-integrations/query"
+                    ],
+                    "message": "所选飞书文档均未能读取",
+                }
+            }
+
+    compatibility = SimpleNamespace(runtime=Runtime())
+    result = router.dispatch(
+        compatibility,
+        UiRequest(
+            method="POST",
+            path="clients/project-1/feishu-doc-import/import",
+            query={},
+            body={
+                "items": [
+                    {
+                        "token": "doc-token-1",
+                        "type": "docx",
+                        "title": "成员飞书原文",
+                        "url": "https://example.feishu.cn/docx/doc-token-1",
+                        "content": "RAW_FEISHU_BODY_MUST_NOT_REACH_CLOUD",
+                    }
+                ]
+            },
+            idempotency_key="feishu-document-import-1",
+        ),
+    )
+    assert result["importedCount"] == 0
+    assert result["failedCount"] == 1
+    assert "仅个人可见" in result["items"][0]["message"]
+    assert not any(
+        call[1] == {
+            "resourcePath": "me/feishu-authorization",
+            "authorizationScope": "personal",
+        }
         for call in compatibility.runtime.calls
     )
     assert "RAW_FEISHU_BODY_MUST_NOT_REACH_CLOUD" not in json.dumps(
@@ -2645,6 +2674,47 @@ def test_feishu_document_import_keeps_body_local_and_publishes_only_summary(
 ) -> None:
     database = tmp_path / "local" / "strict-local.db"
     runtime = WorkspaceRuntime(database, MemorySecretStore())
+    with runtime_connection(database, "local") as connection:
+        connection.execute(
+            "INSERT INTO authorization_scopes "
+            "(id,scope_kind,organization_id,created_at,updated_at,status,version,"
+            "lifecycle_state,source_version,projection_state,projected_at) "
+            "VALUES (?,?,?,?,?,'active',1,'active',1,'ready',?)",
+            (
+                "scope-feishu-import",
+                "organization",
+                None,
+                "2026-08-25T00:00:00+00:00",
+                "2026-08-25T00:00:00+00:00",
+                "2026-08-25T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO sandboxes "
+            "(id,scope_id,cloud_api_url,record_kind,cloud_instance_id,"
+            "database_generation_id,sandbox_kind,display_name,runtime_status,"
+            "contract_version,manifest_hash,version,lifecycle_state,created_at,"
+            "updated_at,authority_role) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "sandbox-feishu-import",
+                "scope-feishu-import",
+                "https://feishu-import.invalid",
+                "sandbox",
+                "cloud-feishu-import",
+                runtime.identity.database_generation_id,
+                "organization",
+                "飞书导入测试",
+                "ready",
+                runtime.identity.contract_version,
+                runtime.identity.manifest_hash,
+                1,
+                "active",
+                "2026-08-25T00:00:00+00:00",
+                "2026-08-25T00:00:00+00:00",
+                "local_projection",
+            ),
+        )
+        connection.commit()
     sandbox_id = runtime.current()["sandbox"]["sandboxId"]
     runtime._current_context = lambda require_ready=True: SimpleNamespace(  # type: ignore[method-assign]
         sandbox_id=sandbox_id,
@@ -2654,7 +2724,17 @@ def test_feishu_document_import_keeps_body_local_and_publishes_only_summary(
         principal_id="principal-feishu-import",
         membership_id="membership-feishu-import",
     )
-    raw_body = "FEISHU_RAW_BODY_LOCAL_STORAGE_ONLY_9247"
+    runtime.capture_sandbox_context = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        sandbox_id=sandbox_id,
+        workspace_context=runtime._current_context(),
+        request_seq=1,
+    )
+    runtime.require_project_capability = lambda project_id, capability: {  # type: ignore[method-assign]
+        "projectId": project_id,
+        "capability": capability,
+    }
+    raw_body = b"PK\x03\x04FEISHU_OFFICE_BINARY_LOCAL_STORAGE_ONLY_9247"
+    raw_body_hash = hashlib.sha256(raw_body).hexdigest()
     cloud_payloads: list[tuple[str, dict[str, Any]]] = []
 
     def cloud_query(
@@ -2690,7 +2770,6 @@ def test_feishu_document_import_keeps_body_local_and_publishes_only_summary(
         if path == "/api/v2/platform-integrations/command":
             resource_path = payload["resourcePath"]
             if resource_path == "feishu-doc-import/fetch":
-                assert raw_body not in json.dumps(payload, ensure_ascii=False)
                 return {
                     "result": {
                         "state": "ready",
@@ -2703,7 +2782,18 @@ def test_feishu_document_import_keeps_body_local_and_publishes_only_summary(
                                     "https://example.feishu.cn/docx/"
                                     "docx-token-local"
                                 ),
-                                "content": raw_body,
+                                "artifact": {
+                                    "fileName": "飞书项目背景.docx",
+                                    "mediaType": (
+                                        "application/vnd.openxmlformats-officedocument."
+                                        "wordprocessingml.document"
+                                    ),
+                                    "format": "docx",
+                                    "contentBase64": base64.b64encode(raw_body).decode(),
+                                    "byteSize": len(raw_body),
+                                    "contentHash": raw_body_hash,
+                                    "fidelityState": "provider_export",
+                                },
                             }
                         ],
                         "failedItems": [],
@@ -2719,7 +2809,11 @@ def test_feishu_document_import_keeps_body_local_and_publishes_only_summary(
             raise AssertionError(resource_path)
         if path.endswith("/materials/register-metadata"):
             material = payload["materials"][0]
-            assert raw_body not in json.dumps(payload, ensure_ascii=False)
+            assert base64.b64encode(raw_body).decode() not in json.dumps(
+                payload,
+                ensure_ascii=False,
+            )
+            assert material["contentHash"] == raw_body_hash
             return {
                 "documents": [
                     {
@@ -2734,21 +2828,10 @@ def test_feishu_document_import_keeps_body_local_and_publishes_only_summary(
                     "localSummaryUploaded": False,
                 },
             }
-        if path.endswith("/publish-local-summary"):
-            assert raw_body not in json.dumps(payload, ensure_ascii=False)
-            assert payload["summary"] == "组织共享的飞书项目背景摘要"
-            return {
-                "documentId": "cloud-document-feishu",
-                "version": 2,
-            }
         raise AssertionError(path)
 
     runtime.cloud_query = cloud_query  # type: ignore[method-assign]
     runtime.cloud_command = cloud_command  # type: ignore[method-assign]
-    runtime.private_ai_completion = lambda **_: {  # type: ignore[method-assign]
-        "content": "组织共享的飞书项目背景摘要",
-        "modelName": "strict-summary-test",
-    }
     result = router.dispatch(
         SimpleNamespace(runtime=runtime),
         UiRequest(
@@ -2778,20 +2861,28 @@ def test_feishu_document_import_keeps_body_local_and_publishes_only_summary(
     assert result["importedCount"] == 1
     assert result["failedCount"] == 0
     assert result["items"][0]["documentId"] == "cloud-document-feishu"
-    assert result["items"][0]["sharedKnowledgeState"] == "ready"
+    assert result["items"][0]["sharedKnowledgeState"] == "not_requested"
     assert "UNTRUSTED_RENDERER_BODY_MUST_BE_IGNORED" not in json.dumps(
         cloud_payloads,
         ensure_ascii=False,
     )
     store = LocalProjectMaterialsRepository(runtime)
-    local_document = store.document_text("cloud-document-feishu")
-    assert local_document["content"] == raw_body
+    local_document = next(
+        item
+        for item in store.documents("project-feishu-import")
+        if item["id"] == "cloud-document-feishu"
+    )
+    assert local_document["title"] == "飞书项目背景-飞书"
+    assert Path(local_document["path"]).name.endswith("-飞书.docx")
+    assert Path(local_document["path"]).read_bytes() == raw_body
     with runtime_connection(database, "local", read_only=True) as connection:
         source_objects = connection.execute(
             """
             SELECT COUNT(*)
-            FROM storage_objects
-            WHERE sandbox_id = ? AND media_type = 'text/markdown'
+            FROM object_manifests
+            WHERE holder_instance_id = ?
+              AND holder_role = 'sandbox'
+              AND media_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
             """,
             (sandbox_id,),
         ).fetchone()[0]
@@ -2801,11 +2892,122 @@ def test_feishu_document_import_keeps_body_local_and_publishes_only_summary(
         sandbox_id=sandbox_id,
         membership_id="membership-feishu-import",
     )
-    assert (
-        LocalProjectMaterialsRepository(restarted)
-        .document_text("cloud-document-feishu")["content"]
-        == raw_body
+    restarted_document = next(
+        item
+        for item in LocalProjectMaterialsRepository(restarted).documents(
+            "project-feishu-import"
+        )
+        if item["id"] == "cloud-document-feishu"
     )
+    assert Path(restarted_document["path"]).read_bytes() == raw_body
+
+
+def test_smart_editor_preserves_spreadsheet_tables_and_docx_images(
+    tmp_path: Path,
+) -> None:
+    from openpyxl import Workbook
+
+    workbook_path = tmp_path / "项目清单-飞书.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "项目数据"
+    worksheet.append(["项目", "状态", "说明"])
+    worksheet.append(["蓝信封", "推进中", "保留 A|B 两类"])
+    worksheet.append(["日慈", "完成", "第二行"])
+    workbook.save(workbook_path)
+
+    # Feishu exports have been observed to declare A1 even when sheetData
+    # contains a complete table. Reproduce that provider defect so the smart
+    # editor must discover the real worksheet range instead of trusting it.
+    with zipfile.ZipFile(workbook_path, "r") as source:
+        parts = {name: source.read(name) for name in source.namelist()}
+    sheet_part = "xl/worksheets/sheet1.xml"
+    parts[sheet_part] = parts[sheet_part].replace(
+        b'<dimension ref="A1:C3"/>',
+        b'<dimension ref="A1"/>',
+        1,
+    )
+    rewritten_workbook = workbook_path.with_name("rewritten.xlsx")
+    with zipfile.ZipFile(rewritten_workbook, "w", zipfile.ZIP_DEFLATED) as target:
+        for name, content in parts.items():
+            target.writestr(name, content)
+    rewritten_workbook.replace(workbook_path)
+
+    spreadsheet_markdown = (
+        LocalProjectMaterialsRepository._xlsx_editor_markdown(workbook_path)
+    )
+    assert "## 工作表：项目数据" in spreadsheet_markdown
+    assert "| 项目 | 状态 | 说明 |" in spreadsheet_markdown
+    assert "| 蓝信封 | 推进中 | 保留 A&#124;B 两类 |" in spreadsheet_markdown
+
+    image_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    document_path = tmp_path / "图文手册-飞书.docx"
+    document = Document()
+    document.add_heading("图文手册", level=1)
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "类别"
+    table.cell(0, 1).text = "内容"
+    table.cell(1, 0).text = "战略"
+    table.cell(1, 1).text = "说明 A|B"
+    table.cell(1, 1).add_paragraph("第二段")
+    merged_table = document.add_table(rows=2, cols=3)
+    merged_table.cell(0, 0).merge(merged_table.cell(0, 1)).text = "合并标题"
+    merged_table.cell(0, 2).text = "状态"
+    merged_table.cell(1, 0).text = "项目甲"
+    merged_table.cell(1, 1).text = "项目乙"
+    merged_table.cell(1, 2).text = "推进中"
+    document.add_picture(BytesIO(image_bytes))
+    document.save(document_path)
+
+    document_markdown = (
+        LocalProjectMaterialsRepository._docx_editor_markdown(document_path)
+    )
+    assert "# 图文手册" in document_markdown
+    assert "| 类别 | 内容 |" in document_markdown
+    assert "| 战略 | 说明 A&#124;B<br>第二段 |" in document_markdown
+    assert "| 合并标题 |  | 状态 |" in document_markdown
+    assert "| 项目甲 | 项目乙 | 推进中 |" in document_markdown
+    assert "![文档图片](data:image/png;base64," in document_markdown
+
+    roundtrip_path = tmp_path / "图文手册-重新保存.docx"
+    roundtrip_document = Document(document_path)
+    LocalProjectMaterialsRepository._render_markdown_into_docx(
+        roundtrip_document,
+        title="图文手册",
+        content=document_markdown,
+    )
+    roundtrip_document.save(roundtrip_path)
+    reopened = Document(roundtrip_path)
+    assert len(reopened.tables) == 2
+    assert reopened.tables[0].cell(1, 1).text == "说明 A|B\n第二段"
+    with zipfile.ZipFile(roundtrip_path) as package:
+        assert any(name.startswith("word/media/") for name in package.namelist())
+
+
+def test_external_import_display_title_follows_physical_source_suffix() -> None:
+    assert LocalProjectMaterialsRepository._document_display_title(
+        {"title": "项目手册", "fileName": "项目手册-飞书.docx"},
+        Path("/tmp/project-handbook-飞书.docx"),
+    ) == "项目手册-飞书"
+    assert LocalProjectMaterialsRepository._document_display_title(
+        {"title": "工作台体验", "fileName": "工作台体验_-_小红书.md"},
+        Path("/tmp/workbench-xhs.md"),
+    ) == "工作台体验-小红书"
+    assert LocalProjectMaterialsRepository._document_display_title(
+        {"title": "产品演示", "fileName": "产品演示_-_B站.md"},
+        Path("/tmp/product-bilibili.md"),
+    ) == "产品演示-B站"
+    assert LocalProjectMaterialsRepository._document_display_title(
+        {"title": "已有来源 - 小红书", "fileName": "已有来源_-_小红书.md"},
+        Path("/tmp/existing-xhs.md"),
+    ) == "已有来源-小红书"
+    assert LocalProjectMaterialsRepository._document_display_title(
+        {"title": "旧投影标题", "fileName": "旧投影标题.docx"},
+        Path("/tmp/旧投影标题-飞书.docx"),
+    ) == "旧投影标题-飞书"
 
 
 def test_duplicate_resolution_preflights_local_then_blocks_before_any_delete(
@@ -3088,3 +3290,125 @@ def test_project_list_keeps_cloud_projects_visible_when_local_state_is_corrupt(
     assert listed[0]["name"] == "组织云项目"
     assert listed[0]["folderCount"] == 0
     assert listed[0]["folderCapabilityState"] == "local_recovery_required"
+
+
+def test_project_material_filename_sync_keeps_one_stable_source(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "local" / "strict-local.db"
+    runtime = WorkspaceRuntime(database, MemorySecretStore())
+    with runtime_connection(database, "local") as connection:
+        connection.execute(
+            "INSERT INTO authorization_scopes "
+            "(id,scope_kind,organization_id,created_at,updated_at,status,version,"
+            "lifecycle_state,source_version,projection_state,projected_at) "
+            "VALUES (?,?,?,?,?,'active',1,'active',1,'ready',?)",
+            (
+                "scope-filename-sync",
+                "organization",
+                None,
+                "2026-08-25T00:00:00+00:00",
+                "2026-08-25T00:00:00+00:00",
+                "2026-08-25T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO sandboxes "
+            "(id,scope_id,cloud_api_url,record_kind,cloud_instance_id,"
+            "database_generation_id,sandbox_kind,display_name,runtime_status,"
+            "contract_version,manifest_hash,version,lifecycle_state,created_at,"
+            "updated_at,authority_role) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "sandbox-filename-sync",
+                "scope-filename-sync",
+                "https://filename-sync.invalid",
+                "sandbox",
+                "cloud-filename-sync",
+                runtime.identity.database_generation_id,
+                "organization",
+                "文件改名测试",
+                "ready",
+                runtime.identity.contract_version,
+                runtime.identity.manifest_hash,
+                1,
+                "active",
+                "2026-08-25T00:00:00+00:00",
+                "2026-08-25T00:00:00+00:00",
+                "local_projection",
+            ),
+        )
+        connection.commit()
+    runtime._current_context = lambda require_ready=True: SimpleNamespace(  # type: ignore[method-assign]
+        sandbox_id="sandbox-filename-sync",
+        cloud_instance_id="cloud-filename-sync",
+        organization_id="organization-filename-sync",
+        cloud_api_url="https://filename-sync.invalid",
+        principal_id="principal-filename-sync",
+        membership_id="membership-filename-sync",
+    )
+    store = LocalProjectMaterialsRepository(runtime)
+    project_id = "project-filename-sync"
+
+    generated = store.import_text(
+        project_id=project_id,
+        title="软件生成的小红书转写",
+        content="同一份软件生成正文。",
+    )
+    imported_path = tmp_path / "用户导入原件.md"
+    imported_path.write_text("同一份用户原件正文。", encoding="utf-8")
+    imported = store.import_paths(
+        project_id=project_id,
+        mode="file",
+        paths=[str(imported_path)],
+    )["materials"][0]
+    store.bind_cloud_documents(
+        project_id=project_id,
+        local_materials=[generated, imported],
+        cloud_documents=[
+            {
+                "localSourceId": generated["localSourceId"],
+                "documentId": "document-generated",
+            },
+            {
+                "localSourceId": imported["localSourceId"],
+                "documentId": "document-imported",
+            },
+        ],
+    )
+
+    smart_renamed = store.update_document_text(
+        "document-generated",
+        title="智能编辑改名后的小红书转写",
+        content="同一份软件生成正文。",
+    )
+    assert smart_renamed["fileName"] == "智能编辑改名后的小红书转写.md"
+    assert Path(smart_renamed["path"]).is_file()
+    assert not Path(generated["managedPath"]).exists()
+
+    finder_generated = Path(smart_renamed["path"]).with_name(
+        "Finder 再次改名的小红书转写.md"
+    )
+    Path(smart_renamed["path"]).rename(finder_generated)
+    generated_projection = {
+        item["id"]: item for item in store.documents(project_id)
+    }["document-generated"]
+    assert generated_projection["title"] == "Finder 再次改名的小红书转写"
+    assert generated_projection["path"] == str(finder_generated)
+    assert generated_projection["localSourceId"] == generated["localSourceId"]
+
+    finder_imported = imported_path.with_name("Finder 改名的用户原件.md")
+    imported_path.rename(finder_imported)
+    imported_projection = {
+        item["id"]: item for item in store.documents(project_id)
+    }["document-imported"]
+    assert imported_projection["title"] == "Finder 改名的用户原件"
+    assert imported_projection["path"] == str(finder_imported)
+    assert imported_projection["originalSourcePath"] == str(finder_imported)
+    assert imported_projection["localSourceId"] == imported["localSourceId"]
+
+    state = store._load_project_state(project_id)
+    assert set(state["documents"]) == {"document-generated", "document-imported"}
+    assert all(
+        item["cloudMetadataOperation"] == "update"
+        for item in store.pending_cloud_materials(project_id)
+    )

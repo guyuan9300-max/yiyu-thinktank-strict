@@ -174,6 +174,7 @@ import type {
   FeishuDeliveryProfile,
   FeishuDeliveryProfilePayload,
   FeishuDocImportCandidate,
+  FeishuDocImportResolveFailure,
   FeishuDocImportResult,
   FeishuDocImportStatus,
   FeishuMemberAuthorization,
@@ -418,6 +419,7 @@ import {
   getClients,
   getClientWorkspaceSettings,
   getClientWorkspace,
+  getLocalDocumentFilenameState,
   processPendingProjectMaterials,
   retryProjectMaterialProcessing,
   getClientPageContext,
@@ -449,6 +451,7 @@ import {
   getSettings,
   getCurrentWorkspace,
   getWorkspaces,
+  restoreCurrentWorkspaceSession,
   createWorkspace,
   updateWorkspace,
   activateWorkspace,
@@ -523,7 +526,6 @@ import {
   saveFeishuDeliveryProfile,
   saveFeishuInputMemory,
   searchClientKnowledge,
-  searchFeishuDocsForImport,
   syncOrganizationDirectory,
   resolveFeishuDocImportLinks,
   getClientAnalysisRun,
@@ -8331,9 +8333,9 @@ export default function App() {
   const [latestImportFeedback, setLatestImportFeedback] = useState<ImportFeedback | null>(null);
   const [isFeishuImportOpen, setIsFeishuImportOpen] = useState(false);
   const [feishuImportStatus, setFeishuImportStatus] = useState<FeishuDocImportStatus | null>(null);
-  const [feishuImportQuery, setFeishuImportQuery] = useState('');
   const [feishuImportLinksText, setFeishuImportLinksText] = useState('');
   const [feishuImportCandidates, setFeishuImportCandidates] = useState<FeishuDocImportCandidate[]>([]);
+  const [feishuImportResolveFailures, setFeishuImportResolveFailures] = useState<FeishuDocImportResolveFailure[]>([]);
   const [selectedFeishuImportKeys, setSelectedFeishuImportKeys] = useState<string[]>([]);
   const [isFeishuImportLoading, setIsFeishuImportLoading] = useState(false);
   const [isFeishuImportSubmitting, setIsFeishuImportSubmitting] = useState(false);
@@ -8431,7 +8433,14 @@ export default function App() {
   const feishuStatusHydrationInFlightRef = useRef(false);
   const feishuTaskSyncReadinessInFlightRef = useRef(false);
   const feishuSyncStrictStatusLoaded = orgFeishuIntegrationLoaded;
-  const feishuSyncConnectedByState = Boolean(orgFeishuIntegrationState.enabled);
+  const feishuSyncConnectedByState = Boolean(
+    orgFeishuIntegrationState.enabled ||
+    orgFeishuIntegrationState.authorizationReady ||
+    (
+      orgFeishuIntegrationState.hasAppSecret &&
+      orgFeishuIntegrationState.lastValidationStatus === 'succeeded'
+    ),
+  );
   const feishuSyncStatusLoaded = feishuSyncStrictStatusLoaded || feishuTaskSyncReadiness.checked || feishuSyncConnectedByState;
   const feishuSyncFullyConnected = feishuSyncConnectedByState || feishuTaskSyncReadiness.fullyConnected;
   const feishuSyncTransientUnavailable = Boolean(
@@ -8991,7 +9000,6 @@ export default function App() {
   const authorizationLastConfirmedText = formatAuthorizationTimestamp(
     viewerAuthorization?.lastConfirmedAt || viewerAuthorization?.generatedAt,
   );
-  const authorizationLeaseExpiresText = formatAuthorizationTimestamp(viewerAuthorization?.leaseExpiresAt);
   const canLoadCurrentWorkspaceBusinessData = Boolean(
     hasRawAuthenticatedSession
     && isCloudSession
@@ -9575,7 +9583,6 @@ export default function App() {
     setFeishuAuthorizationBusyAction('idle');
     setIsFeishuImportOpen(false);
     setFeishuImportStatus(null);
-    setFeishuImportQuery('');
     setFeishuImportLinksText('');
     setFeishuImportCandidates([]);
     setSelectedFeishuImportKeys([]);
@@ -10309,16 +10316,33 @@ export default function App() {
 
   const reconcileStaleWorkspaceRuntime = useCallback((reason: string) => {
     if (workspaceRuntimeRecoveryInFlightRef.current) return;
-    if (!workspaceRuntimeBlocksWrites(workspaceRuntimeStatusRef.current)) return;
+    if (!hasRawAuthenticatedSession || authState.sessionMode !== 'cloud') return;
     workspaceRuntimeRecoveryInFlightRef.current = true;
-    void refreshCurrentWorkspaceRuntime(authState, workspaceTransitionRef.current, reason)
+    void restoreCurrentWorkspaceSession()
+      .then(async (restoredAuth) => {
+        const normalizedAuth = normalizeAuthStateForDesktop(restoredAuth);
+        setAuthState(normalizedAuth);
+        const nextWorkspaces = await getWorkspaces();
+        setWorkspacesState(nextWorkspaces);
+        const activeWorkspace = nextWorkspaces.workspaces.find(
+          (item) => item.id === nextWorkspaces.activeSandboxId,
+        ) || null;
+        if (activeWorkspace?.id) activeSandboxIdRef.current = activeWorkspace.id;
+        applyWorkspaceRuntime(activeWorkspace, normalizedAuth);
+        console.info('[workspace-runtime] organization session restored automatically', {
+          reason,
+          sandboxId: activeWorkspace?.id,
+          runtimeStatus: activeWorkspace?.runtimeStatus,
+        });
+      })
       .catch((error) => {
-        console.warn('[workspace-runtime] stale runtime recovery failed', { reason, error });
+        console.warn('[workspace-runtime] automatic organization recovery failed', { reason, error });
+        return refreshCurrentWorkspaceRuntime(authState, workspaceTransitionRef.current, reason);
       })
       .finally(() => {
         workspaceRuntimeRecoveryInFlightRef.current = false;
       });
-  }, [authState]);
+  }, [authState, hasRawAuthenticatedSession]);
 
   useEffect(() => {
     if (loading || !workspaceWritesBlocked) return undefined;
@@ -10335,6 +10359,31 @@ export default function App() {
     }, 600);
     return () => window.clearTimeout(timer);
   }, [loading, reconcileStaleWorkspaceRuntime, workspaceRuntimeStatus, workspaceWritesBlocked]);
+
+  // A cloud session may be left in sync_degraded/legacy lease state by a
+  // transient network failure or an older client.  Keep repairing it in the
+  // background.  The single-flight guard prevents parallel panels from
+  // rotating the same refresh token twice.
+  useEffect(() => {
+    if (loading || !hasRawAuthenticatedSession || authState.sessionMode !== 'cloud') return undefined;
+    const reasonCode = authState.authorization?.reasonCode || '';
+    const needsAutomaticRecovery = workspaceRuntimeStatus === 'sync_degraded'
+      || workspaceRuntimeStatus === 'needs_login'
+      || authState.authorization?.state === 'failed_retryable'
+      || ['authorization_lease_expired', 'authorization_projection_missing', 'authorization_projection_stale', 'cloud_revalidation_pending'].includes(reasonCode);
+    if (!needsAutomaticRecovery) return undefined;
+    const recover = () => reconcileStaleWorkspaceRuntime('automatic-session-recovery');
+    const initialTimer = window.setTimeout(recover, 250);
+    const retryTimer = window.setInterval(recover, 10_000);
+    window.addEventListener('online', recover);
+    window.addEventListener('focus', recover);
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(retryTimer);
+      window.removeEventListener('online', recover);
+      window.removeEventListener('focus', recover);
+    };
+  }, [authState.authorization?.reasonCode, authState.authorization?.state, authState.sessionMode, hasRawAuthenticatedSession, loading, reconcileStaleWorkspaceRuntime, workspaceRuntimeStatus]);
 
   const isLocalServiceStartupError = (error: unknown) => {
     const detail = error instanceof Error ? error.message : String(error ?? '');
@@ -12717,6 +12766,13 @@ export default function App() {
       ].join(':'))
       .join('|');
     if (previousProcessing !== nextProcessing) return false;
+    const previousDocumentNames = (prev.documents || [])
+      .map((item: any) => [item.id, item.title, item.path, item.originalSourcePath].join(':'))
+      .join('|');
+    const nextDocumentNames = (next.documents || [])
+      .map((item: any) => [item.id, item.title, item.path, item.originalSourcePath].join(':'))
+      .join('|');
+    if (previousDocumentNames !== nextDocumentNames) return false;
     if (prev.surrogateCount !== next.surrogateCount) return false;
     if (prev.memoryDocCount !== next.memoryDocCount) return false;
     if (prev.knowledgeStatus?.lastIndexedAt !== next.knowledgeStatus?.lastIndexedAt) return false;
@@ -12789,6 +12845,82 @@ export default function App() {
     currentClientId,
     loading,
     workspaceRuntimeStatus,
+    workspacesState?.activeSandboxId,
+  ]);
+
+  const localDocumentFilenameSignatureRef = useRef<Record<string, string>>({});
+  const localDocumentFilenameSyncInFlightRef = useRef(false);
+  useEffect(() => {
+    if (activeTab !== 'client_workspace' || !currentClientId || !workspace) return undefined;
+    if (workspace.client?.id !== currentClientId) return undefined;
+    let disposed = false;
+    const targetClientId = currentClientId;
+    const startedSandboxId = currentActiveSandboxId();
+    if (localDocumentFilenameSignatureRef.current[targetClientId] === undefined) {
+      localDocumentFilenameSignatureRef.current[targetClientId] = JSON.stringify(
+        (workspace.documents || []).map((document) => ({
+          id: document.id,
+          title: document.title,
+          path: document.path,
+          originalSourcePath: document.originalSourcePath,
+          source: document.source,
+        })),
+      );
+    }
+    const check = async () => {
+      if (disposed || localDocumentFilenameSyncInFlightRef.current) return;
+      localDocumentFilenameSyncInFlightRef.current = true;
+      try {
+        const state = await getLocalDocumentFilenameState(targetClientId);
+        if (
+          disposed
+          || !shouldApplyWorkspaceLoad(null, startedSandboxId)
+          || currentClientIdRef.current !== targetClientId
+        ) return;
+        const signature = JSON.stringify(state.documents);
+        const previousSignature = localDocumentFilenameSignatureRef.current[targetClientId];
+        localDocumentFilenameSignatureRef.current[targetClientId] = signature;
+        if (previousSignature === undefined || previousSignature === signature) return;
+        const byId = new Map(state.documents.map((item) => [item.id, item]));
+        setWorkspace((prev) => {
+          if (!prev || prev.client?.id !== targetClientId) return prev;
+          return {
+            ...prev,
+            documents: (prev.documents || []).map((document) => {
+              const renamed = byId.get(document.id);
+              return renamed ? { ...document, ...renamed } : document;
+            }),
+          };
+        });
+        if (state.needsCloudSync) {
+          const synced = await syncClient(targetClientId);
+          if (
+            !disposed
+            && shouldApplyWorkspaceLoad(null, startedSandboxId)
+            && currentClientIdRef.current === targetClientId
+          ) {
+            setWorkspace((prev) => prev ? { ...prev, client: synced } : prev);
+          }
+        }
+      } catch (error) {
+        console.warn(
+          '[workspace] local filename reconciliation deferred',
+          error instanceof Error ? error.message : String(error),
+        );
+      } finally {
+        localDocumentFilenameSyncInFlightRef.current = false;
+      }
+    };
+    void check();
+    const timer = window.setInterval(() => void check(), 1000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    activeTab,
+    currentClientId,
+    workspace?.client?.id,
     workspacesState?.activeSandboxId,
   ]);
 
@@ -25526,11 +25658,6 @@ export default function App() {
     const visibleSavedMemories = controlledSavedMemories.filter(
       (item) => item.memoryKind === activeMemoryLane,
     );
-    const activeMemoryLaneLabel = activeMemoryLane === 'favorite'
-      ? '收藏'
-      : activeMemoryLane === 'correction'
-        ? '纠错/补充'
-        : '明确记忆';
     const organizationSharedKnowledgeCount = knowledgePresentation?.sourceGroups?.find(
       (group) => group.key === 'organization_knowledge',
     )?.count ?? null;
@@ -27892,16 +28019,6 @@ export default function App() {
     };
 
     const feishuImportKey = (item: FeishuDocImportCandidate) => `${item.type}:${item.token}`;
-    const mergeFeishuImportCandidates = (items: FeishuDocImportCandidate[]) => {
-      setFeishuImportCandidates((prev) => {
-        const map = new Map<string, FeishuDocImportCandidate>();
-        [...prev, ...items].forEach((item) => {
-          if (!item.token) return;
-          map.set(feishuImportKey(item), item);
-        });
-        return Array.from(map.values());
-      });
-    };
     const openFeishuDocImportModal = async () => {
       if (!currentClientId) {
         flash('error', '请先选择客户或项目');
@@ -27910,6 +28027,10 @@ export default function App() {
       setIsFeishuImportOpen(true);
       setFeishuImportMessage('');
       setFeishuImportResult(null);
+      setFeishuImportResolveFailures([]);
+      setFeishuImportLinksText('');
+      setFeishuImportCandidates([]);
+      setSelectedFeishuImportKeys([]);
       setIsFeishuImportLoading(true);
       try {
         const status = await getFeishuDocImportStatus();
@@ -27925,38 +28046,26 @@ export default function App() {
         setIsFeishuImportLoading(false);
       }
     };
-    const handleSearchFeishuDocsForImport = async () => {
-      const query = feishuImportQuery.trim();
-      if (!query) {
-        flash('info', '请先输入飞书文档关键词');
-        return;
-      }
-      setIsFeishuImportLoading(true);
-      setFeishuImportMessage('');
-      try {
-        const result = await searchFeishuDocsForImport({ query, pageSize: 20 });
-        mergeFeishuImportCandidates(result.items || []);
-        setFeishuImportMessage(result.message || (result.items.length ? `找到 ${result.items.length} 份飞书文档` : '没有找到可导入的飞书文档'));
-      } catch (error) {
-        setFeishuImportMessage(error instanceof Error ? error.message : '搜索飞书文档失败');
-      } finally {
-        setIsFeishuImportLoading(false);
-      }
-    };
     const handleResolveFeishuImportLinks = async () => {
-      const links = feishuImportLinksText
-        .split(/\r?\n/)
-        .map((item) => item.trim())
-        .filter(Boolean);
+      const links = Array.from(new Set(
+        (feishuImportLinksText.match(/https?:\/\/[^\s<>"'）)\]]+/g) || [])
+          .map((item) => item.replace(/[，。；;、]+$/g, '').trim())
+          .filter(Boolean),
+      ));
       if (!links.length) {
         flash('info', '请先粘贴飞书文档链接');
         return;
       }
       setIsFeishuImportLoading(true);
       setFeishuImportMessage('');
+      setFeishuImportResolveFailures([]);
       try {
         const result = await resolveFeishuDocImportLinks(links);
-        mergeFeishuImportCandidates(result.items || []);
+        // 每次解析都以本轮已确认可读取的文档替换候选区，避免上轮候选
+        // 因权限变化或链接修改而残留成“看似可选、实际不可导入”的条目。
+        setFeishuImportCandidates(result.items || []);
+        setSelectedFeishuImportKeys([]);
+        setFeishuImportResolveFailures(result.failedItems || []);
         setFeishuImportMessage(result.message || (result.items.length ? `识别到 ${result.items.length} 份飞书文档` : '没有识别到可导入的飞书文档'));
       } catch (error) {
         setFeishuImportMessage(error instanceof Error ? error.message : '解析飞书链接失败');
@@ -27978,9 +28087,39 @@ export default function App() {
       }
       setIsFeishuImportSubmitting(true);
       setFeishuImportResult(null);
-      setFeishuImportMessage('正在导出飞书文档并导入资料库。');
+      setFeishuImportMessage(`正在逐份导入飞书文档（1/${selectedItems.length}）。`);
       try {
-        const result = await importFeishuDocsToClient(currentClientId, selectedItems);
+        // 飞书的 Office 导出需要先在飞书侧生成文件。多份文档放在一个
+        // 同步请求中会累加等待时间，并可能在前几份已经落盘后把整批误报
+        // 为“组织云响应超时”。逐份请求让每份文档拥有独立截止时间和回执；
+        // 单份失败不会阻断后续文档，全部结束后再统一展示结果。
+        const result: FeishuDocImportResult = {
+          clientId: currentClientId,
+          importedCount: 0,
+          failedCount: 0,
+          items: [],
+        };
+        for (const [index, item] of selectedItems.entries()) {
+          setFeishuImportMessage(`正在逐份导入飞书文档（${index + 1}/${selectedItems.length}）：${item.title}`);
+          try {
+            const singleResult = await importFeishuDocsToClient(currentClientId, [item]);
+            result.importedCount += singleResult.importedCount;
+            result.failedCount += singleResult.failedCount;
+            result.items.push(...singleResult.items);
+          } catch (error) {
+            result.failedCount += 1;
+            result.items.push({
+              token: item.token,
+              title: item.title,
+              status: 'failed',
+              documentId: null,
+              fileName: null,
+              path: null,
+              remoteUrl: item.url,
+              message: error instanceof Error ? error.message : '飞书文档导入失败',
+            });
+          }
+        }
         setFeishuImportResult(result);
         await refreshWorkspace(currentClientId);
         if (result.importedCount > 0) {
@@ -29441,7 +29580,6 @@ export default function App() {
                   <Download size={18} className="text-[#5B7BFE]" />
                   从飞书导入文档
                 </div>
-                <p className="mt-1 text-[12px] text-slate-500">选择你有权限访问的飞书文档，导入当前项目资料库。</p>
               </div>
               <button
                 type="button"
@@ -29480,42 +29618,20 @@ export default function App() {
                 </div>
               ) : (
                 <div className="space-y-5">
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <div className="rounded-2xl border border-gray-200 bg-gray-50/70 p-4">
-                      <div className="flex items-center gap-2 text-[13px] font-bold text-slate-800">
-                        <Search size={15} className="text-[#5B7BFE]" />
-                        关键词搜索
-                      </div>
-                      <div className="mt-3 flex gap-2">
-                        <input
-                          value={feishuImportQuery}
-                          onChange={(event) => setFeishuImportQuery(event.target.value)}
-                          onKeyDown={(event) => {
-                            if (event.key === 'Enter') void handleSearchFeishuDocsForImport();
-                          }}
-                          className="min-w-0 flex-1 rounded-xl border border-gray-200 bg-white px-3 py-2 text-[12px] text-slate-800 outline-none transition focus:border-[#8EA2FF]"
-                          placeholder="输入文档关键词"
-                        />
-                        <button
-                          type="button"
-                          disabled={isFeishuImportLoading}
-                          onClick={() => void handleSearchFeishuDocsForImport()}
-                          className="rounded-xl bg-[#5B7BFE] px-3 py-2 text-[12px] font-bold text-white transition hover:bg-[#4A63CF] disabled:cursor-wait disabled:opacity-60"
-                        >
-                          搜索
-                        </button>
-                      </div>
-                    </div>
+                  <div>
                     <div className="rounded-2xl border border-gray-200 bg-gray-50/70 p-4">
                       <div className="flex items-center gap-2 text-[13px] font-bold text-slate-800">
                         <Link2 size={15} className="text-[#5B7BFE]" />
-                        粘贴链接
+                        粘贴飞书文档链接
                       </div>
+                      <p className="mt-1 text-[11px] leading-5 text-slate-500">
+                        支持一次粘贴多条链接。仅个人可见的文档无法导入。导入后成为独立资料，不持续同步飞书原文。
+                      </p>
                       <textarea
                         value={feishuImportLinksText}
                         onChange={(event) => setFeishuImportLinksText(event.target.value)}
                         className="mt-3 h-[76px] w-full resize-none rounded-xl border border-gray-200 bg-white px-3 py-2 text-[12px] leading-5 text-slate-800 outline-none transition focus:border-[#8EA2FF]"
-                        placeholder="一行一个飞书文档链接"
+                        placeholder="可一次粘贴多条飞书文档链接（换行或用空格分隔）"
                       />
                       <button
                         type="button"
@@ -29534,22 +29650,52 @@ export default function App() {
                     </div>
                   )}
 
+                  {feishuImportResolveFailures.length > 0 && (
+                    <div className="rounded-2xl border border-rose-100 bg-rose-50 px-4 py-3">
+                      <p className="text-[12px] font-bold text-rose-700">以下链接未导入</p>
+                      <div className="mt-2 max-h-[100px] space-y-1 overflow-y-auto">
+                        {feishuImportResolveFailures.map((item, index) => (
+                          <p key={`${item.url}-${index}`} className="truncate text-[11px] text-rose-600" title={`${item.url}：${item.message}`}>
+                            {item.message}
+                          </p>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="rounded-2xl border border-gray-200 bg-white">
                     <div className="flex items-center justify-between border-b border-gray-100 px-4 py-3">
                       <span className="text-[13px] font-bold text-slate-900">可导入文档</span>
-                      <span className="text-[11px] font-semibold text-slate-400">{selectedFeishuImportKeys.length}/{feishuImportCandidates.length} 已选</span>
+                      <div className="flex items-center gap-3">
+                        {feishuImportCandidates.length > 0 && (
+                          <label className="flex cursor-pointer items-center gap-1.5 text-[11px] font-semibold text-slate-600">
+                            <input
+                              type="checkbox"
+                              checked={selectedFeishuImportKeys.length === feishuImportCandidates.length}
+                              onChange={(event) => {
+                                setSelectedFeishuImportKeys(event.target.checked
+                                  ? feishuImportCandidates.map((candidate) => feishuImportKey(candidate))
+                                  : []);
+                              }}
+                              className="h-4 w-4 rounded border-gray-300 text-[#5B7BFE]"
+                            />
+                            全选
+                          </label>
+                        )}
+                        <span className="text-[11px] font-semibold text-slate-400">{selectedFeishuImportKeys.length}/{feishuImportCandidates.length} 已选</span>
+                      </div>
                     </div>
                     {feishuImportCandidates.length === 0 ? (
                       <div className="px-4 py-8 text-center text-[12px] text-slate-400">
-                        搜索或粘贴链接后，可在这里勾选要导入的飞书文档。
+                        粘贴并解析链接后，可在这里勾选要导入的飞书文档。
                       </div>
                     ) : (
-                      <div className="max-h-[260px] divide-y divide-gray-100 overflow-y-auto">
+                      <div className="max-h-[144px] divide-y divide-gray-100 overflow-y-auto">
                         {feishuImportCandidates.map((candidate) => {
                           const key = feishuImportKey(candidate);
                           const checked = selectedFeishuImportKeys.includes(key);
                           return (
-                            <label key={key} className="flex cursor-pointer items-start gap-3 px-4 py-3 transition hover:bg-blue-50/40">
+                            <label key={key} className="flex min-h-[48px] cursor-pointer items-center gap-3 px-4 py-3 transition hover:bg-blue-50/40">
                               <input
                                 type="checkbox"
                                 checked={checked}
@@ -29558,13 +29704,10 @@ export default function App() {
                                     prev.includes(key) ? prev.filter((item) => item !== key) : [...prev, key]
                                   ));
                                 }}
-                                className="mt-1 h-4 w-4 rounded border-gray-300 text-[#5B7BFE]"
+                                className="h-4 w-4 rounded border-gray-300 text-[#5B7BFE]"
                               />
                               <div className="min-w-0 flex-1">
                                 <p className="truncate text-[13px] font-bold text-slate-800" title={candidate.title}>{candidate.title}</p>
-                                <p className="mt-1 truncate text-[11px] text-slate-400" title={candidate.url}>
-                                  {candidate.type.toUpperCase()} · {candidate.ownerName || '飞书文档'}{candidate.updatedAt ? ` · ${candidate.updatedAt}` : ''}
-                                </p>
                               </div>
                             </label>
                           );
@@ -29589,8 +29732,7 @@ export default function App() {
               )}
             </div>
 
-            <div className="flex items-center justify-between gap-3 border-t border-gray-100 bg-gray-50 px-6 py-4">
-              <p className="text-[11px] text-slate-400">第一版只导入飞书文档/Docx，不会自动覆盖本地已有资料。</p>
+            <div className="flex items-center justify-end gap-3 border-t border-gray-100 bg-gray-50 px-6 py-4">
               <button
                 type="button"
                 disabled={!feishuImportStatus?.ready || selectedFeishuImportKeys.length === 0 || isFeishuImportSubmitting}
@@ -31231,9 +31373,9 @@ export default function App() {
 	                  )}
 	                  <textarea
 	                    ref={composerTextareaRef}
-	                    className="w-full bg-transparent p-2.5 pl-4 text-[13px] xl:text-[14px] text-gray-800 outline-none resize-none min-h-[44px] xl:min-h-[50px] max-h-[120px] leading-relaxed placeholder-gray-400 font-medium"
+	                    className="w-full bg-transparent p-2.5 pl-4 text-[13px] xl:text-[14px] text-gray-800 outline-none resize-none min-h-[44px] xl:min-h-[50px] max-h-[120px] leading-relaxed placeholder:text-[11px] xl:placeholder:text-[12px] placeholder-gray-400 font-medium"
 	                    placeholder={workspaceRealAiReady
-	                      ? `让 ${aiModelDisplayLabel(health?.ai.provider, health?.ai.model, health?.ai.providerLabel)} 帮你推演 ${currentClient?.name || '当前客户'} 的业务问题...`
+	                      ? `让 AI 帮你推演 ${currentClient?.name || '当前项目'} 的业务问题；也可补充项目信息并说“请记住……”，要求记住的信息会成为项目共享知识`
 	                      : `先配置大模型，再向 ${currentClient?.name || '当前客户'} 提问...`}
 	                    value={inputValue}
 	                    onFocus={(event) => {
@@ -33772,7 +33914,7 @@ export default function App() {
                   <BrainCircuit size={16} className="text-purple-500" /> 已存记忆
                 </h3>
               </div>
-              <p className="mb-3 text-[11px] text-gray-400">显示当前项目的正式记住/纠错知识与本人的收藏；系统自动推断不在这里展示。</p>
+              <p className="mb-3 text-[11px] text-gray-400">这里汇总你和同事明确要求记住、纠错/补充的项目知识，以及你本人的收藏。</p>
               <div className="mb-4 grid grid-cols-3 gap-2">
                 {([
                   { key: 'explicit_memory', label: '明确记忆', count: controlledMemoryCounts.explicitMemory },
@@ -33803,7 +33945,13 @@ export default function App() {
                 ) : !knowledgePresentation ? (
                   <p className="text-[12px] text-gray-400">正在读取当前项目记忆…</p>
                 ) : visibleSavedMemories.length === 0 ? (
-                  <p className="text-[12px] text-gray-400 italic">当前项目还没有{activeMemoryLaneLabel}。</p>
+                  <p className="text-[12px] text-gray-400 italic">
+                    {activeMemoryLane === 'explicit_memory'
+                      ? '还没有明确记忆，可在问答中直接说“请记住……”。'
+                      : activeMemoryLane === 'correction'
+                        ? '还没有纠错/补充，可选中答案中的相关文本后提交。'
+                        : '还没有收藏，可在答案底部点击“收藏”。'}
+                  </p>
                 ) : (
                   visibleSavedMemories.map((card) => {
                     const memoryTitle = card.title || '已存记忆';
@@ -33848,10 +33996,7 @@ export default function App() {
                   })
                 )}
               </div>
-              <div className="mt-4 rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2.5">
-                <p className="text-[10px] font-bold text-slate-600">单设备同步边界</p>
-                <p className="mt-1 text-[10px] leading-4 text-slate-500">本环节只准备来源哈希、版本和数量；原对话、回答正文、文件正文、本地路径和密钥不会进入同步清单。</p>
-              </div>
+              <p className="mt-4 text-[10px] leading-4 text-slate-400">原对话、文件正文和本地路径不会上传；这里只显示可控的项目知识与本人收藏。</p>
             </div>}
 
             {memorySyncDialogOpen && (
@@ -37680,12 +37825,12 @@ export default function App() {
       || viewerAuthorization?.state === 'failed_retryable';
     const missingShell = viewerAuthorization?.state === 'ready' && !canUseApplicationShell;
     const title = retryable
-      ? '权限信息暂时无法确认'
+      ? '正在自动恢复组织连接'
       : missingShell
         ? '当前账号未获准进入桌面工作区'
         : '当前权限已被阻止';
     const message = retryable
-      ? '软件保留本机已确认身份，但在权限重新确认前不会加载或写入组织业务数据。'
+      ? '软件正在自动重新验证当前登录信息，无需手动操作；网络恢复后会自动继续。'
       : '这是组织云权限投影的明确结果，不会通过角色名称或本机缓存绕过。';
     return (
       <div className="min-h-screen bg-[#F9FAFB] flex items-center justify-center px-6">
@@ -37696,18 +37841,12 @@ export default function App() {
           <div className="mt-5 rounded-2xl border border-gray-100 bg-gray-50 px-4 py-3 text-[12px] leading-6 text-gray-600">
             <p>账号：{currentSessionUser?.fullName || currentSessionUser?.email || '当前成员'}</p>
             <p>状态：{viewerAuthorization?.state || 'not_connected'} · {viewerAuthorization?.reasonCode || (missingShell ? 'permission_denied' : 'authorization_not_ready')}</p>
-            <p>最后确认：{authorizationLastConfirmedText}</p>
-            <p>租约截止：{authorizationLeaseExpiresText}</p>
+            <p>最近一次确认：{authorizationLastConfirmedText}</p>
           </div>
           <div className="mt-6 flex justify-end gap-3">
             <Button onClick={() => { void handleLogoutFromUi(); }}>
               退出登录
             </Button>
-            {retryable && (
-              <Button primary onClick={() => { void handleActivateWorkspace(currentActiveSandboxId()); }}>
-                重新连接
-              </Button>
-            )}
           </div>
         </div>
       </div>
@@ -38242,9 +38381,9 @@ export default function App() {
                 {authState.degraded && viewerAuthorization?.freshness === 'stale' && (
                   <p
                     className="mt-1 text-[9.5px] leading-4 text-amber-600"
-                    title={`最后确认：${authorizationLastConfirmedText}；租约截止：${authorizationLeaseExpiresText}`}
+                    title={`最近一次确认：${authorizationLastConfirmedText}；软件正在自动恢复连接`}
                   >
-                    最后确认 {authorizationLastConfirmedText} · 租约至 {authorizationLeaseExpiresText}
+                    连接波动，正在自动恢复
                   </p>
                 )}
                 {hasSidebarSessionIdentity && !isLocalSession ? (

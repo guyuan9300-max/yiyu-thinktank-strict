@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import inspect
 import re
 import threading
 from collections import defaultdict
@@ -426,19 +430,29 @@ def _platform_command(
     authorization_scope: str,
     payload: Mapping[str, Any],
     idempotency_key: str,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
-    result = compatibility.runtime.cloud_command(
-        "POST",
-        "/api/v2/platform-integrations/command",
-        payload={
+    command_kwargs: dict[str, Any] = {
+        "payload": {
             "resourcePath": resource_path,
             "authorizationScope": authorization_scope,
             "method": "POST",
             "query": {},
             "payload": dict(payload),
         },
-        idempotency_key=idempotency_key,
-        refresh_business=False,
+        "idempotency_key": idempotency_key,
+        "refresh_business": False,
+    }
+    if (
+        timeout_seconds is not None
+        and "timeout_seconds"
+        in inspect.signature(compatibility.runtime.cloud_command).parameters
+    ):
+        command_kwargs["timeout_seconds"] = timeout_seconds
+    result = compatibility.runtime.cloud_command(
+        "POST",
+        "/api/v2/platform-integrations/command",
+        **command_kwargs,
     )
     command_result = result.get("result")
     if not isinstance(command_result, dict):
@@ -747,6 +761,47 @@ def client_workspace(
             "memories": "knowledge_documents/document_versions/derivation_lineage",
             "documents": "knowledge_documents/document_versions",
         },
+    }
+
+
+@router.get(r"clients/(?P<project_id>[^/]+)/documents/local-filename-state")
+def local_document_filename_state(
+    compatibility: Any,
+    _: UiRequest,
+    match: Any,
+) -> dict[str, Any]:
+    """Return a small, local-only filename projection for the open project.
+
+    ``store.documents`` reconciles an externally renamed source by its stable
+    fingerprint.  This endpoint deliberately returns no file body and performs
+    no cloud read, so the renderer can keep Finder and the visible file list in
+    sync without repeatedly loading the full workspace.  Project access was
+    already pinned when the workspace was opened; the route only exposes rows
+    which are already present in that pinned local projection.
+    """
+
+    project_id = match.group("project_id")
+    store = _local_store(compatibility)
+    documents = _local_call(lambda: store.documents(project_id))
+    pending_updates = {
+        str(item.get("documentId") or item.get("cloudDocumentId") or "")
+        for item in store.pending_cloud_materials(project_id)
+        if str(item.get("cloudMetadataOperation") or "") == "update"
+    }
+    return {
+        "clientId": project_id,
+        "documents": [
+            {
+                "id": str(item.get("id") or ""),
+                "title": str(item.get("title") or ""),
+                "path": str(item.get("path") or ""),
+                "originalSourcePath": item.get("originalSourcePath"),
+                "source": str(item.get("source") or ""),
+            }
+            for item in documents
+        ],
+        "needsCloudSync": bool(pending_updates),
+        "pendingDocumentIds": sorted(value for value in pending_updates if value),
     }
 
 
@@ -4133,28 +4188,9 @@ def import_feishu_documents(
                 or "组织飞书应用尚未配置或验证未通过"
             ),
         )
-    member = _platform_resource(
-        compatibility,
-        resource_path="me/feishu-authorization",
-        authorization_scope="personal",
-    )
-    if not bool(member.get("linked")):
-        authorization_message = str(member.get("lastError") or "").strip()
-        if not authorization_message:
-            authorization_message = (
-                "当前成员飞书 OAuth 回调与加密用户令牌权威尚未接通"
-                if member.get("blockedReason")
-                == "oauth_grant_authority_not_connected"
-                else str(
-                    member.get("blockedReason")
-                    or "当前成员尚未完成飞书授权"
-                )
-            )
-        raise LocalRuntimeError(
-            409,
-            "feishu_member_authorization_required",
-            authorization_message,
-        )
+    # 飞书文档是由组织已验证的自建应用做一次性读取，不要求成员再做
+    # OAuth 绑定。文档自身的可见范围由飞书接口逐条校验；仅个人可见、
+    # 未向组织应用开放的文档会以该文档的失败回执返回，不阻塞其他链接。
     fetched = _platform_command(
         compatibility,
         resource_path="feishu-doc-import/fetch",
@@ -4164,7 +4200,7 @@ def import_feishu_documents(
                 {
                     "token": str(item.get("token") or ""),
                     "type": str(item.get("type") or ""),
-                    "title": str(item.get("title") or "飞书文档"),
+                    "title": str(item.get("title") or "").strip(),
                     "url": str(item.get("url") or ""),
                 }
                 for item in items
@@ -4172,17 +4208,15 @@ def import_feishu_documents(
             ]
         },
         idempotency_key=f"{request.idempotency_key}:fetch",
+        # A long illustrated document can require Feishu export polling plus
+        # a binary download.  This stays below the 120-second UI background
+        # deadline while ordinary cloud requests retain the 15-second budget.
+        timeout_seconds=105.0,
     )
-    fetched_items = [
-        item
-        for item in fetched.get("items") or []
-        if isinstance(item, Mapping)
-        and str(item.get("content") or "").strip()
-    ]
     failures = [
         {
             "token": str(item.get("token") or ""),
-            "title": str(item.get("title") or "飞书文档"),
+            "title": str(item.get("title") or "未识别标题"),
             "status": "failed",
             "documentId": None,
             "fileName": None,
@@ -4193,6 +4227,40 @@ def import_feishu_documents(
         for item in fetched.get("failedItems") or []
         if isinstance(item, Mapping)
     ]
+    fetched_items: list[Mapping[str, Any]] = []
+    for item in fetched.get("items") or []:
+        if not isinstance(item, Mapping):
+            continue
+        artifact = item.get("artifact")
+        if not isinstance(artifact, Mapping):
+            failures.append(
+                {
+                    "token": str(item.get("token") or ""),
+                    "title": str(item.get("title") or "未识别标题"),
+                    "status": "failed",
+                    "documentId": None,
+                    "fileName": None,
+                    "path": None,
+                    "remoteUrl": str(item.get("url") or ""),
+                    "message": "飞书没有返回可保存的 Office 导出文件",
+                }
+            )
+            continue
+        if not str(item.get("title") or "").strip():
+            failures.append(
+                {
+                    "token": str(item.get("token") or ""),
+                    "title": "未识别标题",
+                    "status": "failed",
+                    "documentId": None,
+                    "fileName": None,
+                    "path": None,
+                    "remoteUrl": str(item.get("url") or ""),
+                    "message": "飞书没有返回文档标题，未创建无标题资料",
+                }
+            )
+            continue
+        fetched_items.append(item)
     if not fetched_items:
         return {
             "clientId": project_id,
@@ -4208,12 +4276,32 @@ def import_feishu_documents(
     local_materials: list[dict[str, Any]] = []
     fetched_by_local_source: dict[str, Mapping[str, Any]] = {}
     for item in fetched_items:
+        artifact = item.get("artifact")
+        if not isinstance(artifact, Mapping):
+            continue
         try:
+            data = base64.b64decode(
+                str(artifact.get("contentBase64") or ""),
+                validate=True,
+            )
+            expected_hash = str(artifact.get("contentHash") or "")
+            expected_size = int(artifact.get("byteSize") or 0)
+            if (
+                expected_size != len(data)
+                or hashlib.sha256(data).hexdigest() != expected_hash
+            ):
+                raise LocalRuntimeError(
+                    502,
+                    "feishu_export_integrity_invalid",
+                    "飞书导出文件完整性校验失败，本次未保存",
+                )
             local = _local_call(
-                lambda item=item: store.import_text(
+                lambda item=item, artifact=artifact, data=data: store.import_bytes(
                     project_id=project_id,
-                    title=str(item.get("title") or "飞书文档"),
-                    content=str(item.get("content") or ""),
+                    title=str(item.get("title") or "").strip(),
+                    file_name=str(artifact.get("fileName") or ""),
+                    media_type=str(artifact.get("mediaType") or ""),
+                    data=data,
                     idempotency_key=(
                         f"{request.idempotency_key}:local:"
                         + sha256_text(
@@ -4222,11 +4310,25 @@ def import_feishu_documents(
                     ),
                 )
             )
+        except (binascii.Error, ValueError):
+            failures.append(
+                {
+                    "token": str(item.get("token") or ""),
+                    "title": str(item.get("title") or "未识别标题"),
+                    "status": "failed",
+                    "documentId": None,
+                    "fileName": None,
+                    "path": None,
+                    "remoteUrl": str(item.get("url") or ""),
+                    "message": "飞书导出文件编码无效，本次未保存",
+                }
+            )
+            continue
         except LocalRuntimeError as exc:
             failures.append(
                 {
                     "token": str(item.get("token") or ""),
-                    "title": str(item.get("title") or "飞书文档"),
+                    "title": str(item.get("title") or "未识别标题"),
                     "status": "failed",
                     "documentId": None,
                     "fileName": None,
@@ -4245,7 +4347,7 @@ def import_feishu_documents(
             "failedCount": len(failures),
             "items": failures,
             "state": "blocked",
-            "message": "飞书正文已读取，但未能保存到当前设备",
+            "message": "飞书 Office 文件已导出，但未能保存到当前设备",
         }
     registered = compatibility.runtime.cloud_command(
         "POST",
@@ -4293,63 +4395,11 @@ def import_feishu_documents(
         summary_state = "not_connected"
         summary_message = ""
         if document_id:
-            try:
-                completion = compatibility.runtime.private_ai_completion(
-                    system_prompt=(
-                        "你是项目资料摘要器。只根据当前成员设备上的飞书文档"
-                        "正文生成可供本组织共享的中文项目背景摘要；保留主体、"
-                        "事实、时间、承诺、风险和待办，不补造信息。"
-                    ),
-                    prompt=str(remote.get("content") or "")[:120_000],
-                    creativity_mode="strict",
-                )
-                summary = str(completion.get("content") or "").strip()
-                if not summary:
-                    raise LocalRuntimeError(
-                        502,
-                        "feishu_import_summary_empty",
-                        "组织模型没有生成可发布摘要",
-                    )
-                _local_call(
-                    lambda: store.update_ai_summary(
-                        document_id,
-                        summary=summary,
-                        model_name=str(
-                            completion.get("modelName")
-                            or "organization_default"
-                        ),
-                    )
-                )
-                compatibility.runtime.cloud_command(
-                    "POST",
-                    f"{_CLOUD_ROOT}/projects/{_segment(project_id)}"
-                    f"/documents/{_segment(document_id)}"
-                    "/publish-local-summary",
-                    payload={
-                        "expectedVersion": int(document.get("version") or 1),
-                        "sourceContentHash": local["contentHash"],
-                        "summary": summary[:4000],
-                        "generatorVersion": str(
-                            completion.get("modelName")
-                            or "organization_default"
-                        ),
-                    },
-                    idempotency_key=(
-                        f"{request.idempotency_key}:summary:{document_id}"
-                    ),
-                    refresh_business=False,
-                )
-                summary_state = "ready"
-            except LocalRuntimeError as exc:
-                summary_state = (
-                    "failed_retryable"
-                    if exc.status_code >= 500
-                    else "blocked"
-                )
-                summary_message = (
-                    "正文已保存在当前设备；组织共享摘要未生成："
-                    + exc.message
-                )
+            # 导入命令只负责把已经验证可读的正文保存到本机并登记唯一云端
+            # 元数据。共享摘要、Wiki 和检索索引统一交给工作台现有的资料
+            # 处理队列；这里同步等待组织模型会让两份普通文档也超过 UI
+            # 截止时间，形成“实际仍在后台成功、界面先报超时”的假失败。
+            summary_state = "not_requested"
             _platform_command(
                 compatibility,
                 resource_path="feishu-doc-import/register-mapping",

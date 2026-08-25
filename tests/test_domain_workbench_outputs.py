@@ -22,6 +22,7 @@ from backend.app.ui_domains import workbench_outputs
 from backend.app.ui_domains.workbench_outputs import (
     _answer_export_title,
     _explicit_project_memory_statement,
+    _favorite_excerpt,
     _published_meeting_payload,
 )
 from backend.app.workbench_chat_local import (
@@ -446,6 +447,43 @@ def test_gc07_project_update_and_gc15_official_paths_are_connected(
         "POST",
         "/api/v2/workbench/reports/report_gc09/restore",
     )
+
+
+def test_workbench_answer_favorites_use_only_the_strict_mobile_consult_routes() -> None:
+    project_id = "client_favorite_contract"
+    answer_id = "answer_favorite_contract"
+    favorite_id = "favorite_contract"
+
+    assert WorkspaceRuntime._connected_cloud_path_allowed(
+        "GET",
+        f"/api/v2/mobile-consult/projects/{project_id}/favorites",
+    )
+    assert WorkspaceRuntime._connected_cloud_path_allowed(
+        "POST",
+        f"/api/v2/mobile-consult/answers/{answer_id}/favorite",
+    )
+    assert WorkspaceRuntime._connected_cloud_path_allowed(
+        "DELETE",
+        f"/api/v2/mobile-consult/favorites/{favorite_id}",
+    )
+    assert not WorkspaceRuntime._connected_cloud_path_allowed(
+        "GET",
+        "/api/v2/mobile-consult/projects/client/favorites/unbounded",
+    )
+    assert not WorkspaceRuntime._connected_cloud_path_allowed(
+        "POST",
+        "/api/v2/mobile-consult/answers/answer/favorite/unbounded",
+    )
+
+
+def test_workbench_answer_favorite_uses_the_canonical_markdown_body() -> None:
+    assert _favorite_excerpt(
+        {
+            "answerMarkdown": "## 项目结论\n\n这是用户实际看到的回答。",
+            "answer": "",
+            "content": "",
+        }
+    ) == "## 项目结论\n\n这是用户实际看到的回答。"
 
 
 def test_gc15_official_website_builds_strict_knowledge_and_agent_receipt(

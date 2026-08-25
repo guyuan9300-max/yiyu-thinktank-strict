@@ -860,6 +860,8 @@ def create_app(config: LocalConfig | None = None) -> FastAPI:
             else background_ui_dispatch
             if request.method == "POST"
             and (
+                ui_path.strip("/").endswith("/feishu-doc-import/import")
+                or
                 ui_path.strip("/").endswith("/process-pending")
                 or ui_path.strip("/").endswith("/retry-transcription")
                 or ui_path.strip("/").endswith("/narrative/regenerate")

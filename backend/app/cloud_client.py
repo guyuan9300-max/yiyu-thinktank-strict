@@ -61,6 +61,7 @@ class CloudClient:
         query_params: dict[str, str] | None = None,
         idempotency_key: str | None = None,
         allow_array: bool = False,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any] | list[Any]:
         headers = {"Accept": "application/json", "X-Yiyu-Client": "strict-desktop-v1"}
         if access_token:
@@ -74,6 +75,16 @@ class CloudClient:
                 headers=headers,
                 json=json_body,
                 params=query_params,
+                timeout=(
+                    httpx.Timeout(
+                        connect=min(float(timeout_seconds), 5.0),
+                        read=float(timeout_seconds),
+                        write=float(timeout_seconds),
+                        pool=5.0,
+                    )
+                    if timeout_seconds is not None
+                    else self.timeout
+                ),
             )
         except httpx.TimeoutException as exc:
             raise CloudClientError(504, "cloud_timeout", "组织云响应超时") from exc
@@ -122,6 +133,7 @@ class CloudClient:
         query_params: dict[str, str] | None = None,
         idempotency_key: str | None = None,
         allow_array: bool = False,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any] | list[Any]:
         normalized_method = method.strip().upper()
         normalized_path = "/" + path.strip().lstrip("/")
@@ -141,6 +153,7 @@ class CloudClient:
             query_params=query_params,
             idempotency_key=idempotency_key,
             allow_array=allow_array,
+            timeout_seconds=timeout_seconds,
         )
 
     def handshake(self) -> dict[str, Any]:

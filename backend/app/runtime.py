@@ -387,6 +387,11 @@ class WorkspaceRuntime:
                 return True
             if path == "/api/v2/mobile-link-transfers/pending":
                 return True
+            if re.fullmatch(
+                r"/api/v2/mobile-consult/projects/[^/]+/favorites",
+                path,
+            ):
+                return True
             if path in {
                 "/api/v2/data-center-support/team-sync/stats",
                 "/api/v2/data-center-support/evidence-quality",
@@ -699,6 +704,12 @@ class WorkspaceRuntime:
                 or path == "/api/v2/workbench/libraries/writing_skill"
                 or bool(
                     re.fullmatch(
+                        r"/api/v2/mobile-consult/answers/[^/]+/favorite",
+                        path,
+                    )
+                )
+                or bool(
+                    re.fullmatch(
                         r"/api/v2/workbench/projects/[^/]+/suggestion-log",
                         path,
                     )
@@ -845,6 +856,10 @@ class WorkspaceRuntime:
             return bool(
                 re.fullmatch(r"/api/v2/agent-skills/[^/]+", path)
                 or path == "/api/v2/organization-access/feishu/member-authorization"
+                or re.fullmatch(
+                    r"/api/v2/mobile-consult/favorites/[^/]+",
+                    path,
+                )
                 or
                 re.fullmatch(r"/api/v2/gc06/planning-cycles/[^/]+", path)
                 or
@@ -874,6 +889,7 @@ class WorkspaceRuntime:
         payload: Mapping[str, Any] | None = None,
         query: Mapping[str, str] | None = None,
         idempotency_key: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> Any:
         method = method.upper()
         if not self._connected_cloud_path_allowed(method, path):
@@ -894,14 +910,22 @@ class WorkspaceRuntime:
         client = self.cloud_factory(context.cloud_api_url)
 
         def execute(access_token: str) -> Any:
+            request_kwargs: dict[str, Any] = {
+                "access_token": access_token,
+                "query_params": dict(query or {}),
+                "json_body": dict(payload or {}) if method != "GET" else None,
+                "idempotency_key": idempotency_key,
+                "allow_array": method == "GET",
+            }
+            # Only long-running provider imports opt into a longer budget.
+            # Keeping the default call shape preserves injected test clients
+            # and leaves login, task saves and ordinary reads at 15 seconds.
+            if timeout_seconds is not None:
+                request_kwargs["timeout_seconds"] = float(timeout_seconds)
             return client.request_v2(
                 method,
                 path,
-                access_token=access_token,
-                query_params=dict(query or {}),
-                json_body=dict(payload or {}) if method != "GET" else None,
-                idempotency_key=idempotency_key,
-                allow_array=method == "GET",
+                **request_kwargs,
             )
 
         def requires_session_refresh(exc: CloudClientError) -> bool:
@@ -1580,6 +1604,7 @@ class WorkspaceRuntime:
         payload: Mapping[str, Any],
         idempotency_key: str,
         refresh_business: bool = True,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         del refresh_business
         result = self._connected_cloud_request(
@@ -1587,6 +1612,7 @@ class WorkspaceRuntime:
             path,
             payload=payload,
             idempotency_key=idempotency_key,
+            timeout_seconds=timeout_seconds,
         )
         if not isinstance(result, dict):
             raise LocalRuntimeError(502, "cloud_response_invalid", "组织云返回结构不完整")
@@ -2838,9 +2864,9 @@ class WorkspaceRuntime:
         connected = row["runtime_status"] in {"ready", "sync_degraded"}
         authorization = (snapshot or {}).get("authorization") or {}
         if authorization.get("state") == "blocked":
-            status_message = "权限租约已过期，请重新连接组织云"
+            status_message = "正在自动重新验证当前组织身份"
         elif row["runtime_status"] == "sync_degraded":
-            status_message = "组织云连接失败，当前使用租约内的最后确认权限"
+            status_message = "组织云暂时不可达，正在后台自动恢复连接"
         else:
             status_message = "组织工作空间已准备完成"
         return {
@@ -4387,7 +4413,7 @@ class WorkspaceRuntime:
 
     def _restore_active_session(self) -> dict[str, Any]:
         sandbox = self._active_sandbox()
-        if sandbox is None or sandbox["runtime_status"] == "needs_login":
+        if sandbox is None:
             return self.current()
         try:
             session, secret_reference, bundle = self._load_session_bundle(sandbox)
@@ -4408,19 +4434,36 @@ class WorkspaceRuntime:
                     "authorization_projection_stale",
                 }:
                     raise
-                refresh_key = (
-                    "gc01-restore-refresh-"
-                    + sha256_text(str(bundle["refreshToken"]))[:32]
-                )
-                session, secret_reference, bundle = self._refresh_local_session(
-                    sandbox=sandbox,
-                    session=session,
-                    secret_reference=secret_reference,
-                    bundle=bundle,
-                    client=client,
-                    idempotency_key=refresh_key,
-                )
-                payload = client.current_session(str(bundle["accessToken"]))
+                with self.local_storage_object_lock(
+                    sandbox_id=str(sandbox["id"]),
+                    object_id="gc01.local.session.refresh",
+                ):
+                    # Another panel may already have rotated the token while
+                    # this restore call was waiting.  Always reload first and
+                    # reuse that session before consuming the refresh token.
+                    session, secret_reference, bundle = self._load_session_bundle(sandbox)
+                    try:
+                        payload = client.current_session(str(bundle["accessToken"]))
+                    except CloudClientError as current_exc:
+                        if current_exc.status_code != 401 and current_exc.code not in {
+                            "authorization_lease_expired",
+                            "authorization_projection_missing",
+                            "authorization_projection_stale",
+                        }:
+                            raise
+                        refresh_key = (
+                            "gc01-restore-refresh-"
+                            + sha256_text(str(bundle["refreshToken"]))[:32]
+                        )
+                        session, secret_reference, bundle = self._refresh_local_session(
+                            sandbox=sandbox,
+                            session=session,
+                            secret_reference=secret_reference,
+                            bundle=bundle,
+                            client=client,
+                            idempotency_key=refresh_key,
+                        )
+                        payload = client.current_session(str(bundle["accessToken"]))
             self._validate_restored_identity(sandbox, bundle, payload)
             self._apply_restored_authorization(sandbox, payload)
             now = utc_now()
@@ -4442,7 +4485,7 @@ class WorkspaceRuntime:
             status = "needs_login" if exc.status_code in {401, 403} else "sync_degraded"
             self._set_workspace_runtime_status(str(sandbox["id"]), status)
         except LocalRuntimeError as exc:
-            status = "sync_degraded" if exc.status_code >= 500 else "needs_login"
+            status = "needs_login" if exc.status_code in {401, 403} else "sync_degraded"
             self._set_workspace_runtime_status(str(sandbox["id"]), status)
         return self.current()
 

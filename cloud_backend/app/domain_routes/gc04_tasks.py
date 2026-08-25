@@ -1,6 +1,8 @@
 """Unregistered GC-04/GC-05 routes for integration by the shared entry thread."""
 
+from datetime import datetime
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
 from fastapi import Body, Depends, FastAPI, Header, status
 
@@ -22,6 +24,119 @@ def register_gc04_task_routes(
     platform_integrations = PlatformIntegrationsRepository(repository)
     Identity = Annotated[SessionIdentity, Depends(identity_dependency)]
     IdempotencyKey = Annotated[str, Header(alias="Idempotency-Key")]
+
+    def task_change_summary(
+        before: dict[str, Any], after: dict[str, Any]
+    ) -> tuple[list[str], dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+        """Describe the four user-visible fields that warrant a notification."""
+
+        labels: list[str] = []
+        field_changes: dict[str, dict[str, str]] = {}
+
+        def value(record: dict[str, Any], keys: tuple[str, ...]) -> Any:
+            return next((record.get(key) for key in keys if key in record), None)
+
+        def compact(raw: Any, *, limit: int = 34) -> str:
+            text = str(raw or "").strip()
+            if not text:
+                return "未设置"
+            return text if len(text) <= limit else f"{text[:limit]}…"
+
+        def time_text(raw: Any) -> str:
+            text = str(raw or "").strip()
+            if not text:
+                return "未设置"
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+                return parsed.astimezone(ZoneInfo("Asia/Shanghai")).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            except ValueError:
+                return compact(text)
+
+        priority_names = {"low": "低", "normal": "普通", "high": "高"}
+
+        old_title = value(before, ("title",))
+        new_title = value(after, ("title",))
+        if old_title != new_title:
+            labels.append("任务名称")
+            field_changes["title"] = {
+                "old": compact(old_title),
+                "new": compact(new_title),
+            }
+
+        old_start = value(before, ("scheduled_start_at", "scheduledStartAt"))
+        old_end = value(before, ("scheduled_end_at", "scheduledEndAt"))
+        new_start = value(after, ("scheduled_start_at", "scheduledStartAt"))
+        new_end = value(after, ("scheduled_end_at", "scheduledEndAt"))
+
+        def time_range(start: Any, end: Any) -> str:
+            start_text, end_text = time_text(start), time_text(end)
+            if start_text == "未设置":
+                return "未设置"
+            if end_text == "未设置":
+                return start_text
+            if start_text[:10] == end_text[:10]:
+                return f"{start_text}—{end_text[11:]}"
+            return f"{start_text}—{end_text}"
+
+        if old_start != new_start or old_end != new_end:
+            labels.append("时间")
+            field_changes["time"] = {
+                "old": time_range(old_start, old_end),
+                "new": time_range(new_start, new_end),
+            }
+
+        old_priority = value(before, ("priority",))
+        new_priority = value(after, ("priority",))
+        if old_priority != new_priority:
+            labels.append("优先级")
+            field_changes["priority"] = {
+                "old": priority_names.get(str(old_priority or ""), compact(old_priority)),
+                "new": priority_names.get(str(new_priority or ""), compact(new_priority)),
+            }
+
+        def collaborators(record: dict[str, Any]) -> tuple[tuple[str, str, str], ...]:
+            rows = record.get("collaborators")
+            if not isinstance(rows, list):
+                return ()
+            return tuple(
+                sorted(
+                    (
+                        str(item.get("subject_membership_id") or ""),
+                        str(item.get("role_key") or ""),
+                        str(item.get("display_name") or "未命名成员"),
+                    )
+                    for item in rows
+                    if isinstance(item, dict)
+                    and str(item.get("assignment_state") or "")
+                    in {"assigned", "awaiting_owner", "returned"}
+                )
+            )
+
+        role_names = {"owner": "负责人", "collaborator": "协作者"}
+        before_roles = {
+            member_id: role_names.get(role, "未参与")
+            for member_id, role, _name in collaborators(before)
+        }
+        after_roles = {
+            member_id: role_names.get(role, "未参与")
+            for member_id, role, _name in collaborators(after)
+        }
+        role_changes = {
+            member_id: {
+                "old": before_roles.get(member_id, "未参与"),
+                "new": after_roles.get(member_id, "未参与"),
+            }
+            for member_id in set(before_roles) | set(after_roles)
+            if before_roles.get(member_id, "未参与")
+            != after_roles.get(member_id, "未参与")
+        }
+        if role_changes:
+            labels.append("你的身份")
+        return labels, field_changes, role_changes
 
     def finish_with_feishu_notification(
         identity: SessionIdentity,
@@ -205,14 +320,44 @@ def register_gc04_task_routes(
         identity: Identity,
         idempotency_key: IdempotencyKey,
     ) -> dict[str, Any]:
+        before = domain.task_detail(identity, task_id=task_id)["task"]
         result = domain.update_task(
             identity,
             task_id=task_id,
             payload=payload,
             idempotency_key=idempotency_key,
         )
+        after = result.get("task") if isinstance(result, dict) else None
+        was_completed = bool(before.get("completed_at") or before.get("completedAt"))
+        is_completed = bool(
+            isinstance(after, dict)
+            and (after.get("completed_at") or after.get("completedAt"))
+        )
+        event = (
+            "completed" if not was_completed and is_completed
+            else "reopened" if was_completed and not is_completed
+            else "updated"
+        )
+        if event == "updated" and isinstance(after, dict):
+            change_labels, field_changes, role_changes = task_change_summary(before, after)
+            result = {
+                **result,
+                "notificationChanges": change_labels,
+                "notificationFieldChanges": field_changes,
+                "notificationRoleChanges": role_changes,
+            }
+            # Description-only edits are intentionally silent on Feishu.
+            if not change_labels:
+                return {
+                    **result,
+                    "notificationResult": {
+                        "state": "skipped",
+                        "reason": "no_notifiable_changes",
+                        "message": "任务已保存；本次变化无需发送飞书通知",
+                    },
+                }
         return finish_with_feishu_notification(
-            identity, result, event="updated", idempotency_key=idempotency_key
+            identity, result, event=event, idempotency_key=idempotency_key
         )
 
     @app.delete("/api/v2/domain/tasks/{task_id}")
@@ -222,12 +367,29 @@ def register_gc04_task_routes(
         identity: Identity,
         idempotency_key: IdempotencyKey,
     ) -> dict[str, Any]:
-        return domain.delete_task(
+        task = domain.task_detail(identity, task_id=task_id)["task"]
+        result = domain.delete_task(
             identity,
             task_id=task_id,
             expected_version=int(payload.get("expectedVersion") or 0),
             idempotency_key=idempotency_key,
         )
+        try:
+            notification = platform_integrations.deliver_task_notifications(
+                identity,
+                result={**result, "task": task},
+                event="deleted",
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            notification = {
+                "state": "failed_retryable",
+                "requestedRecipients": 0,
+                "deliveryCount": 0,
+                "partialSuccess": False,
+                "message": "软件任务已删除；飞书通知和投影稍后重试",
+            }
+        return {**result, "notificationResult": notification}
 
     @app.post("/api/v2/domain/tasks/{task_id}/inbox/{action}")
     def handle_task_inbox(
@@ -245,10 +407,19 @@ def register_gc04_task_routes(
             reason=payload.get("reason"),
             idempotency_key=idempotency_key,
         )
+        if action == "accept":
+            return {
+                **result,
+                "notificationResult": {
+                    "state": "skipped",
+                    "reason": "owner_acceptance_keeps_existing_projection",
+                    "message": "负责人已接受；既有飞书任务和通知保持不变",
+                },
+            }
         return finish_with_feishu_notification(
             identity,
             result,
-            event="accepted" if action == "accept" else "returned",
+            event="returned",
             idempotency_key=idempotency_key,
         )
 

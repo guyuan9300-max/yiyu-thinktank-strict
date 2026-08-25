@@ -1538,6 +1538,45 @@ def sync_project(
     if hasattr(compatibility.runtime, "database_path"):
         store = LocalProjectMaterialsRepository(compatibility.runtime)
         pending_materials = store.pending_cloud_materials(project_id)
+        metadata_updates = [
+            item
+            for item in pending_materials
+            if _string(item.get("cloudMetadataOperation")) == "update"
+            and _string(item.get("cloudDocumentId") or item.get("documentId"))
+        ]
+        for item in metadata_updates:
+            document_id = _string(
+                item.get("cloudDocumentId") or item.get("documentId")
+            )
+            preview = compatibility.runtime.cloud_query(
+                "/api/v2/domain/project-materials/projects/"
+                f"{project_id}/documents/{document_id}/reading-preview"
+            )
+            updated = compatibility.runtime.cloud_command(
+                "PATCH",
+                "/api/v2/domain/project-materials/projects/"
+                f"{project_id}/documents/{document_id}/local-metadata",
+                payload={
+                    "expectedVersion": int(preview.get("aggregateVersion") or 1),
+                    "title": item.get("title") or item.get("fileName"),
+                    "fileName": item.get("fileName"),
+                    "contentHash": item.get("contentHash"),
+                    "byteSize": int(item.get("byteSize") or 0),
+                    "mediaType": item.get("mediaType"),
+                },
+                idempotency_key=(
+                    f"{request.idempotency_key}:rename:{document_id}:"
+                    f"{sha256_text(_string(item.get('fileName')))[:12]}"
+                ),
+            )
+            store.complete_cloud_metadata_update(
+                project_id=project_id,
+                document_id=document_id,
+                version=int(updated.get("version") or 1),
+            )
+        pending_materials = [
+            item for item in pending_materials if item not in metadata_updates
+        ]
         if pending_materials:
             material_signature = sha256_text(
                 canonical_json(
@@ -2159,6 +2198,15 @@ def _answer_for_message(
     return answer
 
 
+def _favorite_excerpt(answer: Mapping[str, Any]) -> str:
+    """Return the canonical visible answer body for a member favorite."""
+    return _string(
+        answer.get("answerMarkdown")
+        or answer.get("answer")
+        or answer.get("content")
+    )
+
+
 @router.get(r"clients/([^/]+)/workspace/chat/messages/([^/]+)")
 def get_chat_message(
     compatibility: Any,
@@ -2270,7 +2318,7 @@ def favorite_answer(
         request,
         "POST",
         f"/api/v2/mobile-consult/answers/{_string(answer.get('answerId'))}/favorite",
-        {"projectId": project_id, "excerpt": _string(answer.get("answer") or answer.get("content"))},
+        {"projectId": project_id, "excerpt": _favorite_excerpt(answer)},
     )
     return {
         **result,

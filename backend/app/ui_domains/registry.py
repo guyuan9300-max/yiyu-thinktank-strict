@@ -54,6 +54,10 @@ def build_default_registry() -> UiDomainRegistry:
         ("POST", r"clients"),
         ("PUT", r"clients/(?P<project_id>[^/]+)"),
         ("GET", r"clients/(?P<project_id>[^/]+)/workspace"),
+        (
+            "GET",
+            r"clients/(?P<project_id>[^/]+)/documents/local-filename-state",
+        ),
         ("POST", r"imports"),
         (
             "POST",

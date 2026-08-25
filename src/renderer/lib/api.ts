@@ -2100,6 +2100,16 @@ export async function getCurrentWorkspace() {
   return request<SandboxWorkspaceRecord>('/api/v2/ui/workspaces/current');
 }
 
+/**
+ * Revalidate the active organization session and repair its local projection.
+ * This is deliberately separate from workspace activation: a transient cloud
+ * failure or an expired access token must never require the user to switch the
+ * workspace again merely to refresh credentials.
+ */
+export async function restoreCurrentWorkspaceSession() {
+  return request<AuthState>('/api/v2/workspaces/restore', { method: 'POST' });
+}
+
 export async function createWorkspace(payload: SandboxWorkspaceCreatePayload) {
   return request<SandboxWorkspacesResponse>('/api/v2/ui/workspaces', {
     method: 'POST',
@@ -2535,13 +2545,6 @@ export async function getFeishuDocImportStatus() {
   return request<FeishuDocImportStatus>('/api/v2/ui/feishu-doc-import/status');
 }
 
-export async function searchFeishuDocsForImport(payload: { query: string; pageSize?: number }) {
-  return request<FeishuDocImportSearchResult>('/api/v2/ui/feishu-doc-import/search', {
-    method: 'POST',
-    body: JSON.stringify({ query: payload.query, pageSize: payload.pageSize ?? 20 }),
-  });
-}
-
 export async function resolveFeishuDocImportLinks(links: string[]) {
   return request<FeishuDocImportSearchResult>('/api/v2/ui/feishu-doc-import/resolve-links', {
     method: 'POST',
@@ -2912,6 +2915,19 @@ export async function syncClient(id: string) {
   return request<ClientSummary>(`/api/v2/ui/clients/${encodeURIComponent(id)}/sync`, {
     method: 'POST',
   });
+}
+
+export interface LocalDocumentFilenameState {
+  clientId: string;
+  documents: Array<Pick<DocumentRecord, 'id' | 'title' | 'path' | 'originalSourcePath' | 'source'>>;
+  needsCloudSync: boolean;
+  pendingDocumentIds: string[];
+}
+
+export async function getLocalDocumentFilenameState(clientId: string) {
+  return request<LocalDocumentFilenameState>(
+    `/api/v2/ui/clients/${encodeURIComponent(clientId)}/documents/local-filename-state`,
+  );
 }
 
 export async function updateClient(id: string, payload: ClientMutationPayload) {

@@ -270,6 +270,54 @@ def test_task_notification_to_self_has_exactly_one_recipient(
     ]
 
 
+def test_task_notification_card_states_actor_role_and_changes() -> None:
+    card = PlatformIntegrationsRepository._task_notification_card(
+        task={
+            "title": "飞书卡片字段验收",
+            "priority": "high",
+            "scheduled_start_at": "2026-08-25T09:00:00+08:00",
+            "scheduled_end_at": "2026-08-25T10:00:00+08:00",
+        },
+        action_label="任务已修改",
+        sender_name="林佳维",
+        recipient_role="负责人",
+        event="updated",
+        field_changes={
+            "title": {"old": "飞书卡片验收", "new": "飞书卡片字段验收"},
+            "time": {
+                "old": "2026-08-25 09:00—10:00",
+                "new": "2026-08-25 09:00—11:00",
+            },
+            "priority": {"old": "普通", "new": "高"},
+        },
+    )
+
+    assert card["header"]["title"]["content"] == "任务已修改"
+    content = card["elements"][0]["text"]["content"]
+    assert "任务名称（修改）：** 飞书卡片验收 → **飞书卡片字段验收**" in content
+    assert "时间（修改）：** 2026-08-25 09:00—10:00 → **2026-08-25 09:00—11:00**" in content
+    assert "优先级（修改）：** 普通 → **高**" in content
+    assert "修改项" not in content
+    assert "任务说明" not in content
+    assert "你的身份：** 负责人" in content
+    assert "操作者：** 林佳维" in content
+    assert content.index("你的身份：** 负责人") < content.index("时间（修改）：**")
+    assert content.index("时间（修改）：**") < content.index("优先级（修改）：**")
+    assert "你有一项任务需要处理" not in content
+    assert "来自" not in content
+
+    role_card = PlatformIntegrationsRepository._task_notification_card(
+        task={"title": "身份变更验收", "priority": "normal"},
+        action_label="任务已修改",
+        sender_name="林佳维",
+        recipient_role="负责人",
+        event="updated",
+        role_change={"old": "协作者", "new": "负责人"},
+    )
+    role_content = role_card["elements"][0]["text"]["content"]
+    assert "你的身份（修改）：** 协作者 → **负责人**" in role_content
+
+
 def test_task_notification_holds_collaborators_until_owner_accepts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -325,3 +373,192 @@ def test_task_notification_holds_collaborators_until_owner_accepts(
     assert result["requestedRecipients"] == 1
     assert recipients == [owner.membership_id]
     assert collaborator.membership_id not in recipients
+
+
+def test_feishu_task_update_uses_member_delta_endpoints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, identity, _payload = _repository(tmp_path)
+    platform = PlatformIntegrationsRepository(repository)
+    calls: list[dict[str, Any]] = []
+
+    with platform._connection() as connection:
+        connection.execute(
+            "INSERT INTO feishu_mappings "
+            "(id,scope_id,external_side_effect_id,remote_id,remote_receipt,status,"
+            "mapping_kind,local_resource_id,bound_membership_id,created_at,revoked_at,"
+            "version,lifecycle_state,updated_at,deleted_at) "
+            "VALUES (?,?,NULL,?,?,'active','task_v2_task',?,NULL,?,NULL,1,'active',?,NULL)",
+            (
+                "feishu-map-update-test",
+                identity.scope_id,
+                "remote-task-1",
+                '{"remoteUrl":"https://example.invalid/task/remote-task-1"}',
+                "local-task-1",
+                "2026-08-25T00:00:00Z",
+                "2026-08-25T00:00:00Z",
+            ),
+        )
+        connection.commit()
+    monkeypatch.setattr(platform, "_feishu_configuration", lambda _identity: {})
+    monkeypatch.setattr(
+        platform,
+        "_feishu_tenant_access_token",
+        lambda _identity, _configuration: "tenant-token",
+    )
+
+    def fake_provider(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append(
+            {
+                "method": method,
+                "url": url,
+                "payload": kwargs.get("payload"),
+            }
+        )
+        if method == "GET":
+            return {
+                "data": {
+                    "task": {
+                        "guid": "remote-task-1",
+                        "members": [
+                            {"id": "old-open-id", "type": "user", "role": "assignee"}
+                        ],
+                    }
+                }
+            }
+        return {
+            "data": {
+                "task": {
+                    "guid": "remote-task-1",
+                    "url": "https://example.invalid/task/remote-task-1",
+                }
+            }
+        }
+
+    monkeypatch.setattr(platform, "_feishu_provider_json", fake_provider)
+    monkeypatch.setattr(
+        platform,
+        "_record_command",
+        lambda *_args, **kwargs: dict(kwargs.get("result_details") or {}),
+    )
+    monkeypatch.setattr(platform, "_record_feishu_mapping", lambda *_args, **_kwargs: None)
+
+    result = platform._project_task_to_feishu(
+        identity,
+        task={
+            "id": "local-task-1",
+            "title": "任务更新投影",
+            "description": "只用正式字段更新任务",
+            "version": 2,
+            "scheduled_start_at": "2026-08-24T09:00",
+            "scheduled_end_at": "2026-08-24T10:00",
+        },
+        member_open_ids=["new-open-id"],
+        idempotency_key="feishu-task-update-member-delta",
+        event="updated",
+    )
+
+    patch_call = next(call for call in calls if call["method"] == "PATCH")
+    assert "members" not in patch_call["payload"]["task"]
+    assert "members" not in patch_call["payload"]["update_fields"]
+    add_call = next(call for call in calls if call["url"].endswith("/add_members"))
+    remove_call = next(call for call in calls if call["url"].endswith("/remove_members"))
+    assert add_call["payload"]["members"] == [
+        {"id": "new-open-id", "type": "user", "role": "assignee"}
+    ]
+    assert remove_call["payload"]["members"] == [
+        {"id": "old-open-id", "type": "user", "role": "assignee"}
+    ]
+    assert result["state"] == "completed"
+
+
+def test_feishu_task_non_create_never_falls_back_to_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, identity, _payload = _repository(tmp_path)
+    platform = PlatformIntegrationsRepository(repository)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        platform,
+        "_feishu_provider_json",
+        lambda method, url, **kwargs: calls.append({"method": method, "url": url}) or {},
+    )
+    monkeypatch.setattr(
+        platform,
+        "_record_command",
+        lambda *_args, **kwargs: dict(kwargs.get("result_details") or {}),
+    )
+
+    result = platform._project_task_to_feishu(
+        identity,
+        task={"id": "missing-map-task", "title": "不可降级新建", "version": 3},
+        member_open_ids=["open-id"],
+        idempotency_key="missing-map-complete",
+        event="completed",
+    )
+
+    assert result["state"] == "failed_retryable"
+    assert calls == []
+
+
+def test_feishu_task_complete_and_reopen_patch_same_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, identity, _payload = _repository(tmp_path)
+    platform = PlatformIntegrationsRepository(repository)
+    with platform._connection() as connection:
+        connection.execute(
+            "INSERT INTO feishu_mappings "
+            "(id,scope_id,external_side_effect_id,remote_id,remote_receipt,status,"
+            "mapping_kind,local_resource_id,bound_membership_id,created_at,revoked_at,"
+            "version,lifecycle_state,updated_at,deleted_at) "
+            "VALUES (?,?,NULL,?,?,'active','task_v2_task',?,NULL,?,NULL,1,'active',?,NULL)",
+            (
+                "feishu-map-completion-test",
+                identity.scope_id,
+                "same-remote-task",
+                '{"remoteUrl":"https://example.invalid/task/same-remote-task"}',
+                "completion-task",
+                "2026-08-25T00:00:00Z",
+                "2026-08-25T00:00:00Z",
+            ),
+        )
+        connection.commit()
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(platform, "_feishu_configuration", lambda _identity: {})
+    monkeypatch.setattr(
+        platform, "_feishu_tenant_access_token", lambda _identity, _configuration: "token"
+    )
+
+    def fake_provider(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"method": method, "url": url, "payload": kwargs.get("payload")})
+        return {"data": {"task": {"guid": "same-remote-task"}}}
+
+    monkeypatch.setattr(platform, "_feishu_provider_json", fake_provider)
+    monkeypatch.setattr(
+        platform,
+        "_record_command",
+        lambda *_args, **kwargs: {
+            "operationId": "completion-operation",
+            **dict(kwargs.get("result_details") or {}),
+        },
+    )
+    monkeypatch.setattr(platform, "_record_feishu_mapping", lambda *_args, **_kwargs: None)
+
+    for event in ("completed", "reopened"):
+        result = platform._project_task_to_feishu(
+            identity,
+            task={"id": "completion-task", "title": "同一飞书任务", "version": 4},
+            member_open_ids=[],
+            idempotency_key=f"same-map-{event}",
+            event=event,
+        )
+        assert result["remoteId"] == "same-remote-task"
+
+    assert all(call["method"] == "PATCH" for call in calls)
+    assert all(call["url"].endswith("/same-remote-task") for call in calls)
+    assert calls[0]["payload"]["update_fields"] == ["completed_at"]
+    assert calls[1]["payload"]["task"]["completed_at"] == "0"

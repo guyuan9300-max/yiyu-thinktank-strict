@@ -5528,8 +5528,19 @@ export interface FeishuDocImportCandidate {
   source: 'search' | 'link';
 }
 
+export interface FeishuDocImportResolveFailure {
+  url: string;
+  title?: string;
+  token?: string;
+  type?: string;
+  status: 'failed';
+  errorCode: string;
+  message: string;
+}
+
 export interface FeishuDocImportSearchResult {
   items: FeishuDocImportCandidate[];
+  failedItems?: FeishuDocImportResolveFailure[];
   message: string;
 }
 
