@@ -83,6 +83,11 @@ test('network git retries terminate the whole process tree and verify GitHub mai
     true,
   );
   assert.match(collabSource, /if \(trackingAfterPush !== localHead\)/);
+  assert.equal(
+    collabSource.includes("'http.version=HTTP/1.1'"),
+    true,
+  );
+  assert.match(collabSource, /action: '推送 GitHub main'[\s\S]*timeoutMs: 180_000/);
 });
 
 test('maintenance push uses the bounded publish gate instead of stale full-suite fixtures', () => {

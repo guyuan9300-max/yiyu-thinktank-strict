@@ -809,11 +809,18 @@ async function fetchMain(repoPath: string): Promise<void> {
 
   await runNetworkGit(
     repoPath,
-    ['fetch', '--prune', 'origin', '+refs/heads/main:refs/remotes/origin/main'],
+    [
+      '-c',
+      'http.version=HTTP/1.1',
+      'fetch',
+      '--prune',
+      'origin',
+      '+refs/heads/main:refs/remotes/origin/main',
+    ],
     {
       action: '读取 GitHub main',
       attempts: 3,
-      timeoutMs: 15_000,
+      timeoutMs: 60_000,
     },
   );
   const fetchedOid = await run(repoPath, ['rev-parse', 'refs/remotes/origin/main']);
@@ -968,11 +975,17 @@ export async function pushStrictMain(
   }
   await runNetworkGit(
     repoPath,
-    ['push', 'origin', `HEAD:refs/heads/${STRICT_REPOSITORY.targetBranch}`],
+    [
+      '-c',
+      'http.version=HTTP/1.1',
+      'push',
+      'origin',
+      `HEAD:refs/heads/${STRICT_REPOSITORY.targetBranch}`,
+    ],
     {
       action: '推送 GitHub main',
       attempts: 3,
-      timeoutMs: 30_000,
+      timeoutMs: 180_000,
     },
   );
   const localHead = await run(repoPath, ['rev-parse', 'HEAD']);
