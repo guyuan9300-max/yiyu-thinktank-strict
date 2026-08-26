@@ -38,7 +38,6 @@ type TaskCalendarViewProps = {
   uiSessionScopeKey: string;
   tasks: Task[];
   meetings?: GC06Meeting[];
-  clientColorById?: Record<string, string>;
   currentUserId?: string | null;
   calendarDisplayMode: CalendarDisplayMode;
   onSetCalendarDisplayMode: (mode: CalendarDisplayMode) => void;
@@ -65,6 +64,9 @@ type TaskCalendarViewProps = {
   isTaskOverdue: (task: Task, today?: Date) => boolean;
   roleFilter: CalendarRoleFilter;
   onRoleFilterChange: (role: CalendarRoleFilter) => void;
+  projectFilterId: string;
+  onProjectFilterChange: (projectId: string) => void;
+  projectOptions: Array<{ id: string; name: string }>;
 };
 
 const sourceTypeLabels: Record<string, string> = {
@@ -84,7 +86,8 @@ const DAY_MINUTES = 24 * 60;
 const WEEK_MAX_VISIBLE_COLUMNS = 3; // 同时段最多可见 3 个任务卡,第 4 个起聚合 +N
 const WEEK_OVERLAP_INDENT_RATIO = 0.18; // indent 风格:每个后续重叠任务向右偏移 18%
 const WEEK_OVERLAP_INDENT_THRESHOLD = 2; // 重叠任务数 ≤ 2 时均分宽度,≥ 3 用 indent 风格
-const DEFAULT_UNLINKED_TASK_COLOR = '#5B7BFE';
+const HIGH_PRIORITY_TASK_COLOR = '#5B7BFE';
+const STANDARD_PRIORITY_TASK_COLOR = '#16A34A';
 const LOCAL_DRAFT_NOTICE = '任务正在保存，稍后再调整时间。';
 
 // 月视图跨天连续条单车道高度(px)
@@ -104,6 +107,7 @@ function isMultiDayCalendarTask(task: Task): boolean {
 
 function formatMonthTaskStartTime(task: Task) {
   const range = resolveTaskDateTimeRange(task);
+  if (!range.hasExplicitTime) return '';
   return `${String(range.startDateTime.getHours()).padStart(2, '0')}:${String(range.startDateTime.getMinutes()).padStart(2, '0')}`;
 }
 
@@ -307,22 +311,11 @@ function taskOrgSummary(task: Task) {
   return parts.join(' · ');
 }
 
-function isTransportItineraryTask(task: Task) {
-  const text = `${task.title || ''}\n${task.desc || ''}`.trim();
-  if (!text) return false;
-  return /(飞[\u4e00-\u9fff]{1,8}|飞去[\u4e00-\u9fff]{1,8}|飞往[\u4e00-\u9fff]{1,8}|航班|机票|火车去[\u4e00-\u9fff]{1,8}|高铁去[\u4e00-\u9fff]{1,8}|动车去[\u4e00-\u9fff]{1,8}|坐火车去[\u4e00-\u9fff]{1,8}|坐高铁去[\u4e00-\u9fff]{1,8}|乘火车去[\u4e00-\u9fff]{1,8}|乘高铁去[\u4e00-\u9fff]{1,8})/.test(text);
+function calendarTaskAccentColor(task: Task) {
+  return task.priority === 'high' ? HIGH_PRIORITY_TASK_COLOR : STANDARD_PRIORITY_TASK_COLOR;
 }
 
-function calendarTaskAccentColor(task: Task, clientColorById?: Record<string, string>) {
-  if (isTransportItineraryTask(task)) return '#16A34A';
-  const normalizedClientId = (task.clientId || '').trim();
-  if (!normalizedClientId) return DEFAULT_UNLINKED_TASK_COLOR;
-  const clientColor = (clientColorById?.[normalizedClientId] || '').trim();
-  if (clientColor) return clientColor;
-  return DEFAULT_UNLINKED_TASK_COLOR;
-}
-
-function calendarChipStyle(task: Task, clientColorById?: Record<string, string>) {
+function calendarChipStyle(task: Task) {
   if (task.status === 'done') {
     return {
       color: '#94A3B8',
@@ -330,7 +323,7 @@ function calendarChipStyle(task: Task, clientColorById?: Record<string, string>)
       borderColor: '#E2E8F0',
     };
   }
-  const accentColor = calendarTaskAccentColor(task, clientColorById);
+  const accentColor = calendarTaskAccentColor(task);
   return {
     color: accentColor,
     backgroundColor: `${accentColor}14`,
@@ -444,7 +437,6 @@ export function TaskCalendarView({
   uiSessionScopeKey,
   tasks,
   meetings = [],
-  clientColorById,
   currentUserId: _currentUserId,
   calendarDisplayMode,
   onSetCalendarDisplayMode,
@@ -467,6 +459,9 @@ export function TaskCalendarView({
   isTaskOverdue,
   roleFilter,
   onRoleFilterChange,
+  projectFilterId,
+  onProjectFilterChange,
+  projectOptions,
 }: TaskCalendarViewProps) {
   const [isJumpPickerOpen, setIsJumpPickerOpen] = useState(false);
   const [jumpDateInput, setJumpDateInput] = useState(() => formatJumpDateValue(selectedDate));
@@ -819,7 +814,7 @@ export function TaskCalendarView({
         const slots: Array<MonthDayBarSlot | null> = new Array(laneCount).fill(null);
         placed.forEach(({ bar, lane }) => {
           if (col < bar.firstCol || col > bar.lastCol) return;
-          const fullTitle = `${formatMonthTaskStartTime(bar.task)} ${bar.task.title}`;
+          const fullTitle = [formatMonthTaskStartTime(bar.task), bar.task.title].filter(Boolean).join(' ');
           slots[lane] = {
             task: bar.task,
             roundLeft: col === bar.firstCol && !bar.continuesLeft,
@@ -977,7 +972,7 @@ export function TaskCalendarView({
         const dayStart = new Date(day.getFullYear(), day.getMonth(), day.getDate());
         const dayEnd = addDays(dayStart, 1);
         return tasks.filter((task) => {
-          if (getTaskScheduleRange(task)) return false;
+          if (resolveTaskDateTimeRange(task).hasExplicitTime) return false;
           const tDate = resolveTaskCalendarDate(task);
           if (!tDate) return false;
           return tDate >= dayStart && tDate < dayEnd;
@@ -1708,10 +1703,99 @@ export function TaskCalendarView({
   const periodStats = calendarDisplayMode === 'week' ? visibleWeekStats : monthStats;
   const periodTitle = calendarDisplayMode === 'week' ? visibleWeekPage.title : formatMonthTitle(activeMonthDate);
 
+  const renderWeekUnscheduledRow = (page: typeof visibleWeekPage) => (
+    <div
+      className="grid h-14 shrink-0 grid-cols-[56px_repeat(7,minmax(0,1fr))] border-b border-gray-100 bg-amber-50/30"
+      aria-label="未安排具体时间的任务"
+    >
+      <div className="flex items-center justify-end border-r border-gray-100 px-2 text-right text-[10px] font-semibold text-amber-700">
+        未安排
+      </div>
+      {page.days.map((day, dayIndex) => {
+        const items = page.unscheduledByDay[dayIndex] || [];
+        return (
+          <div
+            key={`${page.key}-fixed-unscheduled-${day.toISOString()}`}
+            className="h-14 overflow-y-auto overscroll-contain border-l border-gray-100 px-1.5 py-1 scrollbar-thin"
+          >
+            <div className="flex min-h-full flex-col gap-1">
+              {items.map((task) => {
+                const isTaskLocalDraft = isLocalDraftTaskId(task.id);
+                const isDone = task.status === 'done';
+                return (
+                  <div
+                    key={`${page.key}-fixed-unscheduled-${day.toISOString()}-${task.id}`}
+                    role="button"
+                    tabIndex={0}
+                    draggable={!isTaskLocalDraft}
+                    onDragStart={(event) => {
+                      if (isTaskLocalDraft) {
+                        event.preventDefault();
+                        onCalendarNotice?.('info', LOCAL_DRAFT_NOTICE);
+                        return;
+                      }
+                      event.dataTransfer.effectAllowed = 'move';
+                      event.dataTransfer.setData('text/plain', task.id);
+                      try {
+                        const sourceEl = event.currentTarget as HTMLElement;
+                        const ghostEl = sourceEl.cloneNode(true) as HTMLElement;
+                        const rect = sourceEl.getBoundingClientRect();
+                        ghostEl.style.cssText = `position:fixed; top:-9999px; left:-9999px; width:${rect.width}px; opacity:0.85; transform:rotate(-1.5deg); box-shadow:0 8px 16px rgba(15,23,42,0.18); pointer-events:none; z-index:9999;`;
+                        document.body.appendChild(ghostEl);
+                        event.dataTransfer.setDragImage(
+                          ghostEl,
+                          Math.min(rect.width / 2, 80),
+                          Math.min(rect.height / 2, 12),
+                        );
+                        window.setTimeout(() => {
+                          try { document.body.removeChild(ghostEl); } catch { /* ignore */ }
+                        }, 0);
+                      } catch {
+                        // The native drag still works when a custom preview is unavailable.
+                      }
+                      dragDropHandledRef.current = false;
+                      setDraggingTaskId(task.id);
+                    }}
+                    onDragEnd={() => {
+                      if (!dragDropHandledRef.current) {
+                        setDraggingTaskId(null);
+                        setDragTargetDay(null);
+                        setDragTargetMinute(null);
+                      }
+                      dragDropHandledRef.current = false;
+                    }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onOpenTaskEditor(task);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        onOpenTaskEditor(task);
+                      }
+                    }}
+                    className={`shrink-0 truncate rounded-md border px-2 py-0.5 text-[10px] font-semibold leading-4 transition ${isTaskLocalDraft ? 'cursor-default opacity-60' : 'cursor-grab active:cursor-grabbing hover:shadow-sm'} ${isDone ? 'border-slate-200 bg-slate-50 text-slate-400 line-through' : 'border-amber-200 bg-white text-amber-900 hover:border-amber-300'} ${draggingTaskId === task.id ? 'opacity-50' : ''}`}
+                    title={`未安排时间：${task.title}\n拖到下方时间格即可分配时间`}
+                    aria-label={`未安排任务 ${task.title}：拖到时间格分配时间，或点击编辑`}
+                  >
+                    {task.title}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+
   return (
     <div ref={calendarRootRef} className="grid h-full min-h-0 w-full min-w-0 grid-cols-1 items-stretch gap-6 transition-all xl:grid-cols-[minmax(0,1fr)]">
-      <div className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-visible rounded-2xl border border-gray-100 bg-white">
-        <div ref={calendarToolbarRef} className="sticky top-0 z-40 flex flex-col gap-3 rounded-t-2xl border-b border-gray-100 bg-white/95 px-5 py-5 backdrop-blur lg:px-6">
+      <div className={`flex h-full min-h-0 w-full min-w-0 flex-col rounded-2xl border border-gray-100 bg-white ${calendarDisplayMode === 'week' ? 'overflow-hidden' : 'overflow-visible'}`}>
+        <div
+          ref={calendarToolbarRef}
+          className={`${calendarDisplayMode === 'week' ? 'relative shrink-0' : 'sticky top-0'} z-40 flex flex-col gap-3 rounded-t-2xl border-b border-gray-100 bg-white/95 px-5 py-5 backdrop-blur lg:px-6`}
+        >
           <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
             <div className="space-y-3">
               <div className="flex flex-wrap items-center gap-3">
@@ -1739,6 +1823,20 @@ export function TaskCalendarView({
             </div>
 
             <div className="flex flex-wrap items-center justify-end gap-2 self-start lg:self-auto">
+              <label className="inline-flex items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-2 text-[11px] font-bold text-gray-500">
+                <span>项目</span>
+                <select
+                  value={projectFilterId}
+                  onChange={(event) => onProjectFilterChange(event.target.value)}
+                  className="max-w-[160px] bg-transparent text-[11px] font-bold text-gray-800 outline-none"
+                >
+                  <option value="__all__">全部项目</option>
+                  <option value="__none__">无项目</option>
+                  {projectOptions.map((project) => (
+                    <option key={project.id} value={project.id}>{project.name}</option>
+                  ))}
+                </select>
+              </label>
               <div className="inline-flex rounded-xl bg-gray-100 p-1" aria-label="按本人在事项中的身份筛选">
                 {([
                   ['creator', '发起人'],
@@ -1922,8 +2020,8 @@ export function TaskCalendarView({
                           }
                           onOpenTaskEditor(item.task);
                         }}
-                        className={`relative flex h-[18px] max-w-[260px] shrink-0 items-center rounded-md border pl-7 pr-2 text-[10px] font-semibold leading-none ${isTaskLocalDraft ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'} ${item.task.status === 'done' ? 'line-through' : ''} ${draggingTaskId === item.task.id ? 'opacity-50' : ''}`}
-                        style={calendarChipStyle(item.task, clientColorById)}
+                        className={`relative flex h-[18px] max-w-[260px] shrink-0 items-center rounded-md border pl-7 pr-2 text-[10px] font-semibold leading-none ${isTaskLocalDraft ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'} ${item.task.status === 'done' ? 'line-through' : ''} ${draggingTaskId === item.task.id ? 'opacity-50' : ''} ${isTaskOverdue(item.task, today) && item.task.status !== 'done' ? 'ring-1 ring-rose-400' : ''}`}
+                        style={calendarChipStyle(item.task)}
                       >
                         <button
                           type="button"
@@ -2153,7 +2251,7 @@ export function TaskCalendarView({
                               if (!slot) {
                                 return <div key={`barspace-${lane}`} style={{ height: MONTH_MULTIDAY_BAR_HEIGHT }} aria-hidden="true" />;
                               }
-                              const barStyle = calendarChipStyle(slot.task, clientColorById);
+                              const barStyle = calendarChipStyle(slot.task);
                               return (
                                 <div
                                   key={`bar-${lane}-${slot.task.id}`}
@@ -2197,7 +2295,7 @@ export function TaskCalendarView({
                                       onOpenTaskEditor(slot.task);
                                     }
                                   }}
-                                  className={`relative flex items-center gap-0.5 overflow-visible whitespace-nowrap border-y px-2 text-[11px] font-semibold leading-none shadow-[0_1px_2px_rgba(15,23,42,0.04)] ${isLocalDraftTaskId(slot.task.id) ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'} ${draggingTaskId === slot.task.id ? 'opacity-50' : ''} ${slot.roundLeft ? 'ml-0 rounded-l-md border-l' : '-ml-2'} ${slot.roundRight ? 'mr-0 rounded-r-md border-r' : '-mr-2'} ${slot.task.status === 'done' ? 'line-through' : ''}`}
+                                  className={`relative flex items-center gap-0.5 overflow-visible whitespace-nowrap border-y px-2 text-[11px] font-semibold leading-none shadow-[0_1px_2px_rgba(15,23,42,0.04)] ${isLocalDraftTaskId(slot.task.id) ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'} ${draggingTaskId === slot.task.id ? 'opacity-50' : ''} ${slot.roundLeft ? 'ml-0 rounded-l-md border-l' : '-ml-2'} ${slot.roundRight ? 'mr-0 rounded-r-md border-r' : '-mr-2'} ${slot.task.status === 'done' ? 'line-through' : ''} ${isTaskOverdue(slot.task, today) && slot.task.status !== 'done' ? 'ring-1 ring-rose-400' : ''}`}
                                   style={{ height: MONTH_MULTIDAY_BAR_HEIGHT, color: barStyle.color, backgroundColor: barStyle.backgroundColor, borderColor: barStyle.borderColor }}
                                 >
                                   {slot.continuesLeft && (
@@ -2325,14 +2423,12 @@ export function TaskCalendarView({
                                     }
                                     dragDropHandledRef.current = false;
                                   }}
-                                  className={`group relative mx-px block h-[18px] max-w-full rounded-md border py-0 pl-2 pr-1 text-left text-[11px] font-semibold leading-none ${isTaskLocalDraft ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'} ${
+                                  className={`group relative mx-px flex h-[18px] max-w-full items-center rounded-md border py-0 pl-2 pr-1 text-left text-[11px] font-semibold leading-none ${isTaskLocalDraft ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'} ${
                                     task.status === 'done' ? 'line-through' : 'shadow-[0_1px_2px_rgba(15,23,42,0.04)]'
                                   } ${draggingTaskId === task.id ? 'opacity-50' : ''} ${
                                     isTaskOverdue(task, today) && task.status !== 'done' ? 'ring-1 ring-rose-400' : ''
-                                  } ${
-                                    task.priority === 'high' && task.status !== 'done' ? 'border-l-[3px]' : ''
                                   }`}
-                                  style={calendarChipStyle(task, clientColorById)}
+                                  style={calendarChipStyle(task)}
                                   title={`${timePrefix}${task.title}${taskOrgSummary(task) ? ` · ${taskOrgSummary(task)}` : ''}`}
                                   onClick={(event) => {
                                     event.stopPropagation();
@@ -2367,7 +2463,7 @@ export function TaskCalendarView({
                                   >
                                     {task.status === 'done' ? <Check size={10} strokeWidth={3} /> : null}
                                   </button>
-                                  <span className="flex items-center gap-0.5 overflow-hidden whitespace-nowrap pl-5 pr-1">
+                                  <span className="flex h-full min-w-0 flex-1 items-center gap-0.5 overflow-hidden whitespace-nowrap pl-5 pr-1">
                                     {/* 5/26 ⑯: 跨天任务首尾箭头 — 用户能立刻识别"这个任务是跨多天的, 这是端点之一" */}
                                     {(isLastDay || isMiddleDay) && (
                                       <ChevronLeft size={9} strokeWidth={2.5} className="shrink-0 opacity-70" aria-hidden="true" />
@@ -2404,67 +2500,67 @@ export function TaskCalendarView({
             </div>
           </div>
         ) : (
-          <div className="border-t border-gray-100">
-            <div
-              className="sticky z-30 grid grid-cols-[56px_repeat(7,minmax(0,1fr))] border-b border-gray-100 bg-white/95 backdrop-blur"
-              style={{ top: `${calendarToolbarHeight}px` }}
-            >
-              <div />
-              {visibleWeekPage.days.map((day) => {
-                const isActive = isSameDay(day, selectedDate);
-                const isToday = isSameDay(day, today);
-                const chinaCalendarMarkers = getChinaCalendarMarkers(day);
-                const weekdayShort = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'][day.getDay()];
-                return (
-                  <button
-                    key={`fixed-${day.toISOString()}`}
-                    type="button"
-                    className={`relative border-l border-gray-100 px-2 pt-4 pb-3 text-center transition-colors ${
-                      isActive ? 'bg-[#5B7BFE]/[0.04]' : 'hover:bg-gray-50/60'
-                    }`}
-                    onClick={() => handleDaySelect(day)}
-                  >
-                    <p className={`text-[10px] font-bold uppercase tracking-[0.18em] transition-colors ${
-                      isToday ? 'text-[#5B7BFE]' : isActive ? 'text-gray-700' : 'text-gray-400'
-                    }`}>
-                      {weekdayShort}
-                    </p>
-                    <div className="mt-2.5 flex items-center justify-center">
-                      <span className={`text-[28px] leading-none font-light tracking-tight transition-colors ${
-                        isToday ? 'text-[#5B7BFE]' : isActive ? 'text-gray-900' : 'text-gray-700'
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden border-t border-gray-100">
+            <div className="relative z-30 shrink-0 bg-white/95 backdrop-blur">
+              <div className="grid grid-cols-[56px_repeat(7,minmax(0,1fr))] border-b border-gray-100">
+                <div />
+                {visibleWeekPage.days.map((day) => {
+                  const isActive = isSameDay(day, selectedDate);
+                  const isToday = isSameDay(day, today);
+                  const chinaCalendarMarkers = getChinaCalendarMarkers(day);
+                  const weekdayShort = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'][day.getDay()];
+                  return (
+                    <button
+                      key={`fixed-${day.toISOString()}`}
+                      type="button"
+                      className={`relative border-l border-gray-100 px-2 pt-4 pb-3 text-center transition-colors ${
+                        isActive ? 'bg-[#5B7BFE]/[0.04]' : 'hover:bg-gray-50/60'
+                      }`}
+                      onClick={() => handleDaySelect(day)}
+                    >
+                      <p className={`text-[10px] font-bold uppercase tracking-[0.18em] transition-colors ${
+                        isToday ? 'text-[#5B7BFE]' : isActive ? 'text-gray-700' : 'text-gray-400'
                       }`}>
-                        {String(day.getDate()).padStart(2, '0')}
-                      </span>
-                    </div>
-                    {chinaCalendarMarkers.length > 0 && (
-                      <div className="mt-2 flex flex-wrap items-center justify-center gap-1">
-                        {chinaCalendarMarkers.slice(0, 2).map((marker) => (
-                          <span
-                            key={`fixed-${day.toISOString()}-${marker.kind}-${marker.label}`}
-                            className={`rounded-full border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.06em] leading-none ${calendarMarkerClassName(marker)}`}
-                          >
-                            {marker.label}
-                          </span>
-                        ))}
+                        {weekdayShort}
+                      </p>
+                      <div className="mt-2.5 flex items-center justify-center">
+                        <span className={`text-[28px] leading-none font-light tracking-tight transition-colors ${
+                          isToday ? 'text-[#5B7BFE]' : isActive ? 'text-gray-900' : 'text-gray-700'
+                        }`}>
+                          {String(day.getDate()).padStart(2, '0')}
+                        </span>
                       </div>
-                    )}
-                    <span className={`pointer-events-none absolute left-0 right-0 -bottom-px h-[2px] rounded-full transition-colors ${
-                      isToday ? 'bg-[#5B7BFE]' : isActive ? 'bg-[#9FB2FF]' : 'bg-transparent'
-                    }`} />
-                  </button>
-                );
-              })}
+                      {chinaCalendarMarkers.length > 0 && (
+                        <div className="mt-2 flex flex-wrap items-center justify-center gap-1">
+                          {chinaCalendarMarkers.slice(0, 2).map((marker) => (
+                            <span
+                              key={`fixed-${day.toISOString()}-${marker.kind}-${marker.label}`}
+                              className={`rounded-full border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.06em] leading-none ${calendarMarkerClassName(marker)}`}
+                            >
+                              {marker.label}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      <span className={`pointer-events-none absolute left-0 right-0 -bottom-px h-[2px] rounded-full transition-colors ${
+                        isToday ? 'bg-[#5B7BFE]' : isActive ? 'bg-[#9FB2FF]' : 'bg-transparent'
+                      }`} />
+                    </button>
+                  );
+                })}
+              </div>
+              {renderWeekUnscheduledRow(visibleWeekPage)}
             </div>
             <div
               ref={weekPagerRef}
-              className="overflow-x-auto overscroll-x-contain snap-x snap-proximity scrollbar-hide"
+              className="min-h-0 flex-1 overflow-x-auto overflow-y-hidden overscroll-x-contain snap-x snap-proximity scrollbar-hide"
               onScroll={handleWeekPagerScroll}
             >
-              <div className="flex min-w-full">
+              <div className="flex h-full min-h-0 min-w-full">
                 {weekPages.map((page) => (
                   <div
                     key={page.key}
-                    className={`min-w-full snap-center transition-opacity duration-200 ${
+                    className={`flex h-full min-h-0 min-w-full flex-col snap-center transition-opacity duration-200 ${
                       isWeekPaging
                         ? page === visibleWeekPage
                           ? 'opacity-100'
@@ -2483,7 +2579,7 @@ export function TaskCalendarView({
                   >
                     {/* 未安排时间行 —— 有 dueDate 但没 scheduledStartAt 的任务在这里露面；
                         卡片可拖到下方时间格，复用 handleWeekTimelineTaskDrop 自动分配时间。 */}
-                    {page.unscheduledByDay.some((items) => items.length > 0) && (
+                    {false && page.unscheduledByDay.some((items) => items.length > 0) && (
                       <div className="grid grid-cols-[56px_repeat(7,minmax(0,1fr))] border-b border-gray-100 bg-amber-50/30">
                         <div className="flex items-center justify-end border-r border-gray-100 px-2 py-1.5 text-right text-[10px] font-semibold text-amber-700">
                           未安排
@@ -2593,7 +2689,7 @@ export function TaskCalendarView({
                     )}
 
                     <div
-                      className="overflow-visible"
+                      className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
                       data-week-scroll="true"
                       onScroll={handleWeekVerticalScroll}
                     >
@@ -2909,7 +3005,7 @@ export function TaskCalendarView({
                               const effectiveTimeLabel = `${formatMinuteOfDay(effectiveStart)}-${formatMinuteOfDay(effectiveEndMinute)}`;
                               const top = (effectiveStart / DAY_TIMELINE_SLOT_MINUTES) * DAY_TIMELINE_SLOT_HEIGHT;
                               const height = Math.max(40, ((effectiveEndMinute - effectiveStart) / DAY_TIMELINE_SLOT_MINUTES) * DAY_TIMELINE_SLOT_HEIGHT - 4);
-                              const chipStyle = calendarChipStyle(task, clientColorById);
+                              const chipStyle = calendarChipStyle(task);
                               const isResizing = resizingTaskId === task.id;
                               const isTaskLocalDraft = isLocalDraftTaskId(task.id);
                               const isCrossDayTask = isMultiDayCalendarTask(task);
@@ -2970,6 +3066,8 @@ export function TaskCalendarView({
                                     color: task.status === 'done' ? '#94A3B8' : chipStyle.color,
                                     backgroundColor: task.status === 'done' ? '#F8FAFC' : `${chipStyle.color}0F`,
                                     boxShadow: `inset 3px 0 0 0 ${task.status === 'done' ? '#CBD5E1' : chipStyle.color}`,
+                                    outline: isTaskOverdue(task, today) && task.status !== 'done' ? '1px solid #FB7185' : 'none',
+                                    outlineOffset: '-1px',
                                     zIndex: draggingTaskId === task.id || isResizing ? 50 : overlapZIndex,
                                   }}
                                   onMouseDown={(event) => {

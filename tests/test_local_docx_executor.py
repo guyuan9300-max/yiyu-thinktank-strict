@@ -98,6 +98,59 @@ def _editable_docx(path: Path) -> None:
     document.save(path)
 
 
+def test_docx_editor_preserves_headings_lists_inline_styles_and_tables(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "rich-feishu-export-飞书.docx"
+    document = Document()
+    title = document.add_paragraph()
+    title_run = title.add_run("rich-feishu-export")
+    title_run.bold = True
+    document.add_heading("一级标题", level=1)
+    document.add_heading("二级标题", level=2)
+    paragraph = document.add_paragraph()
+    bold = paragraph.add_run("粗体 ")
+    bold.bold = True
+    paragraph.add_run("与")
+    italic = paragraph.add_run("斜体")
+    italic.italic = True
+    adjacent = document.add_paragraph()
+    adjacent.add_run("选择")
+    adjacent_bold = adjacent.add_run("“资助”")
+    adjacent_bold.bold = True
+    adjacent.add_run("形式继续推进")
+    document.add_paragraph("第一项", style="List Number")
+    document.add_paragraph("第一项说明")
+    document.add_paragraph("第二项", style="List Number")
+    document.add_paragraph("第二项说明")
+    document.add_paragraph("第三项", style="List Number")
+    for value in ("项目符号一", "项目符号二"):
+        document.add_paragraph(value, style="List Bullet")
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "字段"
+    table.cell(0, 1).text = "内容"
+    table.cell(1, 0).text = "项目"
+    table.cell(1, 1).text = "益语智库"
+    document.save(source)
+
+    markdown = LocalProjectMaterialsRepository._docx_editor_markdown(source)
+
+    assert markdown.splitlines()[0] == "# 一级标题"
+    assert "rich-feishu-export" not in markdown
+    assert "## 二级标题" in markdown
+    assert "**粗体**" in markdown
+    assert "与*斜体*" in markdown
+    assert "选择&#8203;**“资助”**&#8203;形式继续推进" in markdown
+    assert "1\\. 第一项" in markdown
+    assert "2\\. 第二项" in markdown
+    assert "3\\. 第三项" in markdown
+    assert "1\\. 第一项\n\n第一项说明\n\n2\\. 第二项" in markdown
+    assert "2\\. 第二项\n\n第二项说明\n\n3\\. 第三项" in markdown
+    assert "- 项目符号一" in markdown
+    assert "| 字段 | 内容 |" in markdown
+    assert "| 项目 | 益语智库 |" in markdown
+
+
 def test_docx_template_fill_is_local_managed_idempotent_and_restartable(
     tmp_path: Path,
 ) -> None:

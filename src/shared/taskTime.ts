@@ -193,8 +193,25 @@ export function getTaskDeadline(task: TaskTimeInput) {
 }
 
 export function getTaskScheduleRange(task: TaskTimeInput): TaskScheduleRange | null {
-  const start = parseTaskDateTimeValue(task.scheduledStartAt) || legacyScheduleStart(task);
+  const startValue = task.scheduledStartAt || task.startDate;
+  const legacyTimedStartValue = !startValue && task.dueDate && hasExplicitTaskTime(task.dueDate)
+    ? task.dueDate
+    : null;
+  const effectiveStartValue = startValue || legacyTimedStartValue;
+  const start = parseTaskDateTimeValue(effectiveStartValue) || legacyScheduleStart(task);
   if (!start) return null;
+  const hasExplicitStartTime = hasExplicitTaskTime(effectiveStartValue);
+  if (!hasExplicitStartTime) {
+    const inclusiveEnd = parseTaskDateValue(task.dueDate)
+      || parseTaskDateValue(task.deadlineAt)
+      || startOfTaskDay(start);
+    const safeInclusiveEnd = inclusiveEnd >= startOfTaskDay(start) ? inclusiveEnd : startOfTaskDay(start);
+    return {
+      start: startOfTaskDay(start),
+      end: addTaskDays(startOfTaskDay(safeInclusiveEnd), 1),
+      hasExplicitEnd: safeInclusiveEnd.getTime() !== startOfTaskDay(start).getTime(),
+    };
+  }
   const explicitEnd = parseTaskDateTimeValue(task.scheduledEndAt);
   if (explicitEnd && explicitEnd > start) {
     return { start, end: explicitEnd, hasExplicitEnd: true };
@@ -225,9 +242,15 @@ export function isTaskDone(task: Pick<TaskTimeInput, 'status'>) {
 
 export function isTaskOverdue(task: TaskTimeInput, today = new Date()) {
   if (isTaskDone(task)) return false;
-  const deadline = getTaskDeadline(task);
-  if (!deadline) return false;
-  return startOfTaskDay(deadline).getTime() < startOfTaskDay(today).getTime();
+  // 有正式排期的任务以实际结束日期判断逾期；只有没有排期时才退回截止日期。
+  // 这样拖动任务后不会继续被旧 deadlineAt 标成逾期，也避免同一任务出现两套时间权威。
+  const range = getTaskScheduleRange(task);
+  const rangeHasTime = Boolean(hasExplicitTaskTime(task.scheduledStartAt) || hasExplicitTaskTime(task.startDate));
+  const overdueAt = range
+    ? (rangeHasTime ? range.end : new Date(range.end.getTime() - 1))
+    : getTaskDeadline(task);
+  if (!overdueAt) return false;
+  return startOfTaskDay(overdueAt).getTime() < startOfTaskDay(today).getTime();
 }
 
 export function isSameTaskDay(left: Date, right: Date) {
@@ -305,8 +328,7 @@ export function getTaskDisplayTime(task: TaskTimeInput): TaskDisplayTime | null 
 }
 
 /**
- * 卡片统一时间口径：单日只突出开始时间；跨天完整显示首尾时间点。
- * 历史日期型任务没有显式钟点时，按产品默认 09:00 展示，不反写权威事实。
+ * 卡片统一时间口径：仅日期不伪造钟点；明确时段才显示 24 小时时间。
  */
 export function formatTaskCardScheduleLabel(task: TaskTimeInput, includeSingleDate = false) {
   const range = getTaskScheduleRange(task);
@@ -317,7 +339,13 @@ export function formatTaskCardScheduleLabel(task: TaskTimeInput, includeSingleDa
         || (!task.scheduledStartAt && hasExplicitTaskTime(task.dueDate)),
     );
     const start = new Date(range.start);
-    if (!hasExplicitStart) start.setHours(9, 0, 0, 0);
+    if (!hasExplicitStart) {
+      const inclusiveEnd = new Date(range.end.getTime() - 1);
+      const startLabel = formatDateInputValue(start).replaceAll('-', '/');
+      const endLabel = formatDateInputValue(inclusiveEnd).replaceAll('-', '/');
+      if (!includeSingleDate) return '';
+      return startLabel === endLabel ? startLabel : `${startLabel} – ${endLabel}`;
+    }
     const end = range.hasExplicitEnd
       ? new Date(range.end)
       : addMinutes(start, durationFromTask(task));
@@ -331,7 +359,7 @@ export function formatTaskCardScheduleLabel(task: TaskTimeInput, includeSingleDa
   if (!deadline) return '无日期';
   const display = new Date(deadline);
   if (!hasExplicitTaskTime(task.deadlineAt) && !hasExplicitTaskTime(task.dueDate)) {
-    display.setHours(9, 0, 0, 0);
+    return includeSingleDate ? formatDateInputValue(display).replaceAll('-', '/') : '';
   }
   return includeSingleDate ? formatTaskNumericDateTime(display) : formatTaskClockTime(display);
 }

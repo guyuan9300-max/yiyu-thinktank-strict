@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -316,6 +318,102 @@ def test_task_notification_card_states_actor_role_and_changes() -> None:
     )
     role_content = role_card["elements"][0]["text"]["content"]
     assert "你的身份（修改）：** 协作者 → **负责人**" in role_content
+
+
+def test_task_notification_date_only_never_invents_midnight() -> None:
+    single_day = PlatformIntegrationsRepository._task_time_text(
+        {"start_date": "2026-08-26", "due_date": "2026-08-26"}
+    )
+    date_range = PlatformIntegrationsRepository._task_time_text(
+        {"start_date": "2026-08-26", "due_date": "2026-08-28"}
+    )
+
+    assert single_day == "2026-08-26"
+    assert date_range == "2026-08-26—2026-08-28"
+    assert "00:00" not in single_day + date_range
+
+    projected_single = PlatformIntegrationsRepository._task_time_text(
+        {"scheduled_start_at": "2026-08-27", "due_date": "2026-08-27"}
+    )
+    projected_range = PlatformIntegrationsRepository._task_time_text(
+        {"scheduled_start_at": "2026-08-28", "due_date": "2026-08-30"}
+    )
+    assert projected_single == "2026-08-27"
+    assert projected_range == "2026-08-28—2026-08-30"
+    assert "00:00" not in projected_single + projected_range
+
+
+def test_feishu_calendar_date_only_uses_inclusive_software_range() -> None:
+    platform = PlatformIntegrationsRepository.__new__(PlatformIntegrationsRepository)
+    single_day = platform._feishu_task_event_payload(
+        {
+            "title": "单日仅日期",
+            "scheduled_start_at": "2026-08-27",
+            "due_date": "2026-08-27",
+        },
+        notify=False,
+    )
+    date_range = platform._feishu_task_event_payload(
+        {
+            "title": "多日仅日期",
+            "scheduled_start_at": "2026-08-28",
+            "due_date": "2026-08-30",
+        },
+        notify=False,
+    )
+
+    assert single_day["start_time"] == {"date": "2026-08-27"}
+    assert single_day["end_time"] == {"date": "2026-08-28"}
+    assert date_range["start_time"] == {"date": "2026-08-28"}
+    assert date_range["end_time"] == {"date": "2026-08-31"}
+
+
+def test_feishu_task_date_only_projection_is_all_day(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, identity, _payload = _repository(tmp_path)
+    platform = PlatformIntegrationsRepository(repository)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(platform, "_feishu_configuration", lambda _identity: {})
+    monkeypatch.setattr(
+        platform,
+        "_feishu_tenant_access_token",
+        lambda _identity, _configuration: "tenant-token",
+    )
+
+    def fake_provider(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"method": method, "url": url, "payload": kwargs.get("payload")})
+        return {"data": {"task": {"guid": "date-only-remote"}}}
+
+    monkeypatch.setattr(platform, "_feishu_provider_json", fake_provider)
+    monkeypatch.setattr(
+        platform,
+        "_record_command",
+        lambda *_args, **kwargs: dict(kwargs.get("result_details") or {}),
+    )
+    monkeypatch.setattr(platform, "_record_feishu_mapping", lambda *_args, **_kwargs: None)
+
+    result = platform._project_task_to_feishu(
+        identity,
+        task={
+            "id": "date-only-task",
+            "title": "多日仅日期",
+            "version": 1,
+            "scheduled_start_at": "2026-08-28",
+            "due_date": "2026-08-30",
+        },
+        member_open_ids=[],
+        idempotency_key="date-only-task-create",
+        event="created",
+    )
+
+    payload = calls[0]["payload"]
+    assert payload["start"]["is_all_day"] is True
+    assert payload["due"]["is_all_day"] is True
+    assert datetime.fromtimestamp(payload["start"]["timestamp"] / 1000, ZoneInfo("Asia/Shanghai")).date() == date(2026, 8, 28)
+    assert datetime.fromtimestamp(payload["due"]["timestamp"] / 1000, ZoneInfo("Asia/Shanghai")).date() == date(2026, 8, 30)
+    assert result["state"] == "completed"
 
 
 def test_task_notification_holds_collaborators_until_owner_accepts(

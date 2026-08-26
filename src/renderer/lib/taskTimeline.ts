@@ -7,7 +7,6 @@ import {
   taskOverlapsDateWindow,
 } from '../../shared/taskTime';
 
-const TASK_DEFAULT_DUE_TIME = '09:00';
 const DAY_MINUTES = 24 * 60;
 const MIN_DURATION_MINUTES = 15;
 const DEFAULT_TIMED_DURATION_MINUTES = 60;
@@ -127,8 +126,7 @@ export function normalizeDdlToDateTime(label?: string | null) {
 
 export function resolveTaskDueTimeForDisplay(datePart?: string | null, timePart?: string | null) {
   if (!(datePart || '').trim()) return '';
-  const normalizedTime = normalizeTaskTimeInput(timePart);
-  return normalizedTime || TASK_DEFAULT_DUE_TIME;
+  return normalizeTaskTimeInput(timePart);
 }
 
 export function formatTaskDateTimeLabel(
@@ -180,7 +178,7 @@ export function formatTaskTimelineLabel(task: Pick<Task, 'startDate' | 'dueDate'
   const baseLabel = formatTaskDateTimeLabel(dueDatePart, { fallbackTime: null });
   const startMinute = minuteOfDayFromTaskTime(normalizedDueTime);
   if (startMinute === null) {
-    return `${baseLabel} ${normalizedDueTime}`.trim();
+    return baseLabel;
   }
   const durationMinutes = Math.max(MIN_DURATION_MINUTES, task.durationMinutes || 0);
   const endMinute = Math.min(startMinute + durationMinutes, DAY_MINUTES);
@@ -192,7 +190,10 @@ export function resolveTaskTimelineDateTime(task: Pick<Task, 'startDate' | 'dueD
   if (canonicalDate) return canonicalDate;
   if (task.dueDate) {
     const { date, time } = splitTaskDueDateTime(task.dueDate);
-    const normalizedDue = date ? `${date}T${resolveTaskDueTimeForDisplay(date, time)}` : task.dueDate;
+    const normalizedTime = date ? resolveTaskDueTimeForDisplay(date, time) : '';
+    const normalizedDue = date
+      ? (normalizedTime ? `${date}T${normalizedTime}` : `${date}T00:00:00`)
+      : task.dueDate;
     const parsedDue = new Date(normalizedDue);
     if (!Number.isNaN(parsedDue.getTime())) return parsedDue;
   }
@@ -217,8 +218,14 @@ export function resolveTaskDateTimeRange(
 ): TaskDateTimeRange {
   const placement = getTaskCalendarPlacement(task as Task);
   if (placement.range) {
+    const hasExplicitTime = Boolean(
+      splitTaskDueDateTime(task.scheduledStartAt).time
+      || splitTaskDueDateTime(task.scheduledEndAt).time
+      || splitTaskDueDateTime(task.startDate).time
+      || splitTaskDueDateTime(task.dueDate).time
+    );
     return {
-      hasExplicitTime: true,
+      hasExplicitTime,
       startDateTime: placement.range.start,
       endDateTime: placement.range.end,
     };
@@ -283,26 +290,20 @@ export function resolveTaskDateTimeRange(
 
   const normalizedStartDate = startDate || dueDate || fallbackDate;
   if (dueDate) {
-    const defaultMinute = minuteOfDayFromTaskTime(TASK_DEFAULT_DUE_TIME) ?? 9 * 60;
     const startBaseDate = startDate || dueDate;
-    const startDateTime = dateTimeFromDateAndMinute(startBaseDate, startMinute ?? defaultMinute);
-    const endDateTime = dateTimeFromDateAndMinute(dueDate, dueMinute ?? defaultMinute);
     return {
-      hasExplicitTime: true,
-      startDateTime,
-      endDateTime: endDateTime > startDateTime
-        ? endDateTime
-        : new Date(startDateTime.getTime() + safeDuration * 60_000),
+      hasExplicitTime: false,
+      startDateTime: startOfDayValue(startBaseDate),
+      endDateTime: addDays(startOfDayValue(dueDate), 1),
     };
   }
 
   const durationDays = Math.max(1, Math.ceil(Math.max(0, task.durationMinutes ?? 0) / DAY_MINUTES));
-  const defaultMinute = minuteOfDayFromTaskTime(TASK_DEFAULT_DUE_TIME) ?? 9 * 60;
-  const fallbackStartDateTime = dateTimeFromDateAndMinute(normalizedStartDate, defaultMinute);
+  const fallbackStartDateTime = startOfDayValue(normalizedStartDate);
   return {
-    hasExplicitTime: true,
+    hasExplicitTime: false,
     startDateTime: fallbackStartDateTime,
-    endDateTime: new Date(fallbackStartDateTime.getTime() + Math.max(safeDuration, DEFAULT_TIMED_DURATION_MINUTES) * 60_000),
+    endDateTime: addDays(fallbackStartDateTime, 1),
   };
 }
 
@@ -316,6 +317,9 @@ export function taskCoversCalendarDate(task: Task, date: Date) {
 }
 
 export function buildTaskDayTimedSegment(task: Task, dayDate: Date) {
+  // 纯日期任务（包括跨日）属于日历的“未安排时间”区域，不能因为
+  // getTaskScheduleRange 提供了整日覆盖范围就被伪装成 00:00-24:00。
+  if (!resolveTaskDateTimeRange(task).hasExplicitTime) return null;
   const range = getTaskScheduleRange(task);
   if (!range) return null;
   const dayStart = startOfDayValue(dayDate);
@@ -378,31 +382,69 @@ export function assignTimedTaskLanes<T extends { startMinute: number; endMinute:
   return result;
 }
 
-// ─── 跨天起止时间段（任务编辑器"时间段"tab 用） ───────────────
+// ─── 任务日期与时间 ───────────────────────────────────────────
 //
-// 真相源是 开始日+开始时间 / 结束日+结束时间；scheduledEndAt 可落在不同日期。
-// durationMinutes 由 (end - start) 派生，跨天时可 >1440。
-// 全天（无开始时间）v1 仅单日，落 deadlineAt（忽略 endDate）。
+// 真相源是开始日+可选开始时间 / 结束日+可选结束时间。
+// 纯日期任务允许跨日，日期均为包含式；不伪造 09:00。
+// 有时间时必须起止完整，durationMinutes 由 (end - start) 派生，跨天可 >1440。
 // 范式对齐手机版 mobile/lib/calendar-repository-core.ts:buildScheduleFromStartEnd。
 
 export interface TaskScheduleStartEnd {
   /** 开始日 "YYYY-MM-DD"；为空表示清除排期 */
   startDate: string | null;
-  /** 开始时间 "HH:mm"；为空表示全天 */
+  /** 开始时间 "HH:mm"；为空表示仅日期 */
   startTime: string | null;
-  /** 结束日 "YYYY-MM-DD"；缺省同开始日 */
+  /** 结束日 "YYYY-MM-DD"；设置开始日后必须存在 */
   endDate: string | null;
-  /** 结束时间 "HH:mm"；为空表示不设结束 */
+  /** 结束时间 "HH:mm"；与开始时间同时存在或同时为空 */
   endTime: string | null;
 }
 
 export interface TaskScheduleUpdates {
+  /** API 兼容字段；物理表由 scheduledStartAt 的纯日期承载。 */
+  startDate: string | null;
   dueDate: string | null;
   deadlineAt: string | null;
   scheduledStartAt: string | null;
   scheduledEndAt: string | null;
   /** 跨天可 >1440；null 表示无明确时段 */
   durationMinutes: number | null;
+}
+
+export type TaskScheduleValidation = { valid: true } | { valid: false; message: string };
+
+function isValidScheduleDate(value: string) {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+  const parsed = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return parsed.getFullYear() === Number(match[1])
+    && parsed.getMonth() === Number(match[2]) - 1
+    && parsed.getDate() === Number(match[3]);
+}
+
+export function validateTaskScheduleStartEnd(input: TaskScheduleStartEnd): TaskScheduleValidation {
+  const startDate = (input.startDate || '').trim();
+  const startTime = (input.startTime || '').trim();
+  const endDate = (input.endDate || '').trim();
+  const endTime = (input.endTime || '').trim();
+  if (!startDate) {
+    if (endDate || startTime || endTime) return { valid: false, message: '请先设置开始日期' };
+    return { valid: true };
+  }
+  if (!isValidScheduleDate(startDate) || (endDate && !isValidScheduleDate(endDate))) {
+    return { valid: false, message: '请输入有效日期（YYYY/MM/DD）' };
+  }
+  if (!endDate) return { valid: false, message: '请设置结束日期' };
+  if (endDate < startDate) return { valid: false, message: '结束日期不能早于开始日期' };
+  const hasAnyTime = Boolean(startTime || endTime);
+  if (!hasAnyTime) return { valid: true };
+  if (!normalizeTaskTimeInput(startTime) || !normalizeTaskTimeInput(endTime)) {
+    return { valid: false, message: '开始时间和结束时间必须同时填写，格式为 24 小时制 HH:mm' };
+  }
+  const start = parseScheduleLocalDateTime(combineScheduleDateTime(startDate, startTime));
+  const end = parseScheduleLocalDateTime(combineScheduleDateTime(endDate, endTime));
+  if (!start || !end || end <= start) return { valid: false, message: '结束时间必须晚于开始时间' };
+  return { valid: true };
 }
 
 function combineScheduleDateTime(date: string, time: string): string {
@@ -425,16 +467,25 @@ export function buildTaskScheduleFromStartEnd(input: TaskScheduleStartEnd): Task
 
   // 无开始日 → 清空全部排期
   if (!startDate) {
-    return { dueDate: null, deadlineAt: null, scheduledStartAt: null, scheduledEndAt: null, durationMinutes: null };
+    return { startDate: null, dueDate: null, deadlineAt: null, scheduledStartAt: null, scheduledEndAt: null, durationMinutes: null };
   }
-  // 全天（无开始时间）：v1 仅单日，落 deadlineAt，忽略 endDate
+  // 仅日期：scheduledStartAt 保存纯日期，dueDate 保存包含式结束日期。
+  // 纯日期不做 UTC 换算，也不会被界面伪造成 09:00。
   if (!startTime) {
-    return { dueDate: startDate, deadlineAt: startDate, scheduledStartAt: null, scheduledEndAt: null, durationMinutes: null };
+    const inclusiveEndDate = endDate || startDate;
+    return {
+      startDate,
+      dueDate: inclusiveEndDate,
+      deadlineAt: inclusiveEndDate,
+      scheduledStartAt: startDate,
+      scheduledEndAt: null,
+      durationMinutes: null,
+    };
   }
   const scheduledStartAt = combineScheduleDateTime(startDate, startTime);
-  // 无结束时间 → 只有开始时刻，不设 end
+  // 调用方会先做严格校验；此处仍保持失败安全，不制造半截时段。
   if (!endTime) {
-    return { dueDate: scheduledStartAt, deadlineAt: null, scheduledStartAt, scheduledEndAt: null, durationMinutes: null };
+    return { startDate, dueDate: null, deadlineAt: null, scheduledStartAt: null, scheduledEndAt: null, durationMinutes: null };
   }
   const scheduledEndAt = combineScheduleDateTime(endDate ?? startDate, endTime);
   const start = parseScheduleLocalDateTime(scheduledStartAt);
@@ -442,7 +493,7 @@ export function buildTaskScheduleFromStartEnd(input: TaskScheduleStartEnd): Task
   const durationMinutes = start && end ? Math.round((end.getTime() - start.getTime()) / 60_000) : null;
   // 结束 <= 开始 视为无效，丢弃 end 防脏数据（picker 已校验，这里兜底）
   if (durationMinutes == null || durationMinutes <= 0) {
-    return { dueDate: scheduledStartAt, deadlineAt: null, scheduledStartAt, scheduledEndAt: null, durationMinutes: null };
+    return { startDate, dueDate: null, deadlineAt: null, scheduledStartAt: null, scheduledEndAt: null, durationMinutes: null };
   }
-  return { dueDate: scheduledStartAt, deadlineAt: null, scheduledStartAt, scheduledEndAt, durationMinutes };
+  return { startDate, dueDate: scheduledEndAt, deadlineAt: null, scheduledStartAt, scheduledEndAt, durationMinutes };
 }

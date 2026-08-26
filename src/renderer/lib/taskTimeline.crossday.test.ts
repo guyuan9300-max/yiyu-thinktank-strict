@@ -8,33 +8,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildTaskScheduleFromStartEnd } from './taskTimeline.js';
+import { buildTaskScheduleFromStartEnd, validateTaskScheduleStartEnd } from './taskTimeline.js';
 
 test('无开始日 → 清空全部排期', () => {
   const r = buildTaskScheduleFromStartEnd({ startDate: null, startTime: null, endDate: null, endTime: null });
   assert.deepEqual(r, {
-    dueDate: null, deadlineAt: null, scheduledStartAt: null, scheduledEndAt: null, durationMinutes: null,
+    startDate: null, dueDate: null, deadlineAt: null, scheduledStartAt: null, scheduledEndAt: null, durationMinutes: null,
   });
 });
 
-test('全天（无开始时间）→ 落 deadlineAt，单日，忽略 endDate', () => {
+test('仅日期任务保留完整起止日期，不伪造时间', () => {
   const r = buildTaskScheduleFromStartEnd({
     startDate: '2026-06-10', startTime: null, endDate: '2026-06-12', endTime: null,
   });
-  assert.equal(r.deadlineAt, '2026-06-10');
-  assert.equal(r.dueDate, '2026-06-10');
-  assert.equal(r.scheduledStartAt, null);
+  assert.equal(r.startDate, '2026-06-10');
+  assert.equal(r.deadlineAt, '2026-06-12');
+  assert.equal(r.dueDate, '2026-06-12');
+  assert.equal(r.scheduledStartAt, '2026-06-10');
   assert.equal(r.scheduledEndAt, null);
   assert.equal(r.durationMinutes, null);
 });
 
-test('有开始时间、无结束时间 → 只有开始时刻', () => {
-  const r = buildTaskScheduleFromStartEnd({
+test('有开始时间但没有完整结束时间 → 严格校验阻止保存', () => {
+  const validation = validateTaskScheduleStartEnd({
     startDate: '2026-06-10', startTime: '09:00', endDate: null, endTime: null,
   });
-  assert.equal(r.scheduledStartAt, '2026-06-10T09:00');
-  assert.equal(r.scheduledEndAt, null);
-  assert.equal(r.durationMinutes, null);
+  assert.equal(validation.valid, false);
 });
 
 test('同日时间段 → duration = end - start', () => {
@@ -73,21 +72,43 @@ test('跨多天 → duration 累计', () => {
   assert.equal(r.durationMinutes, 2880);
 });
 
-test('结束缺省 endDate → 视为同开始日', () => {
-  const r = buildTaskScheduleFromStartEnd({
+test('结束缺省 endDate → 严格校验阻止保存', () => {
+  const validation = validateTaskScheduleStartEnd({
     startDate: '2026-06-10', startTime: '09:00', endDate: null, endTime: '10:00',
   });
-  assert.equal(r.scheduledEndAt, '2026-06-10T10:00');
-  assert.equal(r.durationMinutes, 60);
+  assert.equal(validation.valid, false);
 });
 
-test('结束 <= 开始 → 丢弃 end，退化为开始时刻（防脏数据）', () => {
-  const r = buildTaskScheduleFromStartEnd({
+test('结束 <= 开始 → 严格校验阻止保存', () => {
+  const validation = validateTaskScheduleStartEnd({
     startDate: '2026-06-10', startTime: '09:00', endDate: '2026-06-10', endTime: '08:00',
   });
-  assert.equal(r.scheduledStartAt, '2026-06-10T09:00');
-  assert.equal(r.scheduledEndAt, null);
-  assert.equal(r.durationMinutes, null);
+  assert.equal(validation.valid, false);
+});
+
+test('不设置日期和时间 → 合法无排期', () => {
+  assert.deepEqual(
+    validateTaskScheduleStartEnd({ startDate: null, startTime: null, endDate: null, endTime: null }),
+    { valid: true },
+  );
+});
+
+test('单日仅日期与跨日仅日期均合法', () => {
+  assert.deepEqual(
+    validateTaskScheduleStartEnd({ startDate: '2026-06-10', startTime: null, endDate: '2026-06-10', endTime: null }),
+    { valid: true },
+  );
+  assert.deepEqual(
+    validateTaskScheduleStartEnd({ startDate: '2026-06-10', startTime: null, endDate: '2026-06-12', endTime: null }),
+    { valid: true },
+  );
+});
+
+test('有结束信息却无开始日期 → 严格校验阻止保存', () => {
+  const validation = validateTaskScheduleStartEnd({
+    startDate: null, startTime: null, endDate: '2026-06-10', endTime: null,
+  });
+  assert.equal(validation.valid, false);
 });
 
 test('跨年边界 → 正确计算', () => {

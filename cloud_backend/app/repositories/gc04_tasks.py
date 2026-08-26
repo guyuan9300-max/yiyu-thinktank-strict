@@ -974,6 +974,8 @@ class GC04TaskRepository:
         ):
             if source in payload:
                 patch[column] = _text(payload.get(source))
+        if "scheduledStartAt" not in payload and "startDate" in payload:
+            patch["scheduled_start_at"] = _text(payload.get("startDate"))
         if "durationMinutes" in payload:
             patch["duration_minutes"] = _integer(payload.get("durationMinutes"), minimum=0)
         if "taskListId" in payload or "listId" in payload:

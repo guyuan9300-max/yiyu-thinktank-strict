@@ -68,12 +68,23 @@ test('completed tasks are never overdue even when deadline is in the past', () =
   assert.equal(isTaskOverdue(record, new Date(2026, 3, 27)), false);
 });
 
-test('overdue checks deadline only, not past scheduled time', () => {
+test('scheduled tasks become overdue from their actual scheduled end', () => {
   const record = task({
     dueDate: '2026-04-20',
     scheduledStartAt: '2026-04-20T10:00',
     scheduledEndAt: '2026-04-20T11:00',
     deadlineAt: null,
+  });
+
+  assert.equal(isTaskOverdue(record, new Date(2026, 3, 27)), true);
+});
+
+test('scheduled tasks ignore a stale earlier compatibility deadline after rescheduling', () => {
+  const record = task({
+    dueDate: '2026-04-27T10:00',
+    scheduledStartAt: '2026-04-27T10:00',
+    scheduledEndAt: '2026-04-27T11:00',
+    deadlineAt: '2026-04-20',
   });
 
   assert.equal(isTaskOverdue(record, new Date(2026, 3, 27)), false);
@@ -146,11 +157,11 @@ test('task display time is hidden when task has no date', () => {
   assert.equal(getTaskDisplayTime(record), null);
 });
 
-test('card label shows the default 09:00 start for a date-only task', () => {
+test('card label does not invent a start time for a date-only task', () => {
   const record = task({ dueDate: '2026-08-14', deadlineAt: '2026-08-14' });
 
-  assert.equal(formatTaskCardScheduleLabel(record), '09:00');
-  assert.equal(formatTaskCardScheduleLabel(record, true), '2026/08/14 09:00');
+  assert.equal(formatTaskCardScheduleLabel(record), '');
+  assert.equal(formatTaskCardScheduleLabel(record, true), '2026/08/14');
 });
 
 test('card label shows the full range for a cross-day task', () => {

@@ -1,6 +1,7 @@
 """Unregistered GC-04/GC-05 routes for integration by the shared entry thread."""
 
 from datetime import datetime
+import re
 from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
@@ -67,26 +68,39 @@ def register_gc04_task_routes(
                 "new": compact(new_title),
             }
 
-        old_start = value(before, ("scheduled_start_at", "scheduledStartAt"))
-        old_end = value(before, ("scheduled_end_at", "scheduledEndAt"))
-        new_start = value(after, ("scheduled_start_at", "scheduledStartAt"))
-        new_end = value(after, ("scheduled_end_at", "scheduledEndAt"))
+        def schedule(record: dict[str, Any]) -> tuple[Any, Any, bool]:
+            start = value(record, ("scheduled_start_at", "scheduledStartAt"))
+            end = value(record, ("scheduled_end_at", "scheduledEndAt"))
+            if start and re.search(r"(?:T|\s)\d{1,2}:\d{2}", str(start)):
+                return start, end, True
+            start_date = value(
+                record,
+                ("scheduled_start_at", "scheduledStartAt", "start_date", "startDate", "due_date", "dueDate"),
+            )
+            due_date = value(record, ("due_date", "dueDate", "start_date", "startDate"))
+            return start_date, due_date, False
 
-        def time_range(start: Any, end: Any) -> str:
-            start_text, end_text = time_text(start), time_text(end)
+        old_start, old_end, old_timed = schedule(before)
+        new_start, new_end, new_timed = schedule(after)
+
+        def time_range(start: Any, end: Any, *, timed: bool) -> str:
+            start_text = time_text(start) if timed else compact(start)
+            end_text = time_text(end) if timed else compact(end)
             if start_text == "未设置":
                 return "未设置"
             if end_text == "未设置":
                 return start_text
+            if not timed:
+                return start_text if start_text == end_text else f"{start_text}—{end_text}"
             if start_text[:10] == end_text[:10]:
                 return f"{start_text}—{end_text[11:]}"
             return f"{start_text}—{end_text}"
 
-        if old_start != new_start or old_end != new_end:
+        if (old_start, old_end, old_timed) != (new_start, new_end, new_timed):
             labels.append("时间")
             field_changes["time"] = {
-                "old": time_range(old_start, old_end),
-                "new": time_range(new_start, new_end),
+                "old": time_range(old_start, old_end, timed=old_timed),
+                "new": time_range(new_start, new_end, timed=new_timed),
             }
 
         old_priority = value(before, ("priority",))

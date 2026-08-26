@@ -2962,7 +2962,7 @@ export interface Task {
   ddl: string;
   startDate?: string | null;
   dueDate?: string | null;
-  durationMinutes?: number;
+  durationMinutes?: number | null;
   deadlineAt?: string | null;
   scheduledStartAt?: string | null;
   scheduledEndAt?: string | null;
@@ -7460,7 +7460,7 @@ export interface TaskMutationPayload {
   listId: string;
   startDate?: string | null;
   dueDate?: string | null;
-  durationMinutes?: number;
+  durationMinutes?: number | null;
   deadlineAt?: string | null;
   scheduledStartAt?: string | null;
   scheduledEndAt?: string | null;

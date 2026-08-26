@@ -1157,6 +1157,33 @@ class PlatformIntegrationsRepository:
             return None
         return parsed
 
+    @staticmethod
+    def _has_explicit_time(value: Any) -> bool:
+        """Pure ISO dates are all-day values, never midnight appointments."""
+        text = str(value or "").strip()
+        return bool(
+            re.search(r"(?:T|\s)\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$", text)
+        )
+
+    @classmethod
+    def _task_date_range(cls, task: Mapping[str, Any]) -> tuple[date | None, date | None]:
+        scheduled_start = task.get("scheduledStartAt") or task.get("scheduled_start_at")
+        start_date = (
+            cls._calendar_date(scheduled_start)
+            or cls._calendar_date(task.get("startDate") or task.get("start_date"))
+            or cls._calendar_date(task.get("dueDate") or task.get("due_date"))
+            or cls._calendar_date(task.get("deadlineAt"))
+        )
+        end_date = (
+            cls._calendar_date(task.get("dueDate") or task.get("due_date"))
+            or cls._calendar_date(task.get("deadlineAt"))
+            or cls._calendar_date(task.get("scheduledEndAt") or task.get("scheduled_end_at"))
+            or start_date
+        )
+        if start_date is not None and end_date is not None and end_date < start_date:
+            return start_date, None
+        return start_date, end_date
+
     def _feishu_task_event_payload(
         self,
         task: Mapping[str, Any],
@@ -1172,7 +1199,7 @@ class PlatformIntegrationsRepository:
         scheduled_end_text = str(
             task.get("scheduledEndAt") or task.get("scheduled_end_at") or ""
         ).strip()
-        if scheduled_start_text:
+        if self._has_explicit_time(scheduled_start_text):
             scheduled_start = self._calendar_datetime(scheduled_start_text)
             scheduled_end = self._calendar_datetime(scheduled_end_text)
             if scheduled_start is None or (
@@ -1200,18 +1227,20 @@ class PlatformIntegrationsRepository:
             start_time = {"timestamp": str(int(scheduled_start.timestamp()))}
             end_time = {"timestamp": str(int(scheduled_end.timestamp()))}
         else:
-            all_day = (
-                self._calendar_date(task.get("dueDate") or task.get("due_date"))
-                or self._calendar_date(task.get("deadlineAt"))
-                or self._calendar_date(task.get("startDate"))
-            )
-            if all_day is None:
+            start_date, inclusive_end_date = self._task_date_range(task)
+            if start_date is None:
                 raise _FeishuExecutionError(
                     "feishu_task_time_missing",
                     "任务没有可同步的日期，未向飞书发送",
                 )
-            start_time = {"date": all_day.isoformat()}
-            end_time = {"date": (all_day + timedelta(days=1)).isoformat()}
+            if inclusive_end_date is None:
+                raise _FeishuExecutionError(
+                    "feishu_task_time_invalid",
+                    "任务结束日期早于开始日期，未向飞书发送",
+                )
+            start_time = {"date": start_date.isoformat()}
+            # Calendar all-day end dates are exclusive; software due dates are inclusive.
+            end_time = {"date": (inclusive_end_date + timedelta(days=1)).isoformat()}
         return {
             "summary": summary[:255],
             "description": str(task.get("description") or "")[:2000],
@@ -5775,10 +5804,17 @@ class PlatformIntegrationsRepository:
 
     @classmethod
     def _task_time_text(cls, task: Mapping[str, Any]) -> str:
-        start = cls._task_datetime(
-            task.get("scheduled_start_at") or task.get("scheduledStartAt") or task.get("due_date")
-        )
-        end = cls._task_datetime(task.get("scheduled_end_at") or task.get("scheduledEndAt"))
+        scheduled_start = task.get("scheduled_start_at") or task.get("scheduledStartAt")
+        scheduled_end = task.get("scheduled_end_at") or task.get("scheduledEndAt")
+        if not cls._has_explicit_time(scheduled_start):
+            start_date, end_date = cls._task_date_range(task)
+            if start_date is None:
+                return "未设置"
+            if end_date is None or end_date == start_date:
+                return start_date.isoformat()
+            return f"{start_date.isoformat()}—{end_date.isoformat()}"
+        start = cls._task_datetime(scheduled_start)
+        end = cls._task_datetime(scheduled_end)
         if start is None:
             return "未设置"
         if end is None:
@@ -6164,10 +6200,11 @@ class PlatformIntegrationsRepository:
                     "remoteUrl": str(remote_task.get("url") or remote_url or ""),
                 }
             else:
-                start = self._task_datetime(
-                    task.get("scheduled_start_at") or task.get("scheduledStartAt") or task.get("due_date")
-                )
-                end = self._task_datetime(task.get("scheduled_end_at") or task.get("scheduledEndAt"))
+                scheduled_start = task.get("scheduled_start_at") or task.get("scheduledStartAt")
+                scheduled_end = task.get("scheduled_end_at") or task.get("scheduledEndAt")
+                is_timed = self._has_explicit_time(scheduled_start)
+                start = self._task_datetime(scheduled_start) if is_timed else None
+                end = self._task_datetime(scheduled_end) if is_timed else None
                 task_payload: dict[str, Any] = {
                     "summary": str(task.get("title") or "未命名任务")[:3000],
                     "description": str(task.get("description") or "")[:3000],
@@ -6178,6 +6215,28 @@ class PlatformIntegrationsRepository:
                     task_payload["due"] = {"timestamp": int(end.timestamp() * 1000), "is_all_day": False}
                 elif start is not None:
                     task_payload["due"] = {"timestamp": int(start.timestamp() * 1000), "is_all_day": False}
+                else:
+                    start_date, due_date = self._task_date_range(task)
+                    if start_date is not None:
+                        start_at = datetime.combine(
+                            start_date,
+                            datetime.min.time(),
+                            tzinfo=ZoneInfo("Asia/Shanghai"),
+                        )
+                        task_payload["start"] = {
+                            "timestamp": int(start_at.timestamp() * 1000),
+                            "is_all_day": True,
+                        }
+                    if due_date is not None:
+                        due_at = datetime.combine(
+                            due_date,
+                            datetime.min.time(),
+                            tzinfo=ZoneInfo("Asia/Shanghai"),
+                        )
+                        task_payload["due"] = {
+                            "timestamp": int(due_at.timestamp() * 1000),
+                            "is_all_day": True,
+                        }
                 if remote_id:
                     current_result = self._feishu_provider_json(
                         "GET",

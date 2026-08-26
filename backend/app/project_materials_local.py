@@ -5715,7 +5715,66 @@ class LocalProjectMaterialsRepository:
         return "\n".join(sections).strip()
 
     @staticmethod
-    def _docx_paragraph_markdown(paragraph: Any, document: Any) -> tuple[str, list[str]]:
+    def _docx_markdown_text(value: str) -> str:
+        """Escape Word text without flattening its inline formatting."""
+
+        return (
+            str(value or "")
+            .replace("\\", "\\\\")
+            .replace("`", "\\`")
+            .replace("*", "\\*")
+            .replace("_", "\\_")
+            .replace("~", "\\~")
+            .replace("[", "\\[")
+            .replace("]", "\\]")
+        )
+
+    @classmethod
+    def _docx_run_markdown(cls, run: Any) -> str:
+        raw_text = str(run.text or "")
+        if not raw_text:
+            return ""
+        # Markdown does not recognise emphasis when the closing marker is
+        # preceded by whitespace. Feishu exports commonly split a sentence
+        # into a bold run whose trailing blank belongs outside the emphasis.
+        leading = raw_text[: len(raw_text) - len(raw_text.lstrip())]
+        trailing = raw_text[len(raw_text.rstrip()) :]
+        core = raw_text[
+            len(leading) : len(raw_text) - len(trailing) if trailing else None
+        ]
+        text = cls._docx_markdown_text(core)
+        if not text:
+            return cls._docx_markdown_text(raw_text)
+        if bool(getattr(run.font, "strike", False)):
+            text = f"~~{text}~~"
+        if bool(getattr(run, "italic", False)):
+            text = f"*{text}*"
+        if bool(getattr(run, "bold", False)):
+            # CommonMark does not recognise an emphasis delimiter when it is
+            # immediately adjacent to many CJK punctuation/text boundaries.
+            # Keep an encoded, invisible boundary on both sides so MDXEditor
+            # retains every Word bold run instead of silently flattening it.
+            text = f"&#8203;**{text}**&#8203;"
+        return (
+            cls._docx_markdown_text(leading)
+            + text
+            + cls._docx_markdown_text(trailing)
+        )
+
+    @staticmethod
+    def _docx_title_key(value: str) -> str:
+        title = Path(str(value or "")).stem.strip()
+        title = re.sub(
+            r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}-",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        )
+        title = re.sub(r"-(?:飞书|小红书|B站)$", "", title, flags=re.IGNORECASE)
+        return re.sub(r"[\s\u3000·•—_\-:：]+", "", title).casefold()
+
+    @classmethod
+    def _docx_paragraph_markdown(cls, paragraph: Any, document: Any) -> tuple[str, list[str]]:
         try:
             from docx.oxml.ns import qn
         except ImportError as exc:
@@ -5727,22 +5786,137 @@ class LocalProjectMaterialsRepository:
 
         parts: list[str] = []
         images: list[str] = []
-        for run in paragraph.runs:
-            if run.text:
-                parts.append(str(run.text))
-            for blip in run._element.xpath(".//a:blip"):
-                relationship_id = str(blip.get(qn("r:embed")) or "")
-                image_part = document.part.related_parts.get(relationship_id)
-                if image_part is None:
-                    continue
-                media_type = str(
-                    getattr(image_part, "content_type", "image/png")
-                    or "image/png"
-                )
-                encoded = base64.b64encode(image_part.blob).decode("ascii")
-                images.append(f"![文档图片](data:{media_type};base64,{encoded})")
-        text = "".join(parts).strip() or str(paragraph.text or "").strip()
+        inner_content = (
+            paragraph.iter_inner_content()
+            if hasattr(paragraph, "iter_inner_content")
+            else paragraph.runs
+        )
+        for content in inner_content:
+            runs = list(getattr(content, "runs", [])) or [content]
+            rendered_runs: list[str] = []
+            for run in runs:
+                rendered = cls._docx_run_markdown(run)
+                if rendered:
+                    rendered_runs.append(rendered)
+                for blip in run._element.xpath(".//a:blip"):
+                    relationship_id = str(blip.get(qn("r:embed")) or "")
+                    image_part = document.part.related_parts.get(relationship_id)
+                    if image_part is None:
+                        continue
+                    media_type = str(
+                        getattr(image_part, "content_type", "image/png")
+                        or "image/png"
+                    )
+                    encoded = base64.b64encode(image_part.blob).decode("ascii")
+                    images.append(f"![文档图片](data:{media_type};base64,{encoded})")
+            rendered_text = "".join(rendered_runs)
+            url = str(getattr(content, "url", "") or "")
+            if rendered_text and url:
+                safe_url = url.replace(" ", "%20").replace(")", "%29")
+                parts.append(f"[{rendered_text}]({safe_url})")
+            elif rendered_text:
+                parts.append(rendered_text)
+        text = "".join(parts).strip() or cls._docx_markdown_text(
+            str(paragraph.text or "").strip()
+        )
         return text, images
+
+    @staticmethod
+    def _docx_heading_level(paragraph: Any) -> int | None:
+        try:
+            from docx.oxml.ns import qn
+        except ImportError:
+            return None
+
+        style = getattr(paragraph, "style", None)
+        candidates = (
+            str(getattr(style, "name", "") or ""),
+            str(getattr(style, "style_id", "") or ""),
+        )
+        for candidate in candidates:
+            match = re.match(r"^(?:Heading|标题)\s*([1-6])$", candidate, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        p_pr = getattr(paragraph._p, "pPr", None)
+        outline = p_pr.find(qn("w:outlineLvl")) if p_pr is not None else None
+        if outline is not None:
+            try:
+                level = int(outline.get(qn("w:val"))) + 1
+                if 1 <= level <= 6:
+                    return level
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    @staticmethod
+    def _docx_list_metadata(paragraph: Any, document: Any) -> tuple[str, int, int, int] | None:
+        """Return (kind, level, num-id, start) for a Word list paragraph."""
+
+        try:
+            from docx.oxml.ns import qn
+        except ImportError:
+            return None
+        p_pr = getattr(paragraph._p, "pPr", None)
+        num_pr = getattr(p_pr, "numPr", None) if p_pr is not None else None
+        style = getattr(paragraph, "style", None)
+        if num_pr is None and style is not None:
+            style_p_pr = getattr(getattr(style, "element", None), "pPr", None)
+            num_pr = (
+                getattr(style_p_pr, "numPr", None)
+                if style_p_pr is not None
+                else None
+            )
+        if num_pr is None or num_pr.numId is None:
+            return None
+        try:
+            num_id = int(num_pr.numId.val)
+            if num_pr.ilvl is not None:
+                level = int(num_pr.ilvl.val)
+            else:
+                style_level = re.search(
+                    r"(?:List\s+(?:Number|Bullet)|列表)\s*([2-9])$",
+                    str(getattr(style, "name", "") or ""),
+                    re.IGNORECASE,
+                )
+                level = int(style_level.group(1)) - 1 if style_level else 0
+        except (TypeError, ValueError):
+            return None
+
+        numbering_part = getattr(document.part, "numbering_part", None)
+        root = getattr(numbering_part, "element", None)
+        if root is None:
+            return ("unordered", level, num_id, 1)
+        abstract_id = ""
+        for num in root.findall(qn("w:num")):
+            if str(num.get(qn("w:numId")) or "") != str(num_id):
+                continue
+            reference = num.find(qn("w:abstractNumId"))
+            abstract_id = str(reference.get(qn("w:val")) or "") if reference is not None else ""
+            break
+        for abstract in root.findall(qn("w:abstractNum")):
+            if str(abstract.get(qn("w:abstractNumId")) or "") != abstract_id:
+                continue
+            levels = abstract.findall(qn("w:lvl"))
+            selected = next(
+                (
+                    item
+                    for item in levels
+                    if str(item.get(qn("w:ilvl")) or "0") == str(level)
+                ),
+                levels[0] if levels else None,
+            )
+            if selected is None:
+                break
+            num_format = selected.find(qn("w:numFmt"))
+            format_value = str(num_format.get(qn("w:val")) or "") if num_format is not None else ""
+            start_node = selected.find(qn("w:start"))
+            try:
+                start = int(start_node.get(qn("w:val"))) if start_node is not None else 1
+            except (TypeError, ValueError):
+                start = 1
+            kind = "unordered" if format_value.casefold() in {"bullet", "none"} else "ordered"
+            return (kind, max(0, level), num_id, max(1, start))
+        return ("unordered", max(0, level), num_id, 1)
 
     @classmethod
     def _docx_editor_markdown(cls, path: Path) -> str:
@@ -5770,26 +5944,75 @@ class LocalProjectMaterialsRepository:
             ) from exc
 
         sections: list[str] = []
+        list_counters: dict[tuple[int, int], int] = {}
+        active_list_context: tuple[str, int, int] | None = None
+        first_meaningful_paragraph = True
+        document_title_key = cls._docx_title_key(path.name)
         for child in document.element.body.iterchildren():
             if isinstance(child, CT_P):
                 paragraph = Paragraph(child, document)
                 text, images = cls._docx_paragraph_markdown(paragraph, document)
                 if text:
-                    style_name = str(
-                        getattr(getattr(paragraph, "style", None), "name", "")
-                        or ""
+                    paragraph_title_key = cls._docx_title_key(
+                        str(paragraph.text or "")
                     )
-                    heading = re.match(r"^Heading\s+([1-4])$", style_name)
-                    has_numbering = (
-                        paragraph._p.pPr is not None
-                        and paragraph._p.pPr.numPr is not None
-                    )
-                    if heading:
-                        text = f"{'#' * int(heading.group(1))} {text}"
-                    elif has_numbering:
-                        text = f"- {text}"
+                    if (
+                        first_meaningful_paragraph
+                        and document_title_key
+                        and paragraph_title_key == document_title_key
+                    ):
+                        first_meaningful_paragraph = False
+                        sections.extend(images)
+                        continue
+                    first_meaningful_paragraph = False
+                    heading_level = cls._docx_heading_level(paragraph)
+                    list_metadata = cls._docx_list_metadata(paragraph, document)
+                    if heading_level:
+                        active_list_context = None
+                        text = f"{'#' * heading_level} {text}"
+                    elif list_metadata:
+                        kind, level, num_id, start = list_metadata
+                        active_list_context = (kind, level, num_id)
+                        indent = "    " * level
+                        if kind == "ordered":
+                            for key in list(list_counters):
+                                if key[0] == num_id and key[1] > level:
+                                    del list_counters[key]
+                            key = (num_id, level)
+                            number = list_counters.get(key, start - 1) + 1
+                            list_counters[key] = number
+                            # MDXEditor 4 flattens every paragraph inside a
+                            # list item into the same Lexical paragraph. Word
+                            # documents commonly place an explanatory
+                            # paragraph (for example “控制措施”) between two
+                            # numbered paragraphs, so emitting a real Markdown
+                            # list either resets every later item to 1 or
+                            # swallows the explanation into the previous item.
+                            # Keep the source paragraphs independent and escape
+                            # only the list punctuation. Markdown still renders
+                            # the exact visible number, while the DOCX exporter
+                            # below restores it to a Word numbered paragraph.
+                            text = f"{'  ' * level}{number}\\. {text}"
+                        else:
+                            text = f"{indent}- {text}"
+                    elif active_list_context is not None:
+                        # Preserve the original Word paragraph boundary.  Do
+                        # not indent it into the preceding Markdown list item;
+                        # MDXEditor would flatten the two paragraphs visually.
+                        active_list_context = None
                     sections.append(text)
-                sections.extend(images)
+                if images and active_list_context is not None:
+                    _, level, _ = active_list_context
+                    image_indent = "    " * (level + 1)
+                    sections.extend(
+                        "\n".join(
+                            f"{image_indent}{line}" if line else line
+                            for line in image.splitlines()
+                        )
+                        for image in images
+                    )
+                else:
+                    sections.extend(images)
                 continue
             if not isinstance(child, CT_Tbl):
                 continue
@@ -5852,16 +6075,44 @@ class LocalProjectMaterialsRepository:
 
     @staticmethod
     def _add_docx_markdown_runs(paragraph: Any, text: str) -> None:
-        pattern = re.compile(r"(\*\*(.+?)\*\*|`([^`]+)`)")
+        # Editor-only boundaries make CJK-adjacent emphasis parse reliably,
+        # but must never become characters in the saved Word document.
+        text = (
+            str(text or "")
+            .replace("&#8203;", "")
+            .replace("&ZeroWidthSpace;", "")
+            .replace("\u200b", "")
+        )
+        pattern = re.compile(
+            r"(\[([^\]]+)\]\(([^)]+)\)|\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|"
+            r"~~(.+?)~~|(?<!\*)\*([^*]+?)\*(?!\*)|`([^`]+)`)"
+        )
         cursor = 0
         for match in pattern.finditer(text):
             if match.start() > cursor:
                 paragraph.add_run(text[cursor : match.start()])
             if match.group(2) is not None:
-                run = paragraph.add_run(match.group(2))
+                label = match.group(2)
+                url = match.group(3) or ""
+                run = paragraph.add_run(label)
+                run.underline = True
+                if url and url != label:
+                    paragraph.add_run(f" ({url})")
+            elif match.group(4) is not None:
+                run = paragraph.add_run(match.group(4))
                 run.bold = True
+                run.italic = True
+            elif match.group(5) is not None:
+                run = paragraph.add_run(match.group(5))
+                run.bold = True
+            elif match.group(6) is not None:
+                run = paragraph.add_run(match.group(6))
+                run.font.strike = True
+            elif match.group(7) is not None:
+                run = paragraph.add_run(match.group(7))
+                run.italic = True
             else:
-                run = paragraph.add_run(match.group(3) or "")
+                run = paragraph.add_run(match.group(8) or "")
                 run.font.name = "Menlo"
             cursor = match.end()
         if cursor < len(text):
@@ -5987,7 +6238,7 @@ class LocalProjectMaterialsRepository:
                         )
                 continue
 
-            heading = re.match(r"^(#{1,4})\s+(.+)$", line)
+            heading = re.match(r"^(#{1,6})\s+(.+)$", line)
             if heading:
                 level = len(heading.group(1))
                 item = paragraph(f"Heading {level}")
@@ -5995,16 +6246,27 @@ class LocalProjectMaterialsRepository:
                 index += 1
                 continue
 
+            indent_level = min(8, (len(raw) - len(raw.lstrip(" "))) // 4)
             bullet = re.match(r"^[-*+]\s+(.+)$", line)
             if bullet:
-                item = paragraph("List Bullet")
+                list_style = (
+                    "List Bullet"
+                    if indent_level == 0
+                    else f"List Bullet {min(3, indent_level + 1)}"
+                )
+                item = paragraph(list_style)
                 cls._add_docx_markdown_runs(item, bullet.group(1).strip())
                 index += 1
                 continue
 
-            numbered = re.match(r"^\d+[.)]\s+(.+)$", line)
+            numbered = re.match(r"^\d+(?:\\)?[.)]\s+(.+)$", line)
             if numbered:
-                item = paragraph("List Number")
+                list_style = (
+                    "List Number"
+                    if indent_level == 0
+                    else f"List Number {min(3, indent_level + 1)}"
+                )
+                item = paragraph(list_style)
                 cls._add_docx_markdown_runs(item, numbered.group(1).strip())
                 index += 1
                 continue
@@ -6308,7 +6570,7 @@ class LocalProjectMaterialsRepository:
         )
         suffix = path.suffix.lower()
         editor_cache_kind = {
-            ".docx": "docx_editor_v3",
+            ".docx": "docx_editor_v8",
             ".xlsx": "xlsx_editor_v2",
             ".xlsm": "xlsx_editor_v2",
         }.get(suffix)
@@ -6338,7 +6600,7 @@ class LocalProjectMaterialsRepository:
             }
         if suffix == ".docx":
             content = self._docx_editor_markdown(path)
-            kind = "docx_editor_v3"
+            kind = "docx_editor_v8"
         elif suffix in {".xlsx", ".xlsm"}:
             content = self._xlsx_editor_markdown(path)
             kind = "xlsx_editor_v2"
