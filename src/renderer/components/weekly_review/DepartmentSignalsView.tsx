@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import { ArrowUpRight, ArrowDownRight, Minus, ArrowRight } from 'lucide-react';
 import { getDepartmentSignals } from '../../lib/api';
 import type {
-  DepartmentScoreRow,
   DepartmentSignalsResponse,
   ExecutiveDecision,
   ExecutiveHealthIndicator,
@@ -10,8 +9,15 @@ import type {
 
 interface Props {
   weekLabel?: string | null;
-  perspective: 'organization' | 'department' | 'mine';
+  perspective: 'organization' | 'department';
   departmentId?: string | null;
+}
+
+const SIGNAL_CACHE_TTL_MS = 5 * 60 * 1000;
+const signalCache = new Map<string, { data: DepartmentSignalsResponse; fetchedAt: number }>();
+
+function signalCacheKey({ weekLabel, perspective, departmentId }: Props) {
+  return `${weekLabel || ''}:${perspective}:${departmentId || ''}`;
 }
 
 // ─── HealthIndicator ────────────────────────────────────────────────────────
@@ -179,127 +185,6 @@ function DecisionLine({
   );
 }
 
-// ─── DepartmentScoreboard ────────────────────────────────────────────────────
-// Horizontal comparison: 1 row per metric, 1 column per department.
-
-function ScoreBar({ value, max = 100, accent }: { value: number; max?: number; accent: string }) {
-  const pct = Math.max(0, Math.min(100, (value / max) * 100));
-  const barColor =
-    accent === 'success' ? 'bg-emerald-500' : accent === 'danger' ? 'bg-rose-500' : 'bg-gray-900';
-  return (
-    <div className="flex items-center gap-3">
-      <div className="flex-1 h-[3px] bg-gray-100 rounded-full overflow-hidden">
-        <div
-          className={`h-full rounded-full ${barColor} transition-all duration-700`}
-          style={{ width: `${pct}%` }}
-        />
-      </div>
-      <span className="text-[13px] font-medium text-gray-900 tabular-nums w-10 text-right">
-        {value}
-      </span>
-    </div>
-  );
-}
-
-function scoreAccent(score: number, threshold: { good: number; bad: number }): string {
-  if (score >= threshold.good) return 'success';
-  if (score < threshold.bad) return 'danger';
-  return 'neutral';
-}
-
-function DepartmentScoreboard({ rows }: { rows: DepartmentScoreRow[] }) {
-  if (rows.length === 0) return null;
-
-  const metrics: Array<{
-    key: keyof DepartmentScoreRow;
-    label: string;
-    max: number;
-    threshold: { good: number; bad: number };
-    suffix?: string;
-  }> = [
-    { key: 'valueProductionScore', label: '价值产出', max: 100, threshold: { good: 60, bad: 30 } },
-    {
-      key: 'fulfillmentRatePct',
-      label: '本周履约',
-      max: 100,
-      threshold: { good: 70, bad: 30 },
-      suffix: '%',
-    },
-    {
-      key: 'monthlyProgressPct',
-      label: '月目标进度',
-      max: 100,
-      threshold: { good: 50, bad: 20 },
-      suffix: '%',
-    },
-    {
-      key: 'humanEfficiencyScore',
-      label: '人力效率',
-      max: 100,
-      threshold: { good: 70, bad: 40 },
-      suffix: '',
-    },
-  ];
-
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full border-collapse">
-        <thead>
-          <tr className="border-b border-gray-100">
-            <th className="w-32 py-4 text-left text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">
-              指标
-            </th>
-            {rows.map((row) => {
-              const statusDot =
-                row.status === 'abnormal'
-                  ? 'bg-rose-500'
-                  : row.status === 'tight'
-                    ? 'bg-amber-500'
-                    : 'bg-emerald-500';
-              return (
-                <th key={row.departmentId} className="py-4 px-6 text-left">
-                  <div className="flex items-center gap-2">
-                    <span className={`h-1.5 w-1.5 rounded-full ${statusDot}`} />
-                    <span className="text-[14px] font-semibold text-gray-900">{row.departmentName}</span>
-                  </div>
-                  <div className="mt-0.5 ml-3.5 text-[11px] text-gray-400">{row.leaderName || '未指定负责人'}</div>
-                </th>
-              );
-            })}
-          </tr>
-        </thead>
-        <tbody>
-          {metrics.map((m) => (
-            <tr key={m.key} className="border-b border-gray-50">
-              <td className="py-5 text-[12px] font-medium text-gray-500">{m.label}</td>
-              {rows.map((row) => {
-                const value = Number(row[m.key] ?? 0);
-                return (
-                  <td key={row.departmentId} className="py-5 px-6">
-                    <ScoreBar value={value} max={m.max} accent={scoreAccent(value, m.threshold)} />
-                  </td>
-                );
-              })}
-            </tr>
-          ))}
-          <tr>
-            <td className="pt-5 text-[10px] font-bold uppercase tracking-[0.18em] text-gray-300">
-              一线读数
-            </td>
-            {rows.map((row) => (
-              <td key={row.departmentId} className="pt-5 px-6">
-                <p className="text-[12px] leading-relaxed text-gray-500">
-                  {row.headlineInsight || '—'}
-                </p>
-              </td>
-            ))}
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
 // ─── Main view ───────────────────────────────────────────────────────────────
 
 export function DepartmentSignalsView({ weekLabel, perspective, departmentId }: Props) {
@@ -310,19 +195,37 @@ export function DepartmentSignalsView({ weekLabel, perspective, departmentId }: 
   useEffect(() => {
     let cancelled = false;
     async function load() {
-      setLoading(true);
+      const key = signalCacheKey({ weekLabel, perspective, departmentId });
+      const cached = signalCache.get(key);
+      const age = cached ? Date.now() - cached.fetchedAt : Number.POSITIVE_INFINITY;
+      if (cached) {
+        setData(cached.data);
+      }
+      if (cached && age < SIGNAL_CACHE_TTL_MS) {
+        setLoading(false);
+        setError(null);
+        return;
+      }
+      setLoading(!cached);
       setError(null);
       try {
         const resp = await getDepartmentSignals({ weekLabel, perspective, departmentId });
-        if (!cancelled) setData({
+        const normalized = {
           ...resp,
+          perspective: resp.perspective || perspective,
+          generatedAt: resp.generatedAt || new Date().toISOString(),
+          sourceSummary: resp.sourceSummary || '基于当前权限范围内的任务、计划和复盘计算',
           healthIndicators: Array.isArray(resp.healthIndicators) ? resp.healthIndicators : [],
           executiveDecisions: Array.isArray(resp.executiveDecisions) ? resp.executiveDecisions : [],
           departmentScoreboard: Array.isArray(resp.departmentScoreboard) ? resp.departmentScoreboard : [],
           actionAlerts: Array.isArray(resp.actionAlerts) ? resp.actionAlerts : [],
           oneOnOneSuggestions: Array.isArray(resp.oneOnOneSuggestions) ? resp.oneOnOneSuggestions : [],
           departmentSnapshots: Array.isArray(resp.departmentSnapshots) ? resp.departmentSnapshots : [],
-        });
+        };
+        signalCache.set(key, { data: normalized, fetchedAt: Date.now() });
+        if (!cancelled) {
+          setData(normalized);
+        }
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
       } finally {
@@ -341,7 +244,7 @@ export function DepartmentSignalsView({ weekLabel, perspective, departmentId }: 
     );
   }
 
-  if (error) {
+  if (error && !data) {
     return (
       <div className="py-16 max-w-md mx-auto text-center">
         <p className="text-[13px] font-semibold text-rose-700">驾驶舱暂时不可用</p>
@@ -352,29 +255,66 @@ export function DepartmentSignalsView({ weekLabel, perspective, departmentId }: 
 
   if (!data) return null;
 
+  const visibleIndicators = [...data.healthIndicators];
+  const indicatorKeys = new Set(visibleIndicators.map((indicator) => indicator.key));
+  const currentRow = data.departmentScoreboard[0];
+  if (currentRow) {
+    const supplemental: ExecutiveHealthIndicator[] = [
+      {
+        key: 'completed_tasks',
+        label: '已完成',
+        valueText: String(currentRow.taskCompletedCount),
+        unitText: '项',
+        trendDirection: 'flat',
+        accent: currentRow.taskCompletedCount > 0 ? 'success' : 'neutral',
+        helperText: '按任务当前状态计数',
+      },
+      {
+        key: 'pending_tasks',
+        label: '未完成',
+        valueText: String(currentRow.taskPendingCount),
+        unitText: '项',
+        trendDirection: 'flat',
+        accent: currentRow.taskPendingCount > 0 ? 'warning' : 'success',
+        helperText: '仍在推进或尚未开始',
+      },
+      {
+        key: 'reviewed_tasks',
+        label: '已写复盘',
+        valueText: String(currentRow.reviewedTaskCount),
+        unitText: '项',
+        trendDirection: 'flat',
+        accent: currentRow.reviewedTaskCount > 0 ? 'success' : 'neutral',
+        helperText: '已有正文或结构化复盘',
+      },
+    ];
+    supplemental.forEach((indicator) => {
+      if (!indicatorKeys.has(indicator.key)) visibleIndicators.push(indicator);
+    });
+  }
+
   const hasContent =
-    data.healthIndicators.length > 0 ||
-    data.executiveDecisions.length > 0 ||
-    data.departmentScoreboard.length > 0;
+    visibleIndicators.length > 0 || data.executiveDecisions.length > 0;
 
   if (!hasContent) {
     return (
       <div className="py-32 text-center max-w-md mx-auto">
         <p className="text-[14px] font-semibold text-gray-700">本周经营驾驶舱无信号</p>
         <p className="mt-3 text-[12px] leading-relaxed text-gray-400">
-          建立部门月计划、并把任务挂到计划项上，系统会自动开始计算经营健康度。
+          当前范围内尚无可用于计算的本周任务或复盘记录。
         </p>
       </div>
     );
   }
 
   return (
-    <div className="max-w-6xl space-y-16 pt-10 pb-20">
+    <div className="max-w-6xl space-y-16 pt-6">
+      {error && <p className="text-[11px] text-amber-700">刷新失败，当前显示上次结果：{error}</p>}
       {/* L1 · Health indicators */}
-      {data.healthIndicators.length > 0 && (
+      {visibleIndicators.length > 0 && (
         <section>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-x-10 gap-y-8">
-            {data.healthIndicators.map((h) => (
+            {visibleIndicators.map((h) => (
               <HealthIndicator key={h.key} indicator={h} />
             ))}
           </div>
@@ -397,19 +337,6 @@ export function DepartmentSignalsView({ weekLabel, perspective, departmentId }: 
               <DecisionCard key={d.id} decision={d} />
             ))}
           </div>
-        </section>
-      )}
-
-      {/* L3 · Department scoreboard */}
-      {data.departmentScoreboard.length > 0 && (
-        <section>
-          <div className="mb-6 flex items-baseline justify-between">
-            <div>
-              <h2 className="text-[20px] font-light text-gray-900 tracking-tight">部门经营效率</h2>
-              <p className="mt-1 text-[12px] text-gray-400">横向对比各部门本周经营表现</p>
-            </div>
-          </div>
-          <DepartmentScoreboard rows={data.departmentScoreboard} />
         </section>
       )}
     </div>

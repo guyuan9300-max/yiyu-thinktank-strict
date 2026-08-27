@@ -164,9 +164,15 @@ def register_gc06_planning_routes(
     def list_planning_cycles(
         identity: Identity,
         include_archived: Annotated[bool, Query(alias="includeArchived")] = False,
+        include_review_periods: Annotated[
+            bool, Query(alias="includeReviewPeriods")
+        ] = False,
     ) -> list[dict[str, Any]]:
         return gc06_planning.list_planning_cycles(
-            repository, identity, include_archived=include_archived
+            repository,
+            identity,
+            include_archived=include_archived,
+            include_review_periods=include_review_periods,
         )
 
     @app.post("/api/v2/gc06/planning-cycles", status_code=status.HTTP_201_CREATED)

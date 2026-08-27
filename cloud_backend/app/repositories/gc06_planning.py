@@ -599,19 +599,18 @@ def event_line_detail(
             (identity.scope_id, event_line_id),
         ).fetchall()
         task_repository = GC04TaskRepository(repository)
-        owner_departments_by_task = task_repository._owner_departments_by_task(  # noqa: SLF001
-            connection, identity, (str(item["id"]) for item in tasks)
-        )
-        task_payloads = [
-            task_repository._task_payload(  # noqa: SLF001
+        task_payloads = []
+        for item in tasks:
+            task_payload = task_repository._task_payload(  # noqa: SLF001
                 connection,
                 identity,
                 item,
-                owner_departments_by_task=owner_departments_by_task,
-                event_line_detail=True,
             )
-            for item in tasks
-        ]
+            task_payload["viewer_surfaces"] = {
+                **dict(task_payload.get("viewer_surfaces") or {}),
+                "event_line_detail": True,
+            }
+            task_payloads.append(task_payload)
         return {
             "eventLine": _event_line_payload(connection, row),
             "activities": [_activity_payload(item) for item in activities],
@@ -1539,12 +1538,14 @@ def list_planning_cycles(
     identity: SessionIdentity,
     *,
     include_archived: bool = False,
+    include_review_periods: bool = False,
 ) -> list[dict[str, Any]]:
     with repository._connection() as connection:  # noqa: SLF001
         rows = connection.execute(
             "SELECT * FROM planning_cycles WHERE scope_id=? AND "
             "lifecycle_state!='deleted' "
             + ("" if include_archived else "AND lifecycle_state='active' ")
+            + ("" if include_review_periods else "AND record_kind!='cycle' ")
             + "ORDER BY period_start DESC, created_at DESC, id DESC",
             (identity.scope_id,),
         ).fetchall()
@@ -2054,6 +2055,77 @@ def _safe_review_content(value: Any) -> dict[str, Any]:
     return result
 
 
+def _weekly_review_period_bounds(week_label: str) -> tuple[str, str]:
+    try:
+        year_text, week_text = week_label.split("-W", 1)
+        start = date.fromisocalendar(int(year_text), int(week_text), 1)
+    except (TypeError, ValueError) as exc:
+        raise RepositoryError(
+            422,
+            "weekly_review_week_invalid",
+            "周复盘所属周格式无效",
+        ) from exc
+    iso_year, iso_week, _ = start.isocalendar()
+    end = date.fromisocalendar(iso_year, iso_week, 7)
+    return start.isoformat(), end.isoformat()
+
+
+def _ensure_weekly_review_period_cycle(
+    repository: CloudRepository,
+    connection: sqlite3.Connection,
+    identity: SessionIdentity,
+    *,
+    membership_id: str,
+    week_label: str,
+    now: str,
+) -> sqlite3.Row:
+    period_start, period_end = _weekly_review_period_bounds(week_label)
+    cycle_id = "review_period_" + sha256_text(
+        f"{identity.scope_id}|{membership_id}|{week_label}"
+    )[:32]
+    existing = connection.execute(
+        "SELECT * FROM planning_cycles WHERE scope_id=? AND id=? "
+        "AND lifecycle_state!='deleted'",
+        (identity.scope_id, cycle_id),
+    ).fetchone()
+    if existing is not None:
+        return existing
+    _insert_secured_resource(
+        repository,
+        connection,
+        identity,
+        resource_id=cycle_id,
+        resource_kind="planning_cycle",
+        resource_type_key="cycle",
+        now=now,
+    )
+    connection.execute(
+        """
+        INSERT INTO planning_cycles (
+            id, scope_id, event_line_id, period, plan_version, status,
+            record_kind, client_id, department_id, owner_membership_id,
+            period_kind, period_start, period_end, timezone, title, summary,
+            published_at, archived_at, version, lifecycle_state, created_at,
+            updated_at, deleted_at
+        ) VALUES (?, ?, NULL, ?, 1, 'draft', 'cycle', NULL, NULL, ?,
+                  'weekly_review', ?, ?, 'Asia/Shanghai', ?, '', NULL, NULL,
+                  1, 'active', ?, ?, NULL)
+        """,
+        (
+            cycle_id,
+            identity.scope_id,
+            f"{period_start}/{period_end}",
+            membership_id,
+            period_start,
+            period_end,
+            f"{week_label} 复盘周期",
+            now,
+            now,
+        ),
+    )
+    return _planning_row(connection, identity, cycle_id)
+
+
 def _insert_evidence_source_set(
     repository: CloudRepository,
     connection: sqlite3.Connection,
@@ -2319,9 +2391,19 @@ def save_weekly_review_draft(
     payload: Mapping[str, Any],
     idempotency_key: str,
 ) -> dict[str, Any]:
-    planning_cycle_id = _required_text(payload.get("planningCycleId"), "planning_cycle_required", "周复盘必须属于计划周期", limit=200)
+    planning_cycle_id = _text(payload.get("planningCycleId"), limit=200)
+    week_label = _text(payload.get("weekLabel"), limit=20)
+    if not planning_cycle_id and not week_label:
+        raise RepositoryError(
+            422,
+            "weekly_review_week_required",
+            "周复盘必须指定所属周",
+        )
     membership_id = _text(payload.get("membershipId"), limit=200) or identity.membership_id
     content = _safe_review_content(payload.get("content") or {})
+    if week_label:
+        _weekly_review_period_bounds(week_label)
+        content["weekLabel"] = week_label
     expected_raw = payload.get("expectedVersion")
     try:
         expected = int(expected_raw or 0)
@@ -2329,6 +2411,7 @@ def save_weekly_review_draft(
         expected = -1
     normalized = {
         "planningCycleId": planning_cycle_id,
+        "weekLabel": week_label,
         "membershipId": membership_id,
         "expectedVersion": expected,
         "content": content,
@@ -2340,7 +2423,21 @@ def save_weekly_review_draft(
     with repository._connection() as connection:  # noqa: SLF001
         connection.execute("BEGIN IMMEDIATE")
         try:
-            cycle = _planning_row(connection, identity, planning_cycle_id)
+            _membership_row(connection, identity, membership_id)
+            if membership_id != identity.membership_id and not identity.is_admin:
+                raise RepositoryError(403, "weekly_review_forbidden", "不能代写其他成员复盘")
+            if planning_cycle_id:
+                cycle = _planning_row(connection, identity, planning_cycle_id)
+            else:
+                cycle = _ensure_weekly_review_period_cycle(
+                    repository,
+                    connection,
+                    identity,
+                    membership_id=membership_id,
+                    week_label=week_label,
+                    now=now,
+                )
+                planning_cycle_id = str(cycle["id"])
             _require_plan_permission(
                 connection,
                 identity,
@@ -2348,9 +2445,6 @@ def save_weekly_review_draft(
                 department_id=cycle["department_id"],
                 write=False,
             )
-            _membership_row(connection, identity, membership_id)
-            if membership_id != identity.membership_id and not identity.is_admin:
-                raise RepositoryError(403, "weekly_review_forbidden", "不能代写其他成员复盘")
             existing = connection.execute(
                 "SELECT * FROM weekly_reviews WHERE scope_id=? AND membership_id=? "
                 "AND planning_cycle_id=? AND lifecycle_state!='deleted'",

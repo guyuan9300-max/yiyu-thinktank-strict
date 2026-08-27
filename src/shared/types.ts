@@ -3860,9 +3860,17 @@ export interface WeeklyReview {
   personalGrowthNote?: string;
   personalPrivateNote?: string;
   personalVisibility?: 'self';
+  eventGroupingOverrides?: WeeklyReviewEventGroupingOverride[];
   submittedAt: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface WeeklyReviewEventGroupingOverride {
+  id: string;
+  title: string;
+  taskIds: string[];
+  reflectionPromptText?: string | null;
 }
 
 export interface AgentWorklog {
@@ -3934,6 +3942,7 @@ export interface AgentWeeklyPlanPayload {
 
 export interface WeeklyReviewTaskSnapshot {
   title: string;
+  description?: string | null;
   status: TaskStatus;
   startDate?: string | null;
   dueDate?: string | null;
@@ -3948,6 +3957,7 @@ export interface WeeklyReviewTaskSnapshot {
   clientName?: string | null;
   eventLineId?: string | null;
   eventLineName?: string | null;
+  planningCycleId?: string | null;
   tags: TaskTag[];
   listName: string;
   listColor: string;
@@ -4260,17 +4270,34 @@ export interface WeeklyReviewAnalysis {
 export interface WeeklyMainlineCard {
   id?: string;
   title: string;
+  taskIds?: string[];
   taskCount: number;
   completedCount: number;
   pendingCount: number;
-  progressText: string;
-  nextGoalText: string;
+  narrativeText?: string | null;
+  nextMoveText?: string | null;
+  openQuestions?: string[];
+  evidenceRefs?: WeeklyReviewEvidenceRef[];
+  /** Legacy v1 fields are read only so stale local drafts fail softly. */
+  progressText?: string;
+  nextGoalText?: string;
+  whyText?: string | null;
+  meaningText?: string | null;
+  riskText?: string | null;
+  supportText?: string | null;
+  confirmationText?: string | null;
+}
+
+export interface WeeklyReviewEvidenceRef {
+  type: 'task' | 'plan' | 'project' | 'event_line' | 'review';
+  id: string;
+  label: string;
 }
 
 export interface WeeklyMainlineCards {
   summaryText: string;
   mainlines: WeeklyMainlineCard[];
-  generatedBy: 'ai' | 'fallback';
+  generatedBy: 'ai' | 'human' | 'fallback';
   evidenceMeta?: Record<string, unknown>;
 }
 
@@ -4282,17 +4309,18 @@ export interface WeeklyEventReviewCard {
   cardKind: WeeklyEventReviewCardKind;
   taskIds: string[];
   taskTitles: string[];
+  groupReason?: string | null;
   reflectionPromptText: string;
-  progressText: string;
-  nextActionText: string;
-  materialSuggestionText: string;
+  progressText?: string;
+  nextActionText?: string;
+  materialSuggestionText?: string;
   confidence: 'low' | 'medium' | 'high';
-  generatedBy: 'ai' | 'fallback';
+  generatedBy: 'ai' | 'human' | 'fallback';
 }
 
 export interface WeeklyEventReviewCards {
   cards: WeeklyEventReviewCard[];
-  generatedBy: 'ai' | 'fallback';
+  generatedBy: 'ai' | 'human' | 'fallback';
   evidenceMeta?: Record<string, unknown>;
 }
 
@@ -4301,6 +4329,8 @@ export interface WeeklyOverviewRefreshPayload {
   perspective?: ReviewPerspectiveKey | null;
   departmentId?: string | null;
   force?: boolean;
+  groupingOnly?: boolean;
+  eventGroupingOverrides?: WeeklyReviewEventGroupingOverride[];
 }
 
 export interface WeeklyOverviewRefreshStatus {
@@ -4583,10 +4613,13 @@ export interface DepartmentScoreRow {
   departmentId: string;
   departmentName: string;
   leaderName?: string | null;
-  valueProductionScore: number;
+  taskTotalCount: number;
+  taskCompletedCount: number;
+  taskPendingCount: number;
+  reviewedTaskCount: number;
+  blockerCount: number;
+  activePlanCount: number;
   fulfillmentRatePct: number;
-  monthlyProgressPct: number;
-  humanEfficiencyScore: number;
   headlineInsight?: string | null;
   status: string;
 }
@@ -4594,6 +4627,9 @@ export interface DepartmentScoreRow {
 export interface DepartmentSignalsResponse {
   weekLabel: string;
   viewerRole: 'admin' | 'department_lead' | 'employee' | string;
+  perspective: 'organization' | 'department' | string;
+  generatedAt: string;
+  sourceSummary: string;
   healthIndicators: ExecutiveHealthIndicator[];
   executiveDecisions: ExecutiveDecision[];
   departmentScoreboard: DepartmentScoreRow[];
@@ -7823,6 +7859,7 @@ export interface WeeklyReviewPayload {
   workFreeNote?: string;
   personalGrowthNote?: string;
   personalPrivateNote?: string;
+  eventGroupingOverrides?: WeeklyReviewEventGroupingOverride[];
 }
 
 export interface TopicRadarPayload {

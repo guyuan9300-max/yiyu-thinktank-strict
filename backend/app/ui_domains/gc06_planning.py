@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import gettempdir
 from typing import Any, Mapping
@@ -282,6 +282,25 @@ def _week_bounds(label: str) -> tuple[date, date] | None:
     return start, date.fromisocalendar(iso_year, iso_week, 7)
 
 
+def _cycle_overlaps_week(cycle: Mapping[str, Any], week: str) -> bool:
+    bounds = _week_bounds(week)
+    if bounds is None:
+        return False
+    try:
+        start = date.fromisoformat(str(cycle.get("periodStart") or "")[:10])
+        end = date.fromisoformat(str(cycle.get("periodEnd") or "")[:10])
+    except ValueError:
+        return False
+    return start <= bounds[1] and end >= bounds[0]
+
+
+def _previous_week_label(week: str) -> str:
+    bounds = _week_bounds(week)
+    if bounds is None:
+        return ""
+    return _week_label((bounds[0] - timedelta(days=7)).isoformat())
+
+
 def _review_content(review: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     versions = [
         item
@@ -350,7 +369,8 @@ def _basic_review_dashboard(
     matching_cycles = [
         item
         for item in cycles
-        if _week_label(str(item.get("periodStart") or "")) == week
+        if str(item.get("recordKind") or "") in {"organization_plan", "department_plan"}
+        and _cycle_overlaps_week(item, week)
     ]
     cycle_ids = {str(item.get("id") or "") for item in matching_cycles}
     current = next(
@@ -358,10 +378,22 @@ def _basic_review_dashboard(
             item
             for item in reviews
             if str(item.get("membershipId") or "") == membership_id
-            and str(item.get("planningCycleId") or "") in cycle_ids
+            and str(_review_content(item)[1].get("weekLabel") or "") == week
         ),
         None,
     )
+    if current is None:
+        # Reviews created before weekLabel became their stable period identity
+        # are still located through their former formal-plan relationship.
+        current = next(
+            (
+                item
+                for item in reviews
+                if str(item.get("membershipId") or "") == membership_id
+                and str(item.get("planningCycleId") or "") in cycle_ids
+            ),
+            None,
+        )
     current_review = None
     current_content: Mapping[str, Any] = {}
     if current is not None:
@@ -378,11 +410,16 @@ def _basic_review_dashboard(
             "workDirection": str(content.get("workDirection") or ""),
             "nextWeekFocus": str(content.get("nextWeekFocus") or ""),
             "supportNeeded": str(content.get("supportNeeded") or ""),
-            "relatedPlanIds": [str(current.get("planningCycleId") or "")],
+            "relatedPlanIds": sorted(cycle_ids),
             "workFreeNote": str(content.get("summary") or ""),
             "personalGrowthNote": "",
             "personalPrivateNote": "",
             "personalVisibility": "self",
+            "eventGroupingOverrides": [
+                dict(item)
+                for item in content.get("eventGroupingOverrides") or []
+                if isinstance(item, Mapping)
+            ],
             "submittedAt": str(version.get("submittedAt") or ""),
             "createdAt": str(current.get("createdAt") or ""),
             "updatedAt": str(current.get("updatedAt") or ""),
@@ -435,6 +472,7 @@ def _basic_review_dashboard(
             "reviewedAt": current.get("updatedAt") if current else None,
             "taskSnapshot": {
                 "title": task.get("title") or "",
+                "description": task.get("desc") or "",
                 "status": task.get("status") or "todo",
                 "startDate": task.get("startDate"),
                 "dueDate": task.get("dueDate"),
@@ -449,6 +487,7 @@ def _basic_review_dashboard(
                 "clientName": task.get("clientName"),
                 "eventLineId": task.get("eventLineId"),
                 "eventLineName": task.get("eventLineName"),
+                "planningCycleId": task.get("planningCycleId"),
                 "tags": [],
                 "listName": task.get("listName") or "",
                 "listColor": task.get("listColor") or "#5B7BFE",
@@ -512,29 +551,15 @@ def _basic_review_dashboard(
     }
 
 
-def _cycle_for_week(
-    cycles: list[Mapping[str, Any]], week: str
-) -> Mapping[str, Any] | None:
-    bounds = _week_bounds(week)
-    if bounds is None:
-        return None
-    for cycle in cycles:
-        try:
-            start = date.fromisoformat(str(cycle.get("periodStart") or "")[:10])
-            end = date.fromisoformat(str(cycle.get("periodEnd") or "")[:10])
-        except ValueError:
-            continue
-        if start <= bounds[1] and end >= bounds[0]:
-            return cycle
-    return None
-
-
 def _retained_review_sources(
     compatibility: Any,
     *,
     membership_id: str,
 ) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]], dict[str, Any]]:
-    cycles = compatibility.runtime.cloud_query(f"{_CLOUD_ROOT}/planning-cycles")
+    cycles = compatibility.runtime.cloud_query(
+        f"{_CLOUD_ROOT}/planning-cycles",
+        query={"includeReviewPeriods": True},
+    )
     reviews = compatibility.runtime.cloud_query(
         f"{_CLOUD_ROOT}/weekly-reviews",
         query={"membershipId": membership_id},
@@ -649,7 +674,24 @@ def _retained_dashboard(
         department_id=dashboard["activeDepartmentId"],
     )
     if saved_overview:
-        dashboard["weeklyMainlineCards"] = saved_overview.get("cards")
+        saved_cards = saved_overview.get("cards")
+        evidence_meta = (
+            saved_cards.get("evidenceMeta")
+            if isinstance(saved_cards, Mapping)
+            and isinstance(saved_cards.get("evidenceMeta"), Mapping)
+            else {}
+        )
+        if evidence_meta.get("schemaVersion") == "weekly_review_agent_v3":
+            dashboard["weeklyMainlineCards"] = saved_cards
+        saved_event_cards = saved_overview.get("eventCards")
+        saved_event_meta = (
+            saved_event_cards.get("evidenceMeta")
+            if isinstance(saved_event_cards, Mapping)
+            and isinstance(saved_event_cards.get("evidenceMeta"), Mapping)
+            else {}
+        )
+        if saved_event_meta.get("schemaVersion") == "weekly_review_event_agent_v4":
+            dashboard["weeklyEventReviewCards"] = saved_event_cards
         generation.update(dict(saved_overview.get("status") or {}))
     dashboard["weeklyOverviewGenerationStatus"] = generation
     return dashboard
@@ -1051,23 +1093,33 @@ def _save_retained_review(
         compatibility,
         membership_id=membership_id,
     )
-    cycle = _cycle_for_week(cycles, week)
-    if cycle is None:
-        raise LocalRuntimeError(
-            422,
-            "weekly_review_planning_cycle_required",
-            "本周尚未建立组织或部门计划周期，请先由负责人建立计划后再提交复盘",
-        )
-    cycle_id = str(cycle.get("id") or "")
     current = next(
         (
             item
             for item in reviews
-            if str(item.get("planningCycleId") or "") == cycle_id
-            and str(item.get("membershipId") or "") == membership_id
+            if str(item.get("membershipId") or "") == membership_id
+            and str(_review_content(item)[1].get("weekLabel") or "") == week
         ),
         None,
     )
+    if current is None:
+        legacy_cycle_ids = {
+            str(item.get("id") or "")
+            for item in cycles
+            if str(item.get("recordKind") or "")
+            in {"organization_plan", "department_plan"}
+            and _cycle_overlaps_week(item, week)
+        }
+        current = next(
+            (
+                item
+                for item in reviews
+                if str(item.get("membershipId") or "") == membership_id
+                and str(item.get("planningCycleId") or "") in legacy_cycle_ids
+            ),
+            None,
+        )
+    cycle_id = str(current.get("planningCycleId") or "") if current else ""
     task_versions = {
         str(item.get("id") or ""): max(1, int(item.get("version") or 1))
         for item in task_result.get("tasks") or []
@@ -1101,7 +1153,8 @@ def _save_retained_review(
         "POST",
         f"{_CLOUD_ROOT}/weekly-reviews/draft",
         payload={
-            "planningCycleId": cycle_id,
+            **({"planningCycleId": cycle_id} if cycle_id else {}),
+            "weekLabel": week,
             "membershipId": membership_id,
             "expectedVersion": int(current.get("version") or 1) if current else 0,
             "content": {
@@ -1129,6 +1182,15 @@ def _save_retained_review(
                     if "workFreeNote" in request.body
                     else current_content.get("summary") or ""
                 ),
+                "eventGroupingOverrides": [
+                    dict(item)
+                    for item in (
+                        request.body.get("eventGroupingOverrides")
+                        if "eventGroupingOverrides" in request.body
+                        else current_content.get("eventGroupingOverrides") or []
+                    )
+                    if isinstance(item, Mapping)
+                ],
             },
             "evidence": evidence,
         },
@@ -1234,6 +1296,385 @@ def _weekly_agent_json(raw: str) -> Mapping[str, Any]:
     return value
 
 
+def _weekly_review_prompt_task(item: Mapping[str, Any]) -> dict[str, Any]:
+    snapshot = item.get("taskSnapshot") if isinstance(item.get("taskSnapshot"), Mapping) else {}
+    structured = item.get("structuredNote") if isinstance(item.get("structuredNote"), Mapping) else {}
+    return {
+        "taskId": str(item.get("taskId") or ""),
+        "title": str(snapshot.get("title") or ""),
+        "description": str(snapshot.get("description") or "")[:2_000],
+        "status": str(snapshot.get("status") or ""),
+        "scheduledStartAt": snapshot.get("scheduledStartAt") or snapshot.get("startDate"),
+        "scheduledEndAt": snapshot.get("scheduledEndAt") or snapshot.get("dueDate"),
+        "completedAt": snapshot.get("completedAt"),
+        "clientId": snapshot.get("clientId"),
+        "clientName": snapshot.get("clientName"),
+        "eventLineId": snapshot.get("eventLineId"),
+        "eventLineName": snapshot.get("eventLineName"),
+        "planningCycleId": snapshot.get("planningCycleId"),
+        "reviewNote": str(item.get("note") or "")[:2_000],
+        "reviewFields": {
+            key: str(structured.get(key) or "")[:1_000]
+            for key in (
+                "reflection",
+                "progress",
+                "successReason",
+                "successExperience",
+                "blockerReason",
+                "failureInsight",
+                "supportNeeded",
+                "nextAction",
+            )
+            if str(structured.get(key) or "").strip()
+        },
+    }
+
+
+def _weekly_review_event_contexts(
+    compatibility: Any,
+    request: UiRequest,
+    task_items: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    event_line_ids = list(dict.fromkeys(
+        str((item.get("taskSnapshot") or {}).get("eventLineId") or "")
+        for item in task_items
+        if isinstance(item.get("taskSnapshot"), Mapping)
+        and str((item.get("taskSnapshot") or {}).get("eventLineId") or "")
+    ))
+    result: list[dict[str, Any]] = []
+    for event_line_id in event_line_ids[:16]:
+        try:
+            detail = _strict_event_line_detail(compatibility, event_line_id, request)
+        except LocalRuntimeError:
+            continue
+        line = detail.get("eventLine") if isinstance(detail.get("eventLine"), Mapping) else {}
+        activities = [
+            {
+                "id": str(item.get("id") or ""),
+                "happenedAt": item.get("happenedAt"),
+                "title": str(item.get("title") or "")[:300],
+                "summary": str(item.get("summary") or "")[:1_000],
+            }
+            for item in detail.get("activities") or []
+            if isinstance(item, Mapping)
+        ][-8:]
+        result.append({
+            "eventLineId": event_line_id,
+            "name": str(line.get("name") or ""),
+            "goal": str(line.get("goal") or "")[:2_000],
+            "background": str(line.get("background") or "")[:2_000],
+            "lifecycleState": line.get("lifecycleState"),
+            "clientId": line.get("clientId"),
+            "recentActivities": activities,
+        })
+    return result
+
+
+def _enforce_weekly_explicit_event_groups(
+    raw_groups: Any,
+    *,
+    tasks: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep only explicit event-line groups; unlinked tasks wait for member action."""
+    task_by_id = {
+        str(item.get("taskId") or ""): item
+        for item in tasks
+        if str(item.get("taskId") or "")
+    }
+    result: list[dict[str, Any]] = []
+    for raw in raw_groups or []:
+        if not isinstance(raw, Mapping):
+            continue
+        task_ids = list(dict.fromkeys(
+            str(value)
+            for value in raw.get("taskIds") or []
+            if str(value) in task_by_id
+        ))
+        if not task_ids:
+            continue
+        explicit_line_ids = {
+            str(task_by_id[task_id].get("eventLineId") or "")
+            for task_id in task_ids
+            if str(task_by_id[task_id].get("eventLineId") or "")
+        }
+        if len(task_ids) == 1 or (len(explicit_line_ids) == 1 and all(
+            str(task_by_id[task_id].get("eventLineId") or "") in explicit_line_ids
+            for task_id in task_ids
+        )):
+            result.append(dict(raw))
+            continue
+        for task_id in task_ids:
+            title = str(task_by_id[task_id].get("title") or "未命名任务")
+            result.append({
+                "title": title,
+                "taskIds": [task_id],
+                "groupReason": "尚未明确关联同一事件线，默认单列；由成员决定是否与其他任务合并复盘。",
+                "confidence": "low",
+                "reflectionPromptText": f"请单独复盘“{title}”的实际结果；如属同一事件，可勾选后手动合并。",
+            })
+    return result
+
+
+def _normalize_weekly_event_cards(
+    raw_groups: Any,
+    *,
+    tasks: list[Mapping[str, Any]],
+    week_label: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    by_id = {str(item.get("taskId") or ""): item for item in tasks if item.get("taskId")}
+    claimed: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    groups = raw_groups if isinstance(raw_groups, list) else []
+    for raw in groups:
+        if not isinstance(raw, Mapping):
+            continue
+        task_ids = [
+            str(value)
+            for value in raw.get("taskIds") or []
+            if str(value) in by_id and str(value) not in claimed
+        ]
+        task_ids = list(dict.fromkeys(task_ids))
+        explicit_line_ids = {
+            str(by_id[task_id].get("eventLineId") or "")
+            for task_id in task_ids
+            if str(by_id[task_id].get("eventLineId") or "")
+        }
+        if explicit_line_ids:
+            task_ids.extend(
+                task_id
+                for task_id, task in by_id.items()
+                if task_id not in claimed
+                and task_id not in task_ids
+                and str(task.get("eventLineId") or "") in explicit_line_ids
+            )
+        if not task_ids:
+            continue
+        claimed.update(task_ids)
+        related = [by_id[task_id] for task_id in task_ids]
+        explicit_lines = {
+            str(item.get("eventLineId") or "")
+            for item in related
+            if str(item.get("eventLineId") or "")
+        }
+        title = str(raw.get("title") or "").strip() or str(related[0].get("title") or "未命名事件")
+        group_reason = str(raw.get("groupReason") or "").strip()
+        prompt = str(raw.get("reflectionPromptText") or "").strip()
+        confidence = str(raw.get("confidence") or "medium")
+        if confidence not in {"low", "medium", "high"}:
+            confidence = "medium"
+        normalized.append({
+            "id": f"agent-event:{week_label}:{len(normalized) + 1}",
+            "title": title[:160],
+            "cardKind": (
+                "event_line"
+                if len(explicit_lines) == 1
+                else "task_cluster"
+                if len(task_ids) > 1
+                else "single_task"
+            ),
+            "taskIds": task_ids,
+            "taskTitles": [str(item.get("title") or "") for item in related],
+            "groupReason": group_reason[:800],
+            "reflectionPromptText": prompt[:1_200],
+            "confidence": confidence,
+            "generatedBy": "ai",
+        })
+    for task_id, task in by_id.items():
+        if task_id in claimed:
+            continue
+        normalized.append({
+            "id": f"unassigned-event:{week_label}:{len(normalized) + 1}",
+            "title": str(task.get("title") or "未命名任务")[:160],
+            "cardKind": "needs_assignment",
+            "taskIds": [task_id],
+            "taskTitles": [str(task.get("title") or "")],
+            "groupReason": "Agent 没有找到足够证据把这项任务与其他任务归为同一事件。",
+            "reflectionPromptText": "请确认这项任务对应的真实事件，以及它是否应该与其他任务合并复盘。",
+            "confidence": "low",
+            "generatedBy": "fallback",
+        })
+    return {
+        "cards": normalized,
+        "generatedBy": "ai" if normalized and all(item["generatedBy"] == "ai" for item in normalized) else "fallback",
+        "evidenceMeta": {"schemaVersion": "weekly_review_event_agent_v4"},
+    }, normalized
+
+
+def _apply_weekly_event_grouping_overrides(
+    event_cards: dict[str, Any],
+    groups: list[dict[str, Any]],
+    *,
+    overrides: Any,
+    tasks: list[Mapping[str, Any]],
+    week_label: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not isinstance(overrides, list) or not overrides:
+        return event_cards, groups
+    by_id = {str(item.get("taskId") or ""): item for item in tasks if item.get("taskId")}
+    claimed: set[str] = set()
+    human_groups: list[dict[str, Any]] = []
+    for raw in overrides:
+        if not isinstance(raw, Mapping):
+            continue
+        task_ids = list(dict.fromkeys(
+            str(value)
+            for value in raw.get("taskIds") or []
+            if str(value) in by_id and str(value) not in claimed
+        ))
+        if not task_ids:
+            continue
+        claimed.update(task_ids)
+        related = [by_id[value] for value in task_ids]
+        explicit_lines = {
+            str(item.get("eventLineId") or "")
+            for item in related
+            if str(item.get("eventLineId") or "")
+        }
+        human_groups.append({
+            "id": str(raw.get("id") or f"human-event:{week_label}:{len(human_groups) + 1}"),
+            "title": str(raw.get("title") or related[0].get("title") or "未命名事件")[:160],
+            "cardKind": (
+                "event_line"
+                if len(explicit_lines) == 1
+                else "task_cluster"
+                if len(task_ids) > 1
+                else "single_task"
+            ),
+            "taskIds": task_ids,
+            "taskTitles": [str(item.get("title") or "") for item in related],
+            "groupReason": "成员已在本周复盘中确认这组任务的事件归属。",
+            "reflectionPromptText": str(raw.get("reflectionPromptText") or "请围绕这个真实事件记录结果、判断与后续。")[:1_200],
+            "confidence": "high",
+            "generatedBy": "human",
+        })
+    if not human_groups:
+        return event_cards, groups
+    remaining_groups: list[dict[str, Any]] = []
+    for group in groups:
+        remaining_ids = [value for value in group.get("taskIds") or [] if value not in claimed]
+        if not remaining_ids:
+            continue
+        related = [by_id[value] for value in remaining_ids if value in by_id]
+        remaining_groups.append({
+            **group,
+            "taskIds": remaining_ids,
+            "taskTitles": [str(item.get("title") or "") for item in related],
+            "cardKind": group.get("cardKind") if len(remaining_ids) > 1 else "single_task",
+        })
+    next_groups = [*human_groups, *remaining_groups]
+    return {
+        **event_cards,
+        "cards": next_groups,
+        "generatedBy": "human",
+    }, next_groups
+
+
+def _weekly_review_evidence_packs(
+    *,
+    event_groups: list[Mapping[str, Any]],
+    tasks: list[Mapping[str, Any]],
+    plans: list[Mapping[str, Any]],
+    project_contexts: list[Mapping[str, Any]],
+    event_contexts: list[Mapping[str, Any]],
+    current_review: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    tasks_by_id = {str(item.get("taskId") or ""): item for item in tasks}
+    plans_by_id = {str(item.get("id") or ""): item for item in plans if item.get("id")}
+    projects_by_id = {str(item.get("clientId") or ""): item for item in project_contexts if item.get("clientId")}
+    events_by_id = {str(item.get("eventLineId") or ""): item for item in event_contexts if item.get("eventLineId")}
+    packs: list[dict[str, Any]] = []
+    for group in event_groups:
+        related_tasks = [tasks_by_id[value] for value in group.get("taskIds") or [] if value in tasks_by_id]
+        plan_ids = list(dict.fromkeys(
+            str(item.get("planningCycleId") or "")
+            for item in related_tasks
+            if str(item.get("planningCycleId") or "") in plans_by_id
+        ))
+        client_ids = list(dict.fromkeys(
+            str(item.get("clientId") or "")
+            for item in related_tasks
+            if str(item.get("clientId") or "") in projects_by_id
+        ))
+        event_line_ids = list(dict.fromkeys(
+            str(item.get("eventLineId") or "")
+            for item in related_tasks
+            if str(item.get("eventLineId") or "") in events_by_id
+        ))
+        packs.append({
+            "eventGroupId": group.get("id"),
+            "eventTitle": group.get("title"),
+            "groupReason": group.get("groupReason"),
+            "confidence": group.get("confidence"),
+            "tasks": related_tasks,
+            "linkedPlans": [plans_by_id[value] for value in plan_ids],
+            "linkedProjects": [projects_by_id[value] for value in client_ids],
+            "linkedEventLines": [events_by_id[value] for value in event_line_ids],
+            "memberReview": dict(current_review) if current_review else None,
+        })
+    return packs
+
+
+def _save_weekly_event_grouping(compatibility: Any, request: UiRequest) -> dict[str, Any]:
+    perspective = str(request.body.get("perspective") or "mine")
+    department_id = str(request.body.get("departmentId") or "") or None
+    dashboard = _retained_dashboard(
+        compatibility,
+        week=str(request.body.get("weekLabel") or ""),
+        perspective=perspective,
+        department_id=department_id,
+    )
+    generation = dict(dashboard.get("weeklyOverviewGenerationStatus") or {})
+    tasks = [
+        _weekly_review_prompt_task(item)
+        for item in dashboard.get("workItems") or []
+        if isinstance(item, Mapping)
+    ][:80]
+    overrides = [
+        dict(item)
+        for item in request.body.get("eventGroupingOverrides") or []
+        if isinstance(item, Mapping)
+    ]
+    event_cards, groups = _normalize_weekly_event_cards(
+        [],
+        tasks=tasks,
+        week_label=str(dashboard.get("weekLabel") or ""),
+    )
+    event_cards, _groups = _apply_weekly_event_grouping_overrides(
+        event_cards,
+        groups,
+        overrides=overrides,
+        tasks=tasks,
+        week_label=str(dashboard.get("weekLabel") or ""),
+    )
+    projector = _planning_projector(compatibility)
+    saved = projector.load_weekly_overview(
+        membership_id=str(generation.get("viewerUserId") or ""),
+        week_label=str(dashboard.get("weekLabel") or ""),
+        perspective=str(dashboard.get("activePerspective") or "mine"),
+        department_id=dashboard.get("activeDepartmentId"),
+    ) or {}
+    status = dict(saved.get("status") or generation)
+    projector.save_weekly_overview(
+        membership_id=str(generation.get("viewerUserId") or ""),
+        week_label=str(dashboard.get("weekLabel") or ""),
+        perspective=str(dashboard.get("activePerspective") or "mine"),
+        department_id=dashboard.get("activeDepartmentId"),
+        payload={
+            **saved,
+            "cards": saved.get("cards") or {},
+            "eventCards": event_cards,
+            "eventGroupingOverrides": overrides,
+            "status": status,
+        },
+    )
+    return {
+        **generation,
+        **status,
+        "status": "succeeded",
+        "failureReason": None,
+    }
+
+
 def _generate_weekly_overview(compatibility: Any, request: UiRequest) -> dict[str, Any]:
     perspective = str(request.body.get("perspective") or "mine")
     department_id = str(request.body.get("departmentId") or "") or None
@@ -1246,6 +1687,24 @@ def _generate_weekly_overview(compatibility: Any, request: UiRequest) -> dict[st
     work_items = [item for item in dashboard.get("workItems") or [] if isinstance(item, Mapping)]
     plans = [item for item in dashboard.get("plans") or [] if isinstance(item, Mapping)]
     current_review = dashboard.get("currentReview") if isinstance(dashboard.get("currentReview"), Mapping) else {}
+    generation_status = dict(dashboard.get("weeklyOverviewGenerationStatus") or {})
+    saved_overview = _planning_projector(compatibility).load_weekly_overview(
+        membership_id=str(generation_status.get("viewerUserId") or ""),
+        week_label=str(dashboard.get("weekLabel") or ""),
+        perspective=str(dashboard.get("activePerspective") or "mine"),
+        department_id=dashboard.get("activeDepartmentId"),
+    ) or {}
+    if "eventGroupingOverrides" in request.body:
+        raw_event_grouping_overrides = request.body.get("eventGroupingOverrides") or []
+    elif current_review.get("eventGroupingOverrides"):
+        raw_event_grouping_overrides = current_review.get("eventGroupingOverrides") or []
+    else:
+        raw_event_grouping_overrides = saved_overview.get("eventGroupingOverrides") or []
+    event_grouping_overrides = [
+        dict(item)
+        for item in raw_event_grouping_overrides
+        if isinstance(item, Mapping)
+    ]
     if not work_items and not plans and not current_review:
         return {
             **dict(dashboard["weeklyOverviewGenerationStatus"]),
@@ -1260,15 +1719,21 @@ def _generate_weekly_overview(compatibility: Any, request: UiRequest) -> dict[st
         client_id = str(snapshot.get("clientId") or "")
         if client_id and client_id not in client_ids:
             client_ids.append(client_id)
-        tasks_for_prompt.append({
-            "taskId": str(item.get("taskId") or ""),
-            "title": str(snapshot.get("title") or ""),
-            "status": str(snapshot.get("status") or ""),
-            "clientId": client_id or None,
-            "clientName": snapshot.get("clientName"),
-            "note": str(item.get("note") or ""),
-            "structuredNote": item.get("structuredNote") or {},
-        })
+        tasks_for_prompt.append(_weekly_review_prompt_task(item))
+    previous_week = _previous_week_label(str(dashboard["weekLabel"]))
+    previous_tasks_for_prompt: list[dict[str, Any]] = []
+    if previous_week:
+        previous_dashboard = _retained_dashboard(
+            compatibility,
+            week=previous_week,
+            perspective=perspective,
+            department_id=department_id,
+        )
+        previous_tasks_for_prompt = [
+            _weekly_review_prompt_task(item)
+            for item in previous_dashboard.get("workItems") or []
+            if isinstance(item, Mapping)
+        ][:80]
     project_contexts: list[dict[str, Any]] = []
     for client_id in client_ids[:6]:
         try:
@@ -1279,6 +1744,7 @@ def _generate_weekly_overview(compatibility: Any, request: UiRequest) -> dict[st
             "clientId": client_id,
             "sources": _event_line_knowledge_sources(knowledge)[:8],
         })
+    event_contexts = _weekly_review_event_contexts(compatibility, request, work_items)
     material = {
         "weekLabel": dashboard["weekLabel"],
         "perspective": dashboard.get("activePerspective"),
@@ -1287,18 +1753,84 @@ def _generate_weekly_overview(compatibility: Any, request: UiRequest) -> dict[st
         "plans": plans[:20],
         "memberReview": current_review or None,
         "projectKnowledge": project_contexts,
+        "eventLines": event_contexts,
     }
     started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    completion = compatibility.runtime.private_ai_completion(
+    grouping_completion = compatibility.runtime.private_ai_completion(
         system_prompt=(
-            "你是益语智库任务计划 Agent。依据本周正式任务、成员已写复盘、计划以及项目正式知识，"
-            "形成一份可继续由成员修改的周复盘概览。归纳2到6条真实工作主线；只引用输入里的 taskId，"
-            "不得虚构成果、人物、数字或项目背景。输出严格 JSON："
-            '{"summaryText":"...","mainlines":[{"title":"...","taskIds":["..."],'
-            '"progressText":"...","nextGoalText":"..."}]}。不要输出代码围栏或解释。'
+            "你是益语智库周复盘 Agent。第一步只负责从零散任务中还原真实事件。"
+            "优先依据明确事件线、共同计划步骤或交付物、同一项目阶段、共同结果以及前后行动关系归并。"
+            "事件复盘中的归并必须保守：只有任务已明确关联同一事件线时才可自动合并；"
+            "没有明确事件线关系的任务，即使标题相似或属于同一计划，也要分别输出，交给成员手动选择合并。"
+            "日期只用于核验时间是否明显冲突，绝不能因为日期不同就拆开同一事件，也不能因为同一天就合并无关任务。"
+            "例如同一验证工作的准备、执行、复核即使安排在不同日期，也应归为一个事件。"
+            "只使用输入中的 taskId，不得遗漏或重复任务，不得虚构关系。证据不足时保留单项并降低 confidence。"
+            "输出严格 JSON："
+            '{"eventGroups":[{"title":"...","taskIds":["..."],"groupReason":"基于哪些关系归并",'
+            '"confidence":"high|medium|low","reflectionPromptText":"针对这个真实事件的一句开放式复盘提示"}]}。'
+            "不要输出代码围栏或其他解释。"
         ),
         prompt=json.dumps(material, ensure_ascii=False)[:48_000],
-        creativity_mode="strict",
+        creativity_mode="balanced",
+        capability="task_planning_weekly_review",
+        read_timeout_seconds=90.0,
+    )
+    grouping = _weekly_agent_json(str(grouping_completion.get("content") or ""))
+    reconciled_groups = _enforce_weekly_explicit_event_groups(
+        grouping.get("eventGroups"),
+        tasks=tasks_for_prompt,
+    )
+    event_cards, normalized_event_groups = _normalize_weekly_event_cards(
+        reconciled_groups,
+        tasks=tasks_for_prompt,
+        week_label=str(dashboard["weekLabel"]),
+    )
+    event_cards, normalized_event_groups = _apply_weekly_event_grouping_overrides(
+        event_cards,
+        normalized_event_groups,
+        overrides=event_grouping_overrides,
+        tasks=tasks_for_prompt,
+        week_label=str(dashboard["weekLabel"]),
+    )
+    evidence_packs = _weekly_review_evidence_packs(
+        event_groups=normalized_event_groups,
+        tasks=tasks_for_prompt,
+        plans=plans[:20],
+        project_contexts=project_contexts,
+        event_contexts=event_contexts,
+        current_review=current_review,
+    )
+    completion = compatibility.runtime.private_ai_completion(
+        system_prompt=(
+            "你是益语智库周复盘 Agent。你会收到本周真实事件证据包、上周任务和覆盖本周的周/月计划。"
+            "summaryText 是最重要的输出，应写成一段自然、相对完整但不堆砌的周度总述：先概括本周真正的"
+            "工作重点，再结合上周任务说明推进是延续、深化、收尾还是转向；若月度或更长周期计划确有依据，"
+            "再克制地指出下一周可能承接的方向。通常写3到6句，允许比单条主线更详细。即使成员没有写复盘、"
+            "没有关联事件线或项目知识很薄，也必须仅依据任务标题、描述、状态和任务之间的关系形成有用判断。"
+            "缺少辅助材料只会降低判断的具体程度，禁止输出“尚不能判断”“材料不足”“待确认”等面向用户的"
+            "元提示，也不要为了显得谨慎而反复解释缺了什么。"
+            "mainlines 形成1到4条即可，每条只用一两句简明、实事求是地交代这组任务在做什么、当前到哪里；"
+            "有成员复盘时吸收其中结论，没有复盘时就简略交代任务事实。主线可以合并多个相互关联的事件，"
+            "但不得只把任务状态改写成套话。nextMoveText 只在计划、未完成任务或明确行动提供依据时填写；"
+            "openQuestions 固定返回空数组。只能引用输入中的 taskId、eventGroupId 和 evidence ref，"
+            "不得虚构成果、人物、数字或背景。输出严格 JSON："
+            '{"summaryText":"较完整的本周总述","mainlines":[{"title":"...",'
+            '"eventGroupIds":["..."],"taskIds":["..."],"narrativeText":"...",'
+            '"nextMoveText":"可选","openQuestions":[],'
+            '"evidenceRefs":[{"type":"task|plan|project|event_line|review","id":"...","label":"..."}]}]}。'
+            "不要输出代码围栏或其他解释。"
+        ),
+        prompt=json.dumps({
+            "weekLabel": dashboard["weekLabel"],
+            "perspective": dashboard.get("activePerspective"),
+            "previousWeek": {
+                "weekLabel": previous_week,
+                "tasks": previous_tasks_for_prompt,
+            },
+            "plansCoveringThisWeek": plans[:20],
+            "evidencePacks": evidence_packs,
+        }, ensure_ascii=False)[:48_000],
+        creativity_mode="balanced",
         capability="task_planning_weekly_review",
         read_timeout_seconds=90.0,
     )
@@ -1312,9 +1844,20 @@ def _generate_weekly_overview(compatibility: Any, request: UiRequest) -> dict[st
         task_ids = [str(value) for value in raw_line.get("taskIds") or [] if str(value) in by_id]
         task_ids = list(dict.fromkeys(task_ids))
         title = str(raw_line.get("title") or "").strip()
-        progress = str(raw_line.get("progressText") or "").strip()
-        next_goal = str(raw_line.get("nextGoalText") or "").strip()
-        if not title or not progress or not next_goal:
+        narrative = str(raw_line.get("narrativeText") or "").strip()
+        next_move = str(raw_line.get("nextMoveText") or "").strip()
+        evidence_refs = [
+            {
+                "type": str(value.get("type") or "")[:40],
+                "id": str(value.get("id") or "")[:200],
+                "label": str(value.get("label") or "")[:200],
+            }
+            for value in raw_line.get("evidenceRefs") or []
+            if isinstance(value, Mapping)
+            and str(value.get("type") or "") in {"task", "plan", "project", "event_line", "review"}
+            and str(value.get("id") or "")
+        ][:12]
+        if not title or not narrative:
             continue
         related = [by_id[value] for value in task_ids]
         completed_count = sum(str(item.get("status") or "") == "done" for item in related)
@@ -1325,8 +1868,11 @@ def _generate_weekly_overview(compatibility: Any, request: UiRequest) -> dict[st
             "taskCount": len(related),
             "completedCount": completed_count,
             "pendingCount": max(0, len(related) - completed_count),
-            "progressText": progress[:1200],
-            "nextGoalText": next_goal[:1200],
+            "taskIds": task_ids,
+            "narrativeText": narrative[:800],
+            "nextMoveText": next_move[:400] or None,
+            "openQuestions": [],
+            "evidenceRefs": evidence_refs,
         })
         if len(mainlines) >= 6:
             break
@@ -1335,7 +1881,7 @@ def _generate_weekly_overview(compatibility: Any, request: UiRequest) -> dict[st
         raise LocalRuntimeError(502, "weekly_review_agent_empty", "未形成可用的复盘草稿，可以重试")
     generated_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     cards = {
-        "summaryText": summary[:2_400],
+        "summaryText": summary[:3_600],
         "mainlines": mainlines,
         "generatedBy": "ai",
         "evidenceMeta": {
@@ -1343,7 +1889,9 @@ def _generate_weekly_overview(compatibility: Any, request: UiRequest) -> dict[st
             "planningCycleIds": [str(item.get("id") or "") for item in plans if item.get("id")],
             "clientIds": client_ids,
             "modelName": completion.get("modelName"),
+            "groupingModelName": grouping_completion.get("modelName"),
             "agentKind": "task_planning",
+            "schemaVersion": "weekly_review_agent_v3",
         },
     }
     status = {
@@ -1358,7 +1906,12 @@ def _generate_weekly_overview(compatibility: Any, request: UiRequest) -> dict[st
         week_label=str(dashboard["weekLabel"]),
         perspective=str(dashboard.get("activePerspective") or "mine"),
         department_id=dashboard.get("activeDepartmentId"),
-        payload={"cards": cards, "status": status},
+        payload={
+            "cards": cards,
+            "eventCards": event_cards,
+            "eventGroupingOverrides": event_grouping_overrides,
+            "status": status,
+        },
     )
     return status
 
@@ -1369,6 +1922,8 @@ def refresh_retained_review_overview(
     request: UiRequest,
     _: Any,
 ) -> dict[str, Any]:
+    if bool(request.body.get("groupingOnly")):
+        return _save_weekly_event_grouping(compatibility, request)
     return _generate_weekly_overview(compatibility, request)
 
 
@@ -1387,12 +1942,30 @@ def retained_review_department_signals(
     request: UiRequest,
     _: Any,
 ) -> dict[str, Any]:
+    perspective = str(request.query.get("perspective") or "mine")
+    if perspective not in {"organization", "department"}:
+        raise LocalRuntimeError(
+            403,
+            "department_signals_management_scope_required",
+            "部门/组织信号只向具备相应管理视角的用户开放",
+        )
     dashboard = _retained_dashboard(
         compatibility,
         week=str(request.query.get("weekLabel") or ""),
-        perspective=str(request.query.get("perspective") or "mine"),
+        perspective=perspective,
         department_id=str(request.query.get("departmentId") or ""),
     )
+    available_perspectives = {
+        str(item.get("key") or "")
+        for item in dashboard.get("availablePerspectives") or []
+        if isinstance(item, Mapping)
+    }
+    if perspective not in available_perspectives:
+        raise LocalRuntimeError(
+            403,
+            "department_signals_scope_forbidden",
+            "当前账号无权读取该管理范围的信号",
+        )
     review = dashboard.get("currentReview") or {}
     work_items = [
         item for item in dashboard.get("workItems") or [] if isinstance(item, Mapping)
@@ -1403,10 +1976,20 @@ def retained_review_department_signals(
     )
     total = len(work_items)
     completion_rate = round(completed * 100 / total) if total else 0
+    reviewed_count = sum(
+        bool(str(item.get("note") or "").strip())
+        or bool(item.get("structuredNote"))
+        for item in work_items
+    )
     blocker = str(review.get("workBlocker") or "").strip()
     support = str(review.get("supportNeeded") or "").strip()
     next_focus = str(review.get("nextWeekFocus") or "").strip()
     plan_count = len(dashboard.get("plans") or [])
+    blocker_count = sum(
+        bool(str((item.get("structuredNote") or {}).get("blockerReason") or "").strip())
+        for item in work_items
+        if isinstance(item.get("structuredNote"), Mapping)
+    ) + (1 if blocker else 0)
     health_indicators = [
         {
             "key": "weekly_tasks",
@@ -1419,6 +2002,26 @@ def retained_review_department_signals(
             "helperText": "来自当前视角可见任务",
         },
         {
+            "key": "completed_tasks",
+            "label": "已完成",
+            "valueText": str(completed),
+            "unitText": "项",
+            "deltaText": None,
+            "trendDirection": "flat",
+            "accent": "success" if completed else "neutral",
+            "helperText": "按任务当前状态计数",
+        },
+        {
+            "key": "pending_tasks",
+            "label": "未完成",
+            "valueText": str(max(0, total - completed)),
+            "unitText": "项",
+            "deltaText": None,
+            "trendDirection": "flat",
+            "accent": "warning" if total > completed else "success",
+            "helperText": "仍在推进或尚未开始",
+        },
+        {
             "key": "completion_rate",
             "label": "完成率",
             "valueText": str(completion_rate),
@@ -1427,6 +2030,16 @@ def retained_review_department_signals(
             "trendDirection": "flat",
             "accent": "success" if completion_rate >= 70 else "warning" if total else "neutral",
             "helperText": f"{completed}/{total} 项已完成" if total else "本周尚无任务",
+        },
+        {
+            "key": "reviewed_tasks",
+            "label": "已写复盘",
+            "valueText": str(reviewed_count),
+            "unitText": "项",
+            "deltaText": None,
+            "trendDirection": "flat",
+            "accent": "success" if reviewed_count else "neutral",
+            "helperText": "已有正文或结构化复盘",
         },
         {
             "key": "active_plans",
@@ -1441,12 +2054,12 @@ def retained_review_department_signals(
         {
             "key": "blockers",
             "label": "待处理阻塞",
-            "valueText": "1" if blocker else "0",
+            "valueText": str(blocker_count),
             "unitText": "项",
             "deltaText": None,
             "trendDirection": "flat",
-            "accent": "danger" if blocker else "success",
-            "helperText": blocker or "当前复盘未登记阻塞",
+            "accent": "danger" if blocker_count else "success",
+            "helperText": blocker or (f"{blocker_count} 条任务复盘登记了卡点" if blocker_count else "当前复盘未登记阻塞"),
         },
     ]
     decisions = []
@@ -1471,22 +2084,29 @@ def retained_review_department_signals(
                 "sourceRefs": [],
             })
     department_name = str(dashboard.get("activeDepartmentName") or "当前部门")
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     return {
         "weekLabel": dashboard["weekLabel"],
-        "viewerRole": "department_lead" if dashboard.get("activePerspective") == "department" else "employee",
+        "viewerRole": "department_lead" if perspective == "department" else "admin",
+        "perspective": perspective,
+        "generatedAt": generated_at,
+        "sourceSummary": f"基于当前权限范围内 {total} 条任务、{plan_count} 项正式计划和已提交复盘计算",
         "healthIndicators": health_indicators,
         "executiveDecisions": decisions,
         "departmentScoreboard": ([{
             "departmentId": str(dashboard.get("activeDepartmentId") or "current"),
-            "departmentName": department_name,
+            "departmentName": department_name if perspective == "department" else "当前组织",
             "leaderName": dashboard.get("activeDepartmentLeaderName"),
-            "valueProductionScore": completion_rate,
+            "taskTotalCount": total,
+            "taskCompletedCount": completed,
+            "taskPendingCount": max(0, total - completed),
+            "reviewedTaskCount": reviewed_count,
+            "blockerCount": blocker_count,
+            "activePlanCount": plan_count,
             "fulfillmentRatePct": completion_rate,
-            "monthlyProgressPct": completion_rate,
-            "humanEfficiencyScore": completion_rate,
             "headlineInsight": blocker or next_focus or "本周暂无额外信号",
-            "status": "abnormal" if blocker else "normal",
-        }] if dashboard.get("activePerspective") == "department" else []),
+            "status": "abnormal" if blocker_count else "normal",
+        }]),
         "actionAlerts": [],
         "oneOnOneSuggestions": [],
         "departmentSnapshots": [],

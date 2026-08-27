@@ -1180,10 +1180,19 @@ type WeeklyOverviewLine = {
   taskCount: number;
   completedCount: number;
   pendingCount: number;
-  progressText: string;
-  nextGoalText: string;
+  narrativeText: string;
+  nextMoveText: string;
+  openQuestions: string[];
+  evidenceRefs: Array<{
+    type: 'task' | 'plan' | 'project' | 'event_line' | 'review';
+    id: string;
+    label: string;
+  }>;
 };
 
+// Legacy v1 helper shape. The renderer no longer uses its rule-generated
+// judgments, but keeping the type local avoids making old utility removal part
+// of the user-facing weekly-review contract change.
 type WeeklyOverviewLineSignals = {
   pendingTitles: string[];
   blockers: string[];
@@ -1210,9 +1219,10 @@ type ReviewEventCardView = {
   completedCount: number;
   pendingCount: number;
   reviewedCount: number;
+  groupReason: string;
   reflectionPromptText: string;
   confidence: 'low' | 'medium' | 'high';
-  generatedBy: 'ai' | 'fallback';
+  generatedBy: 'ai' | 'human' | 'fallback';
   taskStatus: Task['status'];
 };
 
@@ -6000,6 +6010,7 @@ function materializeTaskFromReviewItem(item: WeeklyReviewTaskEntry, existingTask
     return {
       ...existingTask,
       title: snapshot.title || existingTask.title,
+      desc: snapshot.description ?? existingTask.desc,
       status: snapshot.status || existingTask.status,
       startDate: snapshot.startDate ?? existingTask.startDate ?? null,
       dueDate: snapshot.dueDate ?? existingTask.dueDate ?? null,
@@ -6011,6 +6022,7 @@ function materializeTaskFromReviewItem(item: WeeklyReviewTaskEntry, existingTask
       clientName: snapshot.clientName ?? existingTask.clientName ?? null,
       eventLineId: snapshot.eventLineId ?? eventLineContext?.id ?? existingTask.eventLineId ?? null,
       eventLineName: snapshot.eventLineName ?? eventLineContext?.name ?? existingTask.eventLineName ?? null,
+      planningCycleId: snapshot.planningCycleId ?? existingTask.planningCycleId ?? null,
       ownerId: snapshot.ownerId ?? existingTask.ownerId ?? null,
       ownerName: snapshot.ownerName || existingTask.ownerName || '未指定',
       tags: snapshot.tags?.length ? snapshot.tags : existingTask.tags,
@@ -6030,7 +6042,7 @@ function materializeTaskFromReviewItem(item: WeeklyReviewTaskEntry, existingTask
   return {
     id: item.taskId,
     title: snapshot.title || '未命名任务',
-    desc: snapshot.projectContext?.backgroundSummary || eventLineContext?.summary || '',
+    desc: snapshot.description || snapshot.projectContext?.backgroundSummary || eventLineContext?.summary || '',
     status: snapshot.status || 'todo',
     creatorId: null,
     creatorName: null,
@@ -6051,6 +6063,7 @@ function materializeTaskFromReviewItem(item: WeeklyReviewTaskEntry, existingTask
     clientName: snapshot.clientName ?? null,
     eventLineId: snapshot.eventLineId ?? eventLineContext?.id ?? null,
     eventLineName: snapshot.eventLineName ?? eventLineContext?.name ?? null,
+    planningCycleId: snapshot.planningCycleId ?? null,
     projectModuleId: snapshot.projectContext?.projectModuleId ?? null,
     projectModuleName: snapshot.projectContext?.projectModuleName ?? null,
     projectFlowId: snapshot.projectContext?.projectFlowId ?? null,
@@ -6116,7 +6129,9 @@ function buildReviewGroups(rows: ReviewTaskRow[]): ReviewTaskGroup[] {
   const groups = new Map<string, ReviewTaskRow[]>();
   rows.forEach((row) => {
     const eventLineId = row.task.eventLineId?.trim() || '';
-    const key = eventLineId ? `event-line:${eventLineId}` : `task:${row.task.id}`;
+    const key = eventLineId
+      ? `event-line:${eventLineId}`
+      : `task:${row.task.id}`;
     const bucket = groups.get(key);
     if (bucket) {
       bucket.push(row);
@@ -6191,6 +6206,14 @@ function reviewFoldedTaskCountLabel(taskCount: number, completedCount: number, p
   return `${taskCount} 项纳入 · ${completedCount} 完成${pendingCount > 0 ? ` · ${pendingCount} 待推进` : ''}`;
 }
 
+function suggestMergedReviewEventTitle(cards: ReviewEventCardView[]) {
+  const explicitHeads = cards.map((card) => card.title.split(/[｜|丨:：/／—–-]/, 1)[0]?.trim() || '');
+  if (explicitHeads[0] && explicitHeads.every((value) => value === explicitHeads[0])) {
+    return explicitHeads[0];
+  }
+  return cards[0]?.title || '合并事件';
+}
+
 function buildReviewEventCardFallbackPrompt(card: WeeklyEventReviewCard, rows: ReviewTaskRow[]) {
   const taskTitles = rows.map(({ task }) => task.title).filter(Boolean).slice(0, 3).join('、');
   const title = cleanWeeklyOverviewText(card.title) || taskTitles || '这组任务';
@@ -6230,6 +6253,7 @@ function buildReviewEventCardViews(cards: WeeklyEventReviewCards | null | undefi
         completedCount,
         pendingCount: cardRows.length - completedCount,
         reviewedCount,
+        groupReason: cleanWeeklyOverviewText(card.groupReason),
         reflectionPromptText: cleanWeeklyOverviewText(card.reflectionPromptText) || buildReviewEventCardFallbackPrompt(card, cardRows),
         confidence: card.confidence || 'medium',
         generatedBy: card.generatedBy,
@@ -6490,6 +6514,43 @@ function buildWeeklyOverviewNextGoalText(title: string, rows: ReviewTaskRow[], s
   return formatWeeklyOverviewSentence(`下一步确认${title}是否还需要继续推进；如果不需要，补一条复盘说明，写清本周产出和后续不再跟进的原因`);
 }
 
+function buildWeeklyOverviewJudgmentTexts(
+  title: string,
+  rows: ReviewTaskRow[],
+  signals: WeeklyOverviewLineSignals,
+) {
+  const contextGoal = dedupeWeeklyOverviewLines(rows.flatMap(({ task }) => [
+    task.projectContext?.goalSummary || '',
+    task.projectContext?.backgroundSummary || '',
+    task.recentDecision || '',
+  ]), 1)[0];
+  const support = dedupeWeeklyOverviewLines(rows.flatMap(({ structuredNote, task }) => [
+    structuredNote.supportNeeded,
+    task.projectContext?.currentFocus || '',
+  ]), 1)[0];
+  const completedCount = rows.filter(({ task }) => task.status === 'done').length;
+  const pendingCount = rows.length - completedCount;
+  return {
+    whyText: contextGoal
+      ? formatWeeklyOverviewSentence(contextGoal)
+      : formatWeeklyOverviewSentence(`${title}被纳入本周重点，是因为它关联了${rows.length}项真实推进记录`),
+    meaningText: pendingCount > 0
+      ? formatWeeklyOverviewSentence(`这意味着主线已完成${completedCount}项，但仍有${pendingCount}项没有闭环，不能只按“做过”判断完成`)
+      : formatWeeklyOverviewSentence(`这意味着相关任务已形成阶段性闭环，下一步要确认成果是否真正改变了项目状态`),
+    riskText: signals.blockers.length > 0
+      ? formatWeeklyOverviewSentence(signals.blockers[0])
+      : pendingCount > 0
+        ? formatWeeklyOverviewSentence(`主要风险是${joinWeeklyOverviewItems(signals.pendingTitles, 3)}继续跨周而没有明确交付条件`)
+        : '当前记录中没有明确风险；仍需确认是否存在未写入任务的隐性卡点。',
+    supportText: support
+      ? formatWeeklyOverviewSentence(support)
+      : '当前没有明确提出支持请求；如需跨部门配合，请补充负责人、资源和最晚响应时间。',
+    confirmationText: signals.missingFields.length > 0
+      ? formatWeeklyOverviewSentence(`仍需你确认${joinWeeklyOverviewItems(signals.missingFields, 4)}`)
+      : formatWeeklyOverviewSentence(`请确认${title}的本周结论是否准确，以及是否继续进入下周重点`),
+  };
+}
+
 function scoreWeeklyOverviewGroup(group: { id: string; rows: ReviewTaskRow[] }) {
   const taskCount = group.rows.length;
   const pendingCount = group.rows.filter(({ task }) => task.status !== 'done').length;
@@ -6521,45 +6582,14 @@ function buildWeeklyOverviewModel(rows: ReviewTaskRow[], scope: 'work' | 'person
   const totalCount = rows.length;
   const completedCount = rows.filter(({ task }) => task.status === 'done').length;
   const pendingCount = totalCount - completedCount;
-  const groups = buildWeeklyOverviewGroups(rows)
-    .map((group) => {
-      const signals = buildWeeklyOverviewLineSignals(group.rows);
-      const progressText = buildWeeklyOverviewProgressText(group.title, group.rows);
-      const nextGoalText = buildWeeklyOverviewNextGoalText(group.title, group.rows, signals);
-      const groupPendingCount = group.rows.filter(({ task }) => task.status !== 'done').length;
-      return {
-        id: group.id,
-        title: group.title,
-        taskCount: group.rows.length,
-        completedCount: group.rows.length - groupPendingCount,
-        pendingCount: groupPendingCount,
-        progressText,
-        nextGoalText,
-        score: scoreWeeklyOverviewGroup(group),
-      };
-    })
-    .sort((left, right) => {
-      if (right.score !== left.score) return right.score - left.score;
-      return right.taskCount - left.taskCount;
-    });
-  // 5/26 改: 顾源源反馈"一个月当中重点不止 3 个". 放宽到 6 条上限.
-  // 仍按 scoreWeeklyOverviewGroup 排序, 重要性低的不进列表
-  const mainlines = groups.slice(0, 6).map(({ score, ...line }) => line);
-  const mainlineNames = joinWeeklyOverviewItems(mainlines.map((line) => line.title), 3);
-  const incompleteNames = joinWeeklyOverviewItems(mainlines.filter((line) => line.pendingCount > 0).map((line) => line.title), 2);
-  const scopeLabel = scope === 'work' ? '组织重点' : '成长重点';
-  const scopeText = mainlineNames
-    ? `本周${scopeLabel}集中在${mainlineNames}。`
-    : '本周还没有形成可识别的重点主线。';
-  const closureText = incompleteNames
-    ? `仍有未完成任务集中在${incompleteNames}。`
-    : '当前任务状态整体完成度较高，重点是把已完成内容转成明确的下周目标。';
   return {
     totalCount,
     completedCount,
     pendingCount,
-    summaryText: `${scopeText}${totalCount} 项纳入复盘，${completedCount} 项已完成，${pendingCount} 项未完成。${closureText}`,
-    mainlines,
+    summaryText: totalCount > 0
+      ? `本周共纳入 ${totalCount} 项${scope === 'work' ? '工作' : '个人'}任务，其中 ${completedCount} 项已完成、${pendingCount} 项仍在推进。`
+      : '本周尚未纳入任何复盘事项。',
+    mainlines: [],
   };
 }
 
@@ -6569,17 +6599,18 @@ function buildWeeklyOverviewModelFromBackendCards(cards: WeeklyMainlineCards | n
   const mainlines = (cards.mainlines || [])
     .map((line, index) => {
       const title = cleanWeeklyOverviewText(line.title);
-      const progressText = cleanWeeklyOverviewText(line.progressText);
-      const nextGoalText = cleanWeeklyOverviewText(line.nextGoalText);
-      if (!title || !progressText || !nextGoalText) return null;
+      const narrativeText = cleanWeeklyOverviewText(line.narrativeText);
+      if (!title || !narrativeText) return null;
       return {
         id: line.id || `backend-weekly-mainline-${index}-${title}`,
         title,
         taskCount: Math.max(0, Number(line.taskCount) || 0),
         completedCount: Math.max(0, Number(line.completedCount) || 0),
         pendingCount: Math.max(0, Number(line.pendingCount) || 0),
-        progressText,
-        nextGoalText,
+        narrativeText,
+        nextMoveText: cleanWeeklyOverviewText(line.nextMoveText),
+        openQuestions: (line.openQuestions || []).map((value) => cleanWeeklyOverviewText(value)).filter(Boolean).slice(0, 4),
+        evidenceRefs: (line.evidenceRefs || []).filter((value) => value?.id && value?.label).slice(0, 12),
       };
     })
     .filter((line): line is WeeklyOverviewLine => Boolean(line))
@@ -14692,24 +14723,11 @@ export default function App() {
     );
     const [reviewPerspective, setReviewPerspective] = useRuntimeUiSessionState<ReviewPerspectiveKey>(`${taskUiSessionScope}:review:perspective`, () => defaultReviewPerspective);
     const [reviewDepartmentId, setReviewDepartmentId] = useRuntimeUiSessionState<string>(`${taskUiSessionScope}:review:department`, () => defaultReviewDepartmentId || '');
-    const [reviewDeptDropdownOpen, setReviewDeptDropdownOpen] = useState(false);
-    const [reviewDeptDropdownAnchor, setReviewDeptDropdownAnchor] = useState<{ top: number; left: number } | null>(null);
-    const reviewDeptDropdownRef = useRef<HTMLDivElement>(null);
-    useEffect(() => {
-      if (!reviewDeptDropdownOpen) return;
-      const onDocClick = (e: MouseEvent) => {
-        const target = e.target as HTMLElement | null;
-        // Don't close when clicking the trigger button (it has its own toggle behavior).
-        if (target && target.closest('[data-dept-trigger="1"]')) return;
-        if (!reviewDeptDropdownRef.current) return;
-        if (!reviewDeptDropdownRef.current.contains(e.target as Node)) {
-          setReviewDeptDropdownOpen(false);
-        }
-      };
-      document.addEventListener('mousedown', onDocClick);
-      return () => document.removeEventListener('mousedown', onDocClick);
-    }, [reviewDeptDropdownOpen]);
     const [reviewForm, setReviewForm] = useState<ReviewFormState>(createEmptyReviewForm());
+    const [selectedReviewEventCardIds, setSelectedReviewEventCardIds] = useState<string[]>([]);
+    const [isSavingEventGrouping, setIsSavingEventGrouping] = useState(false);
+    const [isReviewEventMergeDialogOpen, setIsReviewEventMergeDialogOpen] = useState(false);
+    const [reviewEventMergeTitle, setReviewEventMergeTitle] = useState('');
     const [isReviewWeekSwitching, setIsReviewWeekSwitching] = useState(false);
     const reviewRequestDepartmentId = reviewPerspective === 'department' ? reviewDepartmentId || null : null;
     const loadSelectedReviewBlock = (weekLabel?: string | null, options?: { skipAi?: boolean }) => loadReviewBlock(
@@ -14756,7 +14774,12 @@ export default function App() {
     };
     const triggerWeeklyOverviewRefresh = async (
       weekLabel?: string | null,
-      options?: { force?: boolean; reloadOnDone?: boolean; dedupe?: boolean },
+      options?: {
+        force?: boolean;
+        reloadOnDone?: boolean;
+        dedupe?: boolean;
+        eventGroupingOverrides?: Array<{ id: string; title: string; taskIds: string[]; reflectionPromptText?: string | null }>;
+      },
     ) => {
       const targetWeek = resolveSelectedReviewWeekLabel(weekLabel);
       const requestKey = `${targetWeek}:${reviewPerspective}:${reviewRequestDepartmentId || ''}:${options?.force ? 'force' : 'cache'}`;
@@ -14770,6 +14793,7 @@ export default function App() {
           perspective: reviewPerspective,
           departmentId: reviewRequestDepartmentId,
           force: Boolean(options?.force),
+          eventGroupingOverrides: options?.eventGroupingOverrides,
         });
         if (selectedReviewWeekLabelRef.current !== targetWeek) return;
         setWeeklyOverviewRefreshStatus(status);
@@ -14778,8 +14802,10 @@ export default function App() {
         } else if (status.status === 'succeeded' && options?.reloadOnDone !== false) {
           await loadSelectedReviewBlock(targetWeek, { skipAi: true });
         }
+        return status;
       } catch (error) {
         console.warn('[weekly-overview] refresh request failed', error);
+        return undefined;
       }
     };
     useEffect(() => {
@@ -14787,25 +14813,6 @@ export default function App() {
       setReviewDepartmentId(defaultReviewDepartmentId || '');
     }, [currentSessionUser?.id, defaultReviewDepartmentId, defaultReviewPerspective]);
     useEffect(() => () => clearWeeklyOverviewRefreshPoll(), []);
-    useEffect(() => {
-      const scheduleDailyRefresh = () => {
-        const now = new Date();
-        const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-        const storageKey = `weekly-overview-refresh:${todayKey}:${reviewPerspective}:${reviewRequestDepartmentId || 'all'}`;
-        if (now.getHours() >= 9 && window.localStorage.getItem(storageKey) !== 'done') {
-          window.localStorage.setItem(storageKey, 'done');
-          const thisWeek = currentWeekLabel();
-          void triggerWeeklyOverviewRefresh(thisWeek, { reloadOnDone: false, dedupe: false });
-          void triggerWeeklyOverviewRefresh(shiftWeekLabel(thisWeek, -1), { reloadOnDone: false, dedupe: false });
-        }
-        const next = new Date(now);
-        next.setHours(9, 0, 0, 0);
-        if (next <= now) next.setDate(next.getDate() + 1);
-        return window.setTimeout(scheduleDailyRefresh, Math.max(1000, next.getTime() - now.getTime()));
-      };
-      const timer = scheduleDailyRefresh();
-      return () => window.clearTimeout(timer);
-    }, [reviewPerspective, reviewRequestDepartmentId]);
     useEffect(() => {
       if (activeTab !== 'tasks') return undefined;
       const viewport = taskViewportRef.current;
@@ -15257,7 +15264,10 @@ export default function App() {
       ),
       [fallbackReviewPerspectives, reviewDashboard?.availablePerspectives],
     );
-    const shouldShowReviewPerspectiveSwitch = availableReviewPerspectives.length > 1;
+    const availableManagementReviewPerspectives = availableReviewPerspectives.filter(
+      (option) => option.key === 'organization' || option.key === 'department',
+    );
+    const canViewReviewSignals = availableManagementReviewPerspectives.length > 0;
     const reviewDepartmentOptions = (() => {
       const byId = new Map<string, { id: string; name: string }>();
       availableReviewPerspectives.forEach((option) => {
@@ -15273,10 +15283,60 @@ export default function App() {
       }
       return Array.from(byId.values());
     })();
-    const shouldShowReviewDepartmentPicker = reviewPerspective === 'department'
-      && currentSessionUser?.primaryRole === 'admin'
-      && reviewDepartmentOptions.length > 0;
-    const reviewPerspectiveRequiresWorkScope = reviewPerspective === 'organization' || reviewPerspective === 'department';
+    const reviewPerspectiveSelectOptions = availableReviewPerspectives.flatMap((option) => {
+      if (option.key !== 'department') {
+        return [{ value: option.key, label: option.label }];
+      }
+      if (reviewDepartmentOptions.length > 0) {
+        return reviewDepartmentOptions.map((department) => ({
+          value: `department:${department.id}`,
+          label: department.name || option.label,
+        }));
+      }
+      return [{ value: 'department', label: option.label }];
+    });
+    const reviewPerspectiveSelectValue = reviewPerspective === 'department' && reviewDepartmentId
+      ? `department:${reviewDepartmentId}`
+      : reviewPerspective;
+    const applyReviewPerspectiveValue = (value: string) => {
+      if (value.startsWith('department')) {
+        setReviewPerspective('department');
+        setReviewDepartmentId(value.includes(':') ? value.slice(value.indexOf(':') + 1) : reviewDepartmentOptions[0]?.id || '');
+      } else {
+        setReviewPerspective(value as ReviewPerspectiveKey);
+        setReviewDepartmentId('');
+      }
+      setReviewScope('work');
+    };
+    useEffect(() => {
+      if (activeTab !== 'tasks' || taskViewMode !== 'review') return;
+      if (activeReviewTab === 'events') {
+        if (reviewPerspective !== 'mine') {
+          setReviewPerspective('mine');
+          setReviewDepartmentId('');
+        }
+        setReviewScope('work');
+        return;
+      }
+      if (activeReviewTab === 'signals') {
+        if (!canViewReviewSignals) {
+          setActiveReviewTab('events');
+          return;
+        }
+        if (reviewPerspective === 'mine') {
+          const managementPerspective = availableManagementReviewPerspectives[0];
+          setReviewPerspective(managementPerspective.key);
+          setReviewDepartmentId(managementPerspective.departmentId || '');
+        }
+        setReviewScope('work');
+      }
+    }, [
+      activeReviewTab,
+      activeTab,
+      canViewReviewSignals,
+      reviewPerspective,
+      taskViewMode,
+    ]);
     const workReviewItems = useMemo(() => reviewDashboard?.workItems ?? [], [reviewDashboard?.workItems]);
     const personalReviewItems = useMemo(() => reviewDashboard?.personalItems ?? [], [reviewDashboard?.personalItems]);
     const collectStageAnalysis = reviewScope === 'work' ? reviewDashboard?.workAnalysis || null : reviewDashboard?.personalAnalysis || null;
@@ -15727,6 +15787,27 @@ export default function App() {
       ? buildReviewEventCardViews(reviewDashboard?.weeklyEventReviewCards, activeReviewRows)
       : [];
     const shouldUseEventReviewCards = reviewScope === 'work' && activeEventReviewCards.length > 0;
+    const activeEventGroupingCandidates: ReviewEventCardView[] = shouldUseEventReviewCards
+      ? activeEventReviewCards
+      : activeReviewGroups.map((group) => ({
+        id: group.id,
+        title: group.title,
+        cardKind: group.eventLineId ? 'event_line' : 'single_task',
+        taskIds: group.rows.map(({ task }) => task.id),
+        taskTitles: group.rows.map(({ task }) => task.title),
+        rows: group.rows,
+        taskCount: group.taskCount,
+        completedCount: group.completedCount,
+        pendingCount: group.pendingCount,
+        reviewedCount: group.reviewedCount,
+        groupReason: group.eventLineId
+          ? '这些任务已明确关联同一事件线。'
+          : 'Agent 尚未找到足够证据把它与其他任务归为同一事件。',
+        reflectionPromptText: '请确认这项任务对应的真实事件，以及它是否应该与其他任务合并复盘。',
+        confidence: group.eventLineId ? 'high' : 'low',
+        generatedBy: 'fallback',
+        taskStatus: group.taskStatus,
+      }));
     const fallbackWeeklyOverview = buildWeeklyOverviewModel(activeReviewRows, reviewScope);
     const activeWeeklyOverview = reviewScope === 'work'
       ? buildWeeklyOverviewModelFromBackendCards(reviewDashboard?.weeklyMainlineCards, fallbackWeeklyOverview)
@@ -15734,8 +15815,6 @@ export default function App() {
     const weeklyOverviewIsAi = reviewDashboard?.weeklyMainlineCards?.generatedBy === 'ai'
       && (reviewDashboard.weeklyMainlineCards.mainlines?.length || 0) > 0;
     const weeklyOverviewIsRefreshing = weeklyOverviewRefreshStatus?.status === 'running';
-    const weeklyOverviewMaterialPackEmpty = weeklyOverviewRefreshStatus?.status === 'failed'
-      && weeklyOverviewRefreshStatus.failureReason === 'material_pack_empty';
     useEffect(() => {
       if (!expandedReviewGroupId) return;
       const activeReviewModuleIds = shouldUseEventReviewCards
@@ -15745,6 +15824,13 @@ export default function App() {
         setExpandedReviewGroupId(null);
       }
     }, [activeEventReviewCards, activeReviewGroups, expandedReviewGroupId, shouldUseEventReviewCards]);
+    useEffect(() => {
+      const activeIds = new Set(activeEventGroupingCandidates.map((card) => card.id));
+      setSelectedReviewEventCardIds((current) => {
+        const next = current.filter((id) => activeIds.has(id));
+        return next.length === current.length ? current : next;
+      });
+    }, [activeEventGroupingCandidates]);
 
     const ownerCollaborator = editingTask.collaborators[0];
     const selectedTaskCollaborators = ownerCollaborator ? editingTask.collaborators.slice(1) : editingTask.collaborators;
@@ -19896,6 +19982,10 @@ export default function App() {
 
     const generateGlobalSummary = async () => {
       if (!guardWorkspaceWrite('生成复盘')) return;
+      const unsavedCount = dirtyReviewRows().length;
+      if (unsavedCount > 0 && !window.confirm(
+        `当前还有 ${unsavedCount} 条复盘内容未保存。\n\n继续后会先保存这些内容，再生成完整复盘。是否继续？`,
+      )) return;
       setIsGeneratingGlobal(true);
       try {
         const rowsToSave = dirtyReviewRows();
@@ -19922,6 +20012,93 @@ export default function App() {
       } finally {
         setIsGeneratingGlobal(false);
       }
+    };
+
+    const persistEventGroupingOverrides = async (
+      overrides: Array<{ id: string; title: string; taskIds: string[]; reflectionPromptText?: string | null }>,
+    ) => {
+      if (!guardWorkspaceWrite('调整事件归并')) return false;
+      setIsSavingEventGrouping(true);
+      try {
+        const targetWeek = resolveSelectedReviewWeekLabel(selectedReviewWeekLabel);
+        const status = await refreshWeeklyOverview({
+          weekLabel: targetWeek,
+          perspective: reviewPerspective,
+          departmentId: reviewRequestDepartmentId,
+          force: true,
+          groupingOnly: true,
+          eventGroupingOverrides: overrides,
+        });
+        if (!status || status.status === 'failed') {
+          throw new Error(status?.failureReason || '事件归并生成失败');
+        }
+        await loadSelectedReviewBlock(targetWeek, { skipAi: true });
+        setSelectedReviewEventCardIds([]);
+        flash('success', '事件归并已保存，智能概览将在后台更新。');
+        void triggerWeeklyOverviewRefresh(targetWeek, {
+          force: true,
+          reloadOnDone: true,
+          dedupe: false,
+        });
+        return true;
+      } catch (error) {
+        flash('error', error instanceof Error ? error.message : '保存事件归并失败');
+        return false;
+      } finally {
+        setIsSavingEventGrouping(false);
+      }
+    };
+
+    const openReviewEventMergeDialog = () => {
+      const selected = activeEventGroupingCandidates.filter((card) => selectedReviewEventCardIds.includes(card.id));
+      if (selected.length < 2) return;
+      setReviewEventMergeTitle(suggestMergedReviewEventTitle(selected));
+      setIsReviewEventMergeDialogOpen(true);
+    };
+
+    const mergeSelectedReviewEventCards = async () => {
+      const selected = activeEventGroupingCandidates.filter((card) => selectedReviewEventCardIds.includes(card.id));
+      if (selected.length < 2) return;
+      const mergedTaskIds = Array.from(new Set(selected.flatMap((card) => card.taskIds)));
+      const title = reviewEventMergeTitle.trim();
+      if (!title) return;
+      const remaining = activeEventGroupingCandidates
+        .filter((card) => !selectedReviewEventCardIds.includes(card.id))
+        .map((card) => ({
+          id: card.id,
+          title: card.title,
+          taskIds: card.taskIds,
+          reflectionPromptText: card.reflectionPromptText,
+        }));
+      const saved = await persistEventGroupingOverrides([
+        {
+          id: `human-event:${activeReviewWeekLabel}:${mergedTaskIds.join('+')}`,
+          title,
+          taskIds: mergedTaskIds,
+          reflectionPromptText: '请围绕这个真实事件记录结果、判断与后续。',
+        },
+        ...remaining,
+      ]);
+      if (saved) setIsReviewEventMergeDialogOpen(false);
+    };
+
+    const splitReviewEventCard = async (target: ReviewEventCardView) => {
+      if (target.taskIds.length < 2) return;
+      const remaining = activeEventGroupingCandidates
+        .filter((card) => card.id !== target.id)
+        .map((card) => ({
+          id: card.id,
+          title: card.title,
+          taskIds: card.taskIds,
+          reflectionPromptText: card.reflectionPromptText,
+        }));
+      const singles = target.rows.map(({ task }) => ({
+        id: `human-event:${activeReviewWeekLabel}:${task.id}`,
+        title: task.title,
+        taskIds: [task.id],
+        reflectionPromptText: `请单独复盘“${task.title}”的实际结果与后续。`,
+      }));
+      await persistEventGroupingOverrides([...remaining, ...singles]);
     };
 
     const mergeDraftReviewDashboard = (current: ReviewDashboard | null, next: ReviewDashboard): ReviewDashboard => {
@@ -22198,18 +22375,31 @@ export default function App() {
                 </div>
               </div>
 
-              {/* ── 模块 tab + 视角胶囊 · 极简下划线 ── */}
-              <div className="flex items-center justify-between border-b border-gray-100 shrink-0 overflow-x-auto">
+              {/* ── 模块 tab ── */}
+              <div className="flex items-center border-b border-gray-100 shrink-0 overflow-x-auto">
                 <div className="flex items-center gap-10">
                   {([
-                    { id: 'overview' as const, label: '本周概览' },
                     { id: 'events' as const, label: '事件复盘' },
-                    { id: 'signals' as const, label: '部门信号' },
+                    { id: 'overview' as const, label: '本周概览' },
+                    ...(canViewReviewSignals ? [{ id: 'signals' as const, label: '部门/组织信号' }] : []),
                   ]).map((tab) => (
                     <button
                       key={tab.id}
                       type="button"
-                      onClick={() => setActiveReviewTab(tab.id)}
+                      onClick={() => {
+                        if (tab.id === 'events') {
+                          setReviewPerspective('mine');
+                          setReviewDepartmentId('');
+                          setReviewScope('work');
+                        } else if (tab.id === 'signals' && reviewPerspective === 'mine') {
+                          const managementPerspective = availableManagementReviewPerspectives[0];
+                          if (managementPerspective) {
+                            setReviewPerspective(managementPerspective.key);
+                            setReviewDepartmentId(managementPerspective.departmentId || '');
+                          }
+                        }
+                        setActiveReviewTab(tab.id);
+                      }}
                       className={`relative pb-3 text-[13px] tracking-wide transition-colors whitespace-nowrap ${
                         activeReviewTab === tab.id
                           ? 'text-gray-900 font-semibold'
@@ -22223,107 +22413,6 @@ export default function App() {
                     </button>
                   ))}
                 </div>
-                <div className="flex shrink-0 items-center gap-5 pb-3">
-                  {shouldShowReviewPerspectiveSwitch && (() => {
-                    const hasMine = availableReviewPerspectives.some((o) => o.key === 'mine');
-                    const hasDepartment = availableReviewPerspectives.some((o) => o.key === 'department');
-                    const hasOrganization = availableReviewPerspectives.some((o) => o.key === 'organization');
-                    const currentDeptName = reviewDepartmentId
-                      ? (reviewDepartmentOptions.find((d) => d.id === reviewDepartmentId)?.name || '部门视角')
-                      : (reviewDepartmentOptions[0]?.name || '部门视角');
-                    const isDeptActive = reviewPerspective === 'department';
-                    const baseBtn = 'text-[12px] font-medium tracking-wide transition-colors whitespace-nowrap';
-                    const activeBtn = 'text-gray-900 underline underline-offset-[6px] decoration-[1.5px]';
-                    const idleBtn = 'text-gray-400 hover:text-gray-700';
-                    return (
-                      <div className="flex items-center gap-5">
-                        {hasMine && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setReviewPerspective('mine');
-                              setReviewDepartmentId('');
-                            }}
-                            className={`${baseBtn} ${reviewPerspective === 'mine' ? activeBtn : idleBtn}`}
-                          >
-                            我的视角
-                          </button>
-                        )}
-                        {hasDepartment && (
-                          <div className="relative" ref={reviewDeptDropdownRef}>
-                            <button
-                              type="button"
-                              data-dept-trigger="1"
-                              onClick={(e) => {
-                                if (reviewDepartmentOptions.length <= 1) {
-                                  const onlyId = reviewDepartmentOptions[0]?.id || '';
-                                  setReviewPerspective('department');
-                                  if (onlyId) setReviewDepartmentId(onlyId);
-                                  setReviewScope('work');
-                                  return;
-                                }
-                                const rect = e.currentTarget.getBoundingClientRect();
-                                setReviewDeptDropdownAnchor({ top: rect.bottom + 6, left: rect.left });
-                                setReviewDeptDropdownOpen((v) => !v);
-                              }}
-                              className={`${baseBtn} inline-flex items-center gap-1 ${isDeptActive ? activeBtn : idleBtn}`}
-                            >
-                              {isDeptActive && reviewDepartmentOptions.length > 1
-                                ? currentDeptName
-                                : (reviewDepartmentOptions.length <= 1 ? (currentDeptName || '部门视角') : '部门视角')}
-                              {reviewDepartmentOptions.length > 1 && (
-                                <ChevronDown
-                                  size={11}
-                                  strokeWidth={1.8}
-                                  className={`${isDeptActive ? 'text-gray-900' : 'text-gray-300'} transition-transform ${reviewDeptDropdownOpen ? 'rotate-180' : ''}`}
-                                />
-                              )}
-                            </button>
-                            {reviewDeptDropdownOpen && reviewDepartmentOptions.length > 1 && reviewDeptDropdownAnchor && (
-                              <div
-                                className="fixed z-[9999] min-w-[160px] border border-gray-100 bg-white shadow-[0_8px_30px_rgba(0,0,0,0.08)]"
-                                style={{ top: reviewDeptDropdownAnchor.top, left: reviewDeptDropdownAnchor.left }}
-                              >
-                                {reviewDepartmentOptions.map((department) => (
-                                  <button
-                                    key={department.id}
-                                    type="button"
-                                    onClick={() => {
-                                      setReviewPerspective('department');
-                                      setReviewDepartmentId(department.id);
-                                      setReviewScope('work');
-                                      setReviewDeptDropdownOpen(false);
-                                    }}
-                                    className={`w-full px-4 py-2.5 text-left text-[12px] transition-colors hover:bg-gray-50 ${
-                                      isDeptActive && reviewDepartmentId === department.id
-                                        ? 'font-semibold text-gray-900'
-                                        : 'text-gray-600'
-                                    }`}
-                                  >
-                                    {department.name}
-                                  </button>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        )}
-                        {hasOrganization && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setReviewPerspective('organization');
-                              setReviewDepartmentId('');
-                              setReviewScope('work');
-                            }}
-                            className={`${baseBtn} ${reviewPerspective === 'organization' ? activeBtn : idleBtn}`}
-                          >
-                            组织视角
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })()}
-                </div>
               </div>
 
               {/* ── 内容区域（独立滚动，填满剩余高度） ── */}
@@ -22331,41 +22420,52 @@ export default function App() {
 
               {/* ── 本周概览 · 极简 typography ── */}
               {activeReviewTab === 'overview' && (
-                <div className="w-full space-y-16 pt-10 pb-20">
-                  {/* 本周总览 · quote 风格 */}
+                <div className="w-full space-y-14 pt-6 pb-20">
                   <section>
                     <div className="flex items-center justify-between mb-6">
-                      <h2 className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">
-                        本周总览
-                      </h2>
-                      {reviewScope === 'work' && (
+                      <label className="inline-flex items-center gap-2 text-[11px] text-gray-500">
+                        <span>查看范围</span>
+                        <select
+                          value={reviewPerspectiveSelectValue}
+                          onChange={(event) => applyReviewPerspectiveValue(event.target.value)}
+                          className="h-8 min-w-[140px] rounded-md border border-gray-200 bg-white px-2.5 text-[12px] font-medium text-gray-700 outline-none transition focus:border-[#5B7BFE] focus:ring-2 focus:ring-[#5B7BFE]/10"
+                        >
+                          {reviewPerspectiveSelectOptions.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <div className="flex items-center gap-3">
+                      {reviewScope === 'work' && (weeklyOverviewIsRefreshing || weeklyOverviewIsAi) && (
                         <span className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[10px] font-medium tracking-wide ${
                           weeklyOverviewIsRefreshing
                             ? 'border-blue-200 bg-blue-50 text-[#5B7BFE]'
-                            : weeklyOverviewIsAi
-                              ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
-                              : 'border-gray-200 bg-white text-gray-500'
+                            : 'border-emerald-200 bg-emerald-50 text-emerald-700'
                         }`}>
                           <span className={`h-1.5 w-1.5 rounded-full ${
                             weeklyOverviewIsRefreshing
                               ? 'bg-[#5B7BFE] animate-pulse'
-                              : weeklyOverviewIsAi
-                                ? 'bg-emerald-500'
-                                : 'bg-gray-300'
+                              : 'bg-emerald-500'
                           }`} />
                           {weeklyOverviewIsRefreshing
                             ? '正在更新智能概览'
-                            : weeklyOverviewIsAi
-                              ? '智能概览'
-                              : weeklyOverviewMaterialPackEmpty
-                                ? '基础概览'
-                                : '规则概览'}
+                            : '智能概览'}
                         </span>
                       )}
+                      <button
+                        type="button"
+                        onClick={() => void generateGlobalSummary()}
+                        disabled={isGeneratingGlobal}
+                        className="inline-flex h-8 items-center gap-1.5 rounded-md bg-gray-900 px-3.5 text-[11px] font-medium tracking-wide text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {isGeneratingGlobal ? <RefreshCw size={12} className="animate-spin" /> : <Sparkles size={12} />}
+                        <span>{isGeneratingGlobal ? '生成中' : '生成完整复盘'}</span>
+                      </button>
+                      </div>
                     </div>
                     <div className="border-l-[2px] border-gray-200 pl-6">
                       {weeklyOverviewIsAi || activeWeeklyOverview.totalCount > 0 ? (
-                        <p className="text-[18px] font-light leading-[1.75] tracking-tight text-gray-800">
+                        <p className="whitespace-pre-line text-[18px] font-light leading-[1.85] tracking-tight text-gray-800">
                           {activeWeeklyOverview.summaryText}
                         </p>
                       ) : (
@@ -22429,24 +22529,23 @@ export default function App() {
                                       </>
                                     )}
                                   </div>
-                                  <dl className="mt-5 space-y-3">
-                                    <div className="grid grid-cols-[80px_1fr] gap-x-6 items-baseline">
-                                      <dt className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">
-                                        本周推进
-                                      </dt>
-                                      <dd className="text-[14px] leading-relaxed text-gray-700">
-                                        {line.progressText}
-                                      </dd>
+                                  <p className="mt-3 text-[13px] leading-6 text-gray-700">
+                                    {line.narrativeText}
+                                  </p>
+                                  {line.nextMoveText && (
+                                    <p className="mt-2 text-[12px] leading-5 text-[#3652c9]">
+                                      接下来：{line.nextMoveText}
+                                    </p>
+                                  )}
+                                  {line.evidenceRefs.length > 0 && (
+                                    <div className="mt-4 flex flex-wrap gap-1.5">
+                                      {line.evidenceRefs.map((reference) => (
+                                        <span key={`${reference.type}:${reference.id}`} className="rounded bg-gray-100 px-2 py-1 text-[10px] text-gray-500">
+                                          {reference.label}
+                                        </span>
+                                      ))}
                                     </div>
-                                    <div className="grid grid-cols-[80px_1fr] gap-x-6 items-baseline">
-                                      <dt className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">
-                                        下一步目标
-                                      </dt>
-                                      <dd className="text-[14px] leading-relaxed text-gray-700">
-                                        {line.nextGoalText}
-                                      </dd>
-                                    </div>
-                                  </dl>
+                                  )}
                                 </div>
                               </div>
                             </article>
@@ -22460,20 +22559,79 @@ export default function App() {
 
               {/* ── 事件复盘 · 极简 typography ── */}
               {activeReviewTab === 'events' && (
-                <div className="w-full pt-10 pb-20">
-                  <div className="flex items-baseline justify-between mb-10">
-                    <div>
-                      <h2 className="text-[20px] font-light tracking-tight text-gray-900">事件复盘</h2>
-                      <p className="mt-1 text-[12px] text-gray-400 max-w-xl leading-relaxed">
-                        系统按事件线归并相近任务，真正的复盘判断由你写
-                      </p>
-                    </div>
+                <div className="w-full pt-6 pb-20">
+                  <div className="flex items-center justify-between mb-6">
+                    <button
+                      type="button"
+                      onClick={openReviewEventMergeDialog}
+                      disabled={selectedReviewEventCardIds.length < 2 || isSavingEventGrouping}
+                      className="inline-flex h-8 items-center gap-1.5 rounded-md border border-gray-200 bg-white px-3 text-[11px] font-medium text-gray-600 transition hover:border-[#5B7BFE]/40 hover:text-[#5B7BFE] disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <GitMerge size={12} strokeWidth={2} />
+                      合并所选事件{selectedReviewEventCardIds.length > 0 ? `（${selectedReviewEventCardIds.length}）` : ''}
+                    </button>
                     <span className="text-[11px] tabular-nums text-gray-400">
                       <span className="text-gray-900 font-medium">{shouldUseEventReviewCards ? activeEventReviewCards.length : activeReviewGroups.length}</span> 个模块
                       <span className="mx-2 text-gray-200">·</span>
                       <span className="text-gray-900 font-medium">{activeReviewRows.length}</span> 条任务
                     </span>
                   </div>
+
+                  {isReviewEventMergeDialogOpen && (
+                    <div
+                      className="fixed inset-0 z-[120] flex items-center justify-center bg-gray-950/25 px-6 backdrop-blur-[1px]"
+                      onMouseDown={(event) => {
+                        if (event.target === event.currentTarget && !isSavingEventGrouping) {
+                          setIsReviewEventMergeDialogOpen(false);
+                        }
+                      }}
+                    >
+                      <form
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="review-event-merge-title"
+                        className="w-full max-w-md rounded-2xl border border-gray-200 bg-white p-6 shadow-2xl"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void mergeSelectedReviewEventCards();
+                        }}
+                      >
+                        <h3 id="review-event-merge-title" className="text-[17px] font-semibold text-gray-900">
+                          合并为一个事件
+                        </h3>
+                        <p className="mt-2 text-[12px] leading-5 text-gray-500">
+                          已选择 {selectedReviewEventCardIds.length} 个模块。合并只影响本周复盘的梳理，不会改动原任务或事件线。
+                        </p>
+                        <label className="mt-5 block">
+                          <span className="text-[11px] font-medium text-gray-600">事件名称</span>
+                          <input
+                            autoFocus
+                            value={reviewEventMergeTitle}
+                            onChange={(event) => setReviewEventMergeTitle(event.target.value)}
+                            placeholder="例如：日期验证"
+                            className="mt-2 h-10 w-full rounded-lg border border-gray-200 px-3 text-[13px] text-gray-900 outline-none transition focus:border-[#5B7BFE] focus:ring-2 focus:ring-[#5B7BFE]/15"
+                          />
+                        </label>
+                        <div className="mt-6 flex justify-end gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setIsReviewEventMergeDialogOpen(false)}
+                            disabled={isSavingEventGrouping}
+                            className="h-9 rounded-lg px-4 text-[12px] font-medium text-gray-500 transition hover:bg-gray-100 disabled:opacity-40"
+                          >
+                            取消
+                          </button>
+                          <button
+                            type="submit"
+                            disabled={!reviewEventMergeTitle.trim() || isSavingEventGrouping}
+                            className="h-9 rounded-lg bg-gray-900 px-4 text-[12px] font-medium text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            {isSavingEventGrouping ? '正在合并…' : '确认合并'}
+                          </button>
+                        </div>
+                      </form>
+                    </div>
+                  )}
 
                   {activeReviewGroups.length === 0 && (
                     <div className="py-24 text-center">
@@ -22500,6 +22658,19 @@ export default function App() {
                         : `${zebraBg} border-gray-100/80 hover:bg-blue-50/30 hover:border-blue-200/60 hover:shadow-[0_2px_8px_rgba(91,123,254,0.06)]`;
                       return (
                         <article key={card.id} className={`group relative rounded-xl border px-4 py-3 transition-all ${expandedRing}`}>
+                          <label className="absolute right-14 top-4 z-10 inline-flex cursor-pointer items-center gap-1.5 text-[10px] text-gray-400">
+                            <input
+                              type="checkbox"
+                              checked={selectedReviewEventCardIds.includes(card.id)}
+                              onChange={(event) => {
+                                setSelectedReviewEventCardIds((current) => event.target.checked
+                                  ? [...current, card.id]
+                                  : current.filter((id) => id !== card.id));
+                              }}
+                              className="h-3.5 w-3.5 rounded border-gray-300 text-[#5B7BFE] focus:ring-[#5B7BFE]/30"
+                            />
+                            选择
+                          </label>
                           <div className="pl-2">
                             <button
                               type="button"
@@ -22539,6 +22710,18 @@ export default function App() {
                             </button>
                             {isExpanded && (
                               <div className="ml-14 mt-4 pt-4 border-t border-gray-100 space-y-4">
+                                {card.taskCount > 1 && (
+                                  <div className="flex justify-end">
+                                    <button
+                                      type="button"
+                                      onClick={() => void splitReviewEventCard(card)}
+                                      disabled={isSavingEventGrouping}
+                                      className="text-[11px] font-medium text-gray-500 transition hover:text-rose-600 disabled:opacity-40"
+                                    >
+                                      这些不是同一事件，拆开
+                                    </button>
+                                  </div>
+                                )}
                                 <div className="grid grid-cols-[80px_1fr] gap-x-6 items-start">
                                   <div className="flex items-center gap-1.5 pt-0.5">
                                     <ListChecks size={11} strokeWidth={2} className="text-gray-400" />
@@ -22564,6 +22747,12 @@ export default function App() {
                                     )}
                                   </dd>
                                 </div>
+                                {card.groupReason && (
+                                  <div className="grid grid-cols-[80px_1fr] gap-x-6 items-start">
+                                    <dt className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">归并依据</dt>
+                                    <dd className="text-[12px] leading-5 text-gray-500">{card.groupReason}</dd>
+                                  </div>
+                                )}
                                 <WeeklyReviewStructuredFields
                                     scope={reviewScope}
                                     value={cardDraftStructuredNote}
@@ -22629,6 +22818,19 @@ export default function App() {
                         : `${zebraBg} border-gray-100/80 hover:bg-blue-50/30 hover:border-blue-200/60 hover:shadow-[0_2px_8px_rgba(91,123,254,0.06)]`;
                       return (
                         <article key={group.id} className={`group relative rounded-xl border px-4 py-3 transition-all ${expandedRing}`}>
+                          <label className="absolute right-14 top-4 z-10 inline-flex cursor-pointer items-center gap-1.5 text-[10px] text-gray-400">
+                            <input
+                              type="checkbox"
+                              checked={selectedReviewEventCardIds.includes(group.id)}
+                              onChange={(event) => {
+                                setSelectedReviewEventCardIds((current) => event.target.checked
+                                  ? [...current, group.id]
+                                  : current.filter((id) => id !== group.id));
+                              }}
+                              className="h-3.5 w-3.5 rounded border-gray-300 text-[#5B7BFE] focus:ring-[#5B7BFE]/30"
+                            />
+                            选择
+                          </label>
                           <div className="pl-2">
                             <button
                               type="button"
@@ -22667,6 +22869,21 @@ export default function App() {
                             </button>
                             {isExpanded && (
                               <div className="ml-14 mt-4 pt-4 border-t border-gray-100 space-y-4">
+                                {group.taskCount > 1 && (
+                                  <div className="flex justify-end">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const candidate = activeEventGroupingCandidates.find((item) => item.id === group.id);
+                                        if (candidate) void splitReviewEventCard(candidate);
+                                      }}
+                                      disabled={isSavingEventGrouping}
+                                      className="text-[11px] font-medium text-gray-500 transition hover:text-rose-600 disabled:opacity-40"
+                                    >
+                                      这些不是同一事件，拆开
+                                    </button>
+                                  </div>
+                                )}
                                 {group.hasDivergentNotes && (
                                   <div className="flex items-start gap-2.5 rounded-md bg-amber-50/60 border-l-[2px] border-amber-400 px-3.5 py-2.5">
                                     <AlertTriangle size={13} strokeWidth={2} className="text-amber-600 mt-0.5 shrink-0" />
@@ -22778,40 +22995,35 @@ export default function App() {
 
               {/* ── 部门信号 · 协作驾驶舱 ── */}
               {activeReviewTab === 'signals' && (
-                <DepartmentSignalsView
-                  weekLabel={selectedReviewWeekLabel || null}
-                  perspective={
-                    reviewPerspective === 'mine'
-                      ? 'organization'
-                      : (reviewPerspective as 'organization' | 'department')
-                  }
-                  departmentId={reviewRequestDepartmentId}
-                />
+                <div className="w-full pt-6 pb-20">
+                  <label className="inline-flex items-center gap-2 text-[11px] text-gray-500">
+                    <span>查看范围</span>
+                    <select
+                      value={reviewPerspective === 'mine'
+                        ? reviewPerspectiveSelectOptions.find((option) => option.value !== 'mine')?.value || ''
+                        : reviewPerspectiveSelectValue}
+                      onChange={(event) => applyReviewPerspectiveValue(event.target.value)}
+                      className="h-8 min-w-[140px] rounded-md border border-gray-200 bg-white px-2.5 text-[12px] font-medium text-gray-700 outline-none transition focus:border-[#5B7BFE] focus:ring-2 focus:ring-[#5B7BFE]/10"
+                    >
+                      {reviewPerspectiveSelectOptions.filter((option) => option.value !== 'mine').map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <DepartmentSignalsView
+                    weekLabel={selectedReviewWeekLabel || null}
+                    perspective={
+                      reviewPerspective === 'mine'
+                        ? 'organization'
+                        : (reviewPerspective as 'organization' | 'department')
+                    }
+                    departmentId={reviewRequestDepartmentId}
+                  />
+                </div>
               )}
 
               </div>{/* end overflow-y-auto */}
 
-              {/* ── 右下角生成按钮 · 极简 ── */}
-              <div className="fixed bottom-10 right-10 z-40">
-                <button
-                  type="button"
-                  onClick={() => void generateGlobalSummary()}
-                  disabled={isGeneratingGlobal}
-                  className="inline-flex items-center gap-2 bg-gray-900 px-5 py-2.5 text-[12px] font-medium tracking-wide text-white transition-all hover:bg-gray-700 disabled:opacity-60 disabled:cursor-not-allowed shadow-[0_4px_20px_rgba(0,0,0,0.12)]"
-                >
-                  {isGeneratingGlobal ? (
-                    <>
-                      <RefreshCw size={13} strokeWidth={2} className="animate-spin" />
-                      <span>生成中</span>
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles size={13} strokeWidth={2} />
-                      <span>生成周复盘</span>
-                    </>
-                  )}
-                </button>
-              </div>
             </div>
           )}
         </div>

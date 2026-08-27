@@ -11,15 +11,19 @@ from fastapi import FastAPI
 from backend.app.ui_domains import gc06_planning as gc06_ui_domain
 from backend.app.ui_domains.gc06_planning import (
     _basic_review_dashboard,
+    _apply_weekly_event_grouping_overrides,
+    _enforce_weekly_explicit_event_groups,
     _event_line_narrative,
     _event_line_timeline_nodes,
     _merge_review_task_entries,
+    _normalize_weekly_event_cards,
+    _weekly_review_evidence_packs,
     router as gc06_ui_router,
 )
 from backend.app.ui_domains.workflow import router as workflow_ui_router
 from backend.app.ui_domains.routing import UiRequest
 from backend.app.gc06_planning_local import LocalGC06PlanningProjection
-from backend.app.runtime import WorkspaceRuntime
+from backend.app.runtime import LocalRuntimeError, WorkspaceRuntime
 from cloud_backend.app.domain_routes.gc06_planning import register_gc06_planning_routes
 from cloud_backend.app.repositories.gc04_tasks import GC04TaskRepository
 from cloud_backend.app.repositories.gc06_planning import (
@@ -32,8 +36,10 @@ from cloud_backend.app.repositories.gc06_planning import (
     create_planning_cycle,
     delete_planning_cycle,
     derive_task_calendar_projection,
+    event_line_detail,
     list_calendar_entries,
     list_event_lines,
+    list_planning_cycles,
     list_plan_item_tasks,
     migrate_meeting_to_task,
     get_task_plan_link,
@@ -92,8 +98,8 @@ def test_retained_review_dashboard_uses_only_strict_review_plan_and_task_facts()
             "summary": "",
             "status": "published",
             "ownerMembershipId": "membership_review_dashboard",
-            "periodStart": "2026-08-03",
-            "periodEnd": "2026-08-09",
+            "periodStart": "2026-08-01",
+            "periodEnd": "2026-08-31",
         }],
         reviews=[{
             "id": "review_dashboard",
@@ -165,6 +171,455 @@ def test_retained_review_dashboard_uses_only_strict_review_plan_and_task_facts()
     }
 
 
+def test_retained_review_dashboard_finds_review_period_without_formal_plan() -> None:
+    dashboard = _basic_review_dashboard(
+        cycles=[{
+            "id": "review_period_hidden",
+            "recordKind": "cycle",
+            "periodKind": "weekly_review",
+            "periodStart": "2026-08-24",
+            "periodEnd": "2026-08-30",
+            "title": "2026-W35 复盘周期",
+        }],
+        reviews=[{
+            "id": "review_without_plan",
+            "membershipId": "membership_review_dashboard",
+            "planningCycleId": "review_period_hidden",
+            "currentDraftVersionId": "review_version_without_plan",
+            "currentSubmittedVersionId": None,
+            "createdAt": "2026-08-27T09:00:00Z",
+            "updatedAt": "2026-08-27T09:00:00Z",
+            "versions": [{
+                "id": "review_version_without_plan",
+                "businessState": "draft",
+                "content": {
+                    "weekLabel": "2026-W35",
+                    "summary": "没有计划也能复盘",
+                },
+                "createdAt": "2026-08-27T09:00:00Z",
+            }],
+        }],
+        task_rows=[],
+        membership_id="membership_review_dashboard",
+        user_name="复盘成员",
+        requested_week="2026-W35",
+    )
+    assert dashboard["currentReview"]["workProgress"] == "没有计划也能复盘"
+    assert dashboard["currentReview"]["relatedPlanIds"] == []
+    assert dashboard["plans"] == []
+
+
+def test_weekly_review_can_be_saved_without_formal_plan(tmp_path: Path) -> None:
+    repository, identity, _ = _repository(tmp_path)
+    first = save_weekly_review_draft(
+        repository,
+        identity,
+        payload={
+            "reviewId": "weekly_review_without_plan",
+            "weekLabel": "2026-W35",
+            "content": {"summary": "计划只是可选参考"},
+        },
+        idempotency_key="gc06-weekly-review-without-plan-v1",
+    )["weeklyReview"]
+    assert first["planningCycleId"].startswith("review_period_")
+    assert first["versions"][0]["content"]["weekLabel"] == "2026-W35"
+
+    second = save_weekly_review_draft(
+        repository,
+        identity,
+        payload={
+            "planningCycleId": first["planningCycleId"],
+            "weekLabel": "2026-W35",
+            "expectedVersion": first["version"],
+            "content": {"summary": "无计划也能继续保存"},
+        },
+        idempotency_key="gc06-weekly-review-without-plan-v2",
+    )["weeklyReview"]
+    assert second["id"] == first["id"]
+    assert second["versions"][-1]["content"]["summary"] == "无计划也能继续保存"
+    assert list_planning_cycles(repository, identity) == []
+    review_periods = list_planning_cycles(
+        repository,
+        identity,
+        include_review_periods=True,
+    )
+    assert [(item["recordKind"], item["periodKind"]) for item in review_periods] == [
+        ("cycle", "weekly_review")
+    ]
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_retained_review_save_does_not_require_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        gc06_ui_domain,
+        "_retained_review_sources",
+        lambda *_args, **_kwargs: ([], [], {"tasks": []}),
+    )
+    monkeypatch.setattr(
+        gc06_ui_domain,
+        "_retained_dashboard",
+        lambda *_args, **_kwargs: {"weekLabel": "2026-W35"},
+    )
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def _current_context(*, require_ready: bool):
+            assert require_ready is True
+            return SimpleNamespace(membership_id="membership_without_plan")
+
+        @staticmethod
+        def cloud_command(method, path, *, payload, **_kwargs):
+            captured.update({"method": method, "path": path, "payload": payload})
+            return {
+                "weeklyReview": {
+                    "id": "review_without_plan",
+                    "version": 1,
+                }
+            }
+
+    result = gc06_ui_domain._save_retained_review(
+        SimpleNamespace(runtime=Runtime()),
+        UiRequest(
+            method="POST",
+            path="reviews/weekly/draft",
+            query={},
+            body={"weekLabel": "2026-W35", "workFreeNote": "直接复盘"},
+            idempotency_key="weekly-review-without-plan-ui",
+        ),
+        submit=False,
+    )
+    assert result == {"weekLabel": "2026-W35"}
+    assert captured["payload"]["weekLabel"] == "2026-W35"
+    assert "planningCycleId" not in captured["payload"]
+
+
+def test_weekly_event_agent_grouping_does_not_use_date_as_a_split_or_merge_rule() -> None:
+    tasks = [
+        {
+            "taskId": "task_date_prepare",
+            "title": "准备日期验证样本",
+            "scheduledStartAt": "2026-08-25T09:00:00Z",
+            "eventLineId": None,
+        },
+        {
+            "taskId": "task_date_verify",
+            "title": "复核日期验证结果",
+            "scheduledStartAt": "2026-08-27T09:00:00Z",
+            "eventLineId": None,
+        },
+        {
+            "taskId": "task_unrelated_same_day",
+            "title": "整理客户会议名单",
+            "scheduledStartAt": "2026-08-27T10:00:00Z",
+            "eventLineId": None,
+        },
+    ]
+    payload, groups = _normalize_weekly_event_cards(
+        [{
+            "title": "日期验证",
+            "taskIds": ["task_date_prepare", "task_date_verify"],
+            "groupReason": "两项任务共同完成一次验证工作的准备与复核",
+            "confidence": "high",
+            "reflectionPromptText": "这次验证最终确认了什么？",
+        }],
+        tasks=tasks,
+        week_label="2026-W35",
+    )
+    assert groups[0]["taskIds"] == ["task_date_prepare", "task_date_verify"]
+    assert groups[0]["cardKind"] == "task_cluster"
+    assert groups[1]["taskIds"] == ["task_unrelated_same_day"]
+    assert groups[1]["cardKind"] == "needs_assignment"
+    assert payload["evidenceMeta"]["schemaVersion"] == "weekly_review_event_agent_v4"
+
+
+def test_weekly_event_unlinked_siblings_wait_for_manual_merge() -> None:
+    tasks = [
+        {
+            "taskId": "task_multi_date",
+            "title": "日期验证｜多日仅日期",
+            "eventLineId": None,
+        },
+        {
+            "taskId": "task_single_date",
+            "title": "日期验证｜单日仅日期",
+            "eventLineId": None,
+        },
+        {
+            "taskId": "task_feishu",
+            "title": "飞书字段内联修改验收｜20260825",
+            "eventLineId": None,
+        },
+    ]
+    groups = _enforce_weekly_explicit_event_groups(
+        [
+            {"title": "日期验证", "taskIds": ["task_multi_date", "task_single_date"]},
+            {"title": "飞书验收", "taskIds": ["task_feishu"]},
+        ],
+        tasks=tasks,
+    )
+    assert [item["taskIds"] for item in groups] == [
+        ["task_multi_date"],
+        ["task_single_date"],
+        ["task_feishu"],
+    ]
+    assert all("成员决定" in item["groupReason"] for item in groups[:2])
+
+
+def test_weekly_review_evidence_pack_joins_task_plan_project_event_and_review() -> None:
+    packs = _weekly_review_evidence_packs(
+        event_groups=[{
+            "id": "event_group_one",
+            "title": "试点验证",
+            "taskIds": ["task_one"],
+            "groupReason": "共同交付物",
+            "confidence": "high",
+        }],
+        tasks=[{
+            "taskId": "task_one",
+            "title": "复核试点数据",
+            "planningCycleId": "plan_one",
+            "clientId": "project_one",
+            "eventLineId": "event_line_one",
+        }],
+        plans=[{"id": "plan_one", "title": "本周试点计划"}],
+        project_contexts=[{"clientId": "project_one", "sources": [{"id": "knowledge_one"}]}],
+        event_contexts=[{"eventLineId": "event_line_one", "goal": "完成试点验证"}],
+        current_review={"workFreeNote": "本周已完成第一轮核对"},
+    )
+    assert packs == [{
+        "eventGroupId": "event_group_one",
+        "eventTitle": "试点验证",
+        "groupReason": "共同交付物",
+        "confidence": "high",
+        "tasks": [{
+            "taskId": "task_one",
+            "title": "复核试点数据",
+            "planningCycleId": "plan_one",
+            "clientId": "project_one",
+            "eventLineId": "event_line_one",
+        }],
+        "linkedPlans": [{"id": "plan_one", "title": "本周试点计划"}],
+        "linkedProjects": [{"clientId": "project_one", "sources": [{"id": "knowledge_one"}]}],
+        "linkedEventLines": [{"eventLineId": "event_line_one", "goal": "完成试点验证"}],
+        "memberReview": {"workFreeNote": "本周已完成第一轮核对"},
+    }]
+
+
+def test_weekly_event_manual_grouping_saves_without_plan_or_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard = {
+        "weekLabel": "2026-W35",
+        "activePerspective": "mine",
+        "activeDepartmentId": None,
+        "workItems": [
+            {"taskId": "task_multi", "taskSnapshot": {"title": "日期验证｜多日仅日期", "status": "done"}},
+            {"taskId": "task_single", "taskSnapshot": {"title": "日期验证｜单日仅日期", "status": "done"}},
+        ],
+        "weeklyOverviewGenerationStatus": {
+            "weekLabel": "2026-W35",
+            "perspective": "mine",
+            "departmentId": None,
+            "viewerUserId": "membership_one",
+            "status": "idle",
+        },
+    }
+    monkeypatch.setattr(gc06_ui_domain, "_retained_dashboard", lambda *_args, **_kwargs: dashboard)
+    saved: dict[str, object] = {}
+
+    class Projector:
+        @staticmethod
+        def load_weekly_overview(**_kwargs):
+            return None
+
+        @staticmethod
+        def save_weekly_overview(**kwargs):
+            saved.update(kwargs)
+            return {}
+
+    monkeypatch.setattr(gc06_ui_domain, "_planning_projector", lambda _compatibility: Projector())
+    result = gc06_ui_domain._save_weekly_event_grouping(
+        SimpleNamespace(runtime=object()),
+        UiRequest(
+            method="POST",
+            path="reviews/weekly-overview/refresh",
+            query={},
+            body={
+                "weekLabel": "2026-W35",
+                "perspective": "mine",
+                "groupingOnly": True,
+                "eventGroupingOverrides": [{
+                    "id": "human-date",
+                    "title": "日期验证",
+                    "taskIds": ["task_multi", "task_single"],
+                }],
+            },
+            idempotency_key="manual-grouping-without-plan",
+        ),
+    )
+    assert result["status"] == "succeeded"
+    event_cards = saved["payload"]["eventCards"]["cards"]
+    assert event_cards[0]["taskIds"] == ["task_multi", "task_single"]
+    assert event_cards[0]["generatedBy"] == "human"
+
+
+def test_member_event_grouping_override_replaces_agent_group_without_new_table() -> None:
+    tasks = [
+        {"taskId": "task_one", "title": "任务一", "eventLineId": None},
+        {"taskId": "task_two", "title": "任务二", "eventLineId": None},
+    ]
+    original_payload, original_groups = _normalize_weekly_event_cards(
+        [{
+            "title": "Agent 归并",
+            "taskIds": ["task_one", "task_two"],
+            "groupReason": "模型判断",
+            "confidence": "medium",
+            "reflectionPromptText": "请复盘",
+        }],
+        tasks=tasks,
+        week_label="2026-W35",
+    )
+    payload, groups = _apply_weekly_event_grouping_overrides(
+        original_payload,
+        original_groups,
+        overrides=[
+            {"id": "human_one", "title": "任务一", "taskIds": ["task_one"]},
+            {"id": "human_two", "title": "任务二", "taskIds": ["task_two"]},
+        ],
+        tasks=tasks,
+        week_label="2026-W35",
+    )
+    assert [item["taskIds"] for item in groups] == [["task_one"], ["task_two"]]
+    assert all(item["generatedBy"] == "human" for item in groups)
+    assert payload["generatedBy"] == "human"
+
+
+def test_weekly_review_generation_uses_event_then_evidence_pack_agents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dashboard = {
+        "weekLabel": "2026-W35",
+        "activePerspective": "mine",
+        "activeDepartmentId": None,
+        "activeDepartmentName": None,
+        "currentReview": {"id": "review_one", "workFreeNote": "验证需要形成结论"},
+        "plans": [{"id": "plan_one", "title": "验证计划"}],
+        "workItems": [
+            {
+                "taskId": "task_prepare",
+                "taskSnapshot": {
+                    "title": "准备日期验证样本",
+                    "description": "用于确认任务详情是否被读取并进入复盘证据包。",
+                    "status": "done",
+                    "scheduledStartAt": "2026-08-25T09:00:00Z",
+                    "clientId": "project_one",
+                    "clientName": "试点项目",
+                    "planningCycleId": "plan_one",
+                },
+                "note": "已准备样本",
+                "structuredNote": {},
+            },
+            {
+                "taskId": "task_verify",
+                "taskSnapshot": {
+                    "title": "复核日期验证结果",
+                    "status": "done",
+                    "scheduledStartAt": "2026-08-27T09:00:00Z",
+                    "clientId": "project_one",
+                    "clientName": "试点项目",
+                    "planningCycleId": "plan_one",
+                },
+                "note": "完成复核",
+                "structuredNote": {},
+            },
+        ],
+        "weeklyOverviewGenerationStatus": {
+            "weekLabel": "2026-W35",
+            "perspective": "mine",
+            "departmentId": None,
+            "viewerUserId": "membership_one",
+            "status": "idle",
+        },
+    }
+    monkeypatch.setattr(gc06_ui_domain, "_retained_dashboard", lambda *_args, **_kwargs: dashboard)
+    completions = []
+
+    class Runtime:
+        @staticmethod
+        def project_knowledge_context(project_id: str):
+            assert project_id == "project_one"
+            return {
+                "savedMemories": [{
+                    "id": "knowledge_one",
+                    "title": "项目目标",
+                    "summary": "需要验证日期处理是否可靠。",
+                }]
+            }
+
+        @staticmethod
+        def private_ai_completion(**kwargs):
+            completions.append(kwargs)
+            if len(completions) == 1:
+                return {
+                    "content": '{"eventGroups":[{"title":"日期验证","taskIds":["task_prepare","task_verify"],'
+                    '"groupReason":"共同完成一次验证","confidence":"high",'
+                    '"reflectionPromptText":"这次验证确认了什么？"}]}',
+                    "modelName": "grouping-model",
+                }
+            return {
+                "content": '{"summaryText":"本周完成了日期验证并形成可靠性判断。","mainlines":[{'
+                '"title":"日期验证","taskIds":["task_prepare","task_verify"],'
+                '"narrativeText":"准备样本与结果复核共同完成了一轮验证，项目知识表明其目标是确认日期处理可靠性。",'
+                '"nextMoveText":"把结论写入验收标准。","openQuestions":[],"evidenceRefs":['
+                '{"type":"plan","id":"plan_one","label":"验证计划"}]}]}',
+                "modelName": "review-model",
+            }
+
+    saved = {}
+
+    class Projector:
+        @staticmethod
+        def load_weekly_overview(**_kwargs):
+            return None
+
+        @staticmethod
+        def save_weekly_overview(**kwargs):
+            saved.update(kwargs)
+            return {}
+
+    monkeypatch.setattr(gc06_ui_domain, "_planning_projector", lambda _compatibility: Projector())
+    result = gc06_ui_domain._generate_weekly_overview(
+        SimpleNamespace(runtime=Runtime()),
+        UiRequest(
+            method="POST",
+            path="reviews/weekly-overview/refresh",
+            query={},
+            body={"weekLabel": "2026-W35", "perspective": "mine", "force": True},
+            idempotency_key="weekly-review-agent-v2",
+        ),
+    )
+    assert result["status"] == "succeeded"
+    assert len(completions) == 2
+    assert "日期只用于核验" in completions[0]["system_prompt"]
+    assert "用于确认任务详情是否被读取" in completions[0]["prompt"]
+    assert "evidencePacks" in completions[1]["prompt"]
+    assert "用于确认任务详情是否被读取" in completions[1]["prompt"]
+    assert "summaryText 是最重要的输出" in completions[1]["system_prompt"]
+    assert "previousWeek" in completions[1]["prompt"]
+    assert [card["taskIds"] for card in saved["payload"]["eventCards"]["cards"]] == [
+        ["task_prepare"],
+        ["task_verify"],
+    ]
+    mainline = saved["payload"]["cards"]["mainlines"][0]
+    assert mainline["narrativeText"].startswith("准备样本")
+    assert "whyText" not in mainline
+    assert saved["payload"]["cards"]["evidenceMeta"]["schemaVersion"] == "weekly_review_agent_v3"
+
+
 def test_clients_pulse_uses_visible_strict_project_activity(tmp_path: Path) -> None:
     repository, identity, seed = _repository(tmp_path)
     GC04TaskRepository(repository).create_task(
@@ -207,6 +662,12 @@ def test_event_line_reparent_moves_formal_task_to_target_client(tmp_path: Path) 
         idempotency_key="gc06-reparent-attach",
         task_command_port=GC04_FORMAL_TASK_COMMAND_PORT,
     )
+    detail_task = event_line_detail(
+        repository, identity, event_line_id=line["id"]
+    )["tasks"][0]
+    assert detail_task["title"] == "随事件线迁移"
+    assert detail_task["viewer_surfaces"]["event_line_detail"] is True
+    assert detail_task["viewer_capabilities"]["can_view"] is True
     result = reparent_event_line(
         repository,
         identity,
@@ -1642,3 +2103,86 @@ def test_gc06_detached_cloud_and_ui_registrars_are_complete(tmp_path: Path) -> N
             r"(?P<task_id>[^/]+)/milestone",
         ),
     }
+
+
+def test_department_signals_reject_personal_scope_before_querying_data() -> None:
+    with pytest.raises(LocalRuntimeError) as error:
+        gc06_ui_router.dispatch(
+            SimpleNamespace(),
+            UiRequest(
+                method="GET",
+                path="reviews/department-signals",
+                query={"weekLabel": "2026-W35", "perspective": "mine"},
+                body={},
+                idempotency_key="department-signals-personal-scope",
+            ),
+        )
+    assert error.value.status_code == 403
+    assert error.value.code == "department_signals_management_scope_required"
+
+
+def test_department_signals_return_explainable_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        gc06_ui_domain,
+        "_retained_dashboard",
+        lambda *_args, **_kwargs: {
+            "weekLabel": "2026-W35",
+            "activePerspective": "department",
+            "activeDepartmentId": "department-1",
+            "activeDepartmentName": "研究部",
+            "activeDepartmentLeaderName": "负责人",
+            "availablePerspectives": [
+                {"key": "department", "departmentId": "department-1"},
+                {"key": "mine"},
+            ],
+            "currentReview": {"workBlocker": "等待客户确认", "nextWeekFocus": "完成交付"},
+            "plans": [{"id": "plan-1"}],
+            "workItems": [
+                {
+                    "taskSnapshot": {"status": "done"},
+                    "note": "形成第一版结论",
+                    "structuredNote": {},
+                },
+                {
+                    "taskSnapshot": {"status": "doing"},
+                    "note": "",
+                    "structuredNote": {"blockerReason": "缺少材料"},
+                },
+            ],
+        },
+    )
+    result = gc06_ui_router.dispatch(
+        SimpleNamespace(),
+        UiRequest(
+            method="GET",
+            path="reviews/department-signals",
+            query={
+                "weekLabel": "2026-W35",
+                "perspective": "department",
+                "departmentId": "department-1",
+            },
+            body={},
+            idempotency_key="department-signals-explainable",
+        ),
+    )
+    row = result["departmentScoreboard"][0]
+    assert row["taskTotalCount"] == 2
+    assert row["taskCompletedCount"] == 1
+    assert row["taskPendingCount"] == 1
+    assert row["fulfillmentRatePct"] == 50
+    assert row["reviewedTaskCount"] == 2
+    assert row["blockerCount"] == 2
+    assert row["activePlanCount"] == 1
+    assert "valueProductionScore" not in row
+    assert [item["key"] for item in result["healthIndicators"]] == [
+        "weekly_tasks",
+        "completed_tasks",
+        "pending_tasks",
+        "completion_rate",
+        "reviewed_tasks",
+        "active_plans",
+        "blockers",
+    ]
+    assert result["sourceSummary"].startswith("基于当前权限范围内 2 条任务")
