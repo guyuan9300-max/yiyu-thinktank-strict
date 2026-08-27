@@ -238,6 +238,25 @@ def register_gc07_routes(
             idempotency_key=idempotency_key or new_id(),
         )
 
+    @app.put(
+        "/api/v2/domain/project-materials/projects/{project_id}/default-internal"
+    )
+    def set_default_internal_project(
+        project_id: str,
+        payload: Annotated[dict[str, Any], Body()],
+        identity: Annotated[SessionIdentity, Depends(identity_dependency)],
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key"),
+        ] = None,
+    ) -> dict[str, Any]:
+        return domain.set_default_internal_project(
+            identity,
+            project_id=project_id,
+            expected_version=int(payload.get("expectedVersion") or 0),
+            idempotency_key=idempotency_key or new_id(),
+        )
+
     @app.post(
         "/api/v2/domain/project-materials/projects/{project_id}/lifecycle"
     )

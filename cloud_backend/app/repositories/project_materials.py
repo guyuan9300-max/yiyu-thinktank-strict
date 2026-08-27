@@ -1818,6 +1818,103 @@ class GC07ProjectMaterialsRepository:
                 connection.rollback()
                 raise
 
+    def set_default_internal_project(
+        self,
+        identity: SessionIdentity,
+        *,
+        project_id: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        normalized = {
+            "projectId": project_id,
+            "expectedVersion": expected_version,
+        }
+        payload_hash = self._payload_hash(normalized)
+        with self.repository._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                receipt = self._receipt(
+                    connection,
+                    identity,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                )
+                if receipt is not None:
+                    connection.rollback()
+                    return receipt
+                if not identity.is_admin:
+                    raise RepositoryError(
+                        403,
+                        "organization_admin_required",
+                        "只有组织管理员可以设置默认内部项目",
+                    )
+                row = self.repository._require_project_access(
+                    connection,
+                    identity,
+                    project_id=project_id,
+                )
+                current_version = int(row["version"] or 1)
+                if expected_version != current_version:
+                    raise RepositoryError(
+                        409,
+                        "project_version_conflict",
+                        "项目已更新，请刷新后重试",
+                    )
+                now = utc_now()
+                connection.execute(
+                    "UPDATE clients SET is_default_internal=0,version=version+1,"
+                    "updated_at=? WHERE scope_id=? AND id!=? "
+                    "AND is_default_internal=1 AND lifecycle_state='active'",
+                    (now, identity.scope_id, project_id),
+                )
+                updated = connection.execute(
+                    "UPDATE clients SET is_default_internal=1,version=version+1,"
+                    "updated_at=? WHERE id=? AND scope_id=? AND version=? "
+                    "AND lifecycle_state='active'",
+                    (
+                        now,
+                        project_id,
+                        identity.scope_id,
+                        current_version,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RepositoryError(
+                        409,
+                        "project_version_conflict",
+                        "项目已更新，请刷新后重试",
+                    )
+                updated_row = connection.execute(
+                    "SELECT * FROM clients WHERE id=? AND scope_id=?",
+                    (project_id, identity.scope_id),
+                ).fetchone()
+                result = {
+                    "project": self._project_payload(
+                        connection,
+                        identity,
+                        updated_row,
+                    )
+                }
+                self._record_command(
+                    connection,
+                    identity,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                    command_type="client.default_internal_project_set",
+                    aggregate_type="client",
+                    aggregate_id=project_id,
+                    aggregate_version=current_version + 1,
+                    expected_aggregate_version=expected_version,
+                    result=result,
+                    target_resource_id=project_id,
+                )
+                connection.commit()
+                return result
+            except Exception:
+                connection.rollback()
+                raise
+
     def update_project(
         self,
         identity: SessionIdentity,

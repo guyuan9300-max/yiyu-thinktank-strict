@@ -589,9 +589,7 @@ def event_line_detail(
             (identity.scope_id, event_line_id),
         ).fetchall()
         tasks = connection.execute(
-            "SELECT id, client_id, event_line_id, title, lifecycle_state, version, "
-            "due_date, scheduled_start_at, scheduled_end_at, completed_at, updated_at "
-            "FROM tasks WHERE scope_id=? AND event_line_id=? "
+            "SELECT * FROM tasks WHERE scope_id=? AND event_line_id=? "
             "AND lifecycle_state!='deleted' ORDER BY updated_at DESC, id DESC",
             (identity.scope_id, event_line_id),
         ).fetchall()
@@ -600,10 +598,24 @@ def event_line_detail(
             "AND lifecycle_state!='deleted' ORDER BY starts_at, id",
             (identity.scope_id, event_line_id),
         ).fetchall()
+        task_repository = GC04TaskRepository(repository)
+        owner_departments_by_task = task_repository._owner_departments_by_task(  # noqa: SLF001
+            connection, identity, (str(item["id"]) for item in tasks)
+        )
+        task_payloads = [
+            task_repository._task_payload(  # noqa: SLF001
+                connection,
+                identity,
+                item,
+                owner_departments_by_task=owner_departments_by_task,
+                event_line_detail=True,
+            )
+            for item in tasks
+        ]
         return {
             "eventLine": _event_line_payload(connection, row),
             "activities": [_activity_payload(item) for item in activities],
-            "tasks": [dict(item) for item in tasks],
+            "tasks": task_payloads,
             "meetings": [_meeting_payload(connection, item) for item in meetings],
         }
 
@@ -1738,6 +1750,8 @@ def update_planning_cycle(
     idempotency_key: str,
 ) -> dict[str, Any]:
     expected = _positive_int(payload.get("expectedVersion"))
+    period_fields = ("period", "periodKind", "periodStart", "periodEnd", "timezone")
+    updates_period = any(field in payload for field in period_fields)
     normalized = {
         "planningCycleId": planning_cycle_id,
         "expectedVersion": expected,
@@ -1745,6 +1759,18 @@ def update_planning_cycle(
         "summary": _text(payload.get("summary")),
         "status": _text(payload.get("status"), limit=30),
     }
+    if updates_period:
+        period_start = _iso_date(payload.get("periodStart"), field="period_start")
+        period_end = _iso_date(payload.get("periodEnd"), field="period_end")
+        if period_end < period_start:
+            raise RepositoryError(422, "planning_cycle_period_invalid", "计划结束日期不能早于开始日期")
+        normalized.update({
+            "period": _text(payload.get("period"), limit=100) or f"{period_start}/{period_end}",
+            "periodKind": _text(payload.get("periodKind"), limit=40) or "custom",
+            "periodStart": period_start,
+            "periodEnd": period_end,
+            "timezone": _text(payload.get("timezone"), limit=80) or "Asia/Shanghai",
+        })
     if normalized["status"] and normalized["status"] not in PLAN_STATUSES:
         raise RepositoryError(422, "planning_cycle_status_invalid", "计划状态无效")
     payload_hash = sha256_text(canonical_json(normalized))
@@ -1780,6 +1806,30 @@ def update_planning_cycle(
             if str(row["lifecycle_state"] or "active") == "archived":
                 raise RepositoryError(409, "archived_planning_cycle_cannot_be_deleted", "已归档计划不能再删除")
             status = normalized["status"] or str(row["status"])
+            next_title = normalized["title"] or str(row["title"])
+            next_period = normalized["period"] if updates_period else row["period"]
+            next_period_kind = normalized["periodKind"] if updates_period else row["period_kind"]
+            next_period_start = normalized["periodStart"] if updates_period else row["period_start"]
+            next_period_end = normalized["periodEnd"] if updates_period else row["period_end"]
+            next_timezone = normalized["timezone"] if updates_period else row["timezone"]
+            if updates_period:
+                duplicate = connection.execute(
+                    "SELECT id FROM planning_cycles WHERE scope_id=? AND record_kind=? "
+                    "AND department_id IS ? AND client_id IS ? AND period_start=? "
+                    "AND period_end=? AND title=? AND lifecycle_state!='deleted' AND id!=?",
+                    (
+                        identity.scope_id,
+                        row["record_kind"],
+                        row["department_id"],
+                        row["client_id"],
+                        next_period_start,
+                        next_period_end,
+                        next_title,
+                        planning_cycle_id,
+                    ),
+                ).fetchone()
+                if duplicate is not None:
+                    raise RepositoryError(409, "planning_cycle_duplicate", "相同层级和周期的计划已存在")
             if status == "archived" and str(row["status"]) != "archived":
                 linked_tasks = int(connection.execute(
                     "SELECT COUNT(*) FROM tasks WHERE scope_id=? AND planning_cycle_id=? "
@@ -1802,13 +1852,19 @@ def update_planning_cycle(
             archived_at = now if status == "archived" else None
             connection.execute(
                 """
-                UPDATE planning_cycles SET title=?, summary=?, status=?,
+                UPDATE planning_cycles SET period=?, period_kind=?, period_start=?,
+                    period_end=?, timezone=?, title=?, summary=?, status=?,
                     published_at=?, archived_at=?, lifecycle_state=?,
                     plan_version=plan_version+1, version=version+1, updated_at=?
                 WHERE id=? AND scope_id=? AND version=?
                 """,
                 (
-                    normalized["title"] or row["title"],
+                    next_period,
+                    next_period_kind,
+                    next_period_start,
+                    next_period_end,
+                    next_timezone,
+                    next_title,
                     normalized["summary"] if "summary" in payload else row["summary"],
                     status,
                     published_at,
