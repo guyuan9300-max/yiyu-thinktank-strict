@@ -31,4 +31,3 @@ jobs:
       - run: npm ci
       - run: uv sync --frozen --dev
       - run: npm run verify:strict-sync
-      - run: npm run release:cloud-build
