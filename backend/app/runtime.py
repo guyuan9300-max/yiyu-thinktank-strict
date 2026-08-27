@@ -689,6 +689,12 @@ class WorkspaceRuntime:
                 )
                 or bool(
                     re.fullmatch(
+                        r"/api/v2/domain/tasks/[^/]+/timer/(?:start|pause|stop)",
+                        path,
+                    )
+                )
+                or bool(
+                    re.fullmatch(
                         r"/api/v2/domain/task-bulk/[^/]+/commit",
                         path,
                     )

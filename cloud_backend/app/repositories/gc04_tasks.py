@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 
 from strict_common.ids import canonical_json, new_id, sha256_text, utc_now
@@ -22,6 +22,13 @@ PRIORITIES = frozenset({"low", "normal", "high"})
 TASK_VISIBILITIES = frozenset({"self", "participants", "organization"})
 LIST_VISIBILITIES = frozenset({"personal", "organization"})
 ACTIVE_INBOX_STATES = frozenset({"pending", "accepted"})
+TASK_VIEW_PROJECTION_CONTRACT = {
+    "schema": "yiyu.task-viewer-projection.v1",
+    "schemaVersion": 1,
+    "requiredTaskFields": ["viewer_surfaces", "viewer_capabilities"],
+}
+TASK_FOCUS_RUN_KIND = "task_focus_session"
+TASK_TIMER_STATES = frozenset({"running", "paused", "stopped"})
 
 
 def _text(value: Any) -> str | None:
@@ -684,6 +691,84 @@ class GC04TaskRepository:
         return row
 
     @staticmethod
+    def _parse_timer_timestamp(value: Any) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _can_track_task_time(
+        self,
+        connection: sqlite3.Connection,
+        identity: SessionIdentity,
+        row: sqlite3.Row,
+    ) -> bool:
+        if str(row["creator_membership_id"] or "") == identity.membership_id:
+            return True
+        participant = connection.execute(
+            "SELECT 1 FROM task_collaborators WHERE scope_id=? AND task_id=? "
+            "AND subject_membership_id=? AND role_key IN ('owner','collaborator') "
+            "AND assignment_state='assigned' AND inbox_status='accepted' "
+            "AND lifecycle_state='active' LIMIT 1",
+            (identity.scope_id, row["id"], identity.membership_id),
+        ).fetchone()
+        return participant is not None
+
+    def _task_timer_summary(
+        self,
+        connection: sqlite3.Connection,
+        identity: SessionIdentity,
+        task_id: str,
+        *,
+        observed_at: str | None = None,
+    ) -> dict[str, Any]:
+        observed_text = observed_at or utc_now()
+        observed = self._parse_timer_timestamp(observed_text) or datetime.now(timezone.utc)
+        rows = connection.execute(
+            "SELECT * FROM execution_runs WHERE scope_id=? AND task_id=? "
+            "AND initiator_membership_id=? AND run_kind=? "
+            "AND lifecycle_state='active' ORDER BY created_at,id",
+            (
+                identity.scope_id,
+                task_id,
+                identity.membership_id,
+                TASK_FOCUS_RUN_KIND,
+            ),
+        ).fetchall()
+        elapsed_seconds = 0
+        for run in rows:
+            started = self._parse_timer_timestamp(run["started_at"])
+            if started is None:
+                continue
+            status = str(run["status"] or "")
+            finished = self._parse_timer_timestamp(run["finished_at"])
+            end = observed if status == "running" and finished is None else finished
+            if end is not None:
+                elapsed_seconds += max(0, int((end - started).total_seconds()))
+        latest = rows[-1] if rows else None
+        latest_state = str(latest["status"] or "") if latest is not None else "idle"
+        if latest_state not in TASK_TIMER_STATES:
+            latest_state = "idle"
+        return {
+            "state": latest_state,
+            "elapsedSeconds": elapsed_seconds,
+            "activeStartedAt": (
+                latest["started_at"]
+                if latest is not None and latest_state == "running"
+                else None
+            ),
+            "latestRunId": str(latest["id"]) if latest is not None else None,
+            "version": sum(int(run["version"] or 1) for run in rows),
+            "observedAt": observed_text,
+        }
+
+    @staticmethod
     def _require_expected_version(payload: Mapping[str, Any]) -> int:
         try:
             version = int(payload.get("expectedVersion") or payload.get("expected_version") or 0)
@@ -1263,6 +1348,39 @@ class GC04TaskRepository:
             ),
             None,
         )
+        accepted_participant = any(
+            item.get("subject_membership_id") == identity.membership_id
+            and item.get("assignment_state") == "assigned"
+            and item.get("inbox_status") == "accepted"
+            and item.get("role_key") in {"owner", "collaborator"}
+            for item in task["collaborators"]
+        )
+        pending_participant = any(
+            item.get("subject_membership_id") == identity.membership_id
+            and item.get("assignment_state") == "assigned"
+            and item.get("inbox_status") == "pending"
+            and item.get("role_key") in {"owner", "collaborator"}
+            for item in task["collaborators"]
+        )
+        task["viewer_surfaces"] = {
+            "personal_list": accepted_participant,
+            "personal_calendar": accepted_participant,
+            "collaboration_inbox": pending_participant,
+            "event_line_detail": False,
+        }
+        can_write = self._can_write_task(connection, identity, row)
+        task["viewer_capabilities"] = {
+            "can_view": True,
+            "can_edit": can_write,
+            "can_complete": can_write,
+            "can_manage_collaborators": can_write,
+            "can_track_time": self._can_track_task_time(
+                connection, identity, row
+            ),
+        }
+        task["task_timer"] = self._task_timer_summary(
+            connection, identity, str(row["id"])
+        )
         task["returned_to_creator"] = (
             str(row["creator_membership_id"] or "") == identity.membership_id
             and any(
@@ -1343,7 +1461,12 @@ class GC04TaskRepository:
     ) -> dict[str, list[dict[str, Any]]]:
         ids = sorted({_text(item) for item in task_ids} - {None})
         if not ids:
-            return {"tasks": [], "task_collaborators": [], "calendar_entries": []}
+            return {
+                "tasks": [],
+                "task_collaborators": [],
+                "calendar_entries": [],
+                "execution_runs": [],
+            }
         placeholders = ",".join("?" for _ in ids)
         tasks = connection.execute(
             f"SELECT * FROM tasks WHERE scope_id=? AND id IN ({placeholders})",
@@ -1357,10 +1480,22 @@ class GC04TaskRepository:
             f"SELECT * FROM calendar_entries WHERE scope_id=? AND task_id IN ({placeholders})",
             (identity.scope_id, *ids),
         ).fetchall()
+        focus_runs = connection.execute(
+            f"SELECT * FROM execution_runs WHERE scope_id=? "
+            f"AND task_id IN ({placeholders}) AND initiator_membership_id=? "
+            "AND run_kind=? AND lifecycle_state='active'",
+            (
+                identity.scope_id,
+                *ids,
+                identity.membership_id,
+                TASK_FOCUS_RUN_KIND,
+            ),
+        ).fetchall()
         return {
             "tasks": [self._row_dict(row) for row in tasks],
             "task_collaborators": [self._row_dict(row) for row in collaborators],
             "calendar_entries": [self._row_dict(row) for row in calendar],
+            "execution_runs": [self._row_dict(row) for row in focus_runs],
         }
 
     def _rebuild_task_calendar(
@@ -1565,11 +1700,7 @@ class GC04TaskRepository:
             standard_view_ids = {
                 str(task["id"])
                 for task in task_payloads
-                if not bool(task.get("returned_to_creator"))
-                and not (
-                    str(task.get("viewer_inbox_status") or "") == "pending"
-                    and str(task.get("viewer_role_key") or "") == "owner"
-                )
+                if bool((task.get("viewer_surfaces") or {}).get("personal_calendar"))
             }
             calendar = [
                 row
@@ -1587,6 +1718,7 @@ class GC04TaskRepository:
                 "taskTags": tags,
                 "calendarEntries": [self._row_dict(row) for row in calendar],
                 "projection": projection,
+                "viewerProjectionContract": dict(TASK_VIEW_PROJECTION_CONTRACT),
                 "generatedAt": utc_now(),
             }
 
@@ -1875,6 +2007,210 @@ class GC04TaskRepository:
                     aggregate_type="task", aggregate_id=task_id,
                     aggregate_version=int(current["version"]),
                     expected_version=expected, result=result, now=now,
+                )
+                connection.commit()
+                return result
+            except Exception:
+                connection.rollback()
+                raise
+
+    def update_task_timer(
+        self,
+        identity: SessionIdentity,
+        *,
+        task_id: str,
+        action: str,
+        expected_timer_version: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action not in {"start", "pause", "stop"}:
+            raise RepositoryError(422, "task_timer_action_invalid", "计时操作无效")
+        if expected_timer_version < 0:
+            raise RepositoryError(422, "task_timer_version_invalid", "计时版本无效")
+        normalized = {
+            "taskId": task_id,
+            "action": normalized_action,
+            "expectedTimerVersion": expected_timer_version,
+        }
+        payload_hash = _payload_hash(normalized)
+        with self.repository._connection() as connection:  # noqa: SLF001
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                replay = self._receipt(
+                    connection,
+                    identity,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                )
+                if replay is not None:
+                    connection.rollback()
+                    return replay
+                task_row = self._require_task_read(connection, identity, task_id)
+                if not self._can_track_task_time(connection, identity, task_row):
+                    raise RepositoryError(
+                        403,
+                        "task_timer_forbidden",
+                        "只有任务创建人或已接受任务的参与成员可以计时",
+                    )
+                now = utc_now()
+                current_timer = self._task_timer_summary(
+                    connection, identity, task_id, observed_at=now
+                )
+                current_version = int(current_timer["version"] or 0)
+                if current_version != expected_timer_version:
+                    raise RepositoryError(
+                        409,
+                        "task_timer_version_conflict",
+                        "任务计时状态已更新，请刷新后重试",
+                    )
+                current_state = str(current_timer["state"] or "idle")
+                if normalized_action == "start":
+                    if task_row["completed_at"]:
+                        raise RepositoryError(
+                            409,
+                            "task_timer_completed",
+                            "已完成任务不能重新开始计时",
+                        )
+                    if current_state == "running":
+                        raise RepositoryError(
+                            409,
+                            "task_timer_already_running",
+                            "该任务已经在计时",
+                        )
+                    latest_created_row = connection.execute(
+                        "SELECT MAX(created_at) AS created_at FROM execution_runs "
+                        "WHERE scope_id=? AND task_id=? AND initiator_membership_id=? "
+                        "AND run_kind=? AND lifecycle_state='active'",
+                        (
+                            identity.scope_id,
+                            task_id,
+                            identity.membership_id,
+                            TASK_FOCUS_RUN_KIND,
+                        ),
+                    ).fetchone()
+                    latest_created = self._parse_timer_timestamp(
+                        latest_created_row["created_at"] if latest_created_row else None
+                    )
+                    started_at = self._parse_timer_timestamp(now) or datetime.now(
+                        timezone.utc
+                    )
+                    if latest_created is not None and started_at <= latest_created:
+                        started_at = latest_created + timedelta(milliseconds=1)
+                    now = started_at.isoformat(timespec="milliseconds").replace(
+                        "+00:00", "Z"
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO execution_runs (
+                            id,scope_id,bot_id,rule_id,task_id,operation_id,status,
+                            initiator_membership_id,proposal_id,run_kind,
+                            progress_object_manifest_id,result_object_manifest_id,
+                            started_at,finished_at,version,lifecycle_state,
+                            created_at,updated_at,deleted_at
+                        ) VALUES (?,?,NULL,NULL,?,NULL,'running',?,NULL,?,
+                                  NULL,NULL,?,NULL,1,'active',?,?,NULL)
+                        """,
+                        (
+                            new_id(),
+                            identity.scope_id,
+                            task_id,
+                            identity.membership_id,
+                            TASK_FOCUS_RUN_KIND,
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                else:
+                    latest_run_id = str(current_timer.get("latestRunId") or "")
+                    expected_state = "running" if normalized_action == "pause" else None
+                    if not latest_run_id or current_state == "idle":
+                        raise RepositoryError(
+                            409,
+                            "task_timer_not_started",
+                            "该任务尚未开始计时",
+                        )
+                    if expected_state and current_state != expected_state:
+                        raise RepositoryError(
+                            409,
+                            "task_timer_not_running",
+                            "只有正在计时的任务可以暂停",
+                        )
+                    if normalized_action == "stop" and current_state not in {"running", "paused"}:
+                        raise RepositoryError(
+                            409,
+                            "task_timer_not_active",
+                            "当前没有可停止的任务计时",
+                        )
+                    next_status = "paused" if normalized_action == "pause" else "stopped"
+                    finished_at = now if current_state == "running" else None
+                    latest_run = connection.execute(
+                        "SELECT version FROM execution_runs WHERE id=? AND scope_id=? "
+                        "AND task_id=? AND initiator_membership_id=? AND run_kind=? "
+                        "AND lifecycle_state='active'",
+                        (
+                            latest_run_id,
+                            identity.scope_id,
+                            task_id,
+                            identity.membership_id,
+                            TASK_FOCUS_RUN_KIND,
+                        ),
+                    ).fetchone()
+                    if latest_run is None:
+                        raise RepositoryError(
+                            409,
+                            "task_timer_version_conflict",
+                            "任务计时状态已更新，请刷新后重试",
+                        )
+                    cursor = connection.execute(
+                        "UPDATE execution_runs SET status=?,"
+                        "finished_at=COALESCE(?,finished_at),version=version+1,updated_at=? "
+                        "WHERE id=? AND scope_id=? AND task_id=? "
+                        "AND initiator_membership_id=? AND run_kind=? "
+                        "AND version=? AND lifecycle_state='active'",
+                        (
+                            next_status,
+                            finished_at,
+                            now,
+                            latest_run_id,
+                            identity.scope_id,
+                            task_id,
+                            identity.membership_id,
+                            TASK_FOCUS_RUN_KIND,
+                            int(latest_run["version"] or 1),
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RepositoryError(
+                            409,
+                            "task_timer_version_conflict",
+                            "任务计时状态已更新，请刷新后重试",
+                        )
+                timer = self._task_timer_summary(
+                    connection, identity, task_id, observed_at=now
+                )
+                task_payload = self._task_payload(connection, identity, task_row)
+                task_payload["task_timer"] = timer
+                result = {
+                    "task": task_payload,
+                    "taskTimer": timer,
+                    "projection": self._projection_for_tasks(
+                        connection, identity, [task_id]
+                    ),
+                }
+                self._record_command(
+                    connection,
+                    identity,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                    command_type=f"task.timer_{normalized_action}",
+                    aggregate_type="task_timer",
+                    aggregate_id=task_id,
+                    aggregate_version=int(timer["version"] or 1),
+                    expected_version=expected_timer_version or None,
+                    result=result,
+                    now=now,
                 )
                 connection.commit()
                 return result

@@ -18,6 +18,8 @@ router = UiDomainRouter("gc04_gc05_tasks", pin_workspace=True)
 _CLOUD_TASKS = "/api/v2/domain/tasks"
 _CLOUD_TASK_PLANNING = "/api/v2/domain/task-planning"
 _LIST_COLOR = "#5B7BFE"
+_TASK_VIEW_PROJECTION_SCHEMA = "yiyu.task-viewer-projection.v1"
+_TASK_VIEW_PROJECTION_SCHEMA_VERSION = 1
 
 
 def _projector(compatibility: Any) -> LocalGC04TaskProjection:
@@ -26,6 +28,28 @@ def _projector(compatibility: Any) -> LocalGC04TaskProjection:
 
 def _query(compatibility: Any, path: str) -> dict[str, Any]:
     return compatibility.runtime.cloud_query(path)
+
+
+def _require_task_view_projection_contract(payload: Mapping[str, Any]) -> None:
+    contract = payload.get("viewerProjectionContract")
+    contract_valid = (
+        isinstance(contract, Mapping)
+        and str(contract.get("schema") or "") == _TASK_VIEW_PROJECTION_SCHEMA
+        and contract.get("schemaVersion") == _TASK_VIEW_PROJECTION_SCHEMA_VERSION
+    )
+    tasks = payload.get("tasks")
+    fields_valid = isinstance(tasks, list) and all(
+        isinstance(item, Mapping)
+        and isinstance(item.get("viewer_surfaces"), Mapping)
+        and isinstance(item.get("viewer_capabilities"), Mapping)
+        for item in tasks
+    )
+    if not contract_valid or not fields_valid:
+        raise LocalRuntimeError(
+            502,
+            "task_view_projection_contract_mismatch",
+            "组织云任务查看权限协议不兼容，请完成云端升级并重试",
+        )
 
 
 @router.get(r"gc04/project-keyword-profiles")
@@ -126,6 +150,16 @@ def _task_ui(
     viewer_inbox_status = row.get("viewer_inbox_status")
     viewer_role_key = row.get("viewer_role_key")
     returned_to_creator = bool(row.get("returned_to_creator"))
+    viewer_surfaces = (
+        row.get("viewer_surfaces")
+        if isinstance(row.get("viewer_surfaces"), Mapping)
+        else {}
+    )
+    viewer_capabilities = (
+        row.get("viewer_capabilities")
+        if isinstance(row.get("viewer_capabilities"), Mapping)
+        else {}
+    )
     counts: dict[str, int] = {}
     for collaborator in collaborators:
         state = str(collaborator.get("inboxStatus") or "accepted")
@@ -214,6 +248,26 @@ def _task_ui(
         "collaborationSummary": counts,
         "viewerInboxStatus": viewer_inbox_status,
         "viewerCollaborationRole": viewer_role_key,
+        "viewerSurfaces": {
+            "personalList": bool(viewer_surfaces.get("personal_list")),
+            "personalCalendar": bool(viewer_surfaces.get("personal_calendar")),
+            "collaborationInbox": bool(viewer_surfaces.get("collaboration_inbox")),
+            "eventLineDetail": bool(viewer_surfaces.get("event_line_detail")),
+        },
+        "viewerCapabilities": {
+            "canView": bool(viewer_capabilities.get("can_view")),
+            "canEdit": bool(viewer_capabilities.get("can_edit")),
+            "canComplete": bool(viewer_capabilities.get("can_complete")),
+            "canManageCollaborators": bool(
+                viewer_capabilities.get("can_manage_collaborators")
+            ),
+            "canTrackTime": bool(viewer_capabilities.get("can_track_time")),
+        },
+        "timer": (
+            dict(row.get("task_timer") or {})
+            if isinstance(row.get("task_timer"), Mapping)
+            else None
+        ),
         "syncStatus": "synced",
         "syncError": None,
         "createdAt": str(row.get("created_at") or ""),
@@ -284,6 +338,7 @@ def _tag_ui(row: Mapping[str, Any]) -> dict[str, Any]:
 @router.get(r"tasks")
 def task_board(compatibility: Any, _: UiRequest, __: Any) -> dict[str, Any]:
     result = _query(compatibility, _CLOUD_TASKS)
+    _require_task_view_projection_contract(result)
     _apply(compatibility, result, replace_snapshot=True)
     return {
         "tasks": [_task_ui(compatibility, item) for item in result.get("tasks") or []],
@@ -383,6 +438,23 @@ def update_task(
         "PATCH",
         f"{_CLOUD_TASKS}/{quote(task_id, safe='')}",
         payload,
+    )
+    _apply(compatibility, result)
+    return _task_ui(compatibility, result.get("task") or {})
+
+
+@router.post(r"tasks/(?P<task_id>[^/]+)/timer/(?P<action>start|pause|stop)")
+def update_task_timer(
+    compatibility: Any, request: UiRequest, match: Any
+) -> dict[str, Any]:
+    task_id = unquote(match.group("task_id"))
+    action = unquote(match.group("action"))
+    result = _command(
+        compatibility,
+        request,
+        "POST",
+        f"{_CLOUD_TASKS}/{quote(task_id, safe='')}/timer/{quote(action, safe='')}",
+        {"expectedTimerVersion": int(request.body.get("expectedTimerVersion") or 0)},
     )
     _apply(compatibility, result)
     return _task_ui(compatibility, result.get("task") or {})
