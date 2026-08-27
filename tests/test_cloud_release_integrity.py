@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from scripts.strict_cloud_release import (
     ReleaseVerificationError,
+    _tracked_runtime_files,
     detect_task_capabilities,
     inspect_runtime_import_closure,
     verify_release_directory,
@@ -28,6 +30,19 @@ def test_task_release_capabilities_are_cumulative() -> None:
         "taskTimerV1": True,
         "dateOnlyScheduleV1": True,
     }
+
+
+def test_cloud_release_inventory_includes_contract_hash_companions() -> None:
+    git_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    files = _tracked_runtime_files(REPOSITORY_ROOT, git_sha)
+    assert "contracts/strict-cloud-schema-manifest.v1.canonical.sha256" in files
+    assert "contracts/strict-local-schema-manifest.v1.canonical.sha256" in files
 
 
 def test_release_verifier_rejects_a_capability_regression(tmp_path: Path) -> None:

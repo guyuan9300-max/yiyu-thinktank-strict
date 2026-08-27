@@ -85,8 +85,10 @@ set -a
 set +a
 healthy=0
 for _ in $(seq 1 30); do
-  if curl -fsS "http://${YIYU_STRICT_CLOUD_HOST}:${YIYU_STRICT_CLOUD_PORT}/api/v2/health" \
-      | "$runtime_python" -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("status") == "ready" else 1)'; then
+  if health_json="$(curl -fsS \
+      "http://${YIYU_STRICT_CLOUD_HOST}:${YIYU_STRICT_CLOUD_PORT}/api/v2/health" 2>/dev/null)" \
+      && printf '%s' "$health_json" | "$runtime_python" -c \
+      'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("status") == "ready" else 1)' 2>/dev/null; then
     healthy=1
     break
   fi

@@ -28,6 +28,12 @@ EXPLICIT_RUNTIME_FILES = (
     "scripts/migrate_mobile_recording_v10.py",
     "scripts/strict_cloud_release.py",
 )
+REQUIRED_CONTRACT_FILES = (
+    "contracts/strict-cloud-schema-manifest.v1.json",
+    "contracts/strict-cloud-schema-manifest.v1.canonical.sha256",
+    "contracts/strict-local-schema-manifest.v1.json",
+    "contracts/strict-local-schema-manifest.v1.canonical.sha256",
+)
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -192,6 +198,9 @@ def verify_release_directory(
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
         raise ReleaseVerificationError("release file inventory is empty")
+    for relative in REQUIRED_CONTRACT_FILES:
+        if relative not in files:
+            raise ReleaseVerificationError(f"required contract support missing: {relative}")
     for relative, expected_digest in files.items():
         path = release_dir / str(relative)
         if not path.is_file():
@@ -214,7 +223,7 @@ def _tracked_runtime_files(repo_root: Path, git_sha: str) -> list[str]:
         if any(name.startswith(f"{root}/") for root in RUNTIME_ROOTS):
             if name.endswith(".py"):
                 selected.append(name)
-        elif name.startswith("contracts/") and name.endswith(".json"):
+        elif name.startswith("contracts/") and name.endswith((".json", ".sha256")):
             selected.append(name)
         elif name in EXPLICIT_RUNTIME_FILES:
             selected.append(name)
