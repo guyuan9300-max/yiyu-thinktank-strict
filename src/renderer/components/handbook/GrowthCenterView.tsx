@@ -1753,12 +1753,11 @@ function BadgesAndRankTab({ overview, uiSessionScopeKey }: { overview: GrowthOve
   }, []);
 
   useEffect(() => {
-    if (loadedAt > 0 && Date.now() - loadedAt < GROWTH_RUNTIME_CACHE_TTL_MS) {
-      setIsLoading(false);
-      return;
-    }
+    // Badge milestones can change after a cloud-side growth analysis. Refresh
+    // whenever this tab is entered so the complete catalog, including locked
+    // badges, never remains hidden behind the runtime session cache.
     void loadBadges({ keepVisible: Boolean(badgeBoard) });
-  }, [badgeBoard, loadedAt, loadBadges]);
+  }, [loadBadges]);
 
   const rank = overview?.rank;
   const totalXp = overview?.totalXp ?? 0;
@@ -1897,20 +1896,6 @@ function BadgesAndRankTab({ overview, uiSessionScopeKey }: { overview: GrowthOve
         </div>
         {allBadges.length > 0 ? (
           <div>
-            {upcomingBadges.length > 0 && (
-              <div className="gc-badge-section">
-                <div className="gc-badge-section-head">
-                  <div className="gc-badge-section-title">即将点亮</div>
-                  <div className="gc-badge-section-hint">离完成最近的成长里程碑</div>
-                </div>
-                <div className="gc-badge-grid">
-                  {upcomingBadges.map((badge) => (
-                    <BadgeCell key={badge.id} badge={badge} onSelect={setSelectedBadge} />
-                  ))}
-                </div>
-              </div>
-            )}
-
             {litBadges.length > 0 && (
               <div className="gc-badge-section">
                 <div className="gc-badge-section-head">
