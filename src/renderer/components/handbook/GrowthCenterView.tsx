@@ -8,8 +8,6 @@ import {
   ArrowRight,
   BookOpen,
   BrainCircuit,
-  ChevronDown,
-  ChevronUp,
   Eye,
   Heart,
   Layers3,
@@ -38,7 +36,6 @@ import {
   Radar,
   Wrench,
   Star,
-  RefreshCw,
 } from 'lucide-react';
 
 import {
@@ -47,9 +44,7 @@ import {
   getGrowthBadges,
   likeGrowthExperienceWallQuote,
   markHandbookEntryReused,
-  refreshGrowthReadModels,
 } from '../../lib/api';
-import { updateGC13GrowthEvidence } from './gc13/gc13GrowthApi';
 import { useGrowthOverviewState } from '../growth/GrowthContext';
 import { ActivityCalendar } from 'react-activity-calendar';
 import {
@@ -1489,12 +1484,6 @@ function ExperienceWallTab({ uiSessionScopeKey }: { uiSessionScopeKey: string })
    ══════════════════════════════════════════════════════════════════ */
 function AbilityGrowthTab({ overview }: { overview: GrowthOverview | null }) {
   const growthState = useGrowthOverviewState();
-  const [refreshingSummary, setRefreshingSummary] = useState(false);
-  const [summaryError, setSummaryError] = useState<string | null>(null);
-  const [showEvidence, setShowEvidence] = useState(false);
-  const [editingEvidenceId, setEditingEvidenceId] = useState<string | null>(null);
-  const [editingEvidenceSummary, setEditingEvidenceSummary] = useState('');
-  const [updatingEvidenceId, setUpdatingEvidenceId] = useState<string | null>(null);
   const isLoading = !overview && (growthState?.isGrowthLoading ?? false);
   const abilities = overview?.abilities || [];
   const topGaps = useMemo(() => (overview?.abilityGaps || []).slice(0, 3), [overview]);
@@ -1535,41 +1524,6 @@ function AbilityGrowthTab({ overview }: { overview: GrowthOverview | null }) {
       .slice(0, 8);
   }, [overview]);
 
-  const refreshCompanionSummary = async () => {
-    setRefreshingSummary(true);
-    setSummaryError(null);
-    try {
-      await refreshGrowthReadModels(true);
-      await growthState?.refreshGrowthOverview();
-    } catch (error) {
-      setSummaryError(error instanceof Error ? error.message : '成长总结刷新失败，可以重试');
-    } finally {
-      setRefreshingSummary(false);
-    }
-  };
-
-  const updateEvidence = async (
-    evidenceId: string,
-    version: number,
-    action: 'revise' | 'exclude',
-  ) => {
-    setUpdatingEvidenceId(evidenceId);
-    setSummaryError(null);
-    try {
-      await updateGC13GrowthEvidence(evidenceId, action, {
-        expectedVersion: version,
-        ...(action === 'revise' ? { summary: editingEvidenceSummary.trim() } : {}),
-      });
-      setEditingEvidenceId(null);
-      setEditingEvidenceSummary('');
-      await growthState?.refreshGrowthOverview();
-    } catch (error) {
-      setSummaryError(error instanceof Error ? error.message : '成长证据更新失败，可以重试');
-    } finally {
-      setUpdatingEvidenceId(null);
-    }
-  };
-
   if (isLoading) {
     return (
       <div className="gc-loading">
@@ -1597,102 +1551,37 @@ function AbilityGrowthTab({ overview }: { overview: GrowthOverview | null }) {
     <div className="gc-space-y">
       {overview?.companionSummary ? (
         <div className="gc-card" style={{ padding: 20, borderColor: '#DDE6FF', background: 'linear-gradient(180deg,#fff 0%,#fafbff 100%)' }}>
-          <div className="gc-section-header" style={{ marginBottom: 12 }}>
+          <div className="gc-section-header" style={{ marginBottom: 10 }}>
             <div>
               <div className="gc-section-title">本周成长总结</div>
               <div style={{ marginTop: 3, fontSize: 10, color: '#94a3b8' }}>
-                成长陪伴 · 基于 {overview.companionSummary.sourceCount} 条正式工作证据
+                成长陪伴自动整理
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => void refreshCompanionSummary()}
-              disabled={refreshingSummary}
-              className="gc-btn-ghost"
-              style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
-            >
-              <RefreshCw size={13} className={refreshingSummary ? 'animate-spin' : ''} />
-              {refreshingSummary ? '整理中' : '刷新总结'}
-            </button>
+            {(overview.companionSummary.growthHighlights?.length || 0) > 0 && (
+              <span style={{ borderRadius: 999, background: '#ecfdf5', color: '#059669', padding: '4px 9px', fontSize: 10, fontWeight: 600 }}>
+                {overview.companionSummary.growthHighlights?.length} 项进步
+              </span>
+            )}
           </div>
-          <div style={{ fontSize: 13, lineHeight: 1.8, color: '#334155' }}>
+          <div style={{ maxWidth: 900, fontSize: 13, lineHeight: 1.75, color: '#334155' }}>
             {overview.companionSummary.weeklySummary}
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: 10, marginTop: 14 }}>
-            {[
-              ['正在形成的模式', overview.companionSummary.patterns],
-              ['仍需留意的盲点', overview.companionSummary.blindSpots],
-              ['下一步建议', overview.companionSummary.suggestions],
-            ].map(([label, values]) => (
-              <div key={label as string} style={{ borderRadius: 12, background: '#f8fafc', padding: 12 }}>
-                <div style={{ fontSize: 11, fontWeight: 600, color: '#64748b', marginBottom: 6 }}>{label as string}</div>
-                {(values as string[]).map((item) => (
-                  <div key={item} style={{ fontSize: 11, lineHeight: 1.6, color: '#475569', marginTop: 4 }}>· {item}</div>
-                ))}
-              </div>
-            ))}
-          </div>
-          {(overview.evidenceItems?.length || 0) > 0 ? (
-            <div style={{ marginTop: 14, borderTop: '1px solid #eef2f7', paddingTop: 10 }}>
-              <button
-                type="button"
-                className="gc-btn-ghost"
-                onClick={() => setShowEvidence((value) => !value)}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}
-              >
-                {showEvidence ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-                {showEvidence ? '收起本周证据' : `查看本周证据（${overview.evidenceItems?.length || 0}）`}
-              </button>
-              {showEvidence ? (
-                <div style={{ display: 'grid', gap: 8, marginTop: 9 }}>
-                  {(overview.evidenceItems || []).map((item) => (
-                    <div key={item.evidenceId} style={{ borderRadius: 10, background: '#f8fafc', padding: 10 }}>
-                      {editingEvidenceId === item.evidenceId ? (
-                        <>
-                          <textarea
-                            value={editingEvidenceSummary}
-                            onChange={(event) => setEditingEvidenceSummary(event.target.value)}
-                            rows={3}
-                            style={{ width: '100%', resize: 'vertical', border: '1px solid #dbe3ef', borderRadius: 8, padding: 8, fontSize: 11, lineHeight: 1.6 }}
-                          />
-                          <div style={{ display: 'flex', gap: 8, marginTop: 7 }}>
-                            <button
-                              type="button"
-                              className="gc-btn-ghost"
-                              disabled={!editingEvidenceSummary.trim() || updatingEvidenceId === item.evidenceId}
-                              onClick={() => void updateEvidence(item.evidenceId, item.version, 'revise')}
-                            >保存纠正</button>
-                            <button type="button" className="gc-btn-ghost" onClick={() => setEditingEvidenceId(null)}>取消</button>
-                          </div>
-                        </>
-                      ) : (
-                        <>
-                          <div style={{ fontSize: 11, lineHeight: 1.65, color: '#475569' }}>{item.summary}</div>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, marginTop: 6 }}>
-                            <span style={{ fontSize: 10, color: '#94a3b8' }}>{item.sourceType}</span>
-                            <span style={{ display: 'inline-flex', gap: 9 }}>
-                              <button
-                                type="button"
-                                className="gc-btn-ghost"
-                                onClick={() => { setEditingEvidenceId(item.evidenceId); setEditingEvidenceSummary(item.summary); }}
-                              >纠正</button>
-                              <button
-                                type="button"
-                                className="gc-btn-ghost"
-                                disabled={updatingEvidenceId === item.evidenceId}
-                                onClick={() => void updateEvidence(item.evidenceId, item.version, 'exclude')}
-                              >排除</button>
-                            </span>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  ))}
+          {(overview.companionSummary.growthHighlights?.length || 0) > 0 && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(210px,1fr))', gap: 9, marginTop: 13 }}>
+              {(overview.companionSummary.growthHighlights || []).slice(0, 3).map((item) => (
+                <div key={item.id} style={{ borderRadius: 11, border: '1px solid #e8edf7', background: '#fff', padding: '10px 11px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: '#475569' }}>{item.abilityLabel}</span>
+                    <span style={{ fontSize: 10, fontWeight: 600, color: item.trend === 'up' ? '#059669' : '#5B7BFE' }}>
+                      {item.trend === 'up' ? '本周提升 ↑' : item.trend === 'steady' ? '持续稳定 →' : '正在形成 ↗'}
+                    </span>
+                  </div>
+                  <div style={{ marginTop: 5, fontSize: 11, lineHeight: 1.55, color: '#64748b' }}>{item.summary}</div>
                 </div>
-              ) : null}
+              ))}
             </div>
-          ) : null}
-          {summaryError ? <div style={{ marginTop: 10, fontSize: 11, color: '#dc2626' }}>{summaryError}</div> : null}
+          )}
         </div>
       ) : null}
       {/* H4 被看见横幅已移除（用户判断：单条手册被复用对 CEO 视角信息密度不够）*/}

@@ -10,15 +10,6 @@ import {
 
 const LIGHTWEIGHT_TAGS = ['资料不足', '等待他人', '方向不清', '资源不够', '工作过度饱和'] as const;
 
-const GROWTH_HINT_RULES = [
-  { key: 'exec', label: '推进执行', keywords: ['推进', '闭环', '行动项', '排期', '拆解', '跟进', '完成', '延期'] },
-  { key: 'collab', label: '协作沟通', keywords: ['协作', '沟通', '对齐', '会议', '负责人', '跨组', '边界', '配合'] },
-  { key: 'analyze', label: '分析判断', keywords: ['分析', '判断', '原因', '本质', '结论', '规律', '为什么'] },
-  { key: 'insight', label: '客户洞察', keywords: ['客户', '用户', '访谈', '需求', '顾虑', '诉求', '反馈'] },
-  { key: 'risk', label: '风险识别', keywords: ['风险', '阻碍', '卡点', '依赖', '预警', '退回', '失败'] },
-  { key: 'write', label: '写作表达', keywords: ['模板', '方法', '清单', '沉淀', '复用', '记录', '总结'] },
-] as const;
-
 export function createEmptyReviewStructuredNote(): WeeklyReviewTaskStructuredNote {
   return {
     reflection: '',
@@ -54,12 +45,6 @@ function normalizeSimpleReviewText(text: string) {
     .replace(/^阻碍原因：\s*/, '')
     .replace(/^本周推进：\s*/, '')
     .trim();
-}
-
-function detectGrowthHints(text: string) {
-  const normalized = normalizeSimpleReviewText(text);
-  if (!normalized) return [];
-  return GROWTH_HINT_RULES.filter((rule) => rule.keywords.some((keyword) => normalized.includes(keyword))).map((rule) => rule.label);
 }
 
 function detectContributionPremiumHint(text: string) {
@@ -200,7 +185,6 @@ export function WeeklyReviewStructuredFields({
       : '这件事还没推进完，需要什么支持，或者有什么思考？';
   const resolvedPlaceholder = reflectionPlaceholder?.trim() || placeholder;
   const currentValue = getSimpleReviewText(value, taskStatus);
-  const growthHints = detectGrowthHints(currentValue);
   const contributionPremiumHint = detectContributionPremiumHint(currentValue);
   const saveButtonState = isSaving ? 'saving' : saveSucceeded ? 'saved' : saveDisabled ? 'disabled' : 'ready';
   const selectedStatus =
@@ -343,28 +327,6 @@ export function WeeklyReviewStructuredFields({
                 </button>
               );
             })}
-          </div>
-        </div>
-      )}
-
-      {/* 识别到的成长点：Sparkles icon + 极简彩色 chip */}
-      {growthHints.length > 0 && (
-        <div className="grid grid-cols-[80px_1fr] gap-x-6 items-start">
-          <div className="flex items-center gap-1.5 pt-1">
-            <Sparkles size={11} strokeWidth={2} className="text-[#5B7BFE]" />
-            <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">
-              成长识别
-            </span>
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {growthHints.map((label) => (
-              <span
-                key={label}
-                className="inline-flex items-center rounded-md bg-[#EEF4FF] px-2 py-0.5 text-[11.5px] font-medium text-[#335CFF]"
-              >
-                {label}
-              </span>
-            ))}
           </div>
         </div>
       )}

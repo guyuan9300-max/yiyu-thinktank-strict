@@ -1881,8 +1881,8 @@ def record_growth_companion_summary(
         field="source_fingerprint",
     )
     weekly_summary = str(payload.get("weeklySummary") or "").strip()
-    if not 1 <= len(weekly_summary) <= 2_000:
-        raise RepositoryError(422, "gc13_weekly_summary_invalid", "成长周总结需为1至2000个字符")
+    if not 1 <= len(weekly_summary) <= 500:
+        raise RepositoryError(422, "gc13_weekly_summary_invalid", "成长周总结需为1至500个字符")
 
     def short_list(key: str, maximum_items: int = 4) -> list[str]:
         raw = payload.get(key) or []
@@ -1894,6 +1894,72 @@ def record_growth_companion_summary(
     patterns = short_list("patterns")
     blind_spots = short_list("blindSpots")
     suggestions = short_list("suggestions")
+    ability_keys = {"exec", "collab", "analyze", "insight", "risk", "write"}
+    trend_values = {"up", "steady", "forming"}
+    raw_highlights = payload.get("growthHighlights") or []
+    if not isinstance(raw_highlights, list):
+        raise RepositoryError(422, "gc13_growth_highlights_invalid", "growthHighlights 无效")
+    growth_highlights: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_highlights[:3]):
+        if not isinstance(raw, Mapping):
+            continue
+        ability_key = str(raw.get("abilityKey") or "").strip()
+        if ability_key not in ability_keys:
+            continue
+        try:
+            level = max(1, min(5, int(raw.get("level") or 1)))
+        except (TypeError, ValueError):
+            level = 1
+        trend = str(raw.get("trend") or "forming").strip()
+        if trend not in trend_values:
+            trend = "forming"
+        title = str(raw.get("title") or raw.get("abilityLabel") or "").strip()[:80]
+        summary = str(raw.get("summary") or "").strip()[:240]
+        if not title or not summary:
+            continue
+        signal_id = "growth_signal_" + sha256_text(
+            f"{identity.scope_id}|{identity.membership_id}|{source_fingerprint}|{ability_key}|{index}"
+        )[:28]
+        growth_highlights.append(
+            {
+                "id": signal_id,
+                "abilityKey": ability_key,
+                "abilityLabel": str(raw.get("abilityLabel") or title).strip()[:80],
+                "title": title,
+                "summary": summary,
+                "trend": trend,
+                "level": level,
+            }
+        )
+
+    raw_experiences = payload.get("experienceEntries") or []
+    if not isinstance(raw_experiences, list):
+        raise RepositoryError(422, "gc13_experience_entries_invalid", "experienceEntries 无效")
+    experience_entries: list[dict[str, Any]] = []
+    for raw in raw_experiences[:3]:
+        if not isinstance(raw, Mapping):
+            continue
+        text = str(raw.get("text") or "").strip()[:240]
+        if not text:
+            continue
+        kind = str(raw.get("kind") or "distilled").strip()
+        if kind not in {"quote", "distilled"}:
+            kind = "distilled"
+        source_id = str(raw.get("sourceId") or "").strip()[:160]
+        entry_id = "experience_" + sha256_text(
+            f"{identity.scope_id}|{identity.membership_id}|{kind}|{source_id}|{text}"
+        )[:28]
+        experience_entries.append(
+            {
+                "id": entry_id,
+                "kind": kind,
+                "text": text,
+                "category": str(raw.get("category") or "成长经验").strip()[:80],
+                "sourceType": str(raw.get("sourceType") or "weekly_review").strip()[:80],
+                "sourceId": source_id,
+                "sourceTitle": str(raw.get("sourceTitle") or "成长复盘").strip()[:160],
+            }
+        )
     model_name = str(payload.get("modelName") or "").strip()[:160]
     provider_resource_id = str(payload.get("providerResourceId") or "").strip()[:160] or None
     idempotency_key = _identifier(idempotency_key, field="idempotency_key", maximum=200)
@@ -1903,6 +1969,8 @@ def record_growth_companion_summary(
         "patterns": patterns,
         "blindSpots": blind_spots,
         "suggestions": suggestions,
+        "growthHighlights": growth_highlights,
+        "experienceEntries": experience_entries,
         "modelName": model_name or None,
         "providerResourceId": provider_resource_id,
     }
@@ -1927,13 +1995,37 @@ def record_growth_companion_summary(
             return replay
         evidence_rows = _evidence_rows(connection, identity)
         rule_rows = _active_rule_rows(connection, identity)
-        current_fingerprint = _growth_input_fingerprint(evidence_rows, rule_rows)
+        analysis_context = _growth_analysis_context(connection, identity)
+        current_fingerprint = _growth_companion_source_fingerprint(
+            evidence_rows,
+            rule_rows,
+            analysis_context,
+        )
         if current_fingerprint != source_fingerprint:
             connection.rollback()
             raise RepositoryError(409, "gc13_growth_summary_source_changed", "成长证据已变化，请重新生成总结")
         if not evidence_rows:
             connection.rollback()
             raise RepositoryError(422, "gc13_growth_summary_evidence_required", "尚无正式成长证据")
+
+        for entry in experience_entries:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO secured_resources (
+                    id, scope_id, resource_kind, lifecycle_state, version,
+                    resource_type_key, created_at, updated_at, deleted_at,
+                    authority_role, origin_instance_id
+                ) VALUES (?, ?, 'growth_experience_quote', 'active', 1,
+                          'organization_growth_experience', ?, ?, NULL, 'cloud', ?)
+                """,
+                (
+                    entry["id"],
+                    identity.scope_id,
+                    now,
+                    now,
+                    repository.cloud_instance_id,
+                ),
+            )
 
         source_set_id = repository._record_id("source_set", operation_id, "companion-summary")  # noqa: SLF001
         connection.execute(
@@ -2194,6 +2286,351 @@ def _latest_companion_summary(
     return dict(result)
 
 
+def _growth_analysis_context(
+    connection: sqlite3.Connection,
+    identity: SessionIdentity,
+) -> dict[str, Any]:
+    """Return bounded, member-owned work context for semantic growth analysis.
+
+    The context deliberately excludes ``personalPrivateNote``.  It keeps the
+    submitted review text together with the task, event-line and planning
+    context that explains why a reflection matters.
+    """
+
+    rows = connection.execute(
+        """
+        SELECT review.id AS review_id, version.id AS review_version_id,
+               version.version, version.submitted_at, version.content_hash,
+               manifest.receipt
+        FROM weekly_reviews AS review
+        JOIN weekly_review_versions AS version
+          ON version.scope_id=review.scope_id
+         AND version.id=review.current_submitted_version_id
+        JOIN object_manifests AS manifest
+          ON manifest.scope_id=version.scope_id
+         AND manifest.id=version.content_object_manifest_id
+         AND manifest.lifecycle_state='active'
+        WHERE review.scope_id=? AND review.membership_id=?
+          AND review.lifecycle_state='active'
+          AND version.business_state='submitted'
+        ORDER BY version.submitted_at DESC, version.id DESC
+        LIMIT 8
+        """,
+        (identity.scope_id, identity.membership_id),
+    ).fetchall()
+    reviews: list[dict[str, Any]] = []
+    task_ids: set[str] = set()
+    for row in rows:
+        receipt = _json(row["receipt"], {})
+        content = receipt.get("content") if isinstance(receipt, Mapping) else {}
+        content = content if isinstance(content, Mapping) else {}
+        entries: list[dict[str, Any]] = []
+        for raw_entry in content.get("taskEntries") or []:
+            if not isinstance(raw_entry, Mapping):
+                continue
+            task_id = str(raw_entry.get("taskId") or "").strip()
+            if task_id:
+                task_ids.add(task_id)
+            structured = raw_entry.get("structuredNote")
+            structured = structured if isinstance(structured, Mapping) else {}
+            entries.append(
+                {
+                    "taskId": task_id,
+                    "note": str(raw_entry.get("note") or "")[:2_000],
+                    "reflection": str(structured.get("reflection") or "")[:2_000],
+                    "successExperience": str(structured.get("successExperience") or "")[:1_000],
+                    "failureInsight": str(structured.get("failureInsight") or "")[:1_000],
+                    "blockerReason": str(structured.get("blockerReason") or "")[:800],
+                    "supportNeeded": str(structured.get("supportNeeded") or "")[:800],
+                    "nextAction": str(structured.get("nextAction") or "")[:800],
+                    "completionStatus": str(structured.get("completionStatus") or ""),
+                }
+            )
+        reviews.append(
+            {
+                "reviewId": str(row["review_id"]),
+                "reviewVersionId": str(row["review_version_id"]),
+                "version": int(row["version"] or 1),
+                "submittedAt": str(row["submitted_at"] or ""),
+                "contentHash": str(row["content_hash"] or ""),
+                "weekLabel": str(content.get("weekLabel") or ""),
+                "summary": str(content.get("summary") or "")[:2_000],
+                "workFreeNote": str(content.get("workFreeNote") or "")[:2_000],
+                "personalGrowthNote": str(content.get("personalGrowthNote") or "")[:2_000],
+                "taskEntries": entries,
+            }
+        )
+
+    tasks: list[dict[str, Any]] = []
+    if task_ids:
+        placeholders = ",".join("?" for _ in task_ids)
+        task_rows = connection.execute(
+            f"""
+            SELECT task.id, task.title, task.description, task.completion_note,
+                   task.priority, task.completed_at, task.client_id,
+                   event.id AS event_line_id,
+                   COALESCE(event.name,event.title) AS event_line_name,
+                   event.goal AS event_line_goal, event.background AS event_line_background,
+                   cycle.id AS planning_cycle_id, cycle.title AS planning_cycle_title,
+                   cycle.summary AS planning_cycle_summary
+            FROM tasks AS task
+            LEFT JOIN event_lines AS event
+              ON event.scope_id=task.scope_id AND event.id=task.event_line_id
+             AND event.lifecycle_state='active'
+            LEFT JOIN planning_cycles AS cycle
+              ON cycle.scope_id=task.scope_id AND cycle.id=task.planning_cycle_id
+             AND cycle.lifecycle_state='active'
+            WHERE task.scope_id=? AND task.lifecycle_state='active'
+              AND task.id IN ({placeholders})
+            ORDER BY task.completed_at DESC, task.updated_at DESC
+            """,
+            (identity.scope_id, *sorted(task_ids)),
+        ).fetchall()
+        for row in task_rows:
+            tasks.append(
+                {
+                    "taskId": str(row["id"]),
+                    "title": str(row["title"] or "")[:300],
+                    "description": str(row["description"] or "")[:1_500],
+                    "completionNote": str(row["completion_note"] or "")[:1_200],
+                    "priority": str(row["priority"] or ""),
+                    "completedAt": str(row["completed_at"] or ""),
+                    "clientId": str(row["client_id"] or ""),
+                    "eventLine": {
+                        "id": str(row["event_line_id"] or ""),
+                        "name": str(row["event_line_name"] or "")[:300],
+                        "goal": str(row["event_line_goal"] or "")[:800],
+                        "background": str(row["event_line_background"] or "")[:1_000],
+                    },
+                    "planningCycle": {
+                        "id": str(row["planning_cycle_id"] or ""),
+                        "title": str(row["planning_cycle_title"] or "")[:300],
+                        "summary": str(row["planning_cycle_summary"] or "")[:1_000],
+                    },
+                }
+            )
+
+    previous: list[dict[str, Any]] = []
+    previous_rows = connection.execute(
+        """
+        SELECT manifest.receipt
+        FROM execution_runs AS run
+        JOIN object_manifests AS manifest
+          ON manifest.scope_id=run.scope_id
+         AND manifest.id=run.result_object_manifest_id
+         AND manifest.lifecycle_state='active'
+        WHERE run.scope_id=? AND run.initiator_membership_id=?
+          AND run.run_kind='weekly_growth_summary'
+          AND run.status='completed' AND run.lifecycle_state='active'
+        ORDER BY run.finished_at DESC, run.id DESC
+        LIMIT 4
+        """,
+        (identity.scope_id, identity.membership_id),
+    ).fetchall()
+    for row in previous_rows:
+        receipt = _json(row["receipt"], {})
+        result = receipt.get("result") if isinstance(receipt, Mapping) else None
+        if not isinstance(result, Mapping):
+            continue
+        previous.append(
+            {
+                "weeklySummary": str(result.get("weeklySummary") or "")[:500],
+                "growthHighlights": list(result.get("growthHighlights") or [])[:3],
+                "generatedAt": str(result.get("generatedAt") or ""),
+            }
+        )
+    return {"reviews": reviews, "tasks": tasks, "previousGrowth": previous}
+
+
+def _growth_companion_source_fingerprint(
+    evidence_rows: Sequence[Mapping[str, Any]],
+    rule_rows: Sequence[Mapping[str, Any]],
+    analysis_context: Mapping[str, Any],
+) -> str:
+    return sha256_text(
+        canonical_json(
+            {
+                "growthInput": _growth_input_fingerprint(evidence_rows, rule_rows),
+                # Previous AI summaries help the next interpretation compare
+                # periods, but must not invalidate the source immediately after
+                # a new summary is recorded.
+                "analysisContext": {
+                    "reviews": list(analysis_context.get("reviews") or []),
+                    "tasks": list(analysis_context.get("tasks") or []),
+                },
+            }
+        )
+    )
+
+
+def _experience_wall_items(
+    connection: sqlite3.Connection,
+    identity: SessionIdentity,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT run.initiator_membership_id, run.finished_at, manifest.receipt,
+               principal.display_name
+        FROM execution_runs AS run
+        JOIN object_manifests AS manifest
+          ON manifest.scope_id=run.scope_id
+         AND manifest.id=run.result_object_manifest_id
+         AND manifest.lifecycle_state='active'
+        LEFT JOIN organization_memberships AS membership
+          ON membership.scope_id=run.scope_id
+         AND membership.id=run.initiator_membership_id
+        LEFT JOIN principals AS principal
+          ON principal.id=membership.principal_id
+        WHERE run.scope_id=? AND run.run_kind='weekly_growth_summary'
+          AND run.status='completed' AND run.lifecycle_state='active'
+        ORDER BY run.finished_at DESC, run.id DESC
+        LIMIT 200
+        """,
+        (identity.scope_id,),
+    ).fetchall()
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        receipt = _json(row["receipt"], {})
+        result = receipt.get("result") if isinstance(receipt, Mapping) else None
+        if not isinstance(result, Mapping):
+            continue
+        for raw in result.get("experienceEntries") or []:
+            if not isinstance(raw, Mapping):
+                continue
+            entry_id = str(raw.get("id") or "").strip()
+            text = str(raw.get("text") or "").strip()
+            if not entry_id or not text or entry_id in by_id:
+                continue
+            kind = str(raw.get("kind") or "distilled")
+            by_id[entry_id] = {
+                "id": entry_id,
+                "source": "exp_wall",
+                "text": text,
+                "summary": text,
+                "authorUserId": str(row["initiator_membership_id"] or ""),
+                "authorUserName": str(row["display_name"] or "团队成员"),
+                "clientId": None,
+                "clientName": None,
+                "sourceType": (
+                    "review_quote" if kind == "quote" else "review_insight"
+                ),
+                "sourceObjectId": str(raw.get("sourceId") or ""),
+                "sourceTitle": str(raw.get("sourceTitle") or "成长复盘"),
+                "category": str(raw.get("category") or "成长经验"),
+                "reuseCount": 0,
+                "likeCount": 0,
+                "saveCount": 0,
+                "currentUserLiked": False,
+                "linkedContexts": [],
+                "createdAt": str(result.get("generatedAt") or row["finished_at"] or ""),
+            }
+    if not by_id:
+        return []
+    placeholders = ",".join("?" for _ in by_id)
+    reaction_rows = connection.execute(
+        f"""
+        SELECT target_resource_id,
+               COUNT(DISTINCT actor_membership_id) AS like_count,
+               MAX(CASE WHEN actor_membership_id=? THEN 1 ELSE 0 END) AS current_liked
+        FROM audit_events
+        WHERE scope_id=? AND action='gc13.experience_quote.liked'
+          AND target_resource_id IN ({placeholders})
+        GROUP BY target_resource_id
+        """,
+        (identity.membership_id, identity.scope_id, *by_id.keys()),
+    ).fetchall()
+    for row in reaction_rows:
+        item = by_id.get(str(row["target_resource_id"] or ""))
+        if item is None:
+            continue
+        item["likeCount"] = int(row["like_count"] or 0)
+        item["currentUserLiked"] = bool(row["current_liked"])
+    return sorted(
+        by_id.values(),
+        key=lambda item: (str(item.get("createdAt") or ""), str(item.get("id") or "")),
+        reverse=True,
+    )
+
+
+def like_growth_experience_quote(
+    repository: CloudRepository,
+    identity: SessionIdentity,
+    *,
+    quote_id: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    quote_id = _identifier(quote_id, field="experience_quote_id", maximum=160)
+    idempotency_key = _identifier(idempotency_key, field="idempotency_key", maximum=200)
+    now = utc_now()
+    command_type = "gc13.experience_quote.liked"
+    payload_hash = sha256_text(canonical_json({"quoteId": quote_id, "reaction": "like"}))
+    operation_id = repository._operation_id(  # noqa: SLF001
+        identity.scope_id,
+        command_type,
+        idempotency_key,
+    )
+    with repository._connection() as connection:  # noqa: SLF001
+        connection.execute("BEGIN IMMEDIATE")
+        replay = _replay(
+            connection,
+            identity,
+            idempotency_key=idempotency_key,
+            payload_hash=payload_hash,
+        )
+        if replay is not None:
+            connection.rollback()
+            return replay
+        items = _experience_wall_items(connection, identity)
+        item = next((value for value in items if value["id"] == quote_id), None)
+        if item is None:
+            connection.rollback()
+            raise RepositoryError(404, "gc13_experience_quote_not_found", "成长金句不存在")
+        already_liked = connection.execute(
+            """
+            SELECT 1 FROM audit_events
+            WHERE scope_id=? AND action=? AND target_resource_id=?
+              AND actor_membership_id=?
+            LIMIT 1
+            """,
+            (identity.scope_id, command_type, quote_id, identity.membership_id),
+        ).fetchone()
+        result = {
+            **item,
+            "likeCount": int(item.get("likeCount") or 0) + (0 if already_liked else 1),
+            "currentUserLiked": True,
+            "idempotentReplay": bool(already_liked),
+        }
+        result_manifest_id, result_hash = _result_manifest(
+            repository,
+            connection,
+            identity,
+            operation_id=operation_id,
+            kind="growth_experience_quote_like",
+            result=result,
+            now=now,
+        )
+        _trace_command(
+            repository,
+            connection,
+            identity,
+            operation_id=operation_id,
+            idempotency_key=idempotency_key,
+            payload_hash=payload_hash,
+            result_manifest_id=result_manifest_id,
+            result_hash=result_hash,
+            command_type=command_type,
+            aggregate_type="growth_experience_quote",
+            aggregate_id=quote_id,
+            aggregate_version=1,
+            target_resource_id=quote_id,
+            command_status="settled",
+            event_type=command_type,
+            now=now,
+        )
+        connection.commit()
+        return result
+
+
 def growth_snapshot(
     repository: CloudRepository,
     identity: SessionIdentity,
@@ -2201,7 +2638,12 @@ def growth_snapshot(
     with repository._connection() as connection:  # noqa: SLF001
         evidence_rows = _evidence_rows(connection, identity)
         rule_rows = _active_rule_rows(connection, identity)
-        source_fingerprint = _growth_input_fingerprint(evidence_rows, rule_rows)
+        analysis_context = _growth_analysis_context(connection, identity)
+        source_fingerprint = _growth_companion_source_fingerprint(
+            evidence_rows,
+            rule_rows,
+            analysis_context,
+        )
         evidence = [_evidence_dto(row) for row in evidence_rows]
         rules = [_rule_dto(row) for row in rule_rows]
         models = _read_models(connection, identity)
@@ -2277,6 +2719,7 @@ def growth_snapshot(
             ],
             "sourceFingerprint": source_fingerprint,
             "summary": companion_summary,
+            "analysisContext": analysis_context,
         },
         "weeklyReviewAdapter": {
             "contract": "yiyu.gc13.formal-work-evidence-port.v2",
@@ -2314,6 +2757,13 @@ def growth_compatibility_view(
     snapshot = growth_snapshot(repository, identity)
     evidence = list(snapshot["evidence"])
     read_model = dict(snapshot["readModel"])
+    companion_summary = (snapshot.get("companion") or {}).get("summary")
+    companion_summary = companion_summary if isinstance(companion_summary, Mapping) else {}
+    ai_highlights = [
+        item
+        for item in companion_summary.get("growthHighlights") or []
+        if isinstance(item, Mapping)
+    ]
     category_points: dict[str, float] = {}
     for rule in snapshot.get("rules") or []:
         spec = rule.get("spec") if isinstance(rule, Mapping) else None
@@ -2501,9 +2951,18 @@ def growth_compatibility_view(
     previous_month_start = previous_month_end.replace(day=1)
     monthly_tasks = sum(day >= month_start for day in task_dates)
     previous_month_tasks = sum(previous_month_start <= day <= previous_month_end for day in task_dates)
+    ability_key_aliases = {
+        "execution": "exec",
+        "collaboration": "collab",
+        "analysis": "analyze",
+        "reflection": "write",
+    }
     abilities = [
         {
-            "abilityKey": str(item.get("abilityKey") or item.get("metricKey") or "growth"),
+            "abilityKey": ability_key_aliases.get(
+                str(item.get("abilityKey") or ""),
+                str(item.get("abilityKey") or item.get("metricKey") or "growth"),
+            ),
             "label": str(item.get("label") or item.get("abilityKey") or "成长能力"),
             "currentScore": float(item.get("score") or 0),
             "previousScore": 0,
@@ -2515,8 +2974,42 @@ def growth_compatibility_view(
         }
         for item in read_model["abilities"]
     ]
+    ability_by_key = {str(item["abilityKey"]): item for item in abilities}
+    for signal in ai_highlights:
+        ability_key = str(signal.get("abilityKey") or "")
+        if not ability_key:
+            continue
+        try:
+            ai_score = max(20, min(100, int(signal.get("level") or 1) * 20))
+        except (TypeError, ValueError):
+            ai_score = 20
+        trend = str(signal.get("trend") or "forming")
+        weekly_delta = 10 if trend == "up" else 5 if trend == "forming" else 0
+        existing = ability_by_key.get(ability_key)
+        if existing is None:
+            existing = {
+                "abilityKey": ability_key,
+                "label": str(signal.get("abilityLabel") or signal.get("title") or ability_key),
+                "currentScore": ai_score,
+                "previousScore": max(0, ai_score - weekly_delta),
+                "totalXp": ai_score,
+                "weeklyXp": weekly_delta,
+                "stage": str(signal.get("title") or "正在形成"),
+                "nextStage": "持续在真实工作中验证",
+                "evidence": str(signal.get("summary") or ""),
+            }
+            abilities.append(existing)
+            ability_by_key[ability_key] = existing
+        else:
+            existing["currentScore"] = max(float(existing.get("currentScore") or 0), ai_score)
+            existing["previousScore"] = max(
+                0,
+                float(existing["currentScore"]) - weekly_delta,
+            )
+            existing["weeklyXp"] = weekly_delta
+            existing["stage"] = str(signal.get("title") or existing.get("stage") or "正在形成")
+            existing["evidence"] = str(signal.get("summary") or existing.get("evidence") or "")
     if view == "overview":
-        companion_summary = (snapshot.get("companion") or {}).get("summary")
         return {
             "userId": identity.membership_id,
             "userName": identity.display_name,
@@ -2678,6 +3171,57 @@ def growth_compatibility_view(
                     ],
                 }
             )
+        existing_badge_ids = {
+            str(badge.get("id") or "")
+            for category in categories
+            for badge in category.get("badges") or []
+        }
+        for signal in ai_highlights:
+            signal_id = str(signal.get("id") or "")
+            if not signal_id or signal_id in existing_badge_ids:
+                continue
+            label = str(signal.get("title") or signal.get("abilityLabel") or "成长印记")
+            ability_key = str(signal.get("abilityKey") or "growth")
+            categories.append(
+                {
+                    "id": f"category:{signal_id}",
+                    "label": str(signal.get("abilityLabel") or label),
+                    "abilityKey": ability_key,
+                    "abilityLabel": str(signal.get("abilityLabel") or label),
+                    "litCount": 1,
+                    "totalCount": 1,
+                    "badges": [
+                        {
+                            "id": signal_id,
+                            "code": signal_id,
+                            "name": label,
+                            "categoryId": f"category:{signal_id}",
+                            "categoryLabel": str(signal.get("abilityLabel") or label),
+                            "abilityKey": ability_key,
+                            "abilityLabel": str(signal.get("abilityLabel") or label),
+                            "roles": [],
+                            "xp": int(signal.get("level") or 1) * 10,
+                            "iconMotif": "growth_signal",
+                            "description": str(signal.get("summary") or ""),
+                            "whyItMatters": "由成长陪伴结合复盘原文和关联工作理解",
+                            "systemHowText": "AI semantic growth interpretation",
+                            "state": "lit",
+                            "progressValue": 1,
+                            "progressTarget": 1,
+                            "progressPercent": 100,
+                            "progressText": "本期形成",
+                            "nextActionText": "继续在真实工作中验证",
+                            "actionLinks": [],
+                            "evidence": [],
+                            "linkedContexts": [],
+                            "missingSignals": [],
+                            "unlockedAt": str(companion_summary.get("generatedAt") or generated_at),
+                            "masteryLevel": int(signal.get("level") or 1),
+                            "historical": False,
+                        }
+                    ],
+                }
+            )
         lit = sum(item["litCount"] for item in categories)
         return {
             "overview": {
@@ -2693,11 +3237,13 @@ def growth_compatibility_view(
             "updatedAt": generated_at,
         }
     if view == "experience-wall":
+        with repository._connection() as connection:  # noqa: SLF001
+            items = _experience_wall_items(connection, identity)
         return {
-            "items": [],
+            "items": items,
             "refreshedFromCloud": True,
             "cloudSyncError": None,
-            "authorityState": "ready_empty" if not evidence else "not_connected",
+            "authorityState": "ready" if items else "ready_empty",
         }
     if view == "workbench":
         return {

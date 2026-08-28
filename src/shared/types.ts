@@ -6009,6 +6009,24 @@ export interface GrowthCompanionSummary {
   patterns: string[];
   blindSpots: string[];
   suggestions: string[];
+  growthHighlights?: Array<{
+    id: string;
+    abilityKey: GrowthAbilityKey;
+    abilityLabel: string;
+    title: string;
+    summary: string;
+    trend: 'up' | 'steady' | 'forming';
+    level: number;
+  }>;
+  experienceEntries?: Array<{
+    id: string;
+    kind: 'quote' | 'distilled';
+    text: string;
+    category: string;
+    sourceType: string;
+    sourceId: string;
+    sourceTitle: string;
+  }>;
   sourceCount: number;
   generatedAt: string;
   modelName?: string | null;

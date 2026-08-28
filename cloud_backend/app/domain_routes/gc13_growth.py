@@ -10,6 +10,7 @@ from ..repositories.gc13_growth import (
     confirm_growth_evidence,
     growth_compatibility_view,
     growth_snapshot,
+    like_growth_experience_quote,
     publish_growth_rule,
     record_growth_companion_summary,
     rebuild_growth_read_models,
@@ -201,11 +202,12 @@ def register_gc13_growth_routes(
         identity: SessionIdentity = Depends(identity_dependency),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> Any:
-        return _compat_command(
-            f"growth/experience-wall/{quote_id}/like",
-            payload,
+        del payload
+        return like_growth_experience_quote(
+            repository,
             identity,
-            idempotency_key,
+            quote_id=quote_id,
+            idempotency_key=idempotency_key or new_id(),
         )
 
     @app.post("/api/v2/gc13/growth/handbook/{entry_id}/mark-reused")

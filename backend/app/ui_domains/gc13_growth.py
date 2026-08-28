@@ -75,6 +75,8 @@ def rebuild_growth(
         if isinstance(item, dict) and str(item.get("summary") or "").strip()
     ]
     companion = dict(snapshot.get("companion") or {})
+    analysis_context = companion.get("analysisContext")
+    analysis_context = analysis_context if isinstance(analysis_context, dict) else {}
     source_fingerprint = str(companion.get("sourceFingerprint") or "").strip()
     current_summary = companion.get("summary")
     force_summary = bool(request.body.get("forceCompanionSummary"))
@@ -88,12 +90,21 @@ def rebuild_growth(
             {
                 "role": "system",
                 "content": (
-                    "你是益语智库成长陪伴 Agent。只根据当前成员获授权的正式工作证据，"
-                    "生成一份简短但有判断力的周成长总结；不得读取或猜测项目私有事实，"
-                    "不得创建任务、Skill或项目记忆。返回纯 JSON："
-                    '{"weeklySummary":"一段总结","patterns":["模式"],'
-                    '"blindSpots":["盲点"],"suggestions":["下一步建议"]}。'
-                    "patterns、blindSpots、suggestions 各1至3条；证据不足时明确边界，不补造。"
+                    "你是益语智库成长陪伴 Agent。请结合成员提交的复盘原文、任务详情、"
+                    "关联计划与事件背景，以及此前成长总结，理解用户这段时间真正形成了什么"
+                    "能力变化。不能按关键词分类，也不能把完成任务本身等同于成长。每个判断"
+                    "都必须能从输入事实中得到支持；没有明显成长可以少输出或不输出。"
+                    "返回纯 JSON，结构为："
+                    '{"weeklySummary":"不超过180字、最多三句话的总结",'
+                    '"growthHighlights":[{"abilityKey":"exec|collab|analyze|insight|risk|write",'
+                    '"abilityLabel":"中文能力名","title":"简短进步标题",'
+                    '"summary":"不超过80字的具体变化","trend":"up|steady|forming","level":1}],'
+                    '"experienceEntries":[{"kind":"quote|distilled","text":"金句或经验",'
+                    '"category":"能力或经验分类","sourceType":"weekly_review|task|meeting",'
+                    '"sourceId":"输入中的真实来源ID","sourceTitle":"简短来源标题"}]}。'
+                    "growthHighlights最多3条，level为1到5；experienceEntries最多3条。"
+                    "quote必须逐字来自输入原文，概括内容必须标记distilled。不要输出盲点、"
+                    "建议、证据清单或任何JSON之外的文字。"
                 ),
             },
             {
@@ -115,6 +126,7 @@ def rebuild_growth(
                             }
                             for item in evidence[:20]
                         ],
+                        "analysisContext": analysis_context,
                         "abilityModels": list(
                             (snapshot.get("readModel") or {}).get("abilities") or []
                         ),
@@ -138,15 +150,37 @@ def rebuild_growth(
     if not isinstance(generated, dict):
         raise LocalRuntimeError(502, "gc13_growth_summary_invalid", "成长陪伴返回的周总结格式无效，可以重试")
     provider = dict(completion.get("provider") or {})
+    raw_highlights = generated.get("growthHighlights") or []
+    growth_highlights = [
+        dict(item)
+        for item in raw_highlights[:3]
+        if isinstance(item, dict)
+    ] if isinstance(raw_highlights, list) else []
+    raw_experiences = generated.get("experienceEntries") or []
+    context_text = json.dumps(analysis_context, ensure_ascii=False)
+    experience_entries: list[dict[str, Any]] = []
+    if isinstance(raw_experiences, list):
+        for item in raw_experiences[:3]:
+            if not isinstance(item, dict):
+                continue
+            normalized = dict(item)
+            text_value = str(normalized.get("text") or "").strip()
+            if not text_value:
+                continue
+            if str(normalized.get("kind") or "") == "quote" and text_value not in context_text:
+                normalized["kind"] = "distilled"
+            experience_entries.append(normalized)
     saved = compatibility.runtime.cloud_command(
         "POST",
         f"{_CLOUD_ROOT}/companion-summary",
         payload={
             "sourceFingerprint": source_fingerprint,
             "weeklySummary": generated.get("weeklySummary"),
-            "patterns": generated.get("patterns") or [],
-            "blindSpots": generated.get("blindSpots") or [],
-            "suggestions": generated.get("suggestions") or [],
+            "patterns": [],
+            "blindSpots": [],
+            "suggestions": [],
+            "growthHighlights": growth_highlights,
+            "experienceEntries": experience_entries,
             "providerResourceId": provider.get("configId"),
             "modelName": provider.get("modelName"),
         },

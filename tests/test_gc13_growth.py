@@ -21,6 +21,7 @@ from cloud_backend.app.repositories.gc13_growth import (
     PREFERENCE_SCHEMA,
     confirm_growth_evidence,
     growth_snapshot,
+    like_growth_experience_quote,
     publish_growth_rule,
     record_growth_companion_summary,
     rebuild_growth_read_models,
@@ -630,6 +631,26 @@ def test_growth_companion_summary_is_traced_and_unchanged_inputs_do_not_duplicat
             "patterns": ["能够把实践整理为正式证据"],
             "blindSpots": ["协作类证据仍不足"],
             "suggestions": ["下周补充一条协作实践证据"],
+            "growthHighlights": [
+                {
+                    "abilityKey": "insight",
+                    "abilityLabel": "用户洞察",
+                    "title": "用户视角正在形成",
+                    "summary": "开始从用户交互成本判断功能取舍。",
+                    "trend": "up",
+                    "level": 2,
+                }
+            ],
+            "experienceEntries": [
+                {
+                    "kind": "distilled",
+                    "text": "功能取舍要同时考虑架构边界和用户交互成本。",
+                    "category": "用户洞察",
+                    "sourceType": "weekly_review",
+                    "sourceId": "review-growth-1",
+                    "sourceTitle": "本周复盘",
+                }
+            ],
             "modelName": "test-model",
         },
         idempotency_key="gc13-summary-record",
@@ -638,6 +659,27 @@ def test_growth_companion_summary_is_traced_and_unchanged_inputs_do_not_duplicat
     refreshed = growth_snapshot(repository, identity)
     assert refreshed["companion"]["summary"]["weeklySummary"] == "本周完成一次可追源的复盘沉淀。"
     assert refreshed["companion"]["summary"]["sourceCount"] == 1
+    overview = gc13_growth.growth_compatibility_view(
+        repository,
+        identity,
+        view="overview",
+    )
+    assert any(item["abilityKey"] == "insight" for item in overview["abilities"])
+    wall = gc13_growth.growth_compatibility_view(
+        repository,
+        identity,
+        view="experience-wall",
+    )
+    assert wall["authorityState"] == "ready"
+    assert wall["items"][0]["text"] == "功能取舍要同时考虑架构边界和用户交互成本。"
+    liked = like_growth_experience_quote(
+        repository,
+        identity,
+        quote_id=wall["items"][0]["id"],
+        idempotency_key="gc13-like-growth-experience",
+    )
+    assert liked["currentUserLiked"] is True
+    assert liked["likeCount"] == 1
     with runtime_connection(repository.database_path, "cloud") as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM execution_runs WHERE run_kind='weekly_growth_summary'"
