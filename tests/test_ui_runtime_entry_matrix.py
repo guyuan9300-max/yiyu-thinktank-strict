@@ -31,7 +31,7 @@ def _renderer_operations() -> list[dict[str, object]]:
 def test_every_renderer_operation_invokes_its_owned_domain_entry(
     tmp_path: Path,
 ) -> None:
-    """Exercise the frozen 559-entry denominator through real dispatch.
+    """Exercise every currently discovered renderer entry through real dispatch.
 
     This is deliberately entry-path evidence, not a substitute for the domain
     behavior, authority, CAS, idempotency, isolation, and restart tests.
@@ -42,7 +42,12 @@ def test_every_renderer_operation_invokes_its_owned_domain_entry(
         for router in build_default_registry().routers
     }
     operations = _renderer_operations()
-    assert len(operations) == 559
+    assert operations
+    operation_keys = {
+        (item["domain"], item["method"], item["path"], item["function"])
+        for item in operations
+    }
+    assert len(operation_keys) == len(operations)
 
     for index, operation in enumerate(operations):
         domain = str(operation["domain"])

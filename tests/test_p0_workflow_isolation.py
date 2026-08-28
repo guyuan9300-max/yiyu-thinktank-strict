@@ -33,18 +33,20 @@ from backend.app.ui_domains.workflow import (
 from cloud_backend.app.config import CloudConfig
 from cloud_backend.app.main import create_app
 from strict_common.schema import runtime_connection
+from tests.strict_cloud_test_factory import (
+    provision_test_organization,
+    strict_cloud_test_client,
+)
 
 
 def _cloud(tmp_path: Path) -> tuple[TestClient, Path]:
-    database = tmp_path / "strict-p0-workflow.db"
-    config = CloudConfig(
-        data_dir=tmp_path,
-        database_path=database,
+    client, database, _ = strict_cloud_test_client(
+        tmp_path,
         bootstrap_token="p0-workflow-bootstrap",
-        master_key=Fernet.generate_key().decode(),
-        cloud_instance_id=None,
+        cloud_instance_id="cloud-p0-workflow-test",
+        database_name="strict-p0-workflow.db",
     )
-    return TestClient(create_app(config)), database
+    return client, database
 
 
 def _auth(session: dict[str, Any], key: str | None = None) -> dict[str, str]:
@@ -55,18 +57,13 @@ def _auth(session: dict[str, Any], key: str | None = None) -> dict[str, str]:
 
 
 def _bootstrap(client: TestClient) -> dict[str, Any]:
-    response = client.post(
-        "/api/v2/auth/bootstrap-organization",
-        json={
-            "organizationName": "P0 权限测试组织",
-            "displayName": "管理员",
-            "email": "p0-admin@example.com",
-            "password": "admin-password",
-            "bootstrapToken": "p0-workflow-bootstrap",
-        },
+    return provision_test_organization(
+        client,
+        organization_name="P0 权限测试组织",
+        display_name="管理员",
+        email="p0-admin@example.com",
+        password="admin-password",
     )
-    assert response.status_code == 201, response.text
-    return response.json()
 
 
 def _member(client: TestClient, admin: dict[str, Any]) -> dict[str, Any]:

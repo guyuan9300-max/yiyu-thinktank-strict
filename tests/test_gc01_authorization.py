@@ -532,6 +532,8 @@ def test_project_share_is_the_single_gate_for_metadata_and_shared_knowledge(
                         "text": "官网事实哨兵：金老师担任项目理事。",
                         "contentHash": "1" * 64,
                         "capturedAt": "2026-08-06T08:00:00.000Z",
+                        "pageRole": "institutional_profile",
+                        "captureKind": "static",
                     }
                 ],
                 "factCandidates": [
@@ -543,6 +545,8 @@ def test_project_share_is_the_single_gate_for_metadata_and_shared_knowledge(
                         "evidence": "金老师担任项目理事。",
                         "sourceUrl": "https://official.example/shared-project",
                         "sourceTitle": "共享项目官网",
+                        "subjectKind": "person",
+                        "factKind": "person_profile",
                         "confidence": 0.96,
                     }
                 ],

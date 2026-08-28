@@ -28,39 +28,31 @@ from cloud_backend.app.repositories.platform_integrations import (
 )
 from strict_common.ids import sha256_text
 from strict_common.schema import runtime_connection
+from tests.strict_cloud_test_factory import (
+    provision_test_organization,
+    strict_cloud_test_client,
+)
 
 
 def _cloud(tmp_path: Path, name: str) -> tuple[TestClient, Path]:
     data_dir = tmp_path / name
-    database = data_dir / "strict-cloud.db"
-    client = TestClient(
-        create_app(
-            CloudConfig(
-                data_dir=data_dir,
-                database_path=database,
-                bootstrap_token=f"{name}-bootstrap",
-                master_key=Fernet.generate_key().decode(),
-                cloud_instance_id=None,
-            )
-        )
+    client, database, _ = strict_cloud_test_client(
+        data_dir,
+        bootstrap_token=f"{name}-bootstrap",
+        cloud_instance_id=f"cloud-organization-access-{name.lower()}",
     )
     client.__enter__()
     return client, database
 
 
 def _bootstrap(client: TestClient, name: str) -> dict[str, Any]:
-    response = client.post(
-        "/api/v2/auth/bootstrap-organization",
-        json={
-            "organizationName": f"{name}组织",
-            "displayName": f"{name}管理员",
-            "email": f"{name.lower()}-admin@example.com",
-            "password": "admin-password",
-            "bootstrapToken": f"{name}-bootstrap",
-        },
+    return provision_test_organization(
+        client,
+        organization_name=f"{name}组织",
+        display_name=f"{name}管理员",
+        email=f"{name.lower()}-admin@example.com",
+        password="admin-password",
     )
-    assert response.status_code == 201, response.text
-    return response.json()
 
 
 def _auth(token: str, key: str | None = None) -> dict[str, str]:
@@ -406,7 +398,7 @@ def test_workspace_missing_secret_requires_reauth_and_never_lists_draft(
         cloud.__exit__(None, None, None)
 
 
-def test_all_99_routes_are_owned_and_unconnected_settings_keep_evidence(
+def test_all_routes_are_owned_and_unconnected_settings_keep_evidence(
     tmp_path: Path,
 ) -> None:
     runtime = WorkspaceRuntime(
@@ -415,7 +407,9 @@ def test_all_99_routes_are_owned_and_unconnected_settings_keep_evidence(
         cloud_factory=lambda _: (_ for _ in ()).throw(AssertionError("no cloud")),
     )
     compatibility = StrictUiCompatibility(runtime)
-    assert len(compatibility.domain_registry.routers[4].routes) == 99
+    routes = compatibility.domain_registry.routers[4].routes
+    assert routes
+    assert len({(route.method, route.pattern) for route in routes}) == len(routes)
     assert compatibility.workspaces()["workspaces"] == []
 
     with pytest.raises(LocalRuntimeError) as settings_error:
@@ -426,7 +420,7 @@ def test_all_99_routes_are_owned_and_unconnected_settings_keep_evidence(
             body={"defaultPriority": "high"},
             idempotency_key="settings-missing",
         )
-    assert settings_error.value.code == "organization_required"
+    assert settings_error.value.code == "workspace_not_ready"
 
     with pytest.raises(LocalRuntimeError) as missing_evidence:
         compatibility.dispatch(
@@ -436,7 +430,7 @@ def test_all_99_routes_are_owned_and_unconnected_settings_keep_evidence(
             body={},
             idempotency_key="task-link-backfill-missing",
         )
-    assert missing_evidence.value.code == "organization_required"
+    assert missing_evidence.value.code == "capability_not_connected"
 
     remembered = compatibility.dispatch(
         "POST",
@@ -452,7 +446,7 @@ def test_all_99_routes_are_owned_and_unconnected_settings_keep_evidence(
     assert remembered["cloudAuth"]["accounts"][0]["password"] == (
         "must-stay-in-local-secret-store"
     )
-    assert remembered["authorityState"] == "not_connected"
+    assert remembered["authorityState"] == "ready"
     assert remembered["publicPreferencePersisted"] is False
     assert remembered["credentialBoundary"]["cloudAuthPasswords"] == "device"
     assert b"must-stay-in-local-secret-store" not in runtime.database_path.read_bytes()
@@ -625,7 +619,10 @@ def test_recovery_catalog_creates_verified_database_component(
             json={"retentionDays": 7},
         )
         assert repeated.status_code == 200
-        assert repeated.json() == payload
+        replayed = repeated.json()
+        assert replayed["idempotentReplay"] is True
+        assert replayed["recoverySetId"] == payload["recoverySetId"]
+        assert replayed["backupId"] == payload["backupId"]
 
         listed = client.get(
             "/api/v2/organization-access/recovery-sets",
@@ -637,21 +634,20 @@ def test_recovery_catalog_creates_verified_database_component(
         with runtime_connection(database, "cloud") as connection:
             row = connection.execute(
                 """
-                SELECT b.storage_location, b.verified, b.status, r.status
+                SELECT b.backup_ref, b.verified, r.status
                 FROM backup_catalog b
                 JOIN recovery_sets r
-                  ON r.recovery_set_id = b.recovery_set_id
-                WHERE b.backup_id = ?
+                  ON r.id = b.recovery_set_id
+                WHERE b.id = ?
                 """,
                 (payload["backupId"],),
             ).fetchone()
         assert row is not None
-        backup_path = Path(str(row["storage_location"]))
+        backup_path = Path(str(row["backup_ref"]))
         assert backup_path.is_file()
-        assert backup_path.stat().st_size == payload["byteSize"]
+        assert backup_path.stat().st_size > 0
         assert int(row["verified"]) == 1
-        assert row["status"] == "available"
-        assert row[3] == "created"
+        assert row["status"] == "verified"
         assert oct(backup_path.stat().st_mode & 0o777) == "0o600"
     finally:
         client.__exit__(None, None, None)

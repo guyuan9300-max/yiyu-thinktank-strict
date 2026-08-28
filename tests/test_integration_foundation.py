@@ -127,7 +127,7 @@ def test_local_ui_adapter_preserves_multipart_fields_and_file(
     router = next(
         item
         for item in app.state.ui_compat.domain_registry.routers
-        if item.domain == "organization_access"
+        if item.domain == "strict_startup_status"
     )
 
     @router.post(r"test/multipart")

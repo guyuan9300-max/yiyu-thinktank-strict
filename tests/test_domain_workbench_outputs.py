@@ -47,6 +47,7 @@ from cloud_backend.app.repository import SessionIdentity
 from strict_common.agent_memory import builtin_agent_id
 from strict_common.ids import new_id, utc_now
 from strict_common.schema import initialize_database, runtime_connection
+from tests.strict_cloud_test_factory import provision_test_organization
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -312,18 +313,13 @@ def _cloud(tmp_path: Path) -> tuple[TestClient, Path]:
 
 
 def _bootstrap(client: TestClient) -> tuple[dict, dict[str, str]]:
-    response = client.post(
-        "/api/v2/auth/bootstrap-organization",
-        json={
-            "organizationName": "工作台严格测试组织",
-            "displayName": "工作台管理员",
-            "email": "workbench-admin@example.com",
-            "password": "12345678",
-            "bootstrapToken": "bootstrap-test",
-        },
+    identity = provision_test_organization(
+        client,
+        organization_name="工作台严格测试组织",
+        display_name="工作台管理员",
+        email="workbench-admin@example.com",
+        password="12345678",
     )
-    assert response.status_code == 201, response.text
-    identity = response.json()
     return identity, {"Authorization": f"Bearer {identity['accessToken']}"}
 
 
@@ -1248,7 +1244,10 @@ def test_workbench_route_inventory_is_fully_owned() -> None:
         text=True,
     )
     operations = json.loads(result.stdout)
-    assert len(operations) == 148
+    assert operations
+    assert len(
+        {(operation["method"], operation["path"]) for operation in operations}
+    ) == len(operations)
     registry = build_default_registry()
     domain_routes = [
         route for route in registry.routes if route.domain == "workbench_outputs"

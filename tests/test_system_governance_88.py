@@ -19,7 +19,8 @@ def test_verified_backup_activates_strict_recovery_chain(tmp_path: Path) -> None
         retention_days=7,
     )
     assert created["status"] == "verified"
-    assert created["wholeSystemVerified"] is True
+    assert created["wholeSystemVerified"] is False
+    assert created["coverage"] == "cloud_database_only"
     assert replayed["idempotentReplay"] is True
     gate = governance.decide_release_gate(
         identity,

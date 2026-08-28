@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.migrate_agent_skill_foundation_v8 import migrate
+from scripts.migrate_agent_skill_foundation_v8 import frozen_v8_manifest, migrate
 from strict_common.agent_memory import (
     BUILTIN_AGENT_DEFINITIONS,
     builtin_agent_id,
@@ -43,7 +43,7 @@ def _v7_manifest(v8: dict) -> dict:
 
 def _create_v7_source(path: Path, role: str, *, with_organization: bool) -> None:
     contract = LOCAL_CONTRACT if role == "local" else CLOUD_CONTRACT
-    raw = _v7_manifest(contract.raw)
+    raw = _v7_manifest(frozen_v8_manifest(role))  # type: ignore[arg-type]
     manifest_hash = hashlib.sha256(
         json.dumps(
             raw,

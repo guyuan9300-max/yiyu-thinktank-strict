@@ -14,33 +14,29 @@ from cloud_backend.app.repositories.intelligence_growth import (
     IntelligenceGrowthRepository,
 )
 from strict_common.schema import runtime_connection
+from tests.strict_cloud_test_factory import (
+    provision_test_organization,
+    strict_cloud_test_client,
+)
 
 
 def _cloud(tmp_path: Path) -> tuple[TestClient, Path]:
-    database = tmp_path / "strict-cloud.db"
-    config = CloudConfig(
-        data_dir=tmp_path,
-        database_path=database,
+    client, database, _ = strict_cloud_test_client(
+        tmp_path,
         bootstrap_token="bootstrap-test",
-        master_key=Fernet.generate_key().decode(),
-        cloud_instance_id=None,
+        cloud_instance_id="cloud-consultation-test",
     )
-    return TestClient(create_app(config)), database
+    return client, database
 
 
 def _bootstrap(client: TestClient) -> dict[str, Any]:
-    response = client.post(
-        "/api/v2/auth/bootstrap-organization",
-        json={
-            "organizationName": "咨询知识测试组织",
-            "displayName": "管理员",
-            "email": "consultation@example.com",
-            "password": "12345678",
-            "bootstrapToken": "bootstrap-test",
-        },
+    return provision_test_organization(
+        client,
+        organization_name="咨询知识测试组织",
+        display_name="管理员",
+        email="consultation@example.com",
+        password="12345678",
     )
-    assert response.status_code == 201, response.text
-    return response.json()
 
 
 def _headers(

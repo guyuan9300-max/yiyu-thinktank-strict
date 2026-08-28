@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -24,6 +27,129 @@ from strict_common.physical_schema import ddl_from_manifest, ddl_sha256, user_ta
 
 
 Role = Literal["local", "cloud"]
+
+FROZEN_V8_MANIFEST_SHA256 = {
+    "local": "19971bd3a3e1cf9beecdb5893b2b15fd6bc02c8951795fc828105ab481f20432",
+    "cloud": "b1d65aa9e406398dd9692387406a3d8a27beb66c584bd6953c815eb413909a10",
+}
+
+
+def _table(manifest: dict[str, Any], name: str) -> dict[str, Any]:
+    return next(
+        table for table in manifest["allowedTables"]
+        if table["name"] == name
+    )
+
+
+def frozen_v8_manifest(role: Role) -> dict[str, Any]:
+    """Reconstruct and hash-check the immutable v8 migration artifact.
+
+    The active repository manifest has advanced to v10. Historical migration
+    code must not silently read that moving target, so the small reviewed v9/v10
+    schema delta is explicitly removed and the resulting canonical hash is
+    pinned to the original v8 release artifact.
+    """
+
+    current = LOCAL_CONTRACT if role == "local" else CLOUD_CONTRACT
+    raw = copy.deepcopy(current.raw)
+    raw["contractDate"] = "2026-08-06"
+    raw["contractVersion"] = "8"
+    raw["commonRules"].pop("flatPlanning", None)
+    raw["commonRules"].pop("classifiedMobileRecording", None)
+
+    for table_name in ("tasks", "meetings"):
+        table = _table(raw, table_name)
+        table["fields"] = [
+            field for field in table["fields"]
+            if field["name"] != "planning_cycle_id"
+        ]
+
+    planning = _table(raw, "planning_cycles")
+    client_index = next(
+        index for index, field in enumerate(planning["fields"])
+        if field["name"] == "client_id"
+    )
+    planning["fields"].insert(client_index + 1, {
+        "name": "parent_plan_id",
+        "type": "TEXT",
+        "nullable": True,
+        "default": None,
+        "primary_key": False,
+        "reference": {
+            "kind": "foreign_key",
+            "target_table": "planning_cycles",
+            "target_field": "id",
+            "on_delete": "RESTRICT",
+            "source": "终审补充",
+        },
+    })
+    planning["command_invariants"] = []
+
+    decisions = _table(raw, "decision_actions")
+    source_index = next(
+        index for index, field in enumerate(decisions["fields"])
+        if field["name"] == "source_set_id"
+    )
+    decisions["fields"].insert(source_index + 1, {
+        "name": "task_id",
+        "type": "TEXT",
+        "nullable": True,
+        "default": None,
+        "primary_key": False,
+        "reference": {
+            "kind": "foreign_key",
+            "target_table": "tasks",
+            "target_field": "id",
+            "on_delete": "RESTRICT",
+            "source": "蓝图保留",
+        },
+    })
+    decisions["unique_constraints"] = [{
+        "name": "uq_decision_actions_01",
+        "fields": ["task_id"],
+        "where": "task_id IS NOT NULL",
+    }]
+    tombstone_index = next(
+        index for index, check in enumerate(decisions["check_constraints"])
+        if check["name"] == "ck_tombstone_time"
+    )
+    decisions["check_constraints"].insert(tombstone_index, {
+        "name": "ck_primary_task_unique_role",
+        "expression": "task_id IS NULL OR record_kind IN ('decision','plan_action')",
+    })
+    decisions["command_invariants"] = []
+
+    recordings = _table(raw, "recordings")
+    recordings["fields"] = [
+        field for field in recordings["fields"]
+        if field["name"] not in {
+            "binding_kind", "task_id", "client_id", "event_line_id"
+        }
+    ]
+    meeting_field = next(
+        field for field in recordings["fields"]
+        if field["name"] == "meeting_id"
+    )
+    meeting_field["nullable"] = False
+    recordings["check_constraints"] = [
+        check for check in recordings["check_constraints"]
+        if check["name"] not in {
+            "ck_recording_binding_kind", "ck_recording_binding_shape"
+        }
+    ]
+    recordings["command_invariants"] = []
+
+    digest = hashlib.sha256(
+        json.dumps(
+            raw,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    if digest != FROZEN_V8_MANIFEST_SHA256[role]:
+        raise RuntimeError("frozen v8 manifest reconstruction drifted")
+    return raw
 
 
 def _quote(identifier: str) -> str:
@@ -157,9 +283,9 @@ def migrate(source_path: Path, target_path: Path, role: Role) -> dict[str, Any]:
     target_path = target_path.resolve()
     if target_path.exists():
         raise RuntimeError(f"target already exists: {target_path}")
-    contract = LOCAL_CONTRACT if role == "local" else CLOUD_CONTRACT
-    if contract.contract_version != "8":
-        raise RuntimeError("active repository contract is not v8")
+    current_contract = LOCAL_CONTRACT if role == "local" else CLOUD_CONTRACT
+    manifest = frozen_v8_manifest(role)
+    manifest_hash = FROZEN_V8_MANIFEST_SHA256[role]
     source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
     source.row_factory = sqlite3.Row
     source.execute("PRAGMA query_only=ON")
@@ -170,22 +296,23 @@ def migrate(source_path: Path, target_path: Path, role: Role) -> dict[str, Any]:
         target.execute("PRAGMA foreign_keys=OFF")
         target.execute("PRAGMA journal_mode=WAL")
         target.execute("PRAGMA synchronous=FULL")
-        target.executescript(ddl_from_manifest(contract.raw))
+        target.executescript(ddl_from_manifest(manifest))
         target.execute("BEGIN IMMEDIATE")
-        source_counts = _copy_tables(source, target, contract.raw)
+        source_counts = _copy_tables(source, target, manifest)
         now = utc_now()
         build_id = new_id()
         migration_id = new_id()
         generation_id = str(source_identity["database_generation_id"])
-        ddl_hash = ddl_sha256(contract.raw)
+        ddl_hash = ddl_sha256(manifest)
         target.execute("UPDATE schema_versions SET status='superseded' WHERE status='active'")
         target.execute(
             "INSERT INTO schema_versions (id,engine,version,checksum,status,database_role,schema_family,"
             "manifest_hash,migration_set_hash,build_id,created_at,activated_at,authority_role,"
             "origin_instance_id,database_generation_id) VALUES (?,'sqlite',8,?,'active',?,?,?,?,?,?,?,?,?,?)",
             (
-                build_id, ddl_hash, contract.database_role, contract.schema_family,
-                contract.manifest_hash, ddl_hash, build_id, now, now, role,
+                build_id, ddl_hash, current_contract.database_role,
+                current_contract.schema_family, manifest_hash, ddl_hash,
+                build_id, now, now, role,
                 generation_id, generation_id,
             ),
         )
@@ -194,7 +321,7 @@ def migrate(source_path: Path, target_path: Path, role: Role) -> dict[str, Any]:
             "code_hash,started_at,completed_at,rollback_ref,origin_instance_id,created_at,integrity_hash,"
             "authority_role) VALUES (?,?,'agent_skill_foundation_v8',?,'applied','7','8',?,?,?,?,?,?,?,?)",
             (
-                migration_id, build_id, ddl_hash, contract.manifest_hash, now, now,
+                migration_id, build_id, ddl_hash, manifest_hash, now, now,
                 "restore reviewed v7 database backup", generation_id, now,
                 sha256_text(f"{migration_id}|7|8|{ddl_hash}|{now}"), role,
             ),
@@ -211,7 +338,9 @@ def migrate(source_path: Path, target_path: Path, role: Role) -> dict[str, Any]:
             raise RuntimeError(
                 f"target integrity failed quick_check={quick_check} foreign_keys={len(violations)}"
             )
-        if user_tables(target) != set(contract.allowed_tables):
+        if user_tables(target) != {
+            str(table["name"]) for table in manifest["allowedTables"]
+        }:
             raise RuntimeError("target table inventory differs from the v8 manifest")
         return {
             "role": role,

@@ -49,7 +49,11 @@ class SystemGovernanceRepository:
             "checksum": str(row["checksum"] or ""),
             "retentionUntil": row["retention_until"],
             "databaseVerified": bool(row["verified"]),
-            "wholeSystemVerified": str(row["manifest_status"] or "") == "verified",
+            # This recovery artifact contains only the strict cloud database.
+            # A verified recovery manifest proves the component backup, not
+            # object storage, deployment configuration, or the whole system.
+            "wholeSystemVerified": False,
+            "coverage": "cloud_database_only",
             "status": str(row["status"] or "created"),
             "createdAt": str(row["created_at"] or row["backup_created_at"] or ""),
             "verifiedAt": row["verified_at"],
@@ -231,7 +235,8 @@ class SystemGovernanceRepository:
                     "checksum": f"sha256:{checksum}",
                     "retentionUntil": retention_until,
                     "databaseVerified": True,
-                    "wholeSystemVerified": True,
+                    "wholeSystemVerified": False,
+                    "coverage": "cloud_database_only",
                     "status": "verified",
                     "createdAt": now,
                     "verifiedAt": now,

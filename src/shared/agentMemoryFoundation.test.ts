@@ -22,7 +22,7 @@ test('schema readiness covers every table bound by the Agent Memory adapter', ()
   assert.equal(inspectStrict88AgentMemorySchema(inventory.slice(1)).ready, false);
 });
 
-test('both frozen v8 manifests expose the reviewed Agent Memory foundation', () => {
+test('both current manifests expose the reviewed Agent Memory foundation', () => {
   for (const side of ['local', 'cloud']) {
     const manifest = JSON.parse(
       readFileSync(new URL(`../../contracts/strict-${side}-schema-manifest.v1.json`, import.meta.url), 'utf8'),
@@ -34,7 +34,7 @@ test('both frozen v8 manifests expose the reviewed Agent Memory foundation', () 
       name: table.name,
       fields: table.fields.map((field) => field.name),
     }));
-    assert.equal(manifest.contractVersion, '8');
+    assert.equal(manifest.contractVersion, '10');
     assert.equal(manifest.allowedTables.length, 88);
     assert.deepEqual(inspectStrict88AgentMemorySchema(inventory), {
       ready: true,

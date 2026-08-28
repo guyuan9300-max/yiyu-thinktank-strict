@@ -539,30 +539,30 @@ def test_feishu_executors_return_real_preflight_without_frozen_sql(
 ) -> None:
     repository, identity, _payload = _repository(tmp_path)
     platform = PlatformIntegrationsRepository(repository)
-    sync = platform.command(
-        identity,
-        resource_path="feishu-sync/documents",
-        authorization_scope="personal",
-        method="POST",
-        query={},
-        payload={"localId": "document-test"},
-        idempotency_key="platform-88-block-sync",
-    )
-    imported = platform.command(
-        identity,
-        resource_path="feishu-doc-import/search",
-        authorization_scope="personal",
-        method="POST",
-        query={},
-        payload={"query": "test"},
-        idempotency_key="platform-88-block-import",
-    )
-    assert sync["state"] == "blocked"
-    assert imported["state"] == "blocked"
-    assert sync["message"] == "尚未配置飞书应用"
-    assert imported["message"] == "尚未配置飞书应用"
+    with pytest.raises(RepositoryError) as reverse_sync:
+        platform.command(
+            identity,
+            resource_path="feishu-sync/documents",
+            authorization_scope="personal",
+            method="POST",
+            query={},
+            payload={"localId": "document-test"},
+            idempotency_key="platform-88-retired-sync",
+        )
+    assert reverse_sync.value.code == "feishu_document_reverse_projection_retired"
+    with pytest.raises(RepositoryError) as keyword_search:
+        platform.command(
+            identity,
+            resource_path="feishu-doc-import/search",
+            authorization_scope="personal",
+            method="POST",
+            query={},
+            payload={"query": "test"},
+            idempotency_key="platform-88-retired-search",
+        )
+    assert keyword_search.value.code == "feishu_import_action_invalid"
     with runtime_connection(repository.database_path, "cloud") as connection:
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT COUNT(*) FROM operation_attempts WHERE transport_state='blocked'"
-        ).fetchone()[0] == 2
+        ).fetchone()[0] == 0

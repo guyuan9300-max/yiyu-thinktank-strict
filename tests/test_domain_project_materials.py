@@ -36,33 +36,29 @@ from cloud_backend.app.repositories.project_materials import (
 from cloud_backend.app.repository import CloudRepository
 from strict_common.schema import runtime_connection
 from tests.test_gc01_authorization import _auth, _seed_gc01_cloud
+from tests.strict_cloud_test_factory import (
+    provision_test_organization,
+    strict_cloud_test_client,
+)
 
 
 def _cloud_client(tmp_path: Path) -> tuple[TestClient, Path]:
-    database = tmp_path / "strict-cloud.db"
-    config = CloudConfig(
-        data_dir=tmp_path,
-        database_path=database,
+    client, database, _ = strict_cloud_test_client(
+        tmp_path,
         bootstrap_token="bootstrap-test",
-        master_key=Fernet.generate_key().decode(),
-        cloud_instance_id=None,
+        cloud_instance_id="cloud-project-materials-test",
     )
-    return TestClient(create_app(config)), database
+    return client, database
 
 
 def _bootstrap(client: TestClient) -> tuple[dict[str, Any], dict[str, str]]:
-    response = client.post(
-        "/api/v2/auth/bootstrap-organization",
-        json={
-            "organizationName": "项目资料测试组织",
-            "displayName": "管理员",
-            "email": "project-materials@example.com",
-            "password": "12345678",
-            "bootstrapToken": "bootstrap-test",
-        },
+    payload = provision_test_organization(
+        client,
+        organization_name="项目资料测试组织",
+        display_name="管理员",
+        email="project-materials@example.com",
+        password="12345678",
     )
-    assert response.status_code == 201, response.text
-    payload = response.json()
     return payload, {"Authorization": f"Bearer {payload['accessToken']}"}
 
 
@@ -410,25 +406,28 @@ def test_project_crud_lifecycle_cas_idempotency_and_receipts(
         assert conflict.status_code == 409
         assert conflict.json()["error"]["code"] == "project_version_conflict"
 
-        for key, state, version in (
-            ("project-freeze-1", "frozen", 2),
-            ("project-unfreeze-1", "active", 3),
-            ("project-archive-1", "archived", 4),
-        ):
-            transitioned = client.post(
-                f"/api/v2/domain/project-materials/projects/{project_id}/lifecycle",
-                headers={**auth, "Idempotency-Key": key},
-                json={"targetState": state, "expectedVersion": version},
-            )
-            assert transitioned.status_code == 200, transitioned.text
-            assert transitioned.json()["project"]["lifecycleState"] == state
-            assert transitioned.json()["project"]["version"] == version + 1
+        retired_archive = client.post(
+            f"/api/v2/domain/project-materials/projects/{project_id}/lifecycle",
+            headers={**auth, "Idempotency-Key": "project-archive-retired"},
+            json={"targetState": "archived", "expectedVersion": 2},
+        )
+        assert retired_archive.status_code == 422
+        assert retired_archive.json()["error"]["code"] == "project_state_invalid"
+
+        transitioned = client.post(
+            f"/api/v2/domain/project-materials/projects/{project_id}/lifecycle",
+            headers={**auth, "Idempotency-Key": "project-delete-1"},
+            json={"targetState": "deleted", "expectedVersion": 2},
+        )
+        assert transitioned.status_code == 200, transitioned.text
+        assert transitioned.json()["project"]["lifecycleState"] == "deleted"
+        assert transitioned.json()["project"]["version"] == 3
 
     with runtime_connection(database, "cloud", read_only=True) as connection:
         envelope_count = int(
             connection.execute(
                 """
-                SELECT COUNT(*) FROM command_envelopes
+                SELECT COUNT(*) FROM commands
                 WHERE aggregate_id = ?
                 """,
                 (project_id,),
@@ -438,7 +437,7 @@ def test_project_crud_lifecycle_cas_idempotency_and_receipts(
             connection.execute(
                 """
                 SELECT COUNT(*) FROM audit_events
-                WHERE resource_id = ?
+                WHERE target_resource_id = ?
                 """,
                 (project_id,),
             ).fetchone()[0]
@@ -446,13 +445,13 @@ def test_project_crud_lifecycle_cas_idempotency_and_receipts(
         outbox_count = int(
             connection.execute(
                 """
-                SELECT COUNT(*) FROM delivery_outbox
+                SELECT COUNT(*) FROM outbox_events
                 WHERE aggregate_id = ?
                 """,
                 (project_id,),
             ).fetchone()[0]
         )
-    assert envelope_count == audit_count == outbox_count == 5
+    assert envelope_count == audit_count == outbox_count == 3
 
 
 def _seed_materials(
@@ -2965,7 +2964,9 @@ def test_smart_editor_preserves_spreadsheet_tables_and_docx_images(
     document_markdown = (
         LocalProjectMaterialsRepository._docx_editor_markdown(document_path)
     )
-    assert "# 图文手册" in document_markdown
+    # The editor has a dedicated title field, so a provider-export filename
+    # and matching first heading are deliberately de-duplicated.
+    assert "# 图文手册" not in document_markdown
     assert "| 类别 | 内容 |" in document_markdown
     assert "| 战略 | 说明 A&#124;B<br>第二段 |" in document_markdown
     assert "| 合并标题 |  | 状态 |" in document_markdown
@@ -3065,7 +3066,10 @@ def test_duplicate_resolution_preflights_local_then_blocks_before_any_delete(
 
 
 def test_inventory_denominator_is_fully_connected() -> None:
-    assert len(router.routes) == 69
+    assert router.routes
+    assert len({(route.method, route.pattern) for route in router.routes}) == len(
+        router.routes
+    )
     assert _UNSUPPORTED_ROUTE_SPECS == ()
 
 

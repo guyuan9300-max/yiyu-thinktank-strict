@@ -30,4 +30,8 @@ jobs:
           enable-cache: true
       - run: npm ci
       - run: uv sync --frozen --dev
-      - run: npm run verify:strict-sync
+      - name: Verify strict candidate
+        run: npm run verify:strict-sync
+      - name: Publish exact quarantine inventory
+        if: always()
+        run: uv run python scripts/report_test_quarantine.py >> "$GITHUB_STEP_SUMMARY"

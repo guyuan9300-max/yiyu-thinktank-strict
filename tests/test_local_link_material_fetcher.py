@@ -156,7 +156,7 @@ def test_bilibili_prefers_subtitles_and_cleans_temporary_media(
         "BV1ab411c7d9",
         data_root=tmp_path,
     )
-    assert result["title"] == "日慈项目访谈"
+    assert result["title"] == "日慈项目访谈-B站"
     assert result["text"] == "公开简介\n\n项目背景\n下一步行动"
     assert result["metadata"]["transcriptSource"] == "platform_subtitle"
     assert result["metadata"]["mediaCacheStatus"] == "cleaned"
@@ -223,7 +223,7 @@ def test_xiaohongshu_public_text_note_does_not_require_video(
     result = fetcher.fetch_link_material(
         "https://www.xiaohongshu.com/explore/example123"
     )
-    assert result["title"] == "WorkBuddy AI工作台"
+    assert result["title"] == "WorkBuddy AI工作台-小红书"
     assert "提高日常效率" in result["text"]
     assert result["metadata"]["transcriptSource"] == "note_description"
 
