@@ -3231,6 +3231,14 @@ def growth_compatibility_view(
         for item in badge_models:
             badge_key = str(item.get("badgeKey") or "growth")
             earned = str(item.get("state") or "locked") == "earned"
+            score_value = int(float(item.get("score") or 0))
+            target_value = max(1, int(float(item.get("minimum") or 1)))
+            remaining_value = max(0, target_value - score_value)
+            ability_label = str(
+                item.get("categoryLabel")
+                or item.get("label")
+                or "对应能力"
+            )
             categories.append(
                 {
                     "id": f"category:{badge_key}",
@@ -3249,24 +3257,32 @@ def growth_compatibility_view(
                             "abilityKey": str(item.get("abilityKey") or badge_key),
                             "abilityLabel": str(item.get("label") or badge_key),
                             "roles": [],
-                            "xp": int(float(item.get("score") or 0)),
+                            "xp": score_value,
                             "iconMotif": "evidence",
                             "description": str(item.get("description") or "成长能力里程碑"),
                             "whyItMatters": "让同一能力方向的进步阶段清晰可见",
-                            "systemHowText": "growth_evidence confirmed count",
+                            "systemHowText": "",
                             "state": "lit" if earned else "locked",
-                            "progressValue": int(float(item.get("score") or 0)),
-                            "progressTarget": int(float(item.get("minimum") or 1)),
+                            "progressValue": score_value,
+                            "progressTarget": target_value,
                             "progressPercent": int(item.get("progressPercent") or (100 if earned else 0)),
                             "progressText": (
-                                f"{int(float(item.get('score') or 0))}/"
-                                f"{int(float(item.get('minimum') or 1))} XP"
+                                f"{score_value}/{target_value} 成长值"
                             ),
-                            "nextActionText": "继续积累真实成长经验",
+                            "nextActionText": (
+                                f"继续在真实工作中积累“{ability_label}”方向的成长事实"
+                            ),
                             "actionLinks": [],
                             "evidence": [],
                             "linkedContexts": [],
-                            "missingSignals": [] if earned else ["confirmed_evidence"],
+                            "missingSignals": (
+                                []
+                                if earned
+                                else [
+                                    f"距点亮还需 {remaining_value} 点成长值",
+                                    f"还需积累“{ability_label}”方向的真实成长事实",
+                                ]
+                            ),
                             "unlockedAt": generated_at if earned else None,
                             "masteryLevel": int(item.get("evidenceCount") or 0),
                             "historical": False,

@@ -665,13 +665,6 @@ function BadgeModal({ badge, onClose }: { badge: BadgeProgress; onClose: () => v
           )}
         </div>
 
-        {badge.systemHowText && (
-          <div style={{ marginTop: 16 }}>
-            <div className="gc-modal-subtitle">系统如何识别</div>
-            <p style={{ fontSize: 12, lineHeight: 1.7, color: '#64748b' }}>{badge.systemHowText}</p>
-          </div>
-        )}
-
         {/* Progress bar */}
         <div style={{ marginTop: 16, borderRadius: 18, background: '#f8fafc', padding: 16 }}>
           <div className="gc-modal-subtitle">当前进度</div>

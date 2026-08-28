@@ -576,6 +576,18 @@ def test_growth_companion_derives_current_week_task_and_supports_member_exclusio
         for badge in category["badges"]
         if badge["state"] == "lit"
     ] == ["开始推进"]
+    locked_badge = next(
+        badge
+        for category in badges["categories"]
+        for badge in category["badges"]
+        if badge["state"] == "locked"
+    )
+    assert locked_badge["missingSignals"]
+    assert all(
+        any("\u4e00" <= character <= "\u9fff" for character in signal)
+        for signal in locked_badge["missingSignals"]
+    )
+    assert not locked_badge["systemHowText"]
     excluded = update_growth_evidence(
         repository,
         identity,
