@@ -333,6 +333,7 @@ import {
   isTaskOnPersonalSurface,
   type TaskAggregationMode,
 } from '../shared/taskAggregation';
+import { shouldLoadTaskContextBrief } from '../shared/taskContextBriefPolicy';
 import {
   parseWorkspaceThreadPreference,
   pickWorkspaceCurrentThreadId,
@@ -19125,12 +19126,12 @@ export default function App() {
 
     const loadTaskContextBriefForTask = async (task: Task) => {
       const cachedBrief = taskContextBriefs[task.id];
-      if (
-        isLocalDraftTaskId(task.id)
-        || task.scopeMode === 'PERSONAL_ONLY'
-        || (!task.eventLineId && !task.clientId)
-        || (cachedBrief && !cachedBrief.qualityFlags.includes('preview_only'))
-      ) return;
+      if (!shouldLoadTaskContextBrief({
+        isLocalDraft: isLocalDraftTaskId(task.id),
+        scopeMode: task.scopeMode,
+        eventLineId: task.eventLineId,
+        clientId: task.clientId,
+      }, cachedBrief?.qualityFlags)) return;
       markContextBriefLoading([task.id], true);
       try {
         const brief = await getTaskContextBrief(task.id);
@@ -33866,6 +33867,15 @@ export default function App() {
                     >
                       {isFilesTabSearching ? '搜索中' : 'AI 搜'}
                     </Button>
+	                  <Button
+	                    className="h-9 shrink-0 rounded-[14px] px-3 border border-[#E5E5EA] bg-white text-slate-600 shadow-none hover:bg-slate-50"
+	                    onClick={() => void handlePreviewDocumentAutoRepair()}
+	                    disabled={!currentClientId || isDocumentAutoRepairLoading || isDocumentAutoRepairApplying}
+	                    title="检查并整理当前项目资料"
+	                  >
+	                    <Wand2 size={14} />
+	                    整理资料
+	                  </Button>
 	                  </div>
 	                  {searchActive && (
                     <div className="mb-3 space-y-2.5">

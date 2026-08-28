@@ -136,7 +136,7 @@ export function TaskMediaPanel({
                   type="button"
                   onClick={() => onOpenAttachment(recording)}
                   disabled={disabled || recording.pending || !recording.path}
-                  title="播放录音"
+                  title={recording.pending ? '将随任务一并保存' : '播放录音'}
                   className="min-w-0 flex-1 truncate text-left hover:text-blue-700 disabled:text-slate-400"
                 >
                   {recording.title || fileName(recording.path, '文件不存在')}

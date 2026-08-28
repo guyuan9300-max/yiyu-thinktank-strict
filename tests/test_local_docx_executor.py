@@ -14,6 +14,63 @@ from backend.app.project_materials_local import (
 )
 from backend.app.runtime import LocalRuntimeError, WorkspaceRuntime
 from backend.app.secret_store import MemorySecretStore
+from strict_common.ids import utc_now
+
+
+def _seed_runtime_scope(runtime: WorkspaceRuntime) -> str:
+    now = utc_now()
+    sandbox_id = "sandbox-docx-test"
+    with runtime._connection() as connection:
+        connection.execute(
+            "INSERT INTO organizations (id,lifecycle_state,version,updated_at,"
+            "record_kind,name,created_at,deleted_at,projection_state,projected_at) "
+            "VALUES ('organization-docx','active',1,?,'organization',"
+            "'文档测试组织',?,NULL,'current',?)",
+            (now, now, now),
+        )
+        connection.execute(
+            "INSERT INTO principals (id,status,identity_version,updated_at,"
+            "principal_kind,display_name,version,lifecycle_state,created_at,"
+            "deleted_at,projection_state,projected_at) VALUES ("
+            "'principal-docx','active',1,?,'person','文档测试成员',1,"
+            "'active',?,NULL,'current',?)",
+            (now, now, now),
+        )
+        connection.execute(
+            "INSERT INTO authorization_scopes (id,scope_kind,organization_id,"
+            "policy_version,created_at,updated_at,status,version,lifecycle_state,"
+            "deleted_at,projection_state,projected_at) VALUES ('scope-docx',"
+            "'organization','organization-docx',1,?,?,'active',1,'active',NULL,"
+            "'current',?)",
+            (now, now, now),
+        )
+        connection.execute(
+            "INSERT INTO organization_memberships (id,scope_id,principal_id,"
+            "role_key,status,version,record_kind,visibility_scope,lifecycle_state,"
+            "created_at,updated_at,deleted_at,projection_state,projected_at) "
+            "VALUES ('membership-docx','scope-docx','principal-docx','admin',"
+            "'active',1,'membership','organization','active',?,?,NULL,'current',?)",
+            (now, now, now),
+        )
+        connection.execute(
+            "INSERT INTO sandboxes (id,scope_id,principal_id,membership_id,"
+            "record_kind,cloud_instance_id,database_generation_id,sandbox_kind,"
+            "display_name,runtime_status,manifest_hash,version,lifecycle_state,"
+            "created_at,updated_at,deleted_at,authority_role,origin_instance_id) "
+            "VALUES (?,'scope-docx','principal-docx','membership-docx','sandbox',"
+            "'cloud-docx',?,'organization','文档测试工作空间','ready',?,1,"
+            "'active',?,?,NULL,'local',?)",
+            (
+                sandbox_id,
+                runtime.identity.database_generation_id,
+                runtime.identity.manifest_hash,
+                now,
+                now,
+                runtime.identity.database_generation_id,
+            ),
+        )
+        connection.commit()
+    return sandbox_id
 
 
 def _store(
@@ -23,7 +80,7 @@ def _store(
         tmp_path / "local" / "strict-local.db",
         MemorySecretStore(),
     )
-    sandbox_id = runtime.current()["sandbox"]["sandboxId"]
+    sandbox_id = _seed_runtime_scope(runtime)
     runtime._current_context = lambda require_ready=True: SimpleNamespace(  # type: ignore[method-assign]
         sandbox_id=sandbox_id,
         membership_id="member-docx-test",
@@ -345,7 +402,9 @@ def test_docx_editor_roundtrip_preserves_package_cas_and_idempotency(
     assert saved["mediaType"] == store.DOCX_MEDIA_TYPE
     assert saved["fileName"] == "日慈项目资料.docx"
     assert Path(saved["path"]).name.endswith("-日慈项目资料.docx")
-    assert not managed_path.exists()
+    # Editing an imported source creates a managed successor; the user's
+    # original file remains untouched at its original path.
+    assert managed_path.exists()
     assert hashlib.sha256(source.read_bytes()).hexdigest() == original_source_hash
 
     managed_path = Path(saved["path"])
@@ -424,7 +483,7 @@ def test_docx_editor_roundtrip_preserves_package_cas_and_idempotency(
 def test_docx_editor_rejects_corrupt_managed_source_without_overwrite(
     tmp_path: Path,
 ) -> None:
-    _, store, _ = _store(tmp_path)
+    _, store, sandbox_id = _store(tmp_path)
     broken = tmp_path / "broken-source.docx"
     broken.write_bytes(b"not-a-docx")
     material = store.import_paths(
@@ -457,5 +516,6 @@ def test_docx_editor_rejects_corrupt_managed_source_without_overwrite(
     assert invalid.value.code == "local_document_format_invalid"
     assert path.read_bytes() == before
     assert store.runtime.local_storage_object_get(
+        sandbox_id=sandbox_id,
         object_id=entry["localSourceId"]
     )["version"] == row["version"]

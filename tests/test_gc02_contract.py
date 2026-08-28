@@ -946,6 +946,8 @@ def test_gc02_local_client_and_viewer_projection_survive_refresh_and_restart(
             return {"projects": [dict(project)]}
         if path.endswith("/projects/client_gc02_projection"):
             return {"project": dict(project)}
+        if path == "/api/v2/gc06/meetings":
+            return []
         raise AssertionError(path)
 
     runtime.cloud_query = cloud_query  # type: ignore[method-assign]

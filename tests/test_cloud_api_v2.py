@@ -11,34 +11,30 @@ from cloud_backend.app.config import CloudConfig
 from cloud_backend.app.main import create_app
 from strict_common.schema import runtime_connection
 from strict_common.security import LEGACY_PASSWORD_SCHEME, PASSWORD_SCHEME
+from tests.strict_cloud_test_factory import (
+    provision_test_organization,
+    strict_cloud_test_client,
+)
 
 
 def cloud_client(tmp_path: Path) -> tuple[TestClient, Path]:
-    database = tmp_path / "strict-cloud.db"
-    config = CloudConfig(
-        data_dir=tmp_path,
-        database_path=database,
+    client, database, _ = strict_cloud_test_client(
+        tmp_path,
         bootstrap_token="bootstrap-test",
-        master_key=Fernet.generate_key().decode(),
-        cloud_instance_id=None,
+        cloud_instance_id="cloud-api-v2-test",
     )
-    return TestClient(create_app(config)), database
+    return client, database
 
 
 def bootstrap(client: TestClient) -> dict:
-    response = client.post(
-        "/api/v2/auth/bootstrap-organization",
-        json={
-            "organizationName": "严格测试组织",
-            "displayName": "管理员",
-            "email": "admin@example.com",
-            "phone": "13800138000",
-            "password": "12345678",
-            "bootstrapToken": "bootstrap-test",
-        },
+    return provision_test_organization(
+        client,
+        organization_name="严格测试组织",
+        display_name="管理员",
+        email="admin@example.com",
+        phone="13800138000",
+        password="12345678",
     )
-    assert response.status_code == 201, response.text
-    return response.json()
 
 
 def test_identity_organization_permissions_and_ai(tmp_path: Path) -> None:

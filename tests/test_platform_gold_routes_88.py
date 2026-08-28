@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.config import LocalConfig
@@ -19,6 +20,7 @@ from cloud_backend.app.repositories.platform_integrations import (
 from cloud_backend.app.repositories.platform_runtime_diagnostics import (
     PlatformRuntimeDiagnosticsRepository,
 )
+from cloud_backend.app.repository import RepositoryError
 from strict_common.schema import runtime_connection
 from tests.test_gc14_workbench_answer import _repository
 
@@ -143,7 +145,7 @@ def test_feishu_task_and_document_sync_execute_and_settle_in_88_tables(
         assert "正文只在执行请求中短暂使用".encode() not in repository.database_path.read_bytes()
 
 
-def test_feishu_document_search_uses_member_oauth_and_records_safe_receipt(
+def test_feishu_document_search_is_retired_in_favor_of_one_time_link_import(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -161,20 +163,18 @@ def test_feishu_document_search_uses_member_oauth_and_records_safe_receipt(
             }
         },
     )
-    result = platform.request_feishu_import(
-        identity,
-        action="search",
-        payload={"query": "项目资料", "pageSize": 10},
-        idempotency_key="gold-feishu-search",
-    )
-    assert result["state"] == "ready"
-    assert result["items"][0]["token"] == "doc_gold"
+    with pytest.raises(RepositoryError) as retired:
+        platform.request_feishu_import(
+            identity,
+            action="search",
+            payload={"query": "项目资料", "pageSize": 10},
+            idempotency_key="gold-feishu-search-retired",
+        )
+    assert retired.value.code == "feishu_import_action_invalid"
     with runtime_connection(repository.database_path, "cloud") as connection:
-        receipt = connection.execute(
-            "SELECT m.receipt FROM commands c JOIN object_manifests m "
-            "ON m.id=c.payload_object_manifest_id WHERE c.command_type='feishu.import.search'"
-        ).fetchone()[0]
-        assert "项目资料" not in str(receipt)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM commands WHERE command_type='feishu.import.search'"
+        ).fetchone()[0] == 0
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

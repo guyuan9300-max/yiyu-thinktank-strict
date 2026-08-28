@@ -655,7 +655,7 @@ def test_gc01_restart_relogin_and_logout_use_the_recorded_secret_reference(
     }
 
 
-def test_gc01_archived_sandboxes_are_not_switchable_workspaces(
+def test_gc01_archived_sandboxes_remain_available_for_workspace_switching(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "strict-local.db"
@@ -687,7 +687,9 @@ def test_gc01_archived_sandboxes_are_not_switchable_workspaces(
             (sandbox_id,),
         )
         connection.commit()
-    assert runtime.list_workspaces() == []
+    archived = runtime.list_workspaces()
+    assert [item["sandboxId"] for item in archived] == [sandbox_id]
+    assert archived[0]["isActive"] is False
 
 
 def test_gc01_restart_refreshes_expired_access_without_fixed_secret_name(
@@ -716,7 +718,9 @@ def test_gc01_restart_refreshes_expired_access_without_fixed_secret_name(
     restored = restarted.restore_at_startup()
     assert restored["runtimeStatus"] == "ready"
     assert len(cloud.refresh_keys) == 1
-    assert cloud.current_session_count == 2
+    # Startup validates once, reloads under the refresh lock to avoid a
+    # concurrent double refresh, then validates the rotated access token.
+    assert cloud.current_session_count == 3
     with runtime_connection(database, "local") as connection:
         session = connection.execute(
             "SELECT secret_reference FROM sandboxes WHERE id=?",

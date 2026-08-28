@@ -71,13 +71,16 @@ test('all frozen user-facing entry points remain present', () => {
     '客户档案', '判断 & 思考',
     '品牌监测', '时效情报',
     '经验墙', '能力成长', '徽章与排行',
-    '账户', '组织与权限', 'AI 与云端', '飞书自建应用 · 身份绑定',
+    '账户', '组织与权限', 'AI 与云端', 'FEISHU · 飞书集成',
     '音频转文字', '后台深度解析', '音频与附件托管',
     '成长手册', '系统日志', '关于本软件', '反馈与建议',
     '登录组织', '加入组织', '创建组织', '工作空间',
   ];
   const missing = required.filter((label) => !source.includes(label));
   assert.deepEqual(missing, [], `missing frontend entries: ${missing.join('、')}`);
+  assert.ok(appSource.includes('<FeishuOrgIntegrationPanel'));
+  assert.ok(apiSource.includes("'/api/v2/ui/org-integrations/feishu'"));
+  assert.ok(apiSource.includes("'/api/v2/ui/me/feishu-authorization'"));
 });
 
 test('renderer only calls v2 and never calls legacy endpoints', () => {
@@ -202,10 +205,7 @@ test('member task pages skip administrator diagnostics and optimistic draft fetc
     appSource,
     /\.filter\(\(task\) => \(\s*!isLocalDraftTaskId\(task\.id\)[\s\S]{0,160}task\.scopeMode !== 'PERSONAL_ONLY'/,
   );
-  assert.match(
-    appSource,
-    /if \(\s*isLocalDraftTaskId\(task\.id\)[\s\S]{0,180}taskContextBriefs\[task\.id\]\s*\) return;/,
-  );
+  assert.ok(appSource.includes('shouldLoadTaskContextBrief({'));
   assert.match(
     appSource,
     /!isCollapsing && !isLocalDraftTaskId\(taskId\) && !taskSmartBriefs\[taskId\]/,
@@ -288,7 +288,7 @@ test('workbench exposes project knowledge source counts and material boundary', 
   assert.ok(appSource.includes('组织云只返回已发布摘要和关系，不下载源文件正文'));
   assert.ok(appSource.includes('本机私有资料不会上传组织云'));
   assert.equal(appSource.includes('整理资料 · 从本机正文生成并发布组织共享摘要'), false);
-  assert.match(appSource, /onClick:\s*\(\) => void handlePreviewDocumentAutoRepair\(\)/);
+  assert.match(appSource, /onClick=\{\(\) => void handlePreviewDocumentAutoRepair\(\)\}/);
   assert.ok(appSource.includes('源文件和正文始终留在本机，只向当前组织发布摘要与来源校验信息'));
   assert.ok(uiCompatSource.includes('"knowledgeContext": knowledge_context'));
 });

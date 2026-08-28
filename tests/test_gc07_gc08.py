@@ -491,6 +491,8 @@ def test_gc12_official_fact_review_versions_intelligence_and_propagates(
                 "text": "GC12负责人是林佳维。",
                 "contentHash": "7" * 64,
                 "capturedAt": now,
+                "pageRole": "institutional_profile",
+                "captureKind": "static",
             }
         ],
         fact_candidates=[
@@ -502,6 +504,8 @@ def test_gc12_official_fact_review_versions_intelligence_and_propagates(
                 "evidence": "GC12负责人是林佳维。",
                 "sourceUrl": "https://example.org/gc12",
                 "sourceTitle": "GC12官网事实",
+                "subjectKind": "project",
+                "factKind": "person_profile",
                 "confidence": 0.97,
             }
         ],

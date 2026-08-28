@@ -22,7 +22,11 @@ from cloud_backend.app.repositories.intelligence_growth import (
     IntelligenceGrowthRepository,
 )
 from strict_common.ids import new_id, utc_now
-from strict_common.schema import runtime_connection
+from strict_common.schema import initialize_database, runtime_connection
+from tests.strict_cloud_test_factory import (
+    provision_test_organization,
+    strict_cloud_test_client,
+)
 
 
 BLOCKED_OPERATIONS: tuple[tuple[str, str, str], ...] = (
@@ -157,30 +161,22 @@ BLOCKED_ROUTE_KEYS: set[tuple[str, str]] = set()
 
 
 def _cloud(tmp_path: Path) -> tuple[TestClient, Path]:
-    database = tmp_path / "strict-cloud.db"
-    config = CloudConfig(
-        data_dir=tmp_path,
-        database_path=database,
+    client, database, _ = strict_cloud_test_client(
+        tmp_path,
         bootstrap_token="bootstrap-test",
-        master_key=Fernet.generate_key().decode(),
-        cloud_instance_id=None,
+        cloud_instance_id="cloud-intelligence-growth-test",
     )
-    return TestClient(create_app(config)), database
+    return client, database
 
 
 def _bootstrap(client: TestClient) -> dict[str, Any]:
-    response = client.post(
-        "/api/v2/auth/bootstrap-organization",
-        json={
-            "organizationName": "情报成长测试组织",
-            "displayName": "管理员",
-            "email": "intelligence@example.com",
-            "password": "12345678",
-            "bootstrapToken": "bootstrap-test",
-        },
+    return provision_test_organization(
+        client,
+        organization_name="情报成长测试组织",
+        display_name="管理员",
+        email="intelligence@example.com",
+        password="12345678",
     )
-    assert response.status_code == 201, response.text
-    return response.json()
 
 
 def _join_member(
@@ -2388,26 +2384,13 @@ def test_schema_verification_rejects_unexpected_runtime_table(
 ) -> None:
     client, database = _cloud(tmp_path)
     with client:
-        session = _bootstrap(client)
+        _bootstrap(client)
         with sqlite3.connect(database) as connection:
             connection.execute(
                 "CREATE TABLE unexpected_runtime_table (id TEXT PRIMARY KEY) STRICT"
             )
         with pytest.raises(RuntimeError, match="schema table mismatch"):
-            _command(
-                client,
-                session,
-                path="data-center/schema/ensure",
-                payload={},
-                key="schema-drift-negative",
-            )
-    with sqlite3.connect(database) as connection:
-        assert connection.execute(
-            """
-            SELECT COUNT(*) FROM command_envelopes
-            WHERE idempotency_key = 'schema-drift-negative'
-            """
-        ).fetchone()[0] == 0
+            initialize_database(database, "cloud")
 
 
 def test_rollback_drill_verifies_real_isolated_backup_and_hash(

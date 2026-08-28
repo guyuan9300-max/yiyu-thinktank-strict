@@ -27,6 +27,10 @@ from cloud_backend.app.repositories import (
     platform_integrations as cloud_platform_integrations,
 )
 from strict_common.schema import runtime_connection
+from tests.strict_cloud_test_factory import (
+    provision_test_organization,
+    strict_cloud_test_client,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -39,36 +43,22 @@ def _stub_feishu_oauth_relay_registration(monkeypatch):
 
 
 def _cloud(tmp_path: Path) -> tuple[TestClient, Path]:
-    database = tmp_path / "strict-cloud.db"
-    return (
-        TestClient(
-            create_cloud_app(
-                CloudConfig(
-                    data_dir=tmp_path,
-                    database_path=database,
-                    bootstrap_token="platform-bootstrap",
-                    master_key=Fernet.generate_key().decode(),
-                    cloud_instance_id=None,
-                )
-            )
-        ),
-        database,
+    client, database, _ = strict_cloud_test_client(
+        tmp_path,
+        bootstrap_token="platform-bootstrap",
+        cloud_instance_id="cloud-platform-integrations-test",
     )
+    return client, database
 
 
 def _bootstrap(client: TestClient) -> dict[str, Any]:
-    response = client.post(
-        "/api/v2/auth/bootstrap-organization",
-        json={
-            "organizationName": "平台能力测试组织",
-            "displayName": "平台管理员",
-            "email": "platform-admin@example.com",
-            "password": "12345678",
-            "bootstrapToken": "platform-bootstrap",
-        },
+    return provision_test_organization(
+        client,
+        organization_name="平台能力测试组织",
+        display_name="平台管理员",
+        email="platform-admin@example.com",
+        password="12345678",
     )
-    assert response.status_code == 201, response.text
-    return response.json()
 
 
 def _member(
@@ -1216,12 +1206,16 @@ def test_personal_feishu_scope_is_separate_and_profiles_are_audited(
     )
     assert started.json()["result"]["authorizationScope"] == "personal"
     assert import_status.status_code == 200, import_status.text
-    assert import_status.json()["resource"]["ready"] is False
-    assert import_status.json()["resource"]["linked"] is False
-    assert import_status.json()["resource"]["state"] == "blocked"
+    # One-time link import uses the configured organization application.  It
+    # remains available while this member's separate notification/OAuth
+    # authorization is still pending.
+    assert import_status.json()["resource"]["ready"] is True
+    assert import_status.json()["resource"]["linked"] is True
+    assert import_status.json()["resource"]["state"] == "ready"
+    assert import_status.json()["resource"]["blockerType"] is None
     assert (
-        import_status.json()["resource"]["blockerType"]
-        == "member_authorization_required"
+        import_status.json()["resource"]["accessMode"]
+        == "organization_application_one_time_copy"
     )
     assert delivery.status_code == 200, delivery.text
     assert delivery.json()["result"]["authorizationScope"] == "personal"
@@ -1237,42 +1231,38 @@ def test_personal_feishu_scope_is_separate_and_profiles_are_audited(
         assert connection.execute(
             """
             SELECT COUNT(*)
-            FROM external_provider_resources r
-            JOIN authorization_scopes s ON s.scope_id = r.scope_id
-            WHERE s.scope_kind = 'personal'
+            FROM provider_resources r
+            WHERE r.owner_kind = 'membership'
               AND r.resource_kind IN (
-                'member_authorization',
-                'member_delivery_profile'
+                'feishu_member_oauth_authorization',
+                'feishu_member_delivery_profile'
               )
             """
         ).fetchone()[0] == 2
         assert connection.execute(
             """
             SELECT COUNT(*)
-            FROM scoped_configuration_records r
-            JOIN authorization_scopes s ON s.scope_id = r.scope_id
-            WHERE r.configuration_kind = ?
-              AND s.scope_kind = 'organization'
+            FROM provider_resources r
+            WHERE r.resource_kind = ?
+              AND r.owner_kind = 'organization'
             """,
             (cloud_platform_integrations.FEISHU_CONFIGURATION_KIND,),
         ).fetchone()[0] == 1
         assert connection.execute(
             """
             SELECT COUNT(*)
-            FROM scoped_configuration_records r
-            JOIN authorization_scopes s ON s.scope_id = r.scope_id
-            WHERE r.configuration_kind = ?
-              AND s.scope_kind = 'personal'
+            FROM provider_resources r
+            WHERE r.resource_kind = ?
+              AND r.owner_kind = 'membership'
             """,
             (cloud_platform_integrations.FEISHU_CONFIGURATION_KIND,),
         ).fetchone()[0] == 0
         assert connection.execute(
             """
             SELECT COUNT(*)
-            FROM scoped_configuration_records r
-            JOIN authorization_scopes s ON s.scope_id = r.scope_id
-            WHERE r.configuration_kind = ?
-              AND s.scope_kind = 'personal'
+            FROM provider_resources r
+            WHERE r.resource_kind = ?
+              AND r.owner_kind = 'membership'
             """,
             (
                 cloud_platform_integrations
@@ -1283,8 +1273,11 @@ def test_personal_feishu_scope_is_separate_and_profiles_are_audited(
             """
             SELECT COUNT(*)
             FROM operation_attempts a
-            JOIN authorization_scopes s ON s.scope_id = a.scope_id
-            WHERE s.scope_kind = 'personal'
+            JOIN commands c ON c.id = a.command_id
+            WHERE c.command_type IN (
+                'feishu.personal_authorization.start',
+                'feishu.personal_delivery_profile.verify'
+            )
             """
         ).fetchone()[0] == 2
 
@@ -2328,7 +2321,7 @@ def test_feishu_docx_crash_window_reuses_active_lease_then_reclaims_expired(
     assert b"DOCX_CRASH_WINDOW_BODY_5019" not in database.read_bytes()
 
 
-def test_feishu_refresh_serializes_concurrent_stale_token_cas(
+def test_retired_feishu_keyword_search_does_not_refresh_personal_tokens(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -2382,9 +2375,12 @@ def test_feishu_refresh_serializes_concurrent_stale_token_cas(
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(search, (1, 2)))
 
-    assert all(response.status_code == 200 for response in results)
-    assert all(response.json()["result"]["state"] == "ready" for response in results)
-    assert sum(call.get("kind") == "refresh" for call in calls) == 1
+    assert all(response.status_code == 410 for response in results)
+    assert all(
+        response.json()["error"]["code"] == "feishu_import_action_invalid"
+        for response in results
+    )
+    assert sum(call.get("kind") == "refresh" for call in calls) == 0
     persisted = database.read_bytes()
     assert b"concurrent-access-1" not in persisted
     assert b"refresh-cas-code" not in persisted
