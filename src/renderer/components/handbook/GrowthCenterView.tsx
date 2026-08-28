@@ -635,6 +635,16 @@ function BadgeCell({ badge, onSelect }: { badge: BadgeProgress; onSelect: (badge
    ──────────────────────────────────────────────────────────────────── */
 function BadgeModal({ badge, onClose }: { badge: BadgeProgress; onClose: () => void }) {
   const pal = badgePalette(badge.state);
+  const remainingValue = Math.max(0, badge.progressTarget - badge.progressValue);
+  const localizedMissingSignals = badge.missingSignals.filter((signal) => /[\u4e00-\u9fff]/.test(signal));
+  const missingHints = badgeIsLit(badge)
+    ? []
+    : Array.from(new Set([
+        ...(remainingValue > 0 ? [`距点亮还需 ${remainingValue} 点成长值`] : []),
+        ...localizedMissingSignals,
+        `还需积累“${badge.categoryLabel || badge.abilityLabel}”方向的真实成长事实`,
+      ]));
+  const progressText = `${badge.progressValue}/${badge.progressTarget} 成长值`;
   return (
     <div className="gc-modal-overlay" onClick={onClose}>
       <div className="gc-modal" onClick={(e) => e.stopPropagation()}>
@@ -669,7 +679,7 @@ function BadgeModal({ badge, onClose }: { badge: BadgeProgress; onClose: () => v
         <div style={{ marginTop: 16, borderRadius: 18, background: '#f8fafc', padding: 16 }}>
           <div className="gc-modal-subtitle">当前进度</div>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-            <span style={{ fontSize: 12, fontWeight: 600, color: '#334155' }}>{badge.progressText}</span>
+            <span style={{ fontSize: 12, fontWeight: 600, color: '#334155' }}>{progressText}</span>
             <span style={{ fontSize: 14, fontWeight: 600, color: '#335CFE' }}>{badge.progressPercent}%</span>
           </div>
           <div style={{ height: 8, borderRadius: 999, background: '#fff', overflow: 'hidden' }}>
@@ -684,11 +694,11 @@ function BadgeModal({ badge, onClose }: { badge: BadgeProgress; onClose: () => v
           <p style={{ marginTop: 12, fontSize: 11, fontWeight: 500, color: '#94a3b8' }}>获得时间：{formatRelativeMoment(badge.unlockedAt)}</p>
         )}
 
-        {badge.missingSignals.length > 0 && (
+        {missingHints.length > 0 && (
           <div style={{ marginTop: 16 }}>
             <p style={{ fontSize: 11, fontWeight: 600, letterSpacing: 1.2, color: '#94a3b8', marginBottom: 8 }}>还差什么</p>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {badge.missingSignals.map((signal) => (
+              {missingHints.map((signal) => (
                 <span key={signal} style={{ borderRadius: 999, border: '1px solid #e2e8f0', background: '#f8fafc', padding: '4px 10px', fontSize: 10, fontWeight: 500, color: '#64748b' }}>
                   {signal}
                 </span>
