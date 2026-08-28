@@ -566,14 +566,16 @@ def test_growth_companion_derives_current_week_task_and_supports_member_exclusio
         identity,
         view="badges",
     )
-    assert badges["overview"]["totalBadges"] == 4
+    assert badges["overview"]["totalBadges"] == 24
     assert badges["overview"]["litBadges"] == 1
+    assert len(badges["categories"]) == 6
+    assert all(category["totalCount"] == 4 for category in badges["categories"])
     assert [
-        badge["state"]
+        badge["name"]
         for category in badges["categories"]
         for badge in category["badges"]
-        if category["litCount"]
-    ] == ["lit"]
+        if badge["state"] == "lit"
+    ] == ["开始推进"]
     excluded = update_growth_evidence(
         repository,
         identity,

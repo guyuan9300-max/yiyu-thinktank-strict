@@ -1968,39 +1968,6 @@ function BadgesAndRankTab({ overview, uiSessionScopeKey }: { overview: GrowthOve
         )}
       </div>
 
-      {/* Personal rank */}
-      <div>
-        <div className="gc-rank-header">
-          <div className="gc-rank-header-left">
-            <Trophy size={16} color="#f59e0b" />
-            <div className="gc-section-title" style={{ marginBottom: 0 }}>我的成长段位</div>
-          </div>
-        </div>
-        <div className="gc-card gc-rank-list">
-          <div className="gc-rank-row">
-            <div className="gc-icon-token md brand">
-              <Users size={14} color="#335CFE" />
-            </div>
-            <div style={{ minWidth: 0, flex: 1 }}>
-              <div className="gc-rank-name-text">{overview?.userName || '当前用户'} · {rank?.fullLabel || '成长段位'}</div>
-              <div className="gc-rank-meta">
-                {rank?.nextName ? `下一段位：${rank.nextName}，还需 ${rank.xpToNext} XP` : '已达当前最高段位'}
-              </div>
-            </div>
-            <div className="gc-rank-xp">{totalXp.toLocaleString()} XP</div>
-          </div>
-          <div className="gc-rank-bar">
-            <div className="gc-rank-bar-fill" style={{ width: `${rankProgressPercent}%` }} />
-          </div>
-          {weeklyXp > 0 && (
-            <div className="gc-rank-week">
-              <span>本周新增成长值</span>
-              <span>+{weeklyXp} XP</span>
-            </div>
-          )}
-        </div>
-      </div>
-
       {selectedBadge && <BadgeModal badge={selectedBadge} onClose={() => setSelectedBadge(null)} />}
     </div>
   );

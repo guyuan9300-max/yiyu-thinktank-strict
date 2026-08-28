@@ -51,6 +51,69 @@ BUILTIN_GROWTH_RULES: tuple[dict[str, Any], ...] = (
     },
 )
 
+ABILITY_BADGE_CATALOG: tuple[dict[str, Any], ...] = (
+    {
+        "abilityKey": "exec",
+        "label": "推进执行",
+        "badges": (
+            ("exec_start", "开始推进", 10, "能把目标转成明确行动"),
+            ("exec_steady", "稳定交付", 40, "能持续完成约定的交付"),
+            ("exec_closure", "复杂闭环", 70, "能推动多环节工作完整收口"),
+            ("exec_lead", "推进带动", 100, "能用方法带动更复杂的推进"),
+        ),
+    },
+    {
+        "abilityKey": "collab",
+        "label": "协作沟通",
+        "badges": (
+            ("collab_clear", "清晰协作", 10, "能把协作目标和边界说清楚"),
+            ("collab_align", "主动对齐", 40, "能主动建立共识并减少反复"),
+            ("collab_cross", "跨界协同", 70, "能协调多方共同推进"),
+            ("collab_enable", "协作带动", 100, "能让团队协作形成稳定方法"),
+        ),
+    },
+    {
+        "abilityKey": "analyze",
+        "label": "分析判断",
+        "badges": (
+            ("analyze_breakdown", "问题拆解", 10, "能把复杂问题拆成可判断部分"),
+            ("analyze_cause", "因果判断", 40, "能从现象追到关键原因"),
+            ("analyze_system", "系统分析", 70, "能结合多方事实形成完整判断"),
+            ("analyze_transfer", "判断迁移", 100, "能把判断方法迁移到新情境"),
+        ),
+    },
+    {
+        "abilityKey": "insight",
+        "label": "用户洞察",
+        "badges": (
+            ("insight_observe", "用户观察", 10, "能注意到用户的真实反应"),
+            ("insight_need", "需求理解", 40, "能理解表面诉求背后的需要"),
+            ("insight_tradeoff", "体验取舍", 70, "能以用户影响判断产品取舍"),
+            ("insight_transfer", "洞察迁移", 100, "能把用户洞察转成稳定方法"),
+        ),
+    },
+    {
+        "abilityKey": "risk",
+        "label": "风险识别",
+        "badges": (
+            ("risk_notice", "风险察觉", 10, "能发现推进中的潜在风险"),
+            ("risk_warn", "提前预警", 40, "能在影响发生前说明风险"),
+            ("risk_resolve", "风险化解", 70, "能推动关键风险得到解决"),
+            ("risk_prevent", "机制防错", 100, "能把风险经验转成预防机制"),
+        ),
+    },
+    {
+        "abilityKey": "write",
+        "label": "表达沉淀",
+        "badges": (
+            ("write_reflect", "复盘起步", 10, "能留下真实而具体的复盘"),
+            ("write_experience", "经验成形", 40, "能把实践提炼成清晰经验"),
+            ("write_method", "方法沉淀", 70, "能形成可重复使用的方法"),
+            ("write_reuse", "组织复用", 100, "沉淀的方法能够被组织复用"),
+        ),
+    },
+)
+
 ALLOWED_CATEGORIES = frozenset(
     {
         "execution",
@@ -3109,24 +3172,61 @@ def growth_compatibility_view(
     if view == "ledger":
         return {"entries": ledger}
     if view == "badges":
-        badge_models = list(read_model["badges"])
-        if not badge_models:
-            # Product-default baseline badges are a rebuildable presentation of
-            # the existing ability models. They do not add a second badge
-            # authority or require a new table.
-            badge_models = [
-                {
-                    "badgeKey": f"{str(item.get('abilityKey') or 'growth')}_starter",
-                    "label": f"{str(item.get('label') or '成长能力')}起步",
-                    "state": "earned" if int(item.get("evidenceCount") or 0) > 0 else "locked",
-                    "score": float(item.get("score") or 0),
-                    "minimum": 10.0,
-                    "progressPercent": min(100, round(float(item.get("score") or 0) / 10 * 100)),
-                    "abilityKey": str(item.get("abilityKey") or "growth"),
-                    "evidenceCount": int(item.get("evidenceCount") or 0),
+        ability_scores = {
+            str(item.get("abilityKey") or ""): float(item.get("currentScore") or 0)
+            for item in abilities
+        }
+        badge_models = [
+            {
+                "badgeKey": badge_key,
+                "label": badge_label,
+                "description": description,
+                "categoryLabel": str(category["label"]),
+                "state": (
+                    "earned"
+                    if ability_scores.get(str(category["abilityKey"]), 0) >= minimum
+                    else "locked"
+                ),
+                "score": ability_scores.get(str(category["abilityKey"]), 0),
+                "minimum": float(minimum),
+                "progressPercent": min(
+                    100,
+                    round(
+                        ability_scores.get(str(category["abilityKey"]), 0)
+                        / float(minimum)
+                        * 100
+                    ),
+                ),
+                "abilityKey": str(category["abilityKey"]),
+                "evidenceCount": int(
+                    ability_scores.get(str(category["abilityKey"]), 0) > 0
+                ),
+            }
+            for category in ABILITY_BADGE_CATALOG
+            for badge_key, badge_label, minimum, description in category["badges"]
+        ]
+        catalog_badge_indexes = {
+            str(item["badgeKey"]): index for index, item in enumerate(badge_models)
+        }
+        for configured in read_model["badges"]:
+            configured_badge = dict(configured)
+            badge_key = str(configured_badge.get("badgeKey") or "").strip()
+            if not badge_key:
+                continue
+            configured_ability_key = str(configured_badge.get("abilityKey") or "")
+            configured_badge["abilityKey"] = ability_key_aliases.get(
+                configured_ability_key,
+                configured_ability_key,
+            )
+            existing_index = catalog_badge_indexes.get(badge_key)
+            if existing_index is None:
+                catalog_badge_indexes[badge_key] = len(badge_models)
+                badge_models.append(configured_badge)
+            else:
+                badge_models[existing_index] = {
+                    **badge_models[existing_index],
+                    **configured_badge,
                 }
-                for item in read_model["abilities"]
-            ]
         categories = []
         for item in badge_models:
             badge_key = str(item.get("badgeKey") or "growth")
@@ -3151,15 +3251,18 @@ def growth_compatibility_view(
                             "roles": [],
                             "xp": int(float(item.get("score") or 0)),
                             "iconMotif": "evidence",
-                            "description": "仅由已确认成长证据点亮",
-                            "whyItMatters": "能力展示可从权威成长证据重建",
+                            "description": str(item.get("description") or "成长能力里程碑"),
+                            "whyItMatters": "让同一能力方向的进步阶段清晰可见",
                             "systemHowText": "growth_evidence confirmed count",
                             "state": "lit" if earned else "locked",
-                            "progressValue": int(item.get("evidenceCount") or 0),
-                            "progressTarget": 1,
+                            "progressValue": int(float(item.get("score") or 0)),
+                            "progressTarget": int(float(item.get("minimum") or 1)),
                             "progressPercent": int(item.get("progressPercent") or (100 if earned else 0)),
-                            "progressText": f"{int(item.get('evidenceCount') or 0)}/1",
-                            "nextActionText": "继续积累并确认成长证据",
+                            "progressText": (
+                                f"{int(float(item.get('score') or 0))}/"
+                                f"{int(float(item.get('minimum') or 1))} XP"
+                            ),
+                            "nextActionText": "继续积累真实成长经验",
                             "actionLinks": [],
                             "evidence": [],
                             "linkedContexts": [],
@@ -3222,16 +3325,60 @@ def growth_compatibility_view(
                     ],
                 }
             )
+        catalog_labels = {
+            str(item["abilityKey"]): str(item["label"])
+            for item in ABILITY_BADGE_CATALOG
+        }
+        grouped_categories: dict[str, dict[str, Any]] = {}
+        for category in categories:
+            ability_key = str(category.get("abilityKey") or category.get("id") or "growth")
+            grouped = grouped_categories.get(ability_key)
+            if grouped is None:
+                grouped = {
+                    "id": f"category:{ability_key}",
+                    "label": catalog_labels.get(
+                        ability_key,
+                        str(category.get("abilityLabel") or category.get("label") or ability_key),
+                    ),
+                    "abilityKey": ability_key,
+                    "abilityLabel": catalog_labels.get(
+                        ability_key,
+                        str(category.get("abilityLabel") or category.get("label") or ability_key),
+                    ),
+                    "litCount": 0,
+                    "totalCount": 0,
+                    "badges": [],
+                }
+                grouped_categories[ability_key] = grouped
+            for badge in category.get("badges") or []:
+                normalized_badge = {
+                    **badge,
+                    "categoryId": grouped["id"],
+                    "categoryLabel": grouped["label"],
+                }
+                grouped["badges"].append(normalized_badge)
+                grouped["totalCount"] += 1
+                grouped["litCount"] += int(
+                    str(normalized_badge.get("state") or "locked")
+                    in {"lit", "mastered"}
+                )
+        categories = list(grouped_categories.values())
         lit = sum(item["litCount"] for item in categories)
+        total_badges = sum(item["totalCount"] for item in categories)
         return {
             "overview": {
-                "totalBadges": len(categories),
+                "totalBadges": total_badges,
                 "litBadges": lit,
                 "readyBadges": lit,
-                "inProgressBadges": len(categories) - lit,
+                "inProgressBadges": total_badges - lit,
                 "monthlyNewBadges": 0,
                 "totalXp": total_xp,
-                "upcomingBadgeIds": [item["id"] for item in categories if not item["litCount"]],
+                "upcomingBadgeIds": [
+                    str(badge["id"])
+                    for category in categories
+                    for badge in category["badges"]
+                    if str(badge.get("state") or "locked") == "locked"
+                ],
             },
             "categories": categories,
             "updatedAt": generated_at,
