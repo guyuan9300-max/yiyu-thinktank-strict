@@ -1317,6 +1317,7 @@ function AbilityRadar({ abilities, gaps }: { abilities: GrowthAbilityScore[]; ga
    Tab 1: Quote Wall
    ══════════════════════════════════════════════════════════════════ */
 function ExperienceWallTab({ uiSessionScopeKey }: { uiSessionScopeKey: string }) {
+  const growthState = useGrowthOverviewState();
   const [items, setItems] = useRuntimeUiSessionState<GrowthExperienceWallItem[]>(`${uiSessionScopeKey}:items`, []);
   const [loadedAt, setLoadedAt] = useRuntimeUiSessionState<number>(`${uiSessionScopeKey}:loaded-at`, 0);
   const [isLoading, setIsLoading] = useState(loadedAt <= 0);
@@ -1364,6 +1365,12 @@ function ExperienceWallTab({ uiSessionScopeKey }: { uiSessionScopeKey: string })
     reloadExperienceWall()
       .finally(() => setIsLoading(false));
   }, [items.length, loadedAt, reloadExperienceWall]);
+
+  const companionGeneratedAt = growthState?.growthOverview?.companionSummary?.generatedAt || '';
+  useEffect(() => {
+    if (!companionGeneratedAt) return;
+    void reloadExperienceWall();
+  }, [companionGeneratedAt, reloadExperienceWall]);
 
   const sortedEntries = useMemo(() => {
     let filtered = [...items];
