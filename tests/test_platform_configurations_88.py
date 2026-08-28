@@ -18,6 +18,7 @@ from cloud_backend.app.repositories.platform_integrations import (
     PlatformIntegrationsRepository,
 )
 from cloud_backend.app.repositories.platform_operations import PlatformOperationRepository
+from cloud_backend.app.repository import RepositoryError
 from strict_common.schema import runtime_connection
 from tests.test_gc14_workbench_answer import _repository
 
@@ -338,6 +339,86 @@ def test_model_and_asr_routes_use_provider_resources_on_an_88_table_database(
     assert probe.status_code == 200, probe.text
     assert probe.json()["state"] == "registered_not_probed"
     assert b"asr-api-key-outside-sqlite" not in repository.database_path.read_bytes()
+
+
+def test_organization_brand_route_is_versioned_idempotent_and_admin_scoped(
+    tmp_path: Path,
+) -> None:
+    repository, identity, _payload = _repository(tmp_path)
+    app = FastAPI()
+    register_routes(app, repository, lambda: identity)
+    client = TestClient(app)
+    logo_data_url = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    initial = client.get("/api/v2/organization-access/settings/organization-brand")
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["displayName"] == ""
+    assert initial.json()["expectedVersion"] == 0
+
+    payload = {
+        "displayName": "星丛",
+        "logoDataUrl": logo_data_url,
+        "expectedVersion": 0,
+    }
+    saved = client.post(
+        "/api/v2/organization-access/settings/organization-brand",
+        headers={"Idempotency-Key": "organization-brand-save-v1"},
+        json=payload,
+    )
+    replay = client.post(
+        "/api/v2/organization-access/settings/organization-brand",
+        headers={"Idempotency-Key": "organization-brand-save-v1"},
+        json=payload,
+    )
+    assert saved.status_code == 200, saved.text
+    assert replay.status_code == 200, replay.text
+    assert saved.json() == replay.json()
+    assert saved.json()["version"] == 1
+
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        row = connection.execute(
+            "SELECT owner_kind,resource_kind,version,public_config FROM provider_resources "
+            "WHERE resource_kind='organization_brand'"
+        ).fetchone()
+        assert tuple(row[:3]) == ("organization", "organization_brand", 1)
+        assert '"displayName":"星丛"' in str(row["public_config"])
+        connection.execute(
+            "UPDATE organization_memberships SET role_key='employee' WHERE id=?",
+            (identity.membership_id,),
+        )
+        connection.commit()
+
+    with pytest.raises(RepositoryError) as denied:
+        client.post(
+            "/api/v2/organization-access/settings/organization-brand",
+            headers={"Idempotency-Key": "organization-brand-non-admin"},
+            json={**payload, "displayName": "不应写入", "expectedVersion": 1},
+        )
+    assert denied.value.status_code == 403
+    assert denied.value.code == "admin_required"
+
+
+def test_organization_brand_route_rejects_mismatched_image_content(tmp_path: Path) -> None:
+    repository, identity, _payload = _repository(tmp_path)
+    app = FastAPI()
+    register_routes(app, repository, lambda: identity)
+    client = TestClient(app)
+    with pytest.raises(RepositoryError) as invalid:
+        client.post(
+            "/api/v2/organization-access/settings/organization-brand",
+            headers={"Idempotency-Key": "organization-brand-invalid-logo"},
+            json={
+                "displayName": "星丛",
+                "logoDataUrl": "data:image/png;base64,aGVsbG8=",
+                "expectedVersion": 0,
+            },
+        )
+    assert invalid.value.status_code == 422
+    assert invalid.value.code == "organization_brand_logo_invalid"
 
 
 def test_platform_operation_receipt_uses_only_88_table_command_objects(

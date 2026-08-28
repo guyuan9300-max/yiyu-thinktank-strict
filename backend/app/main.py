@@ -856,6 +856,7 @@ def create_app(config: LocalConfig | None = None) -> FastAPI:
                 ui_path.strip("/").endswith("/workspace/chat/plan")
                 or ui_path.strip("/").endswith("/workspace/chat/start")
                 or ui_path.strip("/").endswith("/documents/ai-action")
+                or ui_path.strip("/") == "org-model/plans/parse"
             )
             else background_ui_dispatch
             if request.method == "POST"

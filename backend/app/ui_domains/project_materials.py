@@ -554,6 +554,178 @@ def create_client(
     )
 
 
+def _knowledge_progress_view(
+    *,
+    store: Any,
+    project_id: str,
+    documents: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build the one authoritative material-processing projection.
+
+    Both the full workspace refresh and the lightweight progress endpoint must
+    expose the same durable processing state.  The in-process batch registry is
+    only a liveness hint for a queued attempt; it must never downgrade a
+    durable ``processing`` attempt to ``interrupted`` after a renderer or
+    backend restart.
+    """
+
+    pending = [
+        item
+        for item in documents
+        if str(item.get("parseStatus") or "") in {"queued", "processing"}
+        or (
+            str(item.get("parseStatus") or "") == "ready"
+            and str(item.get("wikiStatus") or "") in {"queued", "processing"}
+        )
+    ]
+    running = [
+        item
+        for item in documents
+        if str(item.get("parseStatus") or "") == "processing"
+        or str(item.get("wikiStatus") or "") == "processing"
+    ]
+    blocked = [
+        item
+        for item in documents
+        if str(item.get("parseStatus") or "") == "blocked"
+    ]
+    failed = [
+        item
+        for item in documents
+        if str(item.get("parseStatus") or "") == "failed_retryable"
+        or str(item.get("wikiStatus") or "") == "failed_retryable"
+    ]
+    ready = [
+        item
+        for item in documents
+        if str(item.get("parseStatus") or "") == "ready"
+        and str(item.get("wikiStatus") or "") == "ready"
+    ]
+
+    # Every forced batch is queued with the same authoritative attempt
+    # started_at. Group by that receipt field so the renderer sees one real
+    # X/N job instead of N unrelated 0/1 jobs (or a shrinking denominator).
+    active_batch_started_at = max(
+        (
+            str(item.get("processingBatchStartedAt") or "")
+            for item in pending
+            if item.get("processingBatchStartedAt")
+        ),
+        default="",
+    )
+    batch_documents = (
+        [
+            item
+            for item in documents
+            if str(item.get("processingBatchStartedAt") or "")
+            == active_batch_started_at
+        ]
+        if active_batch_started_at
+        else []
+    )
+    batch_active = [
+        item
+        for item in batch_documents
+        if str(item.get("parseStatus") or "") in {"queued", "processing"}
+        or (
+            str(item.get("parseStatus") or "") == "ready"
+            and str(item.get("wikiStatus") or "") in {"queued", "processing"}
+        )
+    ]
+    batch_running = [
+        item
+        for item in batch_active
+        if str(item.get("parseStatus") or "") == "processing"
+        or str(item.get("wikiStatus") or "") == "processing"
+    ]
+    batch_current = (
+        batch_running[0]
+        if batch_running
+        else batch_active[0]
+        if batch_active
+        else None
+    )
+    batch_processed = max(0, len(batch_documents) - len(batch_active))
+    batch_is_live = bool(
+        active_batch_started_at
+        and store.is_processing_batch_active(
+            project_id=project_id,
+            batch_started_at=active_batch_started_at,
+        )
+    )
+    job_status = (
+        "running"
+        if batch_running
+        else "queued"
+        if batch_is_live
+        else "interrupted"
+    )
+    jobs = (
+        [
+            {
+                "id": f"local-material-batch:{active_batch_started_at}",
+                "clientId": project_id,
+                "jobType": "local_material_reprocessing",
+                "status": job_status,
+                "totalItems": len(batch_documents),
+                "processedItems": batch_processed,
+                "lastError": None,
+                "currentItemLabel": (batch_current or {}).get("title"),
+                "lastEventMessage": (
+                    f"正在重新解析 {batch_processed + 1}/{len(batch_documents)}"
+                    if batch_current and job_status in {"queued", "running"}
+                    else None
+                ),
+                "recentEvents": [],
+                "queuedItemLabels": [
+                    item.get("title")
+                    for item in batch_active
+                    if item.get("title")
+                ],
+                "resumeDocumentIds": [
+                    str(item.get("id") or "")
+                    for item in batch_active
+                    if item.get("id")
+                ],
+                "createdAt": active_batch_started_at,
+                "startedAt": active_batch_started_at,
+                "finishedAt": None,
+                "updatedAt": (batch_current or {}).get("processedAt")
+                or active_batch_started_at,
+            }
+        ]
+        if batch_documents and batch_active
+        else []
+    )
+    last_job_status = (
+        "failed"
+        if failed
+        else "interrupted"
+        if jobs and jobs[0].get("status") == "interrupted"
+        else "running"
+        if running
+        else "queued"
+        if pending
+        else "completed"
+        if ready
+        else "blocked"
+        if blocked
+        else "idle"
+    )
+    return {
+        "pending": pending,
+        "running": running,
+        "blocked": blocked,
+        "failed": failed,
+        "ready": ready,
+        "jobs": jobs,
+        "lastJobStatus": last_job_status,
+        "lastJobError": (
+            failed[0].get("processingMessage") if failed else None
+        ),
+    }
+
+
 @router.get(r"clients/(?P<project_id>[^/]+)/workspace")
 def client_workspace(
     compatibility: Any,
@@ -598,21 +770,10 @@ def client_workspace(
         and str(row.get("clientId") or "") == project_id
         and str(row.get("lifecycleState") or "active") != "deleted"
     ]
-    pending_jobs = sum(
-        str(item.get("parseStatus") or "") in {"queued", "processing"}
-        or (
-            str(item.get("parseStatus") or "") == "ready"
-            and str(item.get("wikiStatus") or "") in {"queued", "processing"}
-        )
-        for item in queue_documents
-    )
-    failed_jobs = sum(
-        str(item.get("parseStatus") or "") == "failed_retryable"
-        for item in queue_documents
-    )
-    ready_documents = sum(
-        str(item.get("parseStatus") or "") == "ready"
-        for item in queue_documents
+    progress_view = _knowledge_progress_view(
+        store=store,
+        project_id=project_id,
+        documents=queue_documents,
     )
     local_wiki = _local_call(lambda: store.local_wiki_status(project_id))
     knowledge_presentation = _local_call(
@@ -701,20 +862,10 @@ def client_workspace(
             "reclassifiedDocumentCount": 0,
             "qdrantReady": False,
             "lastUpdatedAt": local_wiki.get("updatedAt"),
-            "pendingJobs": pending_jobs,
-            "runningJobs": 0,
-            "lastJobStatus": (
-                "failed"
-                if failed_jobs
-                else "queued"
-                if pending_jobs
-                else "completed"
-                if documents
-                else "idle"
-            ),
-            "lastJobError": (
-                "部分本机资料解析失败，可以重试" if failed_jobs else None
-            ),
+            "pendingJobs": len(progress_view["pending"]),
+            "runningJobs": len(progress_view["running"]),
+            "lastJobStatus": progress_view["lastJobStatus"],
+            "lastJobError": progress_view["lastJobError"],
             "lastSuccessfulRunAt": None,
             "embeddingMode": (
                 "not_connected"
@@ -726,13 +877,10 @@ def client_workspace(
                 if int(local_wiki.get("vectorReadyCount") or 0) > 0
                 else None
             ),
-            "parsedDocuments": ready_documents,
-            "blockedDocuments": sum(
-                str(item.get("parseStatus") or "") == "blocked"
-                for item in queue_documents
-            ),
+            "parsedDocuments": len(progress_view["ready"]),
+            "blockedDocuments": len(progress_view["blocked"]),
         },
-        "knowledgeJobs": [],
+        "knowledgeJobs": progress_view["jobs"],
         "recentReclassEvents": [],
         "surrogateCount": 0,
         "memoryDocCount": len(memory_cards),
@@ -848,133 +996,17 @@ def local_knowledge_progress(
     documents = _local_call(lambda: store.documents(project_id))
     queue_documents = _knowledge_queue_documents(documents)
     local_wiki = _local_call(lambda: store.local_wiki_status(project_id))
-    pending = [
-        item
-        for item in queue_documents
-        if str(item.get("parseStatus") or "")
-        in {"queued", "processing"}
-        or (
-            str(item.get("parseStatus") or "") == "ready"
-            and str(item.get("wikiStatus") or "")
-            in {"queued", "processing"}
-        )
-    ]
-    running = [
-        item
-        for item in queue_documents
-        if str(item.get("parseStatus") or "") == "processing"
-        or str(item.get("wikiStatus") or "") == "processing"
-    ]
-    blocked = [
-        item
-        for item in queue_documents
-        if str(item.get("parseStatus") or "") == "blocked"
-    ]
-    failed = [
-        item
-        for item in queue_documents
-        if str(item.get("parseStatus") or "") == "failed_retryable"
-        or str(item.get("wikiStatus") or "") == "failed_retryable"
-    ]
-    ready = [
-        item
-        for item in queue_documents
-        if str(item.get("parseStatus") or "") == "ready"
-        and str(item.get("wikiStatus") or "") == "ready"
-    ]
-    # Every forced batch is queued with the same authoritative attempt
-    # started_at.  Group by that receipt field so the renderer sees one real
-    # X/N job instead of N unrelated 0/1 jobs (or a shrinking denominator).
-    active_batch_started_at = max(
-        (
-            str(item.get("processingBatchStartedAt") or "")
-            for item in pending
-            if item.get("processingBatchStartedAt")
-        ),
-        default="",
+    progress_view = _knowledge_progress_view(
+        store=store,
+        project_id=project_id,
+        documents=queue_documents,
     )
-    batch_documents = (
-        [
-            item
-            for item in queue_documents
-            if str(item.get("processingBatchStartedAt") or "")
-            == active_batch_started_at
-        ]
-        if active_batch_started_at
-        else []
-    )
-    batch_active = [
-        item
-        for item in batch_documents
-        if str(item.get("parseStatus") or "") in {"queued", "processing"}
-        or (
-            str(item.get("parseStatus") or "") == "ready"
-            and str(item.get("wikiStatus") or "")
-            in {"queued", "processing"}
-        )
-    ]
-    batch_running = [
-        item
-        for item in batch_active
-        if str(item.get("parseStatus") or "") == "processing"
-        or str(item.get("wikiStatus") or "") == "processing"
-    ]
-    batch_current = (
-        batch_running[0]
-        if batch_running
-        else batch_active[0]
-        if batch_active
-        else None
-    )
-    batch_processed = max(0, len(batch_documents) - len(batch_active))
-    batch_is_active = bool(
-        active_batch_started_at
-        and store.is_processing_batch_active(
-            project_id=project_id,
-            batch_started_at=active_batch_started_at,
-        )
-    )
-    jobs = (
-        [
-            {
-                "id": f"local-material-batch:{active_batch_started_at}",
-                "clientId": project_id,
-                "jobType": "local_material_reprocessing",
-                "status": (
-                    "running"
-                    if batch_is_active and batch_running
-                    else "queued"
-                    if batch_is_active
-                    else "interrupted"
-                ),
-                "totalItems": len(batch_documents),
-                "processedItems": batch_processed,
-                "lastError": None,
-                "currentItemLabel": (batch_current or {}).get("title"),
-                "lastEventMessage": (
-                    f"正在重新解析 {batch_processed + 1}/{len(batch_documents)}"
-                    if batch_current
-                    else None
-                ),
-                "recentEvents": [],
-                "queuedItemLabels": [
-                    item.get("title") for item in batch_active if item.get("title")
-                ],
-                "resumeDocumentIds": [
-                    str(item.get("id") or "")
-                    for item in batch_active
-                    if item.get("id")
-                ],
-                "createdAt": active_batch_started_at,
-                "startedAt": active_batch_started_at,
-                "finishedAt": None,
-                "updatedAt": (batch_current or {}).get("processedAt")
-                or active_batch_started_at,
-            }
-        ]
-        if batch_documents and batch_active
-        else []
-    )
+    pending = progress_view["pending"]
+    running = progress_view["running"]
+    blocked = progress_view["blocked"]
+    failed = progress_view["failed"]
+    ready = progress_view["ready"]
+    jobs = progress_view["jobs"]
     return {
         "knowledgeStatus": {
             "totalDocuments": len(documents),
@@ -995,22 +1027,8 @@ def local_knowledge_progress(
             "lastUpdatedAt": local_wiki.get("updatedAt"),
             "pendingJobs": len(pending),
             "runningJobs": len(running),
-            "lastJobStatus": (
-                "failed"
-                if failed
-                else "interrupted"
-                if jobs and jobs[0].get("status") == "interrupted"
-                else "running"
-                if pending
-                else "completed"
-                if ready
-                else "blocked"
-                if blocked
-                else "idle"
-            ),
-            "lastJobError": (
-                failed[0].get("processingMessage") if failed else None
-            ),
+            "lastJobStatus": progress_view["lastJobStatus"],
+            "lastJobError": progress_view["lastJobError"],
             "lastSuccessfulRunAt": local_wiki.get("updatedAt"),
             "embeddingMode": (
                 "local_sparse_vector"

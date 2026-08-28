@@ -204,6 +204,7 @@ import type {
   OrgAiRuntimeStatus,
   OrgMembershipSummary,
   OfficialPushUpdatePayload,
+  OfficialUpdateStatusSnapshot,
   OrgWritingNorm,
   PageContextPack,
   ProjectFlow,
@@ -283,6 +284,11 @@ import { ClientWorkspaceView } from './components/client_workspace/ClientWorkspa
 import { FileTypeIcon, hasOpenableFile } from './components/FileTypeIcon';
 import { MiniPanel } from './components/mini_panel/MiniPanel';
 import { buildMiniData } from './components/mini_panel/buildMiniData';
+import {
+  transitionMiniAiQuickTaskFlow,
+  type MiniAiQuickTaskEvent,
+  type MiniAiQuickTaskStage,
+} from '../shared/miniAiQuickTaskFlow';
 import type {
   WorkspaceAnswerActionName,
   WorkspaceDisplayChatMessage as DisplayChatMessage,
@@ -319,11 +325,28 @@ import {
 } from '../shared/workspaceEvidencePresentation';
 import { formatTaskContextMaterialBoundary } from '../shared/taskContextPresentation.mts';
 import {
+  isActiveKnowledgeJobStatus,
+  shouldPollKnowledgeProgress,
+} from '../shared/knowledgeJobState';
+import {
+  groupTasksByReference,
+  isTaskOnPersonalSurface,
+  type TaskAggregationMode,
+} from '../shared/taskAggregation';
+import {
   parseWorkspaceThreadPreference,
   pickWorkspaceCurrentThreadId,
   type WorkspaceThreadPreference,
 } from '../shared/workspaceThreadSelection';
 import { parseDepartmentInviteCode } from '../shared/departmentInvite';
+import {
+  resolveTaskCreationDefaults,
+  resolveTaskPlanDepartmentIdFromScopeValue,
+  resolveTaskPlanScopeSelectValue,
+  resolveTaskProjectAutoSelection,
+  taskPlanMatchesDepartmentScope,
+  TASK_PLAN_ORGANIZATION_SCOPE_VALUE,
+} from '../shared/taskCreationDefaults';
 import {
   defaultPlanningPeriodKey,
   formatPlanningPeriodLabel,
@@ -576,6 +599,7 @@ import {
   updateTaskSettings,
   updateTaskTag,
   updateTask,
+  updateTaskTimer,
   uploadTaskAttachment,
   deleteTaskAttachment,
   getLocalAsrModelStatus,
@@ -632,6 +656,10 @@ import EventLineReportPanel from './components/tasks/EventLineReportPanel';
 import { TaskTemplateEditorModal } from './components/tasks/TaskTemplateEditorModal';
 import type { TemplateData } from './components/tasks/TaskTemplateEditorModal';
 import { SmartTaskParseModal } from './components/tasks/SmartTaskParseModal';
+import { TaskInlinePriorityEditor } from './components/tasks/TaskInlinePriorityEditor';
+import { TaskInlineScheduleEditor } from './components/tasks/TaskInlineScheduleEditor';
+import { TaskInlineTimer } from './components/tasks/TaskInlineTimer';
+import { TaskTime24Input } from './components/tasks/TaskTime24Input';
 import { AICommandModal } from './components/ai_command/AICommandModal';
 import { AiDelegationsCard } from './components/ai_command/AiDelegationsCard';
 import { SmartFileImportModal } from './components/smart_file_import/SmartFileImportModal';
@@ -643,7 +671,12 @@ import { StrategicBrainView, type ThoughtTaskPayload, DuplicateDocumentsSection 
 import { TopicsManagementView } from './components/topics/TopicsManagementView';
 import { IntelligenceStationView } from './components/intelligence/IntelligenceStationView';
 import { TaskCalendarView } from './components/tasks/TaskCalendarView';
-import { buildTaskScheduleFromStartEnd, resolveTaskDateTimeRange, validateTaskScheduleStartEnd } from './lib/taskTimeline';
+import {
+  buildTaskScheduleFromStartEnd,
+  buildTaskScheduleMoveUpdate,
+  resolveTaskDateTimeRange,
+  validateTaskScheduleStartEnd,
+} from './lib/taskTimeline';
 import { DraggingTaskProvider, TaskRowLongPress } from './components/tasks/longPressDrag';
 import { AgentSimulationCalendarView } from './components/tasks/AgentSimulationCalendarView';
 import { AgentWeeklyPlanEditor } from './components/tasks/AgentWeeklyPlanEditor';
@@ -657,7 +690,7 @@ import { OFFICIAL_PUSH_STATE_EVENT, UPDATE_STATE_KEY, UpdateNotifier, setCachedO
 import { AboutAppSettingsPanel } from './components/settings/AboutAppSettingsPanel';
 import { FeedbackSection } from './components/settings/FeedbackSection';
 import { GrowthCenterView } from './components/handbook/GrowthCenterView';
-import { AppLogoMark, BrandLogoMark } from './components/settings/BrandLogoSettingsCard';
+import { AppLogoMark, BrandDisplayName, BrandLogoMark } from './components/settings/BrandLogoSettingsCard';
 import { FileSearchResultPanel } from './components/data_center/FileSearchResultPanel';
 import { ContradictionAlertPanel } from './components/client_workspace/ContradictionAlertPanel';
 import { GlossaryDriftAlertPanel } from './components/client_workspace/GlossaryDriftAlertPanel';
@@ -709,6 +742,7 @@ import {
   isTaskInCurrentReviewWeek,
   isTaskOverdue as isCanonicalTaskOverdue,
   isTaskToday as isCanonicalTaskToday,
+  resolveTaskEditorDueTime,
 } from '../shared/taskTime';
 
 const InternalCollabPreviewDialog = React.lazy(() => import('./components/collab/CollabDialogs').then((module) => ({ default: module.CollabPreviewDialog })));
@@ -4741,12 +4775,14 @@ function sortTasksByFormalView(tasks: Task[], view: TaskViewDefinition) {
 type TaskPriorityFilter = 'all' | 'high' | 'normal' | 'low';
 type TaskTimeSort = 'newest' | 'oldest';
 type TaskTimeRangeFilter = 'all' | 'last3days' | 'lastMonth' | 'lastHalfYear' | 'custom';
+type TaskAggregationViewMode = 'time' | TaskAggregationMode;
 type TaskExecutionGroupKey = 'earlier' | 'week' | 'later' | 'undated';
 
 type TaskExecutionGroup = {
-  key: TaskExecutionGroupKey;
+  key: string;
   label: string;
   hint: string;
+  sourceId?: string | null;
   tasks: Task[];
   meetings: GC06Meeting[];
 };
@@ -4759,7 +4795,7 @@ const TASK_EXECUTION_GROUP_META: Record<TaskExecutionGroupKey, Omit<TaskExecutio
 };
 
 const TASK_EXECUTION_GROUP_ORDER: TaskExecutionGroupKey[] = ['earlier', 'week', 'later', 'undated'];
-const TASK_EXECUTION_ALWAYS_VISIBLE_GROUP_KEYS = new Set<TaskExecutionGroupKey>(TASK_EXECUTION_GROUP_ORDER);
+const TASK_EXECUTION_ALWAYS_VISIBLE_GROUP_KEYS = new Set<string>(TASK_EXECUTION_GROUP_ORDER);
 
 const TASK_PRIORITY_FILTER_OPTIONS: Array<{ value: TaskPriorityFilter; label: string }> = [
   { value: 'all', label: '全部' },
@@ -5822,10 +5858,35 @@ function buildExecutionTaskGroups(
   }));
 }
 
-function getTaskPrimaryActionLine(task: Task) {
-  const nextAction = (task.nextAction || '').trim();
-  if (nextAction) return nextAction.replace(/^下一步动作[:：]\s*/u, '');
-  return (task.desc || '').split(/\n/).map((line) => line.trim()).find(Boolean) || '还没有写下一步动作';
+function isUnsyncedLocalTask(task: Task) {
+  return task.syncStatus === 'local'
+    || task.syncStatus === 'syncing'
+    || task.syncStatus === 'pending';
+}
+
+function getTaskPrimaryActionDisplay(task: Task) {
+  const candidates = [
+    (task.nextAction || '').replace(/^下一步动作[:：]\s*/u, '').trim(),
+    ...(task.desc || '').split(/\n/).map((line) => line.trim()),
+  ].filter(Boolean);
+  let priorityMarker: string | null = null;
+  let text: string | null = null;
+  candidates.some((candidate) => {
+    const normalizedCandidate = candidate.replace(/^(?:任务说明|任务描述|下一步动作)[:：]\s*/u, '').trim();
+    if (!normalizedCandidate) return false;
+    const priorityMatch = normalizedCandidate.match(/^[\[【［]\s*(P\d)\s*[\]】］]\s*(.*)$/iu);
+    if (priorityMatch) {
+      priorityMarker ||= priorityMatch[1].toUpperCase();
+      if (priorityMatch[2].trim()) {
+        text = priorityMatch[2].trim();
+        return true;
+      }
+      return false;
+    }
+    text = normalizedCandidate;
+    return true;
+  });
+  return { priorityMarker, text };
 }
 
 function getTaskStatusLabel(task: Task) {
@@ -5857,6 +5918,8 @@ function getTaskDueState(task: Task) {
 
 function taskCanToggleCompletion(task: Task, userId: string | null | undefined) {
   if (!userId) return false;
+  if (task.viewerCapabilities) return task.viewerCapabilities.canComplete;
+  if (!isUnsyncedLocalTask(task)) return false;
   if (task.ownerId === userId) return true;
   // 兜底：自己建的任务也能完成。早期 bug 会把 owner_id 留空（应当默认成 creator），
   // 让用户连自己创建的任务都点不了完成。后端默认值已修；这里防 owner_id 还空着的历史行。
@@ -7530,97 +7593,6 @@ function TaskPropertyRow({ icon, label, children, stacked = false }: TaskPropert
   );
 }
 
-function TaskTime24Input({
-  value,
-  onChange,
-  label,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-  label: string;
-}) {
-  const normalizedValue = /^\d{2}:\d{2}$/.test(value) ? value : '';
-  const [hourInput, setHourInput] = useState(normalizedValue.slice(0, 2));
-  const [minuteInput, setMinuteInput] = useState(normalizedValue ? normalizedValue.slice(3, 5) : '');
-
-  useEffect(() => {
-    setHourInput(normalizedValue.slice(0, 2));
-    setMinuteInput(normalizedValue ? normalizedValue.slice(3, 5) : '');
-  }, [normalizedValue]);
-
-  const commitTime = (nextHour: string, nextMinute: string) => {
-    if (!nextHour && !nextMinute) {
-      onChange('');
-      return;
-    }
-    if (!/^\d{2}$/.test(nextHour) || !/^\d{2}$/.test(nextMinute)) return;
-    const hour = Number(nextHour);
-    const minute = Number(nextMinute);
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return;
-    onChange(`${nextHour}:${nextMinute}`);
-  };
-
-  return (
-    <div className="flex w-full items-center justify-center rounded-lg border border-gray-200 bg-white px-1 py-1 text-sm tabular-nums text-gray-700 focus-within:border-[#5B7BFE] focus-within:ring-1 focus-within:ring-[#5B7BFE]/15">
-      <div className="grid grid-cols-[1.75rem_0.75rem_1.75rem] items-center justify-center">
-        <input
-          type="text"
-          inputMode="numeric"
-          maxLength={2}
-          aria-label={`${label}小时（24小时制）`}
-          placeholder="--"
-          value={hourInput}
-          onChange={(event) => {
-            const nextHour = event.target.value.replace(/\D/g, '').slice(0, 2);
-            setHourInput(nextHour);
-            if (!nextHour) {
-              setMinuteInput('');
-              onChange('');
-              return;
-            }
-            commitTime(nextHour, minuteInput);
-          }}
-          onBlur={() => {
-            if (!/^\d{2}$/.test(hourInput) || Number(hourInput) > 23) {
-              setHourInput(normalizedValue.slice(0, 2));
-            } else {
-              commitTime(hourInput, minuteInput);
-            }
-          }}
-          className="w-[1.75rem] min-w-0 appearance-none bg-transparent px-0 py-1 text-center text-sm tabular-nums outline-none"
-        />
-        <span className="w-[0.75rem] select-none text-center text-gray-400" aria-hidden>：</span>
-        <input
-          type="text"
-          inputMode="numeric"
-          maxLength={2}
-          aria-label={`${label}分钟`}
-          placeholder="--"
-          value={minuteInput}
-          onChange={(event) => {
-            const nextMinute = event.target.value.replace(/\D/g, '').slice(0, 2);
-            setMinuteInput(nextMinute);
-            if (!nextMinute) {
-              setHourInput('');
-              onChange('');
-              return;
-            }
-            commitTime(hourInput, nextMinute);
-          }}
-          onBlur={() => {
-            if (!/^\d{2}$/.test(minuteInput) || Number(minuteInput) > 59) {
-              setMinuteInput(normalizedValue ? normalizedValue.slice(3, 5) : '');
-            } else {
-              commitTime(hourInput, minuteInput);
-            }
-          }}
-          className="w-[1.75rem] min-w-0 appearance-none bg-transparent px-0 py-1 text-center text-sm tabular-nums outline-none"
-        />
-      </div>
-    </div>
-  );
-}
-
 function TaskDateInput({
   value,
   onChange,
@@ -8245,6 +8217,7 @@ export default function App() {
   // 跨越 viewMap 边界传给 TasksView，让它切到 tasks 路由后再触发 openTaskEditor。
   const [pendingPlanItemAction, setPendingPlanItemAction] = useState<
     | { kind: 'open-task'; task: Task }
+    | { kind: 'open-ai-quick-task' }
     | { kind: 'generate-from-plan-item'; planItem: { id: string; title?: string; statement?: string; expectedOutput?: string }; scopeName: string; plan: OrgDepartmentPlanSettings }
     | { kind: 'create-from-answer'; draft: { clientId: string; title: string; description: string; priority: string } }
     | null
@@ -8356,6 +8329,9 @@ export default function App() {
   ));
   const [officialPushToast, setOfficialPushToast] = useState<OfficialPushUpdatePayload | null>(() => (
     typeof window !== 'undefined' ? window[UPDATE_STATE_KEY]?.officialPush ?? null : null
+  ));
+  const [officialUpdateToastStatus, setOfficialUpdateToastStatus] = useState<OfficialUpdateStatusSnapshot | null>(() => (
+    typeof window !== 'undefined' ? window[UPDATE_STATE_KEY]?.status ?? null : null
   ));
   const canUseCollabSync = Boolean(desktopAppInfo && desktopAppInfo.platform !== 'browser');
   const isMaintenanceModeActive = Boolean(maintenanceModeStatus?.active);
@@ -9008,6 +8984,16 @@ export default function App() {
     setActiveTab('tasks');
     if (task) setPendingPlanItemAction({ kind: 'open-task', task });
   }, [tasks]);
+  const handleMiniAIQuickCreate = useCallback(() => {
+    if (workspaceWritesBlocked) {
+      flash('info', workspaceRuntimeMessage || '工作空间正在切换或需要重新登录，暂时不能新建任务。');
+      return;
+    }
+    setMiniMode(false);
+    void window.yiyuWorkbench?.setMiniMode?.(false);
+    setActiveTab('tasks');
+    setPendingPlanItemAction({ kind: 'open-ai-quick-task' });
+  }, [workspaceRuntimeMessage, workspaceWritesBlocked]);
   const isCloudSession = authState.sessionMode === 'cloud';
   const isLocalSession = authState.sessionMode === 'local';
   const viewerAuthorization = authState.authorization || null;
@@ -9311,7 +9297,23 @@ export default function App() {
     () => clients.find((client: ClientSummary) => client.id === organizationClientId) || null,
     [clients, organizationClientId],
   );
-  const organizationTaskAutoReason = buildOrganizationTaskAutoReason(organizationTaskName);
+  const taskCreationDefaults = useMemo(
+    () => resolveTaskCreationDefaults({
+      hasOrganization: orgMembershipState.hasOrganization,
+      organizationName: organizationTaskName,
+      organizationClientId,
+      membershipDepartmentId: orgMembershipState.departmentId,
+      sessionDepartmentId: currentSessionUser?.departmentId,
+    }),
+    [
+      currentSessionUser?.departmentId,
+      organizationClientId,
+      organizationTaskName,
+      orgMembershipState.departmentId,
+      orgMembershipState.hasOrganization,
+    ],
+  );
+  const organizationTaskAutoReason = taskCreationDefaults.clientReason;
   const organizationTaskManualReason = buildOrganizationTaskManualReason(organizationTaskName);
   const effectiveTaskSettings = useMemo(
     () => resolveTaskSettings(taskSettingsState, taskLists),
@@ -10447,8 +10449,10 @@ export default function App() {
   useEffect(() => {
     const syncOfficialPushFlag = () => {
       const nextPush = window[UPDATE_STATE_KEY]?.officialPush ?? null;
+      const nextStatus = window[UPDATE_STATE_KEY]?.status ?? null;
       setHasOfficialPush(Boolean(nextPush));
       setOfficialPushToast(nextPush);
+      setOfficialUpdateToastStatus(nextStatus);
     };
     syncOfficialPushFlag();
     window.addEventListener(OFFICIAL_PUSH_STATE_EVENT, syncOfficialPushFlag);
@@ -13187,8 +13191,11 @@ export default function App() {
   };
 
   const workspaceKnowledgeActiveRef = useRef(false);
-  workspaceKnowledgeActiveRef.current =
-    ((workspace?.knowledgeStatus?.pendingJobs || 0) + (workspace?.knowledgeStatus?.runningJobs || 0)) > 0;
+  workspaceKnowledgeActiveRef.current = shouldPollKnowledgeProgress({
+    isSubmitting: false,
+    pendingJobs: workspace?.knowledgeStatus?.pendingJobs || 0,
+    runningJobs: workspace?.knowledgeStatus?.runningJobs || 0,
+  });
 
   useEffect(() => {
     const targetClientId = currentClientId;
@@ -13197,7 +13204,11 @@ export default function App() {
       setIsImportSubmitting(false);
       return;
     }
-    if (!isImportSubmitting && !workspaceKnowledgeActiveRef.current) return;
+    if (!shouldPollKnowledgeProgress({
+      isSubmitting: isImportSubmitting,
+      pendingJobs: workspace?.knowledgeStatus?.pendingJobs || 0,
+      runningJobs: workspace?.knowledgeStatus?.runningJobs || 0,
+    })) return;
     let cancelled = false;
     let polling = false;
     let finalRefreshQueued = false;
@@ -13234,6 +13245,8 @@ export default function App() {
   }, [
     currentClientId,
     isImportSubmitting,
+    workspace?.knowledgeStatus?.pendingJobs,
+    workspace?.knowledgeStatus?.runningJobs,
   ]);
 
   useEffect(() => {
@@ -14118,6 +14131,7 @@ export default function App() {
     notifyGrowthRefresh,
     operators,
     organizationClientId,
+    taskCreationDefaults,
     organizationTaskAutoReason,
     organizationTaskManualReason,
     organizationTaskName,
@@ -14154,8 +14168,9 @@ export default function App() {
     workspaceRuntimeMessage,
     workspaceWritesBlocked,
     workspaceSelectedMeetingId,
-    pendingPlanItemAction,
-    setPendingPlanItemAction,
+	    pendingPlanItemAction,
+	    setPendingPlanItemAction,
+	    returnToMiniModeAfterAiQuickTask: enterMiniMode,
 	  workspacesState,
 	  strictPlanWorkshopState,
 	  isOrganizationPlanningLoading,
@@ -14230,6 +14245,7 @@ export default function App() {
     notifyGrowthRefresh: typeof notifyGrowthRefresh;
     operators: typeof operators;
     organizationClientId: typeof organizationClientId;
+    taskCreationDefaults: typeof taskCreationDefaults;
     organizationTaskAutoReason: typeof organizationTaskAutoReason;
     organizationTaskManualReason: typeof organizationTaskManualReason;
     organizationTaskName: typeof organizationTaskName;
@@ -14268,6 +14284,7 @@ export default function App() {
     workspaceSelectedMeetingId: typeof workspaceSelectedMeetingId;
     pendingPlanItemAction: typeof pendingPlanItemAction;
     setPendingPlanItemAction: typeof setPendingPlanItemAction;
+    returnToMiniModeAfterAiQuickTask: typeof enterMiniMode;
     workspacesState: typeof workspacesState;
     strictPlanWorkshopState: typeof strictPlanWorkshopState;
     isOrganizationPlanningLoading: typeof isOrganizationPlanningLoading;
@@ -14343,6 +14360,7 @@ export default function App() {
       notifyGrowthRefresh,
       operators,
       organizationClientId,
+      taskCreationDefaults,
       organizationTaskAutoReason,
       organizationTaskManualReason,
       organizationTaskName,
@@ -14379,8 +14397,9 @@ export default function App() {
       workspaceRuntimeMessage,
       workspaceWritesBlocked,
       workspaceSelectedMeetingId,
-      pendingPlanItemAction,
-      setPendingPlanItemAction,
+	      pendingPlanItemAction,
+	      setPendingPlanItemAction,
+	      returnToMiniModeAfterAiQuickTask,
       workspacesState,
       strictPlanWorkshopState,
       isOrganizationPlanningLoading,
@@ -14452,6 +14471,9 @@ export default function App() {
     const [taskListProjectFilterId, setTaskListProjectFilterId] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:project`, '__all__');
     const [taskListCustomStartDate, setTaskListCustomStartDate] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:start`, '');
     const [taskListCustomEndDate, setTaskListCustomEndDate] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:end`, '');
+    const [taskAggregationViewMode, setTaskAggregationViewMode] = useRuntimeUiSessionState<TaskAggregationViewMode>(`${taskUiSessionScope}:list:group-by`, 'time');
+    const [inlinePriorityTaskId, setInlinePriorityTaskId] = useState<string | null>(null);
+    const [inlineScheduleTaskId, setInlineScheduleTaskId] = useState<string | null>(null);
     const [selectedListTaskIds, setSelectedListTaskIds] = useRuntimeUiSessionState<string[]>(`${taskUiSessionScope}:list:selected-tasks`, []);
     const [selectedListMeetingIds, setSelectedListMeetingIds] = useRuntimeUiSessionState<string[]>(`${taskUiSessionScope}:list:selected-meetings`, []);
     // 多选模式：默认关，关闭时任务卡上的勾选方框不渲染，避免跟「完成」圆圈视觉打架
@@ -14461,7 +14483,7 @@ export default function App() {
       setSelectedListTaskIds([]);
       setSelectedListMeetingIds([]);
     };
-    const [collapsedTaskGroups, setCollapsedTaskGroups] = useRuntimeUiSessionState<Partial<Record<TaskExecutionGroupKey, boolean>>>(`${taskUiSessionScope}:list:collapsed`, {
+    const [collapsedTaskGroups, setCollapsedTaskGroups] = useRuntimeUiSessionState<Partial<Record<string, boolean>>>(`${taskUiSessionScope}:list:collapsed`, {
       earlier: true,
       week: false,
       later: true,
@@ -14477,8 +14499,14 @@ export default function App() {
     const [inboxCustomStartDate, setInboxCustomStartDate] = useRuntimeUiSessionState(`${taskUiSessionScope}:inbox:start`, '');
     const [inboxCustomEndDate, setInboxCustomEndDate] = useRuntimeUiSessionState(`${taskUiSessionScope}:inbox:end`, '');
     const [taskSearchQuery, setTaskSearchQuery] = useRuntimeUiSessionState(`${taskUiSessionScope}:list:search`, '');
-    const [isTaskModalOpen, setIsTaskModalOpen] = useState(false);
-    const [isSmartParseModalOpen, setIsSmartParseModalOpen] = useState(false);
+	    const [isTaskModalOpen, setIsTaskModalOpen] = useState(false);
+	    const [isSmartParseModalOpen, setIsSmartParseModalOpen] = useState(false);
+	    const miniAiQuickTaskStageRef = useRef<MiniAiQuickTaskStage>('idle');
+	    const advanceMiniAiQuickTaskFlow = (event: MiniAiQuickTaskEvent) => {
+	      const transition = transitionMiniAiQuickTaskFlow(miniAiQuickTaskStageRef.current, event);
+	      miniAiQuickTaskStageRef.current = transition.stage;
+	      return transition;
+	    };
     const [isDuePickerOpen, setIsDuePickerOpen] = useState(false);
     const [duePickerTab, setDuePickerTab] = useState<'date' | 'time'>('date');
     const [duePickerMonth, setDuePickerMonth] = useState(() => getTodayCalendarState().calendarDate);
@@ -14497,10 +14525,10 @@ export default function App() {
       dueDate: '',
       dueTime: '',
       durationMinutes: 60,
-      clientId: '',
+      clientId: taskCreationDefaults.clientId,
       clientTouched: false,
-      clientConfidence: 'none',
-      clientReason: organizationTaskAutoReason,
+      clientConfidence: taskCreationDefaults.clientConfidence,
+      clientReason: taskCreationDefaults.clientReason,
       eventLineId: '',
       eventLineTouched: false,
       eventLineReason: '可选：把任务挂到一条持续推进的事件线上，后续复盘会按事件线聚合。',
@@ -14513,7 +14541,7 @@ export default function App() {
       ddl: '待确认',
       tagIds: [],
       collaborators: buildDefaultCollaborators(),
-      planLinkDepartmentId: currentSessionUser?.departmentId || '',
+      planLinkDepartmentId: taskCreationDefaults.departmentId,
       planLinkCycleType: 'month',
       planLinkPeriodKey: monthKeyFromDate(defaultDueDateFromPreset(effectiveTaskSettings.defaultDueDatePreset)),
       planLinkPlanItemId: '',
@@ -14691,9 +14719,10 @@ export default function App() {
       setTaskEventLineCreateDraft(buildTaskEventLineCreateDraft());
     };
 
-    const closeTaskModal = (reason: string) => {
-      console.info(`[task-modal] close reason=${reason}`);
-      resetTaskModalTransientState();
+	    const closeTaskModal = (reason: string) => {
+	      console.info(`[task-modal] close reason=${reason}`);
+	      if (reason !== 'save-started') advanceMiniAiQuickTaskFlow('dismissed');
+	      resetTaskModalTransientState();
       setIsTaskModalOpen(false);
       // AUDIT-20260518-013: 关闭 modal 时清掉录音错误提示, 下次打开任务编辑器不残留
       setTaskRecordingError(null);
@@ -15580,9 +15609,12 @@ export default function App() {
       }
       return null;
     }, [drillTaskViewOverride]);
-    const baseListTasks = tasks.filter(
-      (task) => task.status !== 'rejected' && task.status !== 'inbox' && !isTaskInboxNotification(task),
-    );
+    const baseListTasks = tasks.filter((task) => (
+      (isTaskOnPersonalSurface(task, 'list') || isUnsyncedLocalTask(task))
+      && task.status !== 'rejected'
+      && task.status !== 'inbox'
+      && !isTaskInboxNotification(task)
+    ));
     const taskProjectFilterOptions = useMemo(
       () => clients
         .filter((client) => !client.isFrozen)
@@ -15654,10 +15686,25 @@ export default function App() {
       taskSearchQuery,
       matchesSelectedProject,
     ]);
-    const executionTaskGroups = useMemo(
-      () => buildExecutionTaskGroups(visibleListTasks, visibleListMeetings, currentTaskMembershipId),
-      [currentTaskMembershipId, visibleListMeetings, visibleListTasks],
+    const groupedListMeetings = useMemo(
+      () => taskAggregationViewMode === 'time' ? visibleListMeetings : [],
+      [taskAggregationViewMode, visibleListMeetings],
     );
+    const executionTaskGroups = useMemo(() => {
+      if (taskAggregationViewMode === 'time') {
+        return buildExecutionTaskGroups(
+          visibleListTasks,
+          groupedListMeetings,
+          currentTaskMembershipId,
+        );
+      }
+      return groupTasksByReference(visibleListTasks, taskAggregationViewMode, {
+        organizationName: organizationTaskName,
+      }).map((group) => ({
+        ...group,
+        meetings: [],
+      }));
+    }, [currentTaskMembershipId, groupedListMeetings, organizationTaskName, taskAggregationViewMode, visibleListTasks]);
     const selectedListTasks = useMemo(() => {
       const selectedIds = new Set(selectedListTaskIds);
       return listTasks.filter((task) => selectedIds.has(task.id));
@@ -15667,12 +15714,12 @@ export default function App() {
       return customerMeetings.filter((meeting) => selectedIds.has(meeting.id));
     }, [customerMeetings, selectedListMeetingIds]);
     const visibleListTaskIds = useMemo(() => new Set(visibleListTasks.map((task) => task.id)), [visibleListTasks]);
-    const visibleListMeetingIds = useMemo(() => new Set(visibleListMeetings.map((meeting) => meeting.id)), [visibleListMeetings]);
+    const visibleListMeetingIds = useMemo(() => new Set(groupedListMeetings.map((meeting) => meeting.id)), [groupedListMeetings]);
     const selectedListRecordCount = selectedListTaskIds.length + selectedListMeetingIds.length;
-    const visibleListRecordCount = visibleListTasks.length + visibleListMeetings.length;
+    const visibleListRecordCount = visibleListTasks.length + groupedListMeetings.length;
     const isAllVisibleListRecordsSelected = visibleListRecordCount > 0
       && visibleListTasks.every((task) => selectedListTaskIds.includes(task.id))
-      && visibleListMeetings.every((meeting) => selectedListMeetingIds.includes(meeting.id));
+      && groupedListMeetings.every((meeting) => selectedListMeetingIds.includes(meeting.id));
     useEffect(() => {
       // visibleListTaskIds 的上游(rawListTasks)未 memo,每次渲染都是新引用,本 effect 每渲染必跑;
       // 无剔除时必须返回同一 prev 引用让 React bail,否则 setState 新数组会自触发重渲染死循环。
@@ -15708,6 +15755,7 @@ export default function App() {
       };
     }, [listTasks, loadProjectStructureForClient, projectStructureCache, taskViewMode, workspace?.client.id]);
     const baseCalendarTasks = tasks.filter((task) => {
+      if (!isTaskOnPersonalSurface(task, 'calendar') && !isUnsyncedLocalTask(task)) return false;
       if (task.status === 'rejected') return false;
       if (task.status === 'inbox' || task.viewerInboxStatus === 'pending') return false;
       if (isTaskInboxNotification(task)) return false;
@@ -15885,24 +15933,28 @@ export default function App() {
       const clear = Boolean(best && best.score >= 2 && (!second || best.score >= second.score + 2));
       setEditingTask((previous) => {
         if (previous.clientTouched) return previous;
-        if (!clear || !best) {
-          if (!previous.clientId || previous.clientConfidence === 'manual') return previous;
-          return {
-            ...previous,
-            clientId: '',
-            clientConfidence: 'none',
-            clientReason: ranked.length > 1
-              ? '识别到多个可能项目，已按匹配度调整候选顺序，请手动选择。'
-              : organizationTaskAutoReason,
-          };
-        }
-        if (previous.clientId === best.profile.clientId && previous.clientConfidence === 'high') return previous;
+        const selection = resolveTaskProjectAutoSelection({
+          currentClientId: previous.clientId,
+          currentConfidence: previous.clientConfidence,
+          currentClientReason: previous.clientReason,
+          clientTouched: previous.clientTouched,
+          organizationClientId,
+          organizationClientReason: organizationTaskAutoReason,
+          clearMatchClientId: clear && best ? best.profile.clientId : null,
+          clearMatchClientName: clear && best ? best.profile.clientName : null,
+          hasAmbiguousMatches: ranked.length > 1,
+        });
+        if (
+          previous.clientId === selection.clientId
+          && previous.clientConfidence === selection.clientConfidence
+          && previous.clientReason === selection.clientReason
+        ) return previous;
         return {
           ...previous,
-          clientId: best.profile.clientId,
-          clientConfidence: 'high',
-          clientReason: `根据标题和说明推荐「${best.profile.clientName}」；保存前仍可手动修改。`,
-          eventLineId: previous.clientId === best.profile.clientId ? previous.eventLineId : '',
+          clientId: selection.clientId,
+          clientConfidence: selection.clientConfidence,
+          clientReason: selection.clientReason,
+          eventLineId: previous.clientId === selection.clientId ? previous.eventLineId : '',
         };
       });
     }, [
@@ -15910,6 +15962,7 @@ export default function App() {
       editingTask.recordMode,
       editingTask.scopeMode,
       isTaskModalOpen,
+      organizationClientId,
       organizationTaskAutoReason,
       taskClientMatchText,
       taskClientScoreById,
@@ -17382,7 +17435,7 @@ export default function App() {
       event.dataTransfer.dropEffect = 'copy';
     };
 
-    const handleSaveTask = async () => {
+	    const handleSaveTask = async () => {
       // S4.1 fix: re-entry guard — 快连点保存按钮 / 录音完成自动触发 时, 防止双保存导致重复任务.
       // 注: 这里读 state isSavingTask 即可 (React batch 保证同 tick 内多次调用看到的是同个值).
       if (isSavingTask) {
@@ -17396,7 +17449,7 @@ export default function App() {
         flash('error', '请填写任务标题');
         return;
       }
-      if (editingTask.recordMode === 'customer_meeting') {
+	      if (editingTask.recordMode === 'customer_meeting') {
         if (!editingTask.clientId) {
           flash('error', '客户会议必须关联项目');
           return;
@@ -17425,7 +17478,8 @@ export default function App() {
           flash('error', '客户会议结束时间必须晚于开始时间');
           return;
         }
-        setIsSavingTask(true);
+	        advanceMiniAiQuickTaskFlow('save-started');
+	        setIsSavingTask(true);
         try {
           const selectedMeetingPlan = strictPlanWorkshopState.departmentPlans.find(
             (plan) => plan.id === editingTask.planLinkPlanItemId,
@@ -17522,15 +17576,18 @@ export default function App() {
               }
             }
           }
-          closeTaskModal('meeting-saved');
+	          const miniFlowTransition = advanceMiniAiQuickTaskFlow('save-succeeded');
+	          closeTaskModal('meeting-saved');
+	          if (miniFlowTransition.shouldReturnToMini) returnToMiniModeAfterAiQuickTask();
           void loadTaskBlock();
           if (!pendingMeetingMediaAction || !meetingMediaActionFailed) {
             if (!pendingMeetingMediaAction) {
               flash('success', editingTask.id ? '客户会议已更新' : '客户会议已创建');
             }
           }
-        } catch (error) {
-          flash('error', error instanceof Error ? error.message : '客户会议保存失败');
+	        } catch (error) {
+	          advanceMiniAiQuickTaskFlow('save-failed');
+	          flash('error', error instanceof Error ? error.message : '客户会议保存失败');
         } finally {
           setIsSavingTask(false);
         }
@@ -17666,7 +17723,8 @@ export default function App() {
       if (taskCalendarDisplayMode !== 'week') {
         focusCalendarOnTaskDate(payload.dueDate || combinedDueDate, payload.ddl);
       }
-      closeTaskModal('save-started');
+	      advanceMiniAiQuickTaskFlow('save-started');
+	      closeTaskModal('save-started');
 
       void (async () => {
         let transferredTaskSnapshot: Task | null = null;
@@ -17712,8 +17770,9 @@ export default function App() {
             sandboxId: saveSandboxId,
             updateVisibleState: saveWorkspaceStillVisible,
           });
-          if (!saveWorkspaceStillVisible) {
-            return;
+	          if (!saveWorkspaceStillVisible) {
+	            advanceMiniAiQuickTaskFlow('abandoned');
+	            return;
           }
 
           // 如果是"点录音按钮触发的保存"，拿到真 taskId 后立刻启动录音
@@ -17791,8 +17850,9 @@ export default function App() {
               if (currentClientId && currentClientId === targetClientId) {
                 await refreshWorkspace(targetClientId);
               }
-            } catch (error) {
-              void loadTaskBlock();
+	            } catch (error) {
+	              advanceMiniAiQuickTaskFlow('abandoned');
+	              void loadTaskBlock();
               if ((savedTask?.eventLineId || draftSnapshot.eventLineId) && activeEventLine?.eventLine.id === (savedTask?.eventLineId || draftSnapshot.eventLineId)) {
                 void openEventLineDetail(savedTask?.eventLineId || draftSnapshot.eventLineId);
               }
@@ -17821,9 +17881,10 @@ export default function App() {
               if (currentClientId && currentClientId === (savedTask.clientId || draftSnapshot.clientId)) {
                 await refreshWorkspace(savedTask.clientId || draftSnapshot.clientId);
               }
-            } catch (error) {
-              void loadTaskBlock();
-              flash(
+	            } catch (error) {
+	              advanceMiniAiQuickTaskFlow('abandoned');
+	              void loadTaskBlock();
+	          flash(
                 'error',
                 `${draftSnapshot.id ? '任务已更新' : '任务已创建'}，但附件归档失败：${
                   error instanceof Error ? error.message : '请稍后重试'
@@ -17851,18 +17912,22 @@ export default function App() {
               : draftSnapshot.id
                 ? '任务已更新'
                 : '任务已创建',
-          );
-        } catch (error) {
+	          );
+	          const miniFlowTransition = advanceMiniAiQuickTaskFlow('save-succeeded');
+	          if (miniFlowTransition.shouldReturnToMini) returnToMiniModeAfterAiQuickTask();
+	        } catch (error) {
           // Local-first: backend saves to local DB first, so failures are rare.
           // If create fails, remove the optimistic draft so it cannot be edited as a real task.
           const saveWorkspaceStillVisible = !saveSandboxId || saveSandboxId === currentTaskSandboxId();
-          if (draftSnapshot.id && existingTaskSnapshot) {
+	          const shouldRestoreTaskDraft = saveWorkspaceStillVisible && !isTaskModalOpenRef.current;
+	          advanceMiniAiQuickTaskFlow(shouldRestoreTaskDraft ? 'save-failed' : 'abandoned');
+	          if (draftSnapshot.id && existingTaskSnapshot) {
             const recoveryTask = transferredTaskSnapshot || existingTaskSnapshot;
             upsertLocalTask(recoveryTask, draftSnapshot.id, {
               sandboxId: saveSandboxId,
               updateVisibleState: saveWorkspaceStillVisible,
             });
-            if (saveWorkspaceStillVisible && !isTaskModalOpenRef.current) {
+	            if (shouldRestoreTaskDraft) {
               const parsedDate = parseTaskDateValue(draftSnapshot.dueDate);
               setDuePickerMonth(parsedDate ? new Date(parsedDate.getFullYear(), parsedDate.getMonth(), 1) : getTodayCalendarState().calendarDate);
               setEditingTask(draftSnapshot);
@@ -17884,7 +17949,7 @@ export default function App() {
             // 仅当当前没有别的任务编辑器打开时，才把失败的草稿恢复到 modal。
             // 否则 A 的失败回调会强制用 A 的 draftSnapshot 覆盖正在编辑的 B 的内容。
             // 跟上面 update 分支的 guard 对齐。
-            if (saveWorkspaceStillVisible && !isTaskModalOpenRef.current) {
+	            if (shouldRestoreTaskDraft) {
               const parsedDate = parseTaskDateValue(draftSnapshot.dueDate);
               setDuePickerMonth(parsedDate ? new Date(parsedDate.getFullYear(), parsedDate.getMonth(), 1) : getTodayCalendarState().calendarDate);
               setEditingTask(draftSnapshot);
@@ -18254,10 +18319,10 @@ export default function App() {
         endTime: nextEndParts.time,
         crossDay: false,
         durationMinutes: Math.max(15, options?.durationMinutes ?? 60),
-        clientId: '',
+        clientId: taskCreationDefaults.clientId,
         clientTouched: false,
-        clientConfidence: 'none',
-        clientReason: organizationTaskAutoReason,
+        clientConfidence: taskCreationDefaults.clientConfidence,
+        clientReason: taskCreationDefaults.clientReason,
         eventLineId: '',
         eventLineTouched: false,
         eventLineReason: '可选：把任务挂到一条持续推进的事件线上，后续复盘会按事件线聚合。',
@@ -18270,7 +18335,7 @@ export default function App() {
         ddl: nextDueParts.date ? formatTaskDueLabel(nextDueDate) : '待确认',
         tagIds: [],
         collaborators: buildDefaultCollaborators(),
-        planLinkDepartmentId: currentSessionUser?.departmentId || '',
+        planLinkDepartmentId: taskCreationDefaults.departmentId,
         planLinkCycleType: 'month',
         planLinkPeriodKey: monthKeyFromDate(nextDueParts.date || nextDueDate),
         planLinkPlanItemId: '',
@@ -18286,7 +18351,8 @@ export default function App() {
 
     // 智能新建任务回调:SmartTaskParseModal 解析完后,把 AI 抽出的字段灌进 editingTask
     // 然后关掉 smart modal 并打开常规 TaskEditorModal,让用户审查/微调后保存
-    const handleSmartParseResult = (result: TaskAiParseResult, originalText: string) => {
+	    const handleSmartParseResult = (result: TaskAiParseResult, originalText: string) => {
+	      advanceMiniAiQuickTaskFlow('parsed');
       const aiDueDate = result.dueDate || undefined;
       const aiDueTime = result.dueTime || '';
       const localTimeRange = inferTaskDueDate({ title: result.title || '', desc: originalText, today: new Date() });
@@ -18636,9 +18702,12 @@ export default function App() {
       if (!pendingPlanItemAction) return;
       const pulse = pendingPlanItemAction;
       setPendingPlanItemAction(null);
-      if (pulse.kind === 'open-task') {
-        openTaskEditor(pulse.task);
-      } else if (pulse.kind === 'generate-from-plan-item') {
+	      if (pulse.kind === 'open-task') {
+	        openTaskEditor(pulse.task);
+	      } else if (pulse.kind === 'open-ai-quick-task') {
+	        advanceMiniAiQuickTaskFlow('open');
+	        setIsSmartParseModalOpen(true);
+	      } else if (pulse.kind === 'generate-from-plan-item') {
         handleGenerateTaskFromPlanItem(pulse.planItem, pulse.scopeName, pulse.plan);
       } else if (pulse.kind === 'create-from-answer') {
         resetTaskDraft();
@@ -18671,10 +18740,10 @@ export default function App() {
       const title = editingTask.title.trim();
       if (!title) return;
       const deptId = editingTask.planLinkDepartmentId;
-      if (!deptId) return;
       const periodKey = editingTask.planLinkPeriodKey;
       const matchingPlans = (strictPlanWorkshopState.departmentPlans || []).filter(
-        (p) => p.departmentId === deptId && (p.weekLabel || '').trim() === periodKey,
+        (p) => taskPlanMatchesDepartmentScope(p.departmentId, deptId)
+          && (p.weekLabel || '').trim() === periodKey,
       );
       const planItems = matchingPlans.flatMap((p) => p.items || []);
       if (planItems.length === 0) return;
@@ -19179,6 +19248,105 @@ export default function App() {
       flash('success', '任务已排入日历。');
     };
 
+    const handleInlineTaskScheduleSave = async (
+      task: Task,
+      value: { date: string; time: string },
+    ) => {
+      if (!guardWorkspaceWrite('调整任务时间')) {
+        throw new Error(workspaceRuntimeMessage || '当前工作空间暂时不能修改任务时间。');
+      }
+      if (isLocalDraftTaskId(task.id)) {
+        throw new Error('任务正在保存，稍后再调整时间。');
+      }
+
+      const normalizedTime = value.time.trim();
+      const scheduleUpdate = normalizedTime
+        ? buildTaskScheduleMoveUpdate(task, {
+          startDate: value.date,
+          startTime: normalizedTime,
+        })
+        : (() => {
+          const currentRange = resolveTaskDateTimeRange(task);
+          const currentStartDay = new Date(
+            currentRange.startDateTime.getFullYear(),
+            currentRange.startDateTime.getMonth(),
+            currentRange.startDateTime.getDate(),
+          );
+          const currentEndDay = new Date(
+            currentRange.endDateTime.getFullYear(),
+            currentRange.endDateTime.getMonth(),
+            currentRange.endDateTime.getDate(),
+          );
+          const calendarDayOffset = Math.max(
+            0,
+            Math.round((currentEndDay.getTime() - currentStartDay.getTime()) / 86_400_000)
+              - (currentRange.hasExplicitTime ? 0 : 1),
+          );
+          const nextStartDay = parseTaskDateValue(value.date);
+          if (!nextStartDay) throw new Error('请选择有效的任务日期。');
+          const nextEndDay = new Date(
+            nextStartDay.getFullYear(),
+            nextStartDay.getMonth(),
+            nextStartDay.getDate() + calendarDayOffset,
+          );
+          return buildTaskScheduleFromStartEnd({
+            startDate: value.date,
+            startTime: null,
+            endDate: formatDateOnlyValue(nextEndDay),
+            endTime: null,
+          });
+        })();
+      const nextDueLabel = formatTaskDueLabel(scheduleUpdate.scheduledStartAt || scheduleUpdate.dueDate);
+
+      await updateTaskWithOverlay(task, {
+        expectedVersion: task.version,
+        ...scheduleUpdate,
+        ddl: nextDueLabel,
+      });
+      flash('success', `任务时间已更新为 ${nextDueLabel}。`);
+    };
+
+    const handleInlineTaskPrioritySave = async (task: Task, priority: Task['priority']) => {
+      if (!guardWorkspaceWrite('调整任务优先级')) {
+        throw new Error(workspaceRuntimeMessage || '当前工作空间暂时不能修改任务优先级。');
+      }
+      if (isLocalDraftTaskId(task.id)) {
+        throw new Error('任务正在保存，稍后再调整优先级。');
+      }
+      if (priority === task.priority) return;
+
+      await updateTaskWithOverlay(task, {
+        expectedVersion: task.version,
+        priority,
+      });
+      const priorityLabel = priority === 'high' ? '高优先级' : priority === 'low' ? '低优先级' : '普通优先级';
+      flash('success', `任务已调整为${priorityLabel}。`);
+    };
+
+    const handleInlineTaskTimerAction = async (
+      task: Task,
+      action: import('./lib/api').TaskTimerAction,
+    ) => {
+      if (!guardWorkspaceWrite('记录任务实际用时')) {
+        throw new Error(workspaceRuntimeMessage || '当前工作空间暂时不能记录任务用时。');
+      }
+      if (isLocalDraftTaskId(task.id)) {
+        throw new Error('任务正在保存，稍后再开始计时。');
+      }
+      const sandboxId = currentTaskSandboxId();
+      const updatedTask = await updateTaskTimer(
+        task.id,
+        action,
+        Number(task.timer?.version || 0),
+        { sandboxId },
+      );
+      if (!sandboxId || sandboxId === currentTaskSandboxId()) {
+        setTasks((previous) => previous.map((item) => (
+          item.id === task.id ? { ...item, ...updatedTask } : item
+        )));
+      }
+    };
+
     const handleRescheduleTask = async (
       task: Task,
       nextDate: string,
@@ -19317,10 +19485,10 @@ export default function App() {
 
     const toggleAllVisibleListRecordSelection = () => {
       setSelectedListTaskIds(isAllVisibleListRecordsSelected ? [] : visibleListTasks.map((task) => task.id));
-      setSelectedListMeetingIds(isAllVisibleListRecordsSelected ? [] : visibleListMeetings.map((meeting) => meeting.id));
+      setSelectedListMeetingIds(isAllVisibleListRecordsSelected ? [] : groupedListMeetings.map((meeting) => meeting.id));
     };
 
-    const toggleExecutionGroupCollapsed = (groupKey: TaskExecutionGroupKey) => {
+    const toggleExecutionGroupCollapsed = (groupKey: string) => {
       setCollapsedTaskGroups((prev) => ({ ...prev, [groupKey]: !prev[groupKey] }));
     };
 
@@ -20456,29 +20624,66 @@ export default function App() {
         >
           {taskViewMode === 'list' && (
             <div className="w-full">
-              <div className="sticky top-0 z-30 mb-4 rounded-2xl border border-gray-100 bg-white/95 px-4 py-3 shadow-sm backdrop-blur">
-                <div className="flex flex-wrap items-center gap-2">
-                  <div className="flex items-center gap-1.5 rounded-2xl border border-gray-200 bg-white px-3 py-2">
-                    <Search size={14} className="text-gray-400 shrink-0" />
+              <div className="sticky top-0 z-30 mb-5 rounded-2xl border border-gray-100 bg-white/95 px-4 py-4 shadow-[0_1px_2px_rgba(15,23,42,0.04)] backdrop-blur">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <div className="group flex h-10 min-w-[210px] flex-1 items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 transition-colors focus-within:border-[#5B7BFE]/50 focus-within:ring-2 focus-within:ring-[#5B7BFE]/10">
+                    <Search size={15} className="shrink-0 text-gray-400 transition-colors group-focus-within:text-[#5B7BFE]" />
                     <input
                       type="text"
                       value={taskSearchQuery}
                       onChange={(e) => setTaskSearchQuery(e.target.value)}
-                      placeholder="搜索任务..."
-                      className="w-[120px] bg-transparent text-[12px] font-bold text-gray-800 outline-none placeholder:text-gray-400 placeholder:font-normal"
+                      placeholder="搜索任务"
+                      aria-label="搜索任务"
+                      className="min-w-0 flex-1 bg-transparent text-[13px] font-medium text-gray-800 outline-none placeholder:font-normal placeholder:text-gray-400"
                     />
                     {taskSearchQuery && (
-                      <button type="button" onClick={() => setTaskSearchQuery('')} className="text-gray-300 hover:text-gray-500">
-                        <X size={12} />
+                      <button
+                        type="button"
+                        onClick={() => setTaskSearchQuery('')}
+                        aria-label="清空任务搜索"
+                        className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-gray-300 transition hover:bg-gray-100 hover:text-gray-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5B7BFE]/30"
+                      >
+                        <X size={13} />
                       </button>
                     )}
                   </div>
-                  <label className="flex items-center gap-2 rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] font-bold text-gray-500">
-                    <span>优先级</span>
+                  <div className="inline-flex h-10 shrink-0 items-center rounded-xl bg-gray-100/90 p-1" role="group" aria-label="任务归类方式">
+                    {([
+                      { value: 'time', label: '按时间' },
+                      { value: 'eventLine', label: '按事件线' },
+                      { value: 'department', label: '按部门' },
+                    ] as Array<{ value: TaskAggregationViewMode; label: string }>).map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        onClick={() => setTaskAggregationViewMode(option.value)}
+                        aria-pressed={taskAggregationViewMode === option.value}
+                        className={`inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-[12px] font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5B7BFE]/30 ${
+                          taskAggregationViewMode === option.value
+                            ? 'bg-white text-[#5B7BFE] shadow-[0_1px_3px_rgba(15,23,42,0.08)]'
+                            : 'text-gray-500 hover:text-gray-800'
+                        }`}
+                      >
+                        {option.value === 'time' ? (
+                          <Clock size={13} strokeWidth={2} />
+                        ) : option.value === 'eventLine' ? (
+                          <GitMerge size={13} strokeWidth={2} />
+                        ) : (
+                          <Users size={13} strokeWidth={2} />
+                        )}
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="hidden h-7 w-px bg-gray-100 2xl:block" aria-hidden />
+                  <label className="flex h-10 shrink-0 items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 text-[12px] font-medium text-gray-500 transition-colors focus-within:border-[#5B7BFE]/50 focus-within:ring-2 focus-within:ring-[#5B7BFE]/10">
+                    <span className="text-gray-400">优先级</span>
+                    <span className="h-4 w-px bg-gray-100" aria-hidden />
                     <select
                       value={taskPriorityFilter}
                       onChange={(event) => setTaskPriorityFilter(event.target.value as TaskPriorityFilter)}
-                      className="bg-transparent text-[12px] font-bold text-gray-800 outline-none"
+                      aria-label="任务优先级"
+                      className="bg-transparent text-[12px] font-semibold text-gray-800 outline-none"
                     >
                       {TASK_PRIORITY_FILTER_OPTIONS.map((option) => (
                         <option key={option.value} value={option.value}>
@@ -20487,12 +20692,14 @@ export default function App() {
                       ))}
                     </select>
                   </label>
-                  <label className="flex items-center gap-2 rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] font-bold text-gray-500">
-                    <span>时间范围</span>
+                  <label className="flex h-10 shrink-0 items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 text-[12px] font-medium text-gray-500 transition-colors focus-within:border-[#5B7BFE]/50 focus-within:ring-2 focus-within:ring-[#5B7BFE]/10">
+                    <span className="text-gray-400">时间范围</span>
+                    <span className="h-4 w-px bg-gray-100" aria-hidden />
                     <select
                       value={taskListTimeRangeFilter}
                       onChange={(event) => setTaskListTimeRangeFilter(event.target.value as TaskTimeRangeFilter)}
-                      className="bg-transparent text-[12px] font-bold text-gray-800 outline-none"
+                      aria-label="任务时间范围"
+                      className="bg-transparent text-[12px] font-semibold text-gray-800 outline-none"
                     >
                       {TASK_TIME_RANGE_OPTIONS.map((option) => (
                         <option key={option.value} value={option.value}>
@@ -20520,7 +20727,7 @@ export default function App() {
                     onClick={() => setHideCompletedInList((prev) => !prev)}
                     role="switch"
                     aria-checked={hideCompletedInList}
-                    className="inline-flex items-center gap-2 rounded-2xl border border-gray-200 bg-white px-3 py-2 text-[12px] font-bold text-gray-600"
+                    className="inline-flex h-10 shrink-0 items-center gap-2.5 rounded-xl border border-gray-200 bg-white px-3 text-[12px] font-semibold text-gray-600 transition-colors hover:border-gray-300 hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5B7BFE]/30"
                   >
                     <span>隐藏已完成</span>
                     <span className={`relative inline-flex h-5 w-9 rounded-full transition-colors ${hideCompletedInList ? 'bg-[#5B7BFE]' : 'bg-gray-200'}`}>
@@ -20545,7 +20752,39 @@ export default function App() {
                     </>
                   )}
                 </div>
-                <p className="mt-2 text-[11px] leading-5 text-gray-400">打勾表示已完成，去掉勾表示重启任务；卡片左边的红色直线表示事项已经逾期。</p>
+                <div className="mt-3 flex flex-col gap-2 border-t border-gray-100 pt-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[#5B7BFE]/[0.08] text-[#5B7BFE]">
+                      {taskAggregationViewMode === 'time' ? (
+                        <Clock size={14} strokeWidth={2} />
+                      ) : taskAggregationViewMode === 'eventLine' ? (
+                        <GitMerge size={14} strokeWidth={2} />
+                      ) : (
+                        <Users size={14} strokeWidth={2} />
+                      )}
+                    </span>
+                    <p className="min-w-0 text-[12px] leading-5 text-gray-500">
+                      <span className="mr-2 font-semibold text-gray-700">
+                        {taskAggregationViewMode === 'time'
+                          ? '按时间整理'
+                          : taskAggregationViewMode === 'eventLine'
+                            ? '按事件线归类'
+                            : '按部门归类'}
+                      </span>
+                      {taskAggregationViewMode === 'time'
+                        ? '按截止时间整理任务与会议，逾期事项会用红色边线提示。'
+                        : taskAggregationViewMode === 'eventLine'
+                          ? '这里只归类我的任务；打开事件线后，会读取其中你有权查看的全部任务。'
+                          : '按负责人当前有效部门归类，未归属或多部门归属的任务会单独收纳。'}
+                    </p>
+                  </div>
+                  <span className="shrink-0 self-start rounded-lg bg-gray-50 px-2.5 py-1 text-[11px] font-medium tabular-nums text-gray-500 sm:self-auto">
+                    当前显示 {visibleListTasks.length} 条任务
+                    {taskAggregationViewMode === 'time' && groupedListMeetings.length > 0
+                      ? ` · ${groupedListMeetings.length} 场会议`
+                      : ''}
+                  </span>
+                </div>
                 {isMultiSelectMode && (
                   <div className="relative mt-3 border-t border-blue-100 pt-3 pr-24">
                     <div className="space-y-2">
@@ -20662,7 +20901,7 @@ export default function App() {
                 )}
               </div>
               <div className="space-y-3">
-                {visibleListTasks.length === 0 && visibleListMeetings.length === 0 && (
+                {visibleListTasks.length === 0 && groupedListMeetings.length === 0 && (
                   <div className="rounded-2xl border border-dashed border-gray-200 bg-white/80 px-5 py-8 text-center text-[13px] text-gray-400">
                     {baseListTasks.length === 0 ? (
                       <>
@@ -20680,7 +20919,7 @@ export default function App() {
                         </button>
                       </>
                     ) : (
-                      <p>当前筛选下暂无任务或会议。</p>
+                      <p>{taskAggregationViewMode === 'time' ? '当前筛选下暂无任务或会议。' : '当前筛选下暂无个人任务。'}</p>
                     )}
                   </div>
                 )}
@@ -20705,37 +20944,52 @@ export default function App() {
                           <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-bold text-gray-500">{group.tasks.length + group.meetings.length}</span>
                           <span className="hidden truncate text-[11px] text-gray-400 md:block">{group.hint}</span>
                         </button>
-                        {isMultiSelectMode ? (
-                          <button
-                            type="button"
-                            onClick={() => toggleListGroupSelection(group.tasks, group.meetings)}
-                            disabled={!hasGroupRecords}
-                            className={`rounded-xl border px-3 py-1.5 text-[11px] font-bold transition ${
-                              isGroupFullySelected
-                                ? 'border-[#5B7BFE] bg-[#EEF2FF] text-[#5B7BFE]'
-                                : hasGroupRecords
+                        <div className="flex shrink-0 items-center gap-2">
+                          {taskAggregationViewMode === 'eventLine' && group.sourceId && (
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setTaskViewMode('event_lines');
+                                void openEventLineDetail(group.sourceId || '');
+                              }}
+                              className="rounded-xl border border-blue-100 bg-blue-50 px-3 py-1.5 text-[11px] font-bold text-[#5B7BFE] transition hover:bg-blue-100"
+                            >
+                              查看事件线
+                            </button>
+                          )}
+                          {isMultiSelectMode ? (
+                            <button
+                              type="button"
+                              onClick={() => toggleListGroupSelection(group.tasks, group.meetings)}
+                              disabled={!hasGroupRecords}
+                              className={`rounded-xl border px-3 py-1.5 text-[11px] font-bold transition ${
+                                isGroupFullySelected
+                                  ? 'border-[#5B7BFE] bg-[#EEF2FF] text-[#5B7BFE]'
+                                  : hasGroupRecords
+                                    ? 'border-gray-200 bg-white text-gray-500 hover:border-[#C9D6FF] hover:text-[#5B7BFE]'
+                                    : 'cursor-not-allowed border-gray-100 bg-gray-50 text-gray-300'
+                              }`}
+                            >
+                              {!hasGroupRecords ? '暂无事项' : isGroupFullySelected ? '取消本组' : selectedCount > 0 ? `已选 ${selectedCount}` : '选择本组'}
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setIsMultiSelectMode(true)}
+                              disabled={!hasGroupRecords}
+                              title={hasGroupRecords ? '进入多选模式，任务和会议卡片上会显示勾选框' : ''}
+                              className={`inline-flex items-center gap-1 rounded-xl border px-3 py-1.5 text-[11px] font-bold transition ${
+                                hasGroupRecords
                                   ? 'border-gray-200 bg-white text-gray-500 hover:border-[#C9D6FF] hover:text-[#5B7BFE]'
                                   : 'cursor-not-allowed border-gray-100 bg-gray-50 text-gray-300'
-                            }`}
-                          >
-                            {!hasGroupRecords ? '暂无事项' : isGroupFullySelected ? '取消本组' : selectedCount > 0 ? `已选 ${selectedCount}` : '选择本组'}
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => setIsMultiSelectMode(true)}
-                            disabled={!hasGroupRecords}
-                            title={hasGroupRecords ? '进入多选模式，任务和会议卡片上会显示勾选框' : ''}
-                            className={`inline-flex items-center gap-1 rounded-xl border px-3 py-1.5 text-[11px] font-bold transition ${
-                              hasGroupRecords
-                                ? 'border-gray-200 bg-white text-gray-500 hover:border-[#C9D6FF] hover:text-[#5B7BFE]'
-                                : 'cursor-not-allowed border-gray-100 bg-gray-50 text-gray-300'
-                            }`}
-                          >
-                            <CheckSquare size={12} />
-                            {hasGroupRecords ? '多选' : '暂无事项'}
-                          </button>
-                        )}
+                              }`}
+                            >
+                              <CheckSquare size={12} />
+                              {hasGroupRecords ? '多选' : '暂无事项'}
+                            </button>
+                          )}
+                        </div>
                       </div>
                       {!isGroupCollapsed && (
                         <div className="space-y-3">
@@ -20896,7 +21150,29 @@ export default function App() {
                             const isSelected = selectedListTaskIds.includes(task.id);
                             const isOverdue = isTaskOverdue(task);
                             const listTimeLabel = formatTaskCardScheduleLabel(task, true);
-                            const listTimeClassName = 'border-slate-100 bg-slate-50 text-slate-600';
+                            const listTimeParts = splitTaskDueDateTime(
+                              task.scheduledStartAt || task.startDate || task.deadlineAt || task.dueDate,
+                            );
+                            const inlineScheduleInitialDate = listTimeParts.date || formatDateOnlyValue(new Date());
+                            const inlineScheduleInitialTime = listTimeParts.time || '';
+                            const primaryActionDisplay = getTaskPrimaryActionDisplay(task);
+                            const priorityLabel = task.priority === 'high'
+                              ? '高优先级'
+                              : task.priority === 'low'
+                                ? '低优先级'
+                                : '普通优先级';
+                            const priorityToneClassName = task.status === 'done'
+                              ? 'border-gray-100 bg-gray-50 text-gray-400'
+                              : task.priority === 'high'
+                                ? 'border-rose-100 bg-rose-50 text-rose-600'
+                                : task.priority === 'low'
+                                  ? 'border-slate-100 bg-slate-50 text-slate-500'
+                                  : 'border-blue-100 bg-blue-50 text-blue-600';
+                            const listTimeClassName = isOverdue
+                              ? 'border-rose-100 bg-rose-50 text-rose-700'
+                              : isTaskDueToday(task)
+                                ? 'border-orange-100 bg-orange-50 text-orange-700'
+                                : 'border-slate-100 bg-slate-50 text-slate-600';
                             const collaboratorCount = task.collaborators.filter((item) => !item.isOwner).length;
                             const ownerCollaboration = task.collaborators.find((item) => item.isOwner && item.userId === task.ownerId);
                             const ownerNeedsConfirmation = ownerCollaboration?.inboxStatus === 'pending'
@@ -20919,10 +21195,14 @@ export default function App() {
                               : isExpanded ? 'before:bg-[#9FB2FF]'
                               : 'before:bg-transparent';
                             return (
-                              <TaskRowLongPress key={task.id} task={task}>
+                              <TaskRowLongPress
+                                key={task.id}
+                                task={task}
+                                overlayActive={inlineScheduleTaskId === task.id || inlinePriorityTaskId === task.id}
+                              >
                               <div
-                                className={`relative border rounded-2xl pl-7 pr-6 py-5 transition-all duration-200 group flex items-start gap-3.5 cursor-pointer
-                                  before:absolute before:left-3 before:top-5 before:bottom-5 before:w-[3px] before:rounded-full ${priorityAccentCls} ${
+                                className={`group relative flex cursor-pointer items-start gap-3 rounded-xl border py-3.5 pl-6 pr-4 transition-all duration-200
+                                  before:absolute before:bottom-3.5 before:left-2.5 before:top-3.5 before:w-[3px] before:rounded-full focus:outline-none focus-visible:ring-2 focus-visible:ring-[#5B7BFE]/30 focus-visible:ring-offset-2 ${priorityAccentCls} ${
                                   isSelected
                                     ? 'border-[#9FB2FF] bg-[#5B7BFE]/[0.04] shadow-[0_1px_2px_rgba(91,123,254,0.05)]'
                                     : isExpanded
@@ -20973,26 +21253,91 @@ export default function App() {
                                     {task.status === 'done' ? <CheckCircle2 size={22} strokeWidth={2} /> : <Circle size={22} strokeWidth={2} />}
                                   </button>
                                 )}
-                                <div className="min-w-0 flex-1 pt-0.5">
-                                  <div className="flex items-start justify-between gap-3">
-                                    <p className={`min-w-0 flex-1 truncate pr-2 text-left text-[14px] font-bold leading-snug lg:text-[15px] ${task.status === 'done' ? 'text-gray-400 line-through' : 'text-gray-900'}`}>{task.title}</p>
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex min-w-0 flex-wrap items-start gap-x-4 gap-y-2">
+                                    <div className="min-w-[240px] flex-1">
+                                      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                                        <p
+                                          className={`min-w-0 max-w-full flex-1 basis-[260px] line-clamp-2 text-left text-[14px] font-bold leading-5 lg:text-[15px] ${task.status === 'done' ? 'text-gray-400 line-through' : 'text-gray-900'}`}
+                                          title={task.title}
+                                        >
+                                          {task.title}
+                                        </p>
+                                        <TaskInlinePriorityEditor
+                                          taskId={task.id}
+                                          taskTitle={task.title}
+                                          priority={task.priority}
+                                          label={priorityLabel}
+                                          marker={primaryActionDisplay.priorityMarker}
+                                          toneClassName={priorityToneClassName}
+                                          isOpen={inlinePriorityTaskId === task.id}
+                                          onOpen={() => {
+                                            if (inlinePriorityTaskId === task.id) {
+                                              setInlinePriorityTaskId(null);
+                                              return;
+                                            }
+                                            if (!guardWorkspaceWrite('调整任务优先级')) return;
+                                            if (isLocalDraftTaskId(task.id)) {
+                                              flash('info', '任务正在保存，稍后再调整优先级。');
+                                              return;
+                                            }
+                                            setInlineScheduleTaskId(null);
+                                            setInlinePriorityTaskId(task.id);
+                                          }}
+                                          onClose={() => setInlinePriorityTaskId((current) => current === task.id ? null : current)}
+                                          onSave={(priority) => handleInlineTaskPrioritySave(task, priority)}
+                                        />
+                                      </div>
+                                      {primaryActionDisplay.text && (
+                                        <div className="mt-1.5 flex min-w-0 items-center gap-2 text-left">
+                                          <span className="shrink-0 text-[10px] font-bold tracking-[0.08em] text-gray-400">下一步</span>
+                                          <p className={`min-w-0 flex-1 truncate text-[12px] leading-5 ${task.status === 'done' ? 'text-gray-400' : 'text-gray-600'}`} title={primaryActionDisplay.text}>
+                                            {primaryActionDisplay.text}
+                                          </p>
+                                        </div>
+                                      )}
+                                    </div>
                                     <div className="flex shrink-0 items-center gap-1.5">
-                                      <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold ${
-                                        task.priority === 'high'
-                                          ? 'border-blue-200 bg-blue-50 text-[#5B7BFE]'
-                                          : 'border-emerald-200 bg-emerald-50 text-emerald-700'
-                                      }`}><Flag size={10} />{task.priority === 'high' ? '高优先级' : task.priority === 'low' ? '低优先级' : '普通优先级'}</span>
-                                      <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold ${listTimeClassName}`}><CalendarIcon size={10} />{listTimeLabel}</span>
-                                      <button type="button" onClick={(event) => { event.stopPropagation(); openTaskEditor(task); }} className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-400 transition hover:border-[#C9D6FF] hover:text-[#5B7BFE]" aria-label={`编辑任务${task.title}`}><Pencil size={12} /></button>
-                                      <button type="button" onClick={(event) => { event.stopPropagation(); void handleDeleteTaskRecord(task); }} className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-400 transition hover:border-rose-200 hover:text-rose-500" aria-label={`删除任务${task.title}`}><Trash2 size={12} /></button>
+                                      <TaskInlineTimer
+                                        taskTitle={task.title}
+                                        timer={task.timer}
+                                        canTrackTime={Boolean(task.viewerCapabilities?.canTrackTime)}
+                                        allowStart={task.status !== 'done'}
+                                        disabled={isLocalDraftTaskId(task.id)}
+                                        onAction={(action) => handleInlineTaskTimerAction(task, action)}
+                                      />
+                                      <TaskInlineScheduleEditor
+                                        taskId={task.id}
+                                        taskTitle={task.title}
+                                        label={listTimeLabel}
+                                        toneClassName={listTimeClassName}
+                                        initialDate={inlineScheduleInitialDate}
+                                        initialTime={inlineScheduleInitialTime}
+                                        isOpen={inlineScheduleTaskId === task.id}
+                                        disabled={isLocalDraftTaskId(task.id)}
+                                        onOpen={() => {
+                                          if (inlineScheduleTaskId === task.id) {
+                                            setInlineScheduleTaskId(null);
+                                            return;
+                                          }
+                                          if (!guardWorkspaceWrite('调整任务时间')) return;
+                                          if (isLocalDraftTaskId(task.id)) {
+                                            flash('info', '任务正在保存，稍后再调整时间。');
+                                            return;
+                                          }
+                                          setInlinePriorityTaskId(null);
+                                          setInlineScheduleTaskId(task.id);
+                                        }}
+                                        onClose={() => setInlineScheduleTaskId((current) => current === task.id ? null : current)}
+                                        onSave={(value) => handleInlineTaskScheduleSave(task, value)}
+                                      />
+                                      <button type="button" onClick={(event) => { event.stopPropagation(); openTaskEditor(task); }} className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-400 transition hover:border-[#C9D6FF] hover:text-[#5B7BFE] focus:outline-none focus-visible:ring-2 focus-visible:ring-[#5B7BFE]/30" aria-label={`编辑任务${task.title}`}><Pencil size={12} /></button>
+                                      <button type="button" onClick={(event) => { event.stopPropagation(); void handleDeleteTaskRecord(task); }} className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-400 transition hover:border-rose-200 hover:text-rose-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-200" aria-label={`删除任务${task.title}`}><Trash2 size={12} /></button>
                                     </div>
                                   </div>
-                                  <p className="mt-2 line-clamp-1 text-left text-[12px] leading-6 text-gray-500">
-                                    {getTaskPrimaryActionLine(task)}
-                                  </p>
-                                  <div className="mt-2 flex w-full flex-wrap items-center gap-2 text-left text-[11px] font-medium">
+                                  <div className="mt-2 flex w-full flex-wrap items-center gap-1.5 text-left text-[11px] font-medium">
                                     {task.projectContext?.clientName || task.clientName ? (
-                                      <span className="flex min-w-0 max-w-[220px] items-center gap-1 rounded-md bg-blue-50 px-2 py-1 text-blue-700">
+                                      <span className="flex min-w-0 max-w-[220px] items-center gap-1 rounded-md bg-blue-50 px-2 py-1 text-blue-700" title={task.projectContext?.clientName || task.clientName || undefined}>
                                         <Briefcase size={12} className="shrink-0" />
                                         <span className="truncate">{task.projectContext?.clientName || task.clientName}</span>
                                       </span>
@@ -21006,12 +21351,13 @@ export default function App() {
                                         type="button"
                                         className="flex min-w-0 max-w-[260px] items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-50"
                                         onClick={(e) => { e.stopPropagation(); setReportEventLineId(task.eventLineId!); }}
+                                        title={`事件线 · ${task.eventLineName}`}
                                       >
                                         <GitMerge size={12} className="shrink-0" />
                                         <span className="truncate">事件线 · {task.eventLineName}</span>
                                       </button>
                                     )}
-                                    <span className="flex min-w-0 max-w-[260px] items-center gap-1 rounded-md bg-gray-50 px-2 py-1 text-gray-500">
+                                    <span className="flex min-w-0 max-w-[260px] items-center gap-1 rounded-md bg-gray-50 px-2 py-1 text-gray-500" title={task.ownerName || '未指定负责人'}>
                                       <User size={12} className="shrink-0" />
                                       <span className="truncate">{task.ownerName || '未指定负责人'}</span>
                                       {collaboratorCount > 0 && <span className="shrink-0">+{collaboratorCount}</span>}
@@ -23496,9 +23842,12 @@ export default function App() {
         {/* AICommandModal 替换 SmartTaskParseModal (顾源源 5/24 §M1).
             SmartTaskParseModal 文件保留 (顾源源 §6 "原智能建任务必须保留"), 可随时回滚.
             AICommandModal 内置 2 mode: quick_task 走原 aiParseTask, ai_command 走新 bot 链路. */}
-        <AICommandModal
-          open={isSmartParseModalOpen}
-          onClose={() => setIsSmartParseModalOpen(false)}
+	        <AICommandModal
+	          open={isSmartParseModalOpen}
+	          onClose={() => {
+	            advanceMiniAiQuickTaskFlow('dismissed');
+	            setIsSmartParseModalOpen(false);
+	          }}
           onQuickTaskParsed={handleSmartParseResult}
           knownClientNames={clients.map((c) => c.name).filter(Boolean) as string[]}
           clientsForResolve={clients
@@ -24729,6 +25078,7 @@ export default function App() {
                         <TaskTime24Input
                           label="开始"
                           value={editingTask.dueTime}
+                          previewValue="09:00"
                           onChange={applyEditingTaskStartTime}
                         />
                       </div>
@@ -24892,7 +25242,7 @@ export default function App() {
                     const departmentChoices = isAdmin ? visibleDepartments : visibleDepartments.filter((d) => d.id === currentSessionUser?.departmentId);
                     const departmentPlans = (strictPlanWorkshopState.departmentPlans || []).filter(
                       (plan) => plan.status !== 'closed'
-                        && plan.departmentId === deptId
+                        && taskPlanMatchesDepartmentScope(plan.departmentId, deptId)
                         && planningCycleTypeForKey(plan.weekLabel) === cycleType,
                     );
                     const periodChoices = [...new Set(departmentPlans.map((plan) => (plan.weekLabel || '').trim()).filter(Boolean))]
@@ -24913,14 +25263,14 @@ export default function App() {
                         </div>
 
                         <div className="space-y-3">
-                          <TaskPropertyRow icon={<Briefcase size={16} />} label="所属部门">
+                          <TaskPropertyRow icon={<Briefcase size={16} />} label="计划归属">
                             <select
-                              value={deptId}
+                              value={resolveTaskPlanScopeSelectValue(deptId)}
                               onChange={(event) => {
-                                const nextDepartmentId = event.target.value;
+                                const nextDepartmentId = resolveTaskPlanDepartmentIdFromScopeValue(event.target.value);
                                 const firstPeriod = strictPlanWorkshopState.departmentPlans.find(
                                   (plan) => plan.status !== 'closed'
-                                    && plan.departmentId === nextDepartmentId
+                                    && taskPlanMatchesDepartmentScope(plan.departmentId, nextDepartmentId)
                                     && planningCycleTypeForKey(plan.weekLabel) === cycleType,
                                 )?.weekLabel || defaultPlanningPeriodKey(cycleType);
                                 setEditingTask((prev) => ({
@@ -24935,7 +25285,7 @@ export default function App() {
                               disabled={!isAdmin && departmentChoices.length <= 1}
                               className="w-full rounded border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-400"
                             >
-                              <option value="">请选择部门</option>
+                              <option value={TASK_PLAN_ORGANIZATION_SCOPE_VALUE}>{organizationTaskName}</option>
                               {departmentChoices.map((dept) => (
                                 <option key={dept.id} value={dept.id}>{dept.name}</option>
                               ))}
@@ -24949,7 +25299,7 @@ export default function App() {
                                 const nextCycleType = event.target.value as PlanningCycleType;
                                 const firstPeriod = strictPlanWorkshopState.departmentPlans.find(
                                   (plan) => plan.status !== 'closed'
-                                    && plan.departmentId === deptId
+                                    && taskPlanMatchesDepartmentScope(plan.departmentId, deptId)
                                     && planningCycleTypeForKey(plan.weekLabel) === nextCycleType,
                                 )?.weekLabel || defaultPlanningPeriodKey(nextCycleType);
                                 setEditingTask((prev) => ({
@@ -27829,9 +28179,7 @@ export default function App() {
         }
         const processed = latestKnowledgeJob?.processedItems || 0;
         const total = latestKnowledgeJob?.totalItems || 0;
-        const activeJob = latestKnowledgeJob?.status === 'queued'
-          || latestKnowledgeJob?.status === 'running'
-          || latestKnowledgeJob?.status === 'interrupted';
+        const activeJob = isActiveKnowledgeJobStatus(latestKnowledgeJob?.status);
         const hasActivity =
           isTemplateFilling ||
           isLinkImporting ||
@@ -37605,7 +37953,13 @@ export default function App() {
         case 'org_rules':
           return renderSystemAdminSection(orgSectionMeta.org_rules.tab);
         case 'about':
-          return <AboutAppSettingsPanel desktopAppInfo={desktopAppInfo} />;
+          return (
+            <AboutAppSettingsPanel
+              desktopAppInfo={desktopAppInfo}
+              organizationScopeKey={currentSessionUser?.organizationId || ''}
+              canManageOrganizationBrand={hasAuthenticatedSession && currentSessionUser?.primaryRole === 'admin'}
+            />
+          );
         case 'system_logs':
           return (
             <div className="space-y-10 max-w-[860px]">
@@ -38277,8 +38631,9 @@ export default function App() {
         today={miniData.today}
         markedDates={miniData.markedDates}
         getDay={miniData.getDay}
-        onToggleTask={handleMiniToggleTask}
-        onQuickAdd={handleMiniQuickAdd}
+	        onToggleTask={handleMiniToggleTask}
+	        onQuickAdd={handleMiniQuickAdd}
+	        onAIQuickCreate={handleMiniAIQuickCreate}
         onOpenTask={handleMiniOpenTask}
         onOpenEvent={handleMiniOpenTask}
         onRestore={exitMiniMode}
@@ -38407,8 +38762,14 @@ export default function App() {
         <div className={`px-4 py-6 md:py-7 ${isSidebarCollapsed ? 'md:px-3' : 'md:px-5'}`}>
           <div className={`flex items-center gap-3 justify-center ${isSidebarCollapsed ? 'md:justify-center' : 'md:justify-between'}`}>
             <div className="flex items-center gap-2.5 min-w-0">
-              <BrandLogoMark className={`shrink-0 ${isSidebarCollapsed ? 'md:w-9 md:h-9' : 'md:w-9 md:h-9'} w-8 h-8`} />
-              <span className={`text-[17px] font-light tracking-tight text-gray-900 truncate ${isSidebarCollapsed ? 'hidden' : 'hidden md:block'}`}>益语智库</span>
+              <BrandLogoMark
+                organizationScopeKey={currentSessionUser?.organizationId || ''}
+                className={`shrink-0 ${isSidebarCollapsed ? 'md:w-9 md:h-9' : 'md:w-9 md:h-9'} w-8 h-8`}
+              />
+              <BrandDisplayName
+                organizationScopeKey={currentSessionUser?.organizationId || ''}
+                className={`text-[17px] font-light tracking-tight text-gray-900 truncate ${isSidebarCollapsed ? 'hidden' : 'hidden md:block'}`}
+              />
             </div>
             <button
               type="button"
@@ -38427,41 +38788,42 @@ export default function App() {
             {navItems.map((item) => {
               const isActive = activeTab === item.id;
               return (
-                <button
-                  key={item.id}
-                  type="button"
-                  aria-label={item.label}
-                  onClick={() => setActiveTab(item.id)}
-                  className={`group relative w-full flex items-center transition-colors duration-150 ${
-                    isSidebarCollapsed
-                      ? `justify-center py-3 rounded-md ${isActive ? 'bg-gray-100' : 'hover:bg-gray-50'}`
-                      : `border-l-[2.5px] py-3 pl-4 pr-3 rounded-r-md ${
-                          isActive
-                            ? 'border-[#5B7BFE] bg-gray-100/70 text-gray-900'
-                            : 'border-transparent text-gray-700 hover:bg-gray-50 hover:text-gray-900'
-                        }`
-                  }`}
-                >
-                  <item.icon
-                    size={18}
-                    strokeWidth={isActive ? 2.25 : 2}
-                    className={`shrink-0 transition-colors ${isSidebarCollapsed ? '' : 'mr-3.5'} ${
-                      isActive ? 'text-[#5B7BFE]' : 'text-gray-500 group-hover:text-gray-800'
-                    }`}
-                  />
-                  <span
-                    className={`${isSidebarCollapsed ? 'hidden' : 'hidden md:block'} truncate text-[14.5px] tracking-[0.005em] ${
-                      isActive ? 'font-semibold' : 'font-medium'
+                <React.Fragment key={item.id}>
+                  <button
+                    type="button"
+                    aria-label={item.label}
+                    onClick={() => setActiveTab(item.id)}
+                    className={`group relative w-full flex items-center transition-colors duration-150 ${
+                      isSidebarCollapsed
+                        ? `justify-center py-3 rounded-md ${isActive ? 'bg-gray-100' : 'hover:bg-gray-50'}`
+                        : `border-l-[2.5px] py-3 pl-4 pr-3 rounded-r-md ${
+                            isActive
+                              ? 'border-[#5B7BFE] bg-gray-100/70 text-gray-900'
+                              : 'border-transparent text-gray-700 hover:bg-gray-50 hover:text-gray-900'
+                          }`
                     }`}
                   >
-                    {item.label}
-                  </span>
-                  {isSidebarCollapsed && (
-                    <span className="pointer-events-none absolute left-full top-1/2 z-30 ml-3 hidden -translate-y-1/2 whitespace-nowrap rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-[12px] font-semibold text-gray-800 shadow-[0_8px_24px_rgba(15,23,42,0.12)] opacity-0 transition-all duration-200 group-hover:translate-x-1 group-hover:opacity-100 md:block">
+                    <item.icon
+                      size={18}
+                      strokeWidth={isActive ? 2.25 : 2}
+                      className={`shrink-0 transition-colors ${isSidebarCollapsed ? '' : 'mr-3.5'} ${
+                        isActive ? 'text-[#5B7BFE]' : 'text-gray-500 group-hover:text-gray-800'
+                      }`}
+                    />
+                    <span
+                      className={`${isSidebarCollapsed ? 'hidden' : 'hidden md:block'} truncate text-[14.5px] tracking-[0.005em] ${
+                        isActive ? 'font-semibold' : 'font-medium'
+                      }`}
+                    >
                       {item.label}
                     </span>
-                  )}
-                </button>
+                    {isSidebarCollapsed && (
+                      <span className="pointer-events-none absolute left-full top-1/2 z-30 ml-3 hidden -translate-y-1/2 whitespace-nowrap rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-[12px] font-semibold text-gray-800 shadow-[0_8px_24px_rgba(15,23,42,0.12)] opacity-0 transition-all duration-200 group-hover:translate-x-1 group-hover:opacity-100 md:block">
+                        {item.label}
+                      </span>
+                    )}
+                  </button>
+                </React.Fragment>
               );
             })}
           </nav>
@@ -38844,10 +39206,16 @@ export default function App() {
             <div className="min-w-0 flex-1">
               <div className="flex items-start gap-2">
                 <div className="min-w-0">
-                  <p className="truncate text-[13px] font-bold text-gray-900">{officialPushToast.title || '收到益语智库官方推送'}</p>
+                  <p className="truncate text-[13px] font-bold text-gray-900">
+                    {officialUpdateToastStatus?.status === 'ready-to-install' || officialUpdateToastStatus?.status === 'installer-opened'
+                      ? `版本 ${officialUpdateToastStatus.version} 已下载完成`
+                      : officialPushToast.title || '收到益语智库官方推送'}
+                  </p>
                   <p className="mt-1 text-[12px] leading-5 text-gray-500">
-                    当前 {officialPushToast.currentVersion}，推送 {officialPushToast.version}
-                    {officialPushToast.packageKind === 'custom' ? '，这是组织定制版。' : '。'}
+                    {officialUpdateToastStatus?.status === 'ready-to-install' || officialUpdateToastStatus?.status === 'installer-opened'
+                      ? '安装包已通过校验，现在可以打开更新页面安装。'
+                      : <>当前 {officialPushToast.currentVersion}，推送 {officialPushToast.version}
+                        {officialPushToast.packageKind === 'custom' ? '，这是组织定制版。' : '。'}</>}
                   </p>
                 </div>
                 <button
@@ -38876,7 +39244,9 @@ export default function App() {
                   }}
                   className="rounded-lg bg-[#5B7BFE] px-3 py-1.5 text-[12px] font-bold text-white hover:bg-[#4A6AED]"
                 >
-                  查看推送
+                  {officialUpdateToastStatus?.status === 'ready-to-install' || officialUpdateToastStatus?.status === 'installer-opened'
+                    ? '前往安装'
+                    : '查看推送'}
                 </button>
               </div>
             </div>

@@ -13,26 +13,19 @@ if str(ROOT) not in sys.path:
 from cloud_backend.app.repositories.gc01_authorization import (
     backfill_authorization_projections,
 )
+from cloud_backend.app.repositories.cloud_instance import require_cloud_instance
 from strict_common.physical_schema import normalized_structure, structure_sha256
 from strict_common.schema import initialize_database, runtime_connection
 
 
-def backfill(database: Path, cloud_instance_id: str | None) -> dict[str, object]:
+def backfill(database: Path, cloud_instance_id: str) -> dict[str, object]:
     identity = initialize_database(database, "cloud")
     with runtime_connection(database, "cloud") as connection:
         before_structure = structure_sha256(normalized_structure(connection))
-        resolved_instance_id = cloud_instance_id
-        if not resolved_instance_id:
-            row = connection.execute(
-                """
-                SELECT state_id FROM state_registry
-                WHERE record_kind='cloud_instance' AND lifecycle_state='active'
-                ORDER BY created_at LIMIT 1
-                """
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("strict cloud has no active cloud instance")
-            resolved_instance_id = str(row["state_id"])
+        resolved_instance_id = require_cloud_instance(
+            connection,
+            expected_cloud_instance_id=cloud_instance_id,
+        )
         counts = backfill_authorization_projections(
             connection,
             origin_instance_id=resolved_instance_id,
@@ -57,7 +50,7 @@ def backfill(database: Path, cloud_instance_id: str | None) -> dict[str, object]
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", required=True, type=Path)
-    parser.add_argument("--cloud-instance-id")
+    parser.add_argument("--cloud-instance-id", required=True)
     args = parser.parse_args()
     print(
         json.dumps(

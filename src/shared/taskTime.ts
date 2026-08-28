@@ -101,6 +101,27 @@ export function normalizeTaskTimeInput(timePart?: string | null) {
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
 }
 
+/**
+ * 编辑器草稿只继承权威数据里明确存在的钟点。界面可以预显 09:00，
+ * 但日期型任务不能因此被保存成一个虚构的 09:00 日程。
+ */
+export function resolveTaskEditorDueTime(value?: string | null) {
+  return splitTaskDateTime(value).time;
+}
+
+export function resolveTaskEditorDueTimeAfterDateChange(nextDueDate?: string | null, currentDueTime?: string | null) {
+  return nextDueDate ? normalizeTaskTimeInput(currentDueTime) : '';
+}
+
+export function resolveTaskEditorTimeDisplay(value?: string | null, previewValue = '') {
+  return normalizeTaskTimeInput(value) || normalizeTaskTimeInput(previewValue);
+}
+
+export function resolveTaskEditorTimeCommit(value: string, hasUserEdited: boolean) {
+  if (!hasUserEdited) return null;
+  return normalizeTaskTimeInput(value) || null;
+}
+
 export function minuteOfDayFromTaskTime(timePart?: string | null) {
   const normalized = normalizeTaskTimeInput(timePart);
   if (!normalized) return null;
@@ -121,6 +142,10 @@ function formatTaskClockTime(date: Date) {
 
 function formatTaskNumericDateTime(date: Date) {
   return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')} ${formatTaskClockTime(date)}`;
+}
+
+function formatTaskNumericDate(date: Date) {
+  return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')}`;
 }
 
 function formatTaskClockRange(start: Date, end: Date) {
@@ -328,7 +353,8 @@ export function getTaskDisplayTime(task: TaskTimeInput): TaskDisplayTime | null 
 }
 
 /**
- * 卡片统一时间口径：仅日期不伪造钟点；明确时段才显示 24 小时时间。
+ * 卡片统一时间口径：单日只突出开始时间；跨天完整显示首尾时间点。
+ * 日期型任务不伪造钟点：紧凑卡片不显示时间，完整卡片只显示日期。
  */
 export function formatTaskCardScheduleLabel(task: TaskTimeInput, includeSingleDate = false) {
   const range = getTaskScheduleRange(task);
@@ -357,11 +383,12 @@ export function formatTaskCardScheduleLabel(task: TaskTimeInput, includeSingleDa
 
   const deadline = getTaskDeadline(task);
   if (!deadline) return '无日期';
-  const display = new Date(deadline);
-  if (!hasExplicitTaskTime(task.deadlineAt) && !hasExplicitTaskTime(task.dueDate)) {
-    return includeSingleDate ? formatDateInputValue(display).replaceAll('-', '/') : '';
-  }
-  return includeSingleDate ? formatTaskNumericDateTime(display) : formatTaskClockTime(display);
+  const hasExplicitDeadlineTime = Boolean(
+    hasExplicitTaskTime(task.deadlineAt)
+      || (!task.deadlineAt && hasExplicitTaskTime(task.dueDate)),
+  );
+  if (!hasExplicitDeadlineTime) return includeSingleDate ? formatTaskNumericDate(deadline) : '';
+  return includeSingleDate ? formatTaskNumericDateTime(deadline) : formatTaskClockTime(deadline);
 }
 
 export function formatScheduleCardLabel(startValue: Date, endValue: Date, includeSingleDate = false) {

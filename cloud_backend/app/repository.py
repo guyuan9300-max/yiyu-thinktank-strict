@@ -24,6 +24,7 @@ from .repositories.gc01_authorization import (
     read_authorization_projection,
     renew_authorization_projection_for_session,
 )
+from .repositories.cloud_instance import require_cloud_instance
 
 
 ACCESS_TTL = timedelta(hours=2)
@@ -176,19 +177,10 @@ class CloudRepository:
 
     def _cloud_instance_id(self, configured: str | None) -> str:
         with self._connection() as connection:
-            row = connection.execute(
-                """
-                SELECT state_id FROM state_registry
-                WHERE record_kind='cloud_instance' AND lifecycle_state='active'
-                ORDER BY created_at LIMIT 1
-                """
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("strict cloud has no active cloud_instance state")
-        actual = str(row["state_id"])
-        if configured and configured != actual:
-            raise RuntimeError("configured cloud instance id does not match database")
-        return actual
+            return require_cloud_instance(
+                connection,
+                expected_cloud_instance_id=configured,
+            )
 
     def handshake(self) -> dict[str, Any]:
         current = database_identity(self.database_path, "cloud")
@@ -1124,6 +1116,906 @@ class CloudRepository:
                 return value.strip()[:2_000]
         return ""
 
+    @staticmethod
+    def _project_story_context(
+        connection: Any,
+        identity: SessionIdentity,
+        *,
+        project_id: str,
+    ) -> dict[str, Any]:
+        """Resolve the single published project Story from the approved 88 tables.
+
+        Generic summaries remain available to other knowledge consumers, but they
+        are deliberately excluded from this authority projection.
+        """
+        authority_row = connection.execute(
+            """
+            SELECT COUNT(*) AS candidate_count, MIN(id) AS story_id
+              FROM narrative_outputs
+             WHERE scope_id=?
+               AND client_id=?
+               AND artifact_kind='project_story'
+               AND lifecycle_state='active'
+               AND deleted_at IS NULL
+               AND publication_state='published'
+               AND visibility_scope='organization'
+               AND published_at IS NOT NULL
+               AND authority_role='cloud'
+            """,
+            (identity.scope_id, project_id),
+        ).fetchone()
+        candidate_count = int(authority_row["candidate_count"] or 0)
+        if candidate_count == 0:
+            return {"state": "not_available", "projectId": project_id}
+        if candidate_count != 1:
+            return {
+                "state": "authority_conflict",
+                "projectId": project_id,
+                "candidateCount": candidate_count,
+            }
+        authority_story_id = str(authority_row["story_id"] or "").strip()
+
+        rows = connection.execute(
+            """
+            SELECT narrative.id AS story_id, narrative.title,
+                   narrative.current_version, narrative.version AS narrative_version,
+                   narrative.published_at, narrative.created_at AS story_created_at,
+                   narrative.updated_at AS story_updated_at,
+                   narrative.source_set_id,
+                   story_resource.version AS story_resource_version,
+                   story_resource.created_at AS story_resource_created_at,
+                   story_resource.updated_at AS story_resource_updated_at,
+                   sources.source_count, sources.version AS source_set_version,
+                   sources.expires_at AS story_sources_expires_at,
+                   sources.created_at AS story_sources_created_at,
+                   sources.updated_at AS story_sources_updated_at,
+                   version.content_hash,
+                   version.integrity_hash AS story_version_integrity_hash,
+                   manifest.receipt, manifest.receipt_hash,
+                   manifest.storage_kind, manifest.media_type,
+                   manifest.created_at AS manifest_created_at,
+                   manifest.verified_at,
+                   version.created_at AS story_version_created_at,
+                   lineage.id AS lineage_id,
+                   lineage.generator_version AS lineage_generator_version,
+                   lineage.generated_at AS lineage_generated_at
+              FROM narrative_outputs AS narrative
+              JOIN secured_resources AS story_resource
+                ON story_resource.scope_id=narrative.scope_id
+               AND story_resource.id=narrative.id
+               AND story_resource.resource_kind='narrative_output'
+               AND story_resource.resource_type_key='project_story'
+               AND story_resource.lifecycle_state='active'
+               AND story_resource.deleted_at IS NULL
+               AND story_resource.authority_role='cloud'
+              JOIN artifact_versions AS version
+                ON version.scope_id=narrative.scope_id
+               AND version.artifact_id=narrative.id
+               AND version.version=narrative.current_version
+               AND version.publication_state='published'
+              JOIN object_manifests AS manifest
+                ON manifest.scope_id=version.scope_id
+               AND manifest.id=version.object_manifest_id
+               AND manifest.lifecycle_state='active'
+               AND manifest.deleted_at IS NULL
+               AND manifest.availability_state='ready'
+               AND manifest.content_hash=version.content_hash
+              JOIN source_sets AS sources
+                ON sources.scope_id=narrative.scope_id
+               AND sources.id=narrative.source_set_id
+               AND sources.id=version.source_set_id
+               AND sources.client_id=narrative.client_id
+               AND sources.lifecycle_state='active'
+               AND sources.deleted_at IS NULL
+               AND sources.publication_state='published'
+               AND sources.purpose_kind='project_story_evidence'
+               AND sources.source_count>0
+              JOIN derivation_lineage AS lineage
+                ON lineage.scope_id=narrative.scope_id
+               AND lineage.source_set_id=narrative.source_set_id
+               AND lineage.derivative_kind='project_story'
+               AND lineage.derivative_object_id=narrative.id
+               AND lineage.invalidated_at IS NULL
+               AND lineage.source_version=sources.version
+               AND lineage.authority_role='cloud'
+             WHERE narrative.scope_id=?
+               AND narrative.client_id=?
+               AND narrative.id=?
+               AND narrative.artifact_kind='project_story'
+               AND narrative.lifecycle_state='active'
+               AND narrative.deleted_at IS NULL
+               AND narrative.publication_state='published'
+               AND narrative.visibility_scope='organization'
+               AND narrative.published_at IS NOT NULL
+               AND version.content_hash IS NOT NULL
+               AND version.content_hash<>''
+               AND narrative.authority_role='cloud'
+               AND version.authority_role='cloud'
+               AND manifest.authority_role='cloud'
+               AND sources.authority_role='cloud'
+               AND story_resource.version=narrative.version
+               AND 1=(
+                 SELECT COUNT(*)
+                   FROM artifact_versions AS version_guard
+                  WHERE version_guard.scope_id=narrative.scope_id
+                    AND version_guard.artifact_id=narrative.id
+                    AND version_guard.version=narrative.current_version
+                    AND version_guard.publication_state='published'
+                    AND version_guard.authority_role='cloud'
+               )
+               AND sources.source_count=(
+                 SELECT COUNT(*)
+                   FROM source_set_members AS member
+                  WHERE member.scope_id=sources.scope_id
+                    AND member.source_set_id=sources.id
+                    AND member.lifecycle_state='active'
+                    AND member.deleted_at IS NULL
+                    AND member.removed_at IS NULL
+                    AND member.authority_role='cloud'
+               )
+               AND 1=(
+                 SELECT COUNT(*)
+                   FROM derivation_lineage AS lineage_guard
+                  WHERE lineage_guard.scope_id=narrative.scope_id
+                    AND lineage_guard.source_set_id=narrative.source_set_id
+                    AND lineage_guard.derivative_kind='project_story'
+                    AND lineage_guard.derivative_object_id=narrative.id
+                    AND lineage_guard.invalidated_at IS NULL
+                    AND lineage_guard.source_version=sources.version
+                    AND lineage_guard.authority_role='cloud'
+               )
+             ORDER BY narrative.published_at DESC, narrative.id
+             LIMIT 2
+            """,
+            (identity.scope_id, project_id, authority_story_id),
+        ).fetchall()
+        if not rows:
+            return {"state": "invalid_authority", "projectId": project_id}
+        if len(rows) != 1:
+            return {"state": "invalid_authority", "projectId": project_id}
+
+        row = rows[0]
+        raw_receipt = str(row["receipt"] or "")
+        if (
+            not raw_receipt
+            or str(row["receipt_hash"] or "").strip()
+            != sha256_text(raw_receipt)
+            or str(row["storage_kind"] or "").strip()
+            != "project_story_snapshot"
+            or str(row["media_type"] or "").strip()
+            != "application/vnd.yiyu.project-story+json"
+            or not str(row["verified_at"] or "").strip()
+        ):
+            return {"state": "invalid_authority", "projectId": project_id}
+        try:
+            receipt = json.loads(raw_receipt)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            receipt = {}
+        if not isinstance(receipt, dict):
+            receipt = {}
+        content_value = receipt.get("contentMarkdown")
+        content = content_value if isinstance(content_value, str) else ""
+        story_id = str(row["story_id"] or "").strip()
+        content_hash = str(row["content_hash"] or "").strip()
+        story_version_integrity_hash = str(
+            row["story_version_integrity_hash"] or ""
+        ).strip()
+        source_set_id = str(row["source_set_id"] or "").strip()
+        source_set_version = int(row["source_set_version"] or 0)
+        lineage_id = str(row["lineage_id"] or "").strip()
+        knowledge_cutoff = str(receipt.get("knowledgeCutoff") or "").strip()
+        generator_version = str(receipt.get("generatorVersion") or "").strip()
+        published_at = str(row["published_at"] or "").strip()
+        receipt_published_at = str(receipt.get("publishedAt") or "").strip()
+        verified_at = str(row["verified_at"] or "").strip()
+        manifest_created_at = str(row["manifest_created_at"] or "").strip()
+        story_version_created_at = str(
+            row["story_version_created_at"] or ""
+        ).strip()
+        story_created_at = str(row["story_created_at"] or "").strip()
+        story_updated_at = str(row["story_updated_at"] or "").strip()
+        story_resource_created_at = str(
+            row["story_resource_created_at"] or ""
+        ).strip()
+        story_resource_updated_at = str(
+            row["story_resource_updated_at"] or ""
+        ).strip()
+        story_sources_created_at = str(
+            row["story_sources_created_at"] or ""
+        ).strip()
+        story_sources_updated_at = str(
+            row["story_sources_updated_at"] or ""
+        ).strip()
+        story_sources_expires_at = str(
+            row["story_sources_expires_at"] or ""
+        ).strip()
+        lineage_generator_version = str(row["lineage_generator_version"] or "").strip()
+        lineage_generated_at = str(row["lineage_generated_at"] or "").strip()
+        version = int(row["current_version"] or 0)
+        try:
+            cutoff_time = _parse_time(knowledge_cutoff)
+            published_time = _parse_time(published_at)
+            receipt_published_time = _parse_time(receipt_published_at)
+            verified_time = _parse_time(verified_at)
+            manifest_created_time = _parse_time(manifest_created_at)
+            story_version_created_time = _parse_time(story_version_created_at)
+            story_created_time = _parse_time(story_created_at)
+            story_updated_time = _parse_time(story_updated_at)
+            story_resource_created_time = _parse_time(story_resource_created_at)
+            story_resource_updated_time = _parse_time(story_resource_updated_at)
+            story_sources_created_time = _parse_time(story_sources_created_at)
+            story_sources_updated_time = _parse_time(story_sources_updated_at)
+            story_sources_expires_time = (
+                _parse_time(story_sources_expires_at)
+                if story_sources_expires_at
+                else None
+            )
+            generated_time = _parse_time(lineage_generated_at)
+            current_time = _parse_time(utc_now())
+        except (TypeError, ValueError):
+            cutoff_time = None
+            published_time = None
+            receipt_published_time = None
+            verified_time = None
+            manifest_created_time = None
+            story_version_created_time = None
+            story_created_time = None
+            story_updated_time = None
+            story_resource_created_time = None
+            story_resource_updated_time = None
+            story_sources_created_time = None
+            story_sources_updated_time = None
+            story_sources_expires_time = None
+            generated_time = None
+            current_time = None
+        timestamps_valid = (
+            cutoff_time is not None
+            and published_time is not None
+            and receipt_published_time is not None
+            and verified_time is not None
+            and manifest_created_time is not None
+            and story_version_created_time is not None
+            and story_created_time is not None
+            and story_updated_time is not None
+            and story_resource_created_time is not None
+            and story_resource_updated_time is not None
+            and story_sources_created_time is not None
+            and story_sources_updated_time is not None
+            and generated_time is not None
+            and current_time is not None
+            and cutoff_time.tzinfo is not None
+            and published_time.tzinfo is not None
+            and receipt_published_time.tzinfo is not None
+            and verified_time.tzinfo is not None
+            and manifest_created_time.tzinfo is not None
+            and story_version_created_time.tzinfo is not None
+            and story_created_time.tzinfo is not None
+            and story_updated_time.tzinfo is not None
+            and story_resource_created_time.tzinfo is not None
+            and story_resource_updated_time.tzinfo is not None
+            and story_sources_created_time.tzinfo is not None
+            and story_sources_updated_time.tzinfo is not None
+            and generated_time.tzinfo is not None
+            and current_time.tzinfo is not None
+            and (
+                not story_sources_expires_at
+                or (
+                    story_sources_expires_time is not None
+                    and story_sources_expires_time.tzinfo is not None
+                    and story_sources_expires_time > current_time
+                )
+            )
+            and receipt_published_time == published_time
+            and cutoff_time <= generated_time <= published_time <= current_time
+            and story_created_time <= story_updated_time <= published_time
+            and story_resource_created_time
+            <= story_resource_updated_time
+            <= published_time
+            and story_sources_created_time
+            <= story_sources_updated_time
+            <= generated_time
+            and generated_time <= story_version_created_time <= published_time
+            and generated_time <= manifest_created_time <= verified_time <= published_time
+        )
+        if (
+            not story_id
+            or not content
+            or content != content.strip()
+            or not content_hash
+            or sha256_text(content) != content_hash
+            or not source_set_id
+            or source_set_version < 1
+            or not lineage_id
+            or version < 1
+            or receipt.get("schema") != "yiyu.authoritative-project-story.v1"
+            or str(receipt.get("projectId") or "").strip() != project_id
+            or str(receipt.get("storyId") or "").strip() != story_id
+            or str(receipt.get("sourceSetId") or "").strip() != source_set_id
+            or receipt.get("sourceSetVersion") != source_set_version
+            or str(receipt.get("lineageId") or "").strip() != lineage_id
+            or receipt.get("version") != version
+            or str(receipt.get("contentHash") or "").strip() != content_hash
+            or story_version_integrity_hash
+            != sha256_text(
+                canonical_json(
+                    {
+                        "schema": "yiyu.authoritative-project-story-version.v1",
+                        "projectId": project_id,
+                        "storyId": story_id,
+                        "sourceSetId": source_set_id,
+                        "sourceSetVersion": source_set_version,
+                        "lineageId": lineage_id,
+                        "version": version,
+                        "contentHash": content_hash,
+                        "factsDigest": str(receipt.get("factsDigest") or ""),
+                        "receiptHash": sha256_text(raw_receipt),
+                    }
+                )
+            )
+            or not generator_version
+            or generator_version != lineage_generator_version
+            or not timestamps_valid
+        ):
+            return {"state": "invalid_authority", "projectId": project_id}
+
+        fact_rows = connection.execute(
+            """
+            SELECT member.id AS member_id, member.ordinal AS story_member_ordinal,
+                   member.added_at AS story_member_added_at,
+                   member.created_at AS story_member_created_at,
+                   member.updated_at AS story_member_updated_at,
+                   fact.id AS fact_id, fact.version AS fact_version,
+                   fact.fact_hash, fact.confirmed_at,
+                   fact.created_at AS fact_created_at,
+                   fact.updated_at AS fact_updated_at,
+                   fact.confirmed_by_membership_id,
+                   fact_resource.created_at AS fact_resource_created_at,
+                   fact_resource.updated_at AS fact_resource_updated_at,
+                   confirmer.created_at AS confirmer_created_at,
+                   confirmer.updated_at AS confirmer_updated_at,
+                   confirmer.expires_at AS confirmer_expires_at,
+                   fact_sources.created_at AS fact_sources_created_at,
+                   fact_sources.updated_at AS fact_sources_updated_at,
+                   fact_sources.expires_at AS fact_sources_expires_at,
+                   fact_source_member.added_at AS fact_source_member_added_at,
+                   fact_source_member.created_at AS fact_source_member_created_at,
+                   fact_source_member.updated_at AS fact_source_member_updated_at,
+                   fact_manifest.content_hash AS fact_manifest_content_hash,
+                   fact_manifest.receipt AS fact_receipt,
+                   fact_manifest.receipt_hash AS fact_receipt_hash,
+                   fact_manifest.storage_kind AS fact_storage_kind,
+                   fact_manifest.media_type AS fact_media_type,
+                   fact_manifest.created_at AS fact_manifest_created_at,
+                   fact_manifest.verified_at AS fact_verified_at,
+                   chunk.id AS chunk_id, chunk.chunk_hash,
+                   chunk.created_at AS chunk_created_at,
+                   chunk.updated_at AS chunk_updated_at,
+                   document.id AS document_id,
+                   document.created_at AS document_created_at,
+                   document.updated_at AS document_updated_at,
+                   document.published_at AS document_published_at,
+                   document_version.version AS document_version,
+                   document_version.created_at AS document_version_created_at,
+                   document_version.integrity_hash AS document_integrity_hash,
+                   document_resource.created_at AS document_resource_created_at,
+                   document_resource.updated_at AS document_resource_updated_at,
+                   source.id AS source_asset_id,
+                   source.created_at AS source_created_at,
+                   source.updated_at AS source_updated_at,
+                   source_resource.created_at AS source_resource_created_at,
+                   source_resource.updated_at AS source_resource_updated_at,
+                   source_manifest.content_hash AS source_manifest_content_hash,
+                   source_manifest.receipt AS source_receipt,
+                   source_manifest.receipt_hash AS source_receipt_hash,
+                   source_manifest.storage_kind AS source_storage_kind,
+                   source_manifest.media_type AS source_media_type,
+                   source_manifest.created_at AS source_manifest_created_at,
+                   source_manifest.verified_at AS source_verified_at,
+                   evidence.locator, evidence.locator_hash,
+                   evidence.created_at AS evidence_created_at
+              FROM source_set_members AS member
+              JOIN atomic_facts AS fact
+                ON fact.scope_id=member.scope_id
+               AND fact.id=member.source_object_id
+               AND fact.version=member.source_version
+               AND fact.lifecycle_state='active'
+               AND fact.deleted_at IS NULL
+               AND fact.verification_state='verified'
+               AND fact.confirmed_at IS NOT NULL
+               AND fact.confirmed_by_membership_id IS NOT NULL
+               AND fact.fact_hash IS NOT NULL
+               AND fact.fact_hash<>''
+               AND fact.authority_role='cloud'
+              JOIN secured_resources AS fact_resource
+                ON fact_resource.scope_id=fact.scope_id
+               AND fact_resource.id=fact.id
+               AND fact_resource.resource_kind='atomic_fact'
+               AND fact_resource.resource_type_key='verified_story_fact'
+               AND fact_resource.version=fact.version
+               AND fact_resource.lifecycle_state='active'
+               AND fact_resource.deleted_at IS NULL
+               AND fact_resource.authority_role='cloud'
+              JOIN object_manifests AS fact_manifest
+                ON fact_manifest.scope_id=fact.scope_id
+               AND fact_manifest.id=fact.fact_object_manifest_id
+               AND fact_manifest.content_hash=fact.fact_hash
+               AND fact_manifest.lifecycle_state='active'
+               AND fact_manifest.deleted_at IS NULL
+               AND fact_manifest.availability_state='ready'
+               AND fact_manifest.authority_role='cloud'
+              JOIN organization_memberships AS confirmer
+                ON confirmer.scope_id=fact.scope_id
+               AND confirmer.id=fact.confirmed_by_membership_id
+               AND confirmer.status='active'
+               AND confirmer.lifecycle_state='active'
+               AND confirmer.deleted_at IS NULL
+              JOIN source_sets AS fact_sources
+                ON fact_sources.scope_id=fact.scope_id
+               AND fact_sources.id=fact.source_set_id
+               AND fact_sources.client_id=?
+               AND fact_sources.purpose_kind='verified_project_fact_evidence'
+               AND fact_sources.publication_state='published'
+               AND fact_sources.source_count=1
+               AND fact_sources.lifecycle_state='active'
+               AND fact_sources.deleted_at IS NULL
+               AND fact_sources.authority_role='cloud'
+              JOIN content_chunks AS chunk
+                ON chunk.scope_id=fact.scope_id
+               AND chunk.id=fact.chunk_id
+               AND chunk.lifecycle_state='active'
+               AND chunk.deleted_at IS NULL
+               AND chunk.authority_role='cloud'
+              JOIN document_versions AS document_version
+                ON document_version.scope_id=chunk.scope_id
+               AND document_version.id=chunk.document_version_id
+               AND document_version.publication_state='published'
+              JOIN knowledge_documents AS document
+                ON document.scope_id=document_version.scope_id
+               AND document.id=document_version.document_id
+               AND document.client_id=?
+               AND document.current_version=document_version.version
+               AND document.parse_state='ready'
+               AND document.publication_state='published'
+               AND document.visibility_scope='organization'
+               AND document.lifecycle_state='active'
+               AND document.deleted_at IS NULL
+              JOIN secured_resources AS document_resource
+                ON document_resource.scope_id=document.scope_id
+               AND document_resource.id=document.id
+               AND document_resource.resource_kind='knowledge_document'
+               AND document_resource.resource_type_key='project_story_evidence_document'
+               AND document_resource.version=document.version
+               AND document_resource.lifecycle_state='active'
+               AND document_resource.deleted_at IS NULL
+               AND document_resource.authority_role='cloud'
+              JOIN source_assets AS source
+                ON source.scope_id=document.scope_id
+               AND source.id=document.source_asset_id
+               AND source.client_id=document.client_id
+               AND source.version=document_version.source_asset_version
+               AND source.content_hash=document_version.content_hash
+               AND source.availability_state='ready'
+               AND source.archived_at IS NULL
+               AND source.lifecycle_state='active'
+               AND source.deleted_at IS NULL
+               AND source.authority_role='cloud'
+              JOIN secured_resources AS source_resource
+                ON source_resource.scope_id=source.scope_id
+               AND source_resource.id=source.id
+               AND source_resource.resource_kind='source_asset'
+               AND source_resource.resource_type_key='project_story_evidence_source'
+               AND source_resource.version=source.version
+               AND source_resource.lifecycle_state='active'
+               AND source_resource.deleted_at IS NULL
+               AND source_resource.authority_role='cloud'
+              JOIN object_manifests AS source_manifest
+                ON source_manifest.scope_id=source.scope_id
+               AND source_manifest.id=source.object_manifest_id
+               AND source_manifest.id=document_version.object_manifest_id
+               AND source_manifest.id=chunk.object_manifest_id
+               AND source_manifest.content_hash=source.content_hash
+               AND source_manifest.content_hash=document_version.content_hash
+               AND source_manifest.content_hash=chunk.chunk_hash
+               AND source_manifest.lifecycle_state='active'
+               AND source_manifest.deleted_at IS NULL
+               AND source_manifest.availability_state='ready'
+               AND source_manifest.authority_role='cloud'
+              JOIN source_set_members AS fact_source_member
+                ON fact_source_member.scope_id=fact_sources.scope_id
+               AND fact_source_member.source_set_id=fact_sources.id
+               AND fact_source_member.source_object_id=document.id
+               AND fact_source_member.source_version=document_version.version
+               AND fact_source_member.source_object_kind='knowledge_document'
+               AND fact_source_member.lifecycle_state='active'
+               AND fact_source_member.deleted_at IS NULL
+               AND fact_source_member.removed_at IS NULL
+               AND fact_source_member.authority_role='cloud'
+              JOIN evidence_links AS evidence
+                ON evidence.scope_id=fact.scope_id
+               AND evidence.fact_id=fact.id
+               AND evidence.source_object_id=document.id
+               AND evidence.source_version=document_version.version
+               AND evidence.source_object_kind='knowledge_document'
+               AND evidence.locator_kind='content_chunk'
+             WHERE member.scope_id=?
+               AND member.source_set_id=?
+               AND member.source_object_kind='atomic_fact'
+               AND member.lifecycle_state='active'
+               AND member.deleted_at IS NULL
+               AND member.removed_at IS NULL
+               AND member.authority_role='cloud'
+               AND 1=(
+                 SELECT COUNT(*)
+                   FROM source_set_members AS fact_member_guard
+                  WHERE fact_member_guard.scope_id=fact_sources.scope_id
+                    AND fact_member_guard.source_set_id=fact_sources.id
+                    AND fact_member_guard.lifecycle_state='active'
+                    AND fact_member_guard.deleted_at IS NULL
+                    AND fact_member_guard.removed_at IS NULL
+                    AND fact_member_guard.authority_role='cloud'
+               )
+            """,
+            (project_id, project_id, identity.scope_id, source_set_id),
+        ).fetchall()
+        if len(fact_rows) != int(row["source_count"] or 0):
+            return {"state": "invalid_authority", "projectId": project_id}
+        seen_fact_ids: set[str] = set()
+        authoritative_fact_descriptors: list[dict[str, Any]] = []
+        for fact_row in fact_rows:
+            fact_id = str(fact_row["fact_id"] or "").strip()
+            raw_fact_receipt = str(fact_row["fact_receipt"] or "")
+            raw_source_receipt = str(fact_row["source_receipt"] or "")
+            locator = str(fact_row["locator"] or "")
+            if (
+                not fact_id
+                or fact_id in seen_fact_ids
+                or not raw_fact_receipt
+                or str(fact_row["fact_receipt_hash"] or "").strip()
+                != sha256_text(raw_fact_receipt)
+                or str(fact_row["fact_storage_kind"] or "").strip()
+                != "verified_fact_receipt"
+                or str(fact_row["fact_media_type"] or "").strip()
+                != "application/vnd.yiyu.verified-project-fact+json"
+                or not raw_source_receipt
+                or str(fact_row["source_receipt_hash"] or "").strip()
+                != sha256_text(raw_source_receipt)
+                or str(fact_row["source_storage_kind"] or "").strip()
+                != "verified_project_source_snapshot"
+                or str(fact_row["source_media_type"] or "").strip()
+                != "application/vnd.yiyu.project-story-source+json"
+                or not locator
+                or str(fact_row["locator_hash"] or "").strip() != sha256_text(locator)
+            ):
+                return {"state": "invalid_authority", "projectId": project_id}
+            seen_fact_ids.add(fact_id)
+            try:
+                fact_receipt = json.loads(raw_fact_receipt)
+                source_receipt = json.loads(raw_source_receipt)
+                locator_receipt = json.loads(locator)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return {"state": "invalid_authority", "projectId": project_id}
+            fact_text = (
+                str(fact_receipt.get("factText") or "").strip()
+                if isinstance(fact_receipt, dict)
+                else ""
+            )
+            try:
+                confirmed_time = _parse_time(str(fact_row["confirmed_at"] or ""))
+                fact_created_time = _parse_time(
+                    str(fact_row["fact_created_at"] or "")
+                )
+                fact_manifest_created_time = _parse_time(
+                    str(fact_row["fact_manifest_created_at"] or "")
+                )
+                fact_verified_time = _parse_time(str(fact_row["fact_verified_at"] or ""))
+                receipt_verified_time = _parse_time(
+                    str(fact_receipt.get("verifiedAt") or "")
+                )
+                source_created_time = _parse_time(
+                    str(fact_row["source_created_at"] or "")
+                )
+                source_updated_time = _parse_time(
+                    str(fact_row["source_updated_at"] or "")
+                )
+                source_manifest_created_time = _parse_time(
+                    str(fact_row["source_manifest_created_at"] or "")
+                )
+                source_verified_time = _parse_time(
+                    str(fact_row["source_verified_at"] or "")
+                )
+                source_captured_time = _parse_time(
+                    str(source_receipt.get("capturedAt") or "")
+                )
+                document_created_time = _parse_time(
+                    str(fact_row["document_created_at"] or "")
+                )
+                document_updated_time = _parse_time(
+                    str(fact_row["document_updated_at"] or "")
+                )
+                document_published_time = _parse_time(
+                    str(fact_row["document_published_at"] or "")
+                )
+                document_version_created_time = _parse_time(
+                    str(fact_row["document_version_created_at"] or "")
+                )
+                chunk_created_time = _parse_time(
+                    str(fact_row["chunk_created_at"] or "")
+                )
+                chunk_updated_time = _parse_time(
+                    str(fact_row["chunk_updated_at"] or "")
+                )
+                story_member_added_time = _parse_time(
+                    str(fact_row["story_member_added_at"] or "")
+                )
+                story_member_created_time = _parse_time(
+                    str(fact_row["story_member_created_at"] or "")
+                )
+                story_member_updated_time = _parse_time(
+                    str(fact_row["story_member_updated_at"] or "")
+                )
+                fact_updated_time = _parse_time(
+                    str(fact_row["fact_updated_at"] or "")
+                )
+                fact_resource_created_time = _parse_time(
+                    str(fact_row["fact_resource_created_at"] or "")
+                )
+                fact_resource_updated_time = _parse_time(
+                    str(fact_row["fact_resource_updated_at"] or "")
+                )
+                confirmer_created_time = _parse_time(
+                    str(fact_row["confirmer_created_at"] or "")
+                )
+                confirmer_updated_time = _parse_time(
+                    str(fact_row["confirmer_updated_at"] or "")
+                )
+                confirmer_expires_at = str(
+                    fact_row["confirmer_expires_at"] or ""
+                ).strip()
+                confirmer_expires_time = (
+                    _parse_time(confirmer_expires_at)
+                    if confirmer_expires_at
+                    else None
+                )
+                fact_sources_created_time = _parse_time(
+                    str(fact_row["fact_sources_created_at"] or "")
+                )
+                fact_sources_updated_time = _parse_time(
+                    str(fact_row["fact_sources_updated_at"] or "")
+                )
+                fact_sources_expires_at = str(
+                    fact_row["fact_sources_expires_at"] or ""
+                ).strip()
+                fact_sources_expires_time = (
+                    _parse_time(fact_sources_expires_at)
+                    if fact_sources_expires_at
+                    else None
+                )
+                fact_source_member_added_time = _parse_time(
+                    str(fact_row["fact_source_member_added_at"] or "")
+                )
+                fact_source_member_created_time = _parse_time(
+                    str(fact_row["fact_source_member_created_at"] or "")
+                )
+                fact_source_member_updated_time = _parse_time(
+                    str(fact_row["fact_source_member_updated_at"] or "")
+                )
+                document_resource_created_time = _parse_time(
+                    str(fact_row["document_resource_created_at"] or "")
+                )
+                document_resource_updated_time = _parse_time(
+                    str(fact_row["document_resource_updated_at"] or "")
+                )
+                source_resource_created_time = _parse_time(
+                    str(fact_row["source_resource_created_at"] or "")
+                )
+                source_resource_updated_time = _parse_time(
+                    str(fact_row["source_resource_updated_at"] or "")
+                )
+                evidence_created_time = _parse_time(
+                    str(fact_row["evidence_created_at"] or "")
+                )
+            except (TypeError, ValueError):
+                confirmed_time = None
+                fact_created_time = None
+                fact_manifest_created_time = None
+                fact_verified_time = None
+                receipt_verified_time = None
+                source_created_time = None
+                source_updated_time = None
+                source_manifest_created_time = None
+                source_verified_time = None
+                source_captured_time = None
+                document_created_time = None
+                document_updated_time = None
+                document_published_time = None
+                document_version_created_time = None
+                chunk_created_time = None
+                chunk_updated_time = None
+                story_member_added_time = None
+                story_member_created_time = None
+                story_member_updated_time = None
+                fact_updated_time = None
+                fact_resource_created_time = None
+                fact_resource_updated_time = None
+                confirmer_created_time = None
+                confirmer_updated_time = None
+                confirmer_expires_at = "invalid"
+                confirmer_expires_time = None
+                fact_sources_created_time = None
+                fact_sources_updated_time = None
+                fact_sources_expires_at = "invalid"
+                fact_sources_expires_time = None
+                fact_source_member_added_time = None
+                fact_source_member_created_time = None
+                fact_source_member_updated_time = None
+                document_resource_created_time = None
+                document_resource_updated_time = None
+                source_resource_created_time = None
+                source_resource_updated_time = None
+                evidence_created_time = None
+            evidence_times = (
+                source_created_time,
+                source_updated_time,
+                source_manifest_created_time,
+                source_verified_time,
+                source_captured_time,
+                document_created_time,
+                document_updated_time,
+                document_published_time,
+                document_version_created_time,
+                chunk_created_time,
+                chunk_updated_time,
+                fact_created_time,
+                fact_updated_time,
+                fact_manifest_created_time,
+                confirmed_time,
+                fact_verified_time,
+                receipt_verified_time,
+                story_member_added_time,
+                story_member_created_time,
+                story_member_updated_time,
+                fact_resource_created_time,
+                fact_resource_updated_time,
+                confirmer_created_time,
+                confirmer_updated_time,
+                fact_sources_created_time,
+                fact_sources_updated_time,
+                fact_source_member_added_time,
+                fact_source_member_created_time,
+                fact_source_member_updated_time,
+                document_resource_created_time,
+                document_resource_updated_time,
+                source_resource_created_time,
+                source_resource_updated_time,
+                evidence_created_time,
+            )
+            fact_timestamps_valid = (
+                all(value is not None for value in evidence_times)
+                and all(value.tzinfo is not None for value in evidence_times)
+                and source_captured_time <= source_verified_time
+                and source_manifest_created_time <= source_verified_time
+                and source_created_time <= document_created_time <= fact_created_time
+                and source_verified_time <= fact_created_time
+                and document_version_created_time <= fact_created_time
+                and chunk_created_time <= fact_created_time
+                and document_published_time <= fact_created_time
+                and fact_created_time <= fact_manifest_created_time
+                and confirmed_time == fact_verified_time == receipt_verified_time
+                and fact_manifest_created_time <= confirmed_time
+                and fact_resource_created_time
+                <= fact_resource_updated_time
+                <= confirmed_time
+                and confirmer_created_time <= confirmer_updated_time <= confirmed_time
+                and (
+                    not confirmer_expires_at
+                    or (
+                        confirmer_expires_time is not None
+                        and confirmer_expires_time.tzinfo is not None
+                        and confirmer_expires_time > confirmed_time
+                    )
+                )
+                and fact_sources_created_time
+                <= fact_sources_updated_time
+                <= confirmed_time
+                and (
+                    not fact_sources_expires_at
+                    or (
+                        fact_sources_expires_time is not None
+                        and fact_sources_expires_time.tzinfo is not None
+                        and fact_sources_expires_time > current_time
+                    )
+                )
+                and fact_source_member_added_time <= confirmed_time
+                and fact_source_member_created_time
+                <= fact_source_member_updated_time
+                <= confirmed_time
+                and document_resource_created_time
+                <= document_resource_updated_time
+                <= confirmed_time
+                and source_resource_created_time
+                <= source_resource_updated_time
+                <= confirmed_time
+                and evidence_created_time <= confirmed_time
+                and source_created_time <= source_updated_time <= confirmed_time
+                and document_created_time <= document_updated_time <= confirmed_time
+                and chunk_created_time <= chunk_updated_time <= confirmed_time
+                and fact_created_time <= fact_updated_time <= confirmed_time
+                and confirmed_time <= cutoff_time
+                and story_member_added_time <= generated_time
+                and story_member_created_time
+                <= story_member_updated_time
+                <= generated_time
+            )
+            if (
+                not isinstance(fact_receipt, dict)
+                or fact_receipt.get("schema") != "yiyu.verified-project-fact.v1"
+                or not fact_text
+                or sha256_text(fact_text) != str(fact_row["fact_hash"] or "").strip()
+                or str(fact_row["fact_manifest_content_hash"] or "").strip()
+                != str(fact_row["fact_hash"] or "").strip()
+                or str(fact_receipt.get("sourceChunkHash") or "").strip()
+                != str(fact_row["chunk_hash"] or "").strip()
+                or str(fact_receipt.get("confirmedByMembershipId") or "").strip()
+                != str(fact_row["confirmed_by_membership_id"] or "").strip()
+                or not isinstance(source_receipt, dict)
+                or source_receipt.get("schema")
+                != "yiyu.project-story-source-snapshot.v1"
+                or str(source_receipt.get("projectId") or "").strip()
+                != project_id
+                or str(source_receipt.get("sourceAssetId") or "").strip()
+                != str(fact_row["source_asset_id"] or "").strip()
+                or str(source_receipt.get("documentId") or "").strip()
+                != str(fact_row["document_id"] or "").strip()
+                or str(source_receipt.get("contentHash") or "").strip()
+                != str(fact_row["chunk_hash"] or "").strip()
+                or str(fact_row["source_manifest_content_hash"] or "").strip()
+                != str(fact_row["chunk_hash"] or "").strip()
+                or str(fact_row["document_integrity_hash"] or "").strip()
+                != sha256_text(
+                    f"{str(fact_row['document_id'] or '').strip()}|"
+                    f"{int(fact_row['document_version'] or 0)}|"
+                    f"{str(fact_row['chunk_hash'] or '').strip()}"
+                )
+                or not isinstance(locator_receipt, dict)
+                or locator_receipt.get("schema")
+                != "yiyu.project-story-fact-evidence.v1"
+                or str(locator_receipt.get("chunkId") or "").strip()
+                != str(fact_row["chunk_id"] or "").strip()
+                or not fact_timestamps_valid
+            ):
+                return {"state": "invalid_authority", "projectId": project_id}
+            authoritative_fact_descriptors.append(
+                {
+                    "ordinal": int(fact_row["story_member_ordinal"] or 0),
+                    "factId": fact_id,
+                    "version": int(fact_row["fact_version"] or 0),
+                    "factHash": str(fact_row["fact_hash"] or "").strip(),
+                }
+            )
+        authoritative_fact_descriptors.sort(
+            key=lambda value: (int(value["ordinal"]), str(value["factId"]))
+        )
+        if str(receipt.get("factsDigest") or "").strip() != sha256_text(
+            canonical_json(authoritative_fact_descriptors)
+        ):
+            return {"state": "invalid_authority", "projectId": project_id}
+        return {
+            "state": "ready",
+            "projectId": project_id,
+            "storyId": story_id,
+            "title": str(row["title"] or "项目 Story"),
+            "version": version,
+            "content": content,
+            "contentHash": content_hash,
+            "sourceSetId": source_set_id,
+            "publicationState": "published",
+            "lifecycleState": "active",
+            "availabilityState": "ready",
+            "publishedAt": published_at,
+            "knowledgeCutoff": knowledge_cutoff,
+            "generatorVersion": generator_version,
+        }
+
     def project_knowledge_context(
         self,
         identity: SessionIdentity,
@@ -1145,6 +2037,11 @@ class CloudRepository:
         }
         with self._connection() as connection:
             project = self._require_project_access(
+                connection,
+                identity,
+                project_id=project_id,
+            )
+            project_story = self._project_story_context(
                 connection,
                 identity,
                 project_id=project_id,
@@ -1457,6 +2354,7 @@ class CloudRepository:
         return {
             "clientId": project_id,
             "state": "ready",
+            "projectStory": project_story,
             "organizationSharedKnowledge": organization_shared,
             "officialWebsiteFacts": website_facts,
             "savedMemories": saved_memories,

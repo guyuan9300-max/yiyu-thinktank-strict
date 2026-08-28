@@ -1990,13 +1990,15 @@ export function TaskCalendarView({
                       );
                     }
                     const isTaskLocalDraft = isLocalDraftTaskId(item.task.id);
+                    const taskScheduleLabel = formatTaskCardScheduleLabel(item.task);
+                    const taskChipLabel = taskScheduleLabel ? `${taskScheduleLabel} ${item.task.title}` : item.task.title;
                     return (
                       <div
                         key={`month-overflow-task-${item.task.id}`}
                         role="button"
                         tabIndex={0}
                         draggable={!isTaskLocalDraft}
-                        title={`${formatTaskCardScheduleLabel(item.task)} ${item.task.title}`}
+                        title={taskChipLabel}
                         onDragStart={(event) => {
                           if (isTaskLocalDraft) {
                             event.preventDefault();
@@ -2039,7 +2041,7 @@ export function TaskCalendarView({
                         >
                           {item.task.status === 'done' ? <Check size={10} strokeWidth={3} /> : null}
                         </button>
-                        <span className="min-w-0 truncate">{formatTaskCardScheduleLabel(item.task)} {item.task.title}</span>
+                        <span className="min-w-0 truncate">{taskChipLabel}</span>
                       </div>
                     );
                   })}
@@ -2385,7 +2387,8 @@ export function TaskCalendarView({
                             ))}
                             {cellChipTasks.slice(0, visibleChipTaskCount).map((task) => {
                               const timedSegment = buildTaskDayTimedSegment(task, cellDate);
-                              const timePrefix = `${formatTaskCardScheduleLabel(task)} `;
+                              const scheduleLabel = formatTaskCardScheduleLabel(task);
+                              const timePrefix = scheduleLabel ? `${scheduleLabel} ` : '';
                               const isTaskLocalDraft = isLocalDraftTaskId(task.id);
                               // 5/26 ⑯: 跨天任务首尾箭头标识. 看 task 的整段 range 跨不跨天.
                               const taskRange = resolveTaskDateTimeRange(task);

@@ -289,10 +289,13 @@ export function TaskRowLongPress({
   task,
   children,
   disabled,
+  overlayActive = false,
 }: {
   task: Task;
   children: React.ReactNode;
   disabled?: boolean;
+  /** 卡片内有浮层展开时，提升整个 transform stacking context，避免被后续卡片遮挡。 */
+  overlayActive?: boolean;
 }) {
   const { longPressProps, progress, isPressing } = useLongPressDrag(task, { disabled });
   return (
@@ -305,6 +308,7 @@ export function TaskRowLongPress({
         transform: progress > 0 && progress < 1 ? `scale(${1 - progress * 0.015})` : 'scale(1)',
         transition: 'transform 80ms ease',
         userSelect: isPressing ? 'none' : 'auto',
+        zIndex: overlayActive ? 30 : 'auto',
       }}
     >
       <LongPressProgressRing progress={progress} />

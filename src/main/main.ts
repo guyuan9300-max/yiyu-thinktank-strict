@@ -27,6 +27,7 @@ import {
   BrowserWindow,
   dialog,
   ipcMain,
+  screen,
   shell,
 } from 'electron';
 import {
@@ -45,6 +46,14 @@ import {
   setOfficialUpdateIdentity,
   setupOfficialUpdater,
 } from './officialUpdater.js';
+import {
+  MAIN_WINDOW_ASPECT_RATIO,
+  MAIN_WINDOW_DEFAULT_SIZE,
+  MAIN_WINDOW_MINIMUM_SIZE,
+  normalizeMainWindowBounds,
+  resolveMainWindowMinimumSize,
+} from './mainWindowLayout.js';
+import { buildMiniWindowBounds } from './miniWindowLayout.js';
 import type {
   FastForwardMainPayload,
   PublishCollabBranchPayload,
@@ -62,7 +71,9 @@ let preMiniWindowState: {
   bounds: { x: number; y: number; width: number; height: number };
   maximized: boolean;
   fullScreen: boolean;
+  alwaysOnTop: boolean;
 } | null = null;
+let mainWindowResizeGuardTimer: ReturnType<typeof setTimeout> | null = null;
 let backendProcess: ChildProcess | null = null;
 let backendPort = 0;
 let desktopToken = '';
@@ -717,10 +728,10 @@ function createWindow(): void {
   const developmentUrl = process.env.VITE_DEV_SERVER_URL;
   mainWindow = new BrowserWindow({
     title: APP_NAME,
-    width: 1440,
-    height: 900,
-    minWidth: 1080,
-    minHeight: 700,
+    width: MAIN_WINDOW_DEFAULT_SIZE.width,
+    height: MAIN_WINDOW_DEFAULT_SIZE.height,
+    minWidth: MAIN_WINDOW_MINIMUM_SIZE.width,
+    minHeight: MAIN_WINDOW_MINIMUM_SIZE.height,
     backgroundColor: '#f4f6f9',
     // Keep the development window observable even while Vite compiles the
     // large renderer; packaged builds still wait for ready-to-show.
@@ -731,6 +742,10 @@ function createWindow(): void {
       nodeIntegration: false,
       sandbox: true,
     },
+  });
+  applyMainWindowLayout(mainWindow);
+  mainWindow.on('resize', () => {
+    scheduleMainWindowLayoutGuard(mainWindow);
   });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url);
@@ -748,8 +763,108 @@ function createWindow(): void {
     );
   }
   mainWindow.once('closed', () => {
+    if (mainWindowResizeGuardTimer) {
+      clearTimeout(mainWindowResizeGuardTimer);
+      mainWindowResizeGuardTimer = null;
+    }
     mainWindow = null;
+    preMiniWindowState = null;
   });
+}
+
+function scheduleMainWindowLayoutGuard(window: BrowserWindow | null): void {
+  if (
+    !window
+    || window.isDestroyed()
+    || preMiniWindowState
+    || window.isMaximized()
+    || window.isFullScreen()
+  ) {
+    return;
+  }
+  if (mainWindowResizeGuardTimer) {
+    clearTimeout(mainWindowResizeGuardTimer);
+  }
+  // Native aspect/minimum constraints cover ordinary dragging. This trailing
+  // guard also repairs accessibility tools and delayed macOS resize callbacks
+  // that can temporarily bypass those native constraints.
+  mainWindowResizeGuardTimer = setTimeout(() => {
+    mainWindowResizeGuardTimer = null;
+    if (
+      window.isDestroyed()
+      || preMiniWindowState
+      || window.isMaximized()
+      || window.isFullScreen()
+    ) {
+      return;
+    }
+    const currentBounds = window.getBounds();
+    const display = screen.getDisplayMatching(currentBounds);
+    const normalizedBounds = normalizeMainWindowBounds(
+      currentBounds,
+      display.workArea,
+    );
+    if (
+      currentBounds.x !== normalizedBounds.x
+      || currentBounds.y !== normalizedBounds.y
+      || currentBounds.width !== normalizedBounds.width
+      || currentBounds.height !== normalizedBounds.height
+    ) {
+      applyMainWindowLayout(window, currentBounds);
+    }
+  }, 120);
+}
+
+function centeredDefaultMainWindowBounds(window: BrowserWindow): Electron.Rectangle {
+  const workArea = screen.getDisplayMatching(window.getBounds()).workArea;
+  return {
+    x: workArea.x + Math.round((workArea.width - MAIN_WINDOW_DEFAULT_SIZE.width) / 2),
+    y: workArea.y + Math.round((workArea.height - MAIN_WINDOW_DEFAULT_SIZE.height) / 2),
+    ...MAIN_WINDOW_DEFAULT_SIZE,
+  };
+}
+
+function applyMainWindowLayout(
+  window: BrowserWindow,
+  requestedBounds: Electron.Rectangle = window.getBounds(),
+): void {
+  const display = screen.getDisplayMatching(requestedBounds);
+  const minimumSize = resolveMainWindowMinimumSize(display.workArea);
+  const bounds = normalizeMainWindowBounds(requestedBounds, display.workArea);
+
+  // Mini mode intentionally uses a tall portrait window. Clear its temporary
+  // constraints before restoring the full workspace, then lock the full UI to
+  // the design baseline so users cannot flatten the typography by dragging.
+  window.setAspectRatio(0);
+  window.setMinimumSize(1, 1);
+  window.setBounds(bounds, true);
+  window.setMinimumSize(minimumSize.width, minimumSize.height);
+  window.setAspectRatio(MAIN_WINDOW_ASPECT_RATIO);
+}
+
+function applyMiniWindowLayout(window: BrowserWindow): void {
+  const display = screen.getDisplayMatching(window.getBounds());
+  const sourceWindowHeight = preMiniWindowState?.bounds.height
+    ?? window.getBounds().height;
+  const bounds = buildMiniWindowBounds(display.workArea, sourceWindowHeight);
+  window.setAspectRatio(0);
+  window.setMinimumSize(
+    Math.min(360, bounds.width),
+    Math.min(320, bounds.height),
+  );
+  window.setBounds(bounds, true);
+  if (process.platform === 'darwin') {
+    window.setAlwaysOnTop(true, 'floating');
+  } else {
+    window.setAlwaysOnTop(true);
+  }
+}
+
+function reflowMiniWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed() || !preMiniWindowState) {
+    return;
+  }
+  applyMiniWindowLayout(mainWindow);
 }
 
 ipcMain.handle('strict:get-runtime', () => ({
@@ -768,24 +883,23 @@ ipcMain.on('strict:get-runtime-sync', (event) => {
   };
 });
 
-ipcMain.handle('strict:set-mini-mode', async (_event, enter: boolean, requestedHeight?: number) => {
+ipcMain.handle('strict:set-mini-mode', async (_event, enter: boolean, _requestedHeight?: number) => {
   if (!mainWindow) {
     return { mini: false };
   }
   const window = mainWindow;
   if (enter) {
-    const miniHeight = Math.max(340, Math.min(680, Math.round(requestedHeight || 360)));
-    // 已经处于精简模式时只是“今天/日历”切页，调整高度即可；不能覆盖
+    // 已经处于精简模式时只是“今天/日历”切页，重新按当前显示器排版；不能覆盖
     // preMiniWindowState，否则退出精简模式时无法回到原窗口。
     if (preMiniWindowState) {
-      window.setMinimumSize(360, 320);
-      window.setSize(420, miniHeight, true);
+      applyMiniWindowLayout(window);
       return { mini: true };
     }
     preMiniWindowState = {
       bounds: window.getBounds(),
       maximized: window.isMaximized(),
       fullScreen: window.isFullScreen(),
+      alwaysOnTop: window.isAlwaysOnTop(),
     };
     // macOS 离开原生全屏是异步的。过去在 setFullScreen(false) 后立即
     // setSize，尺寸请求会被系统吞掉，于是迷你内容被拉伸在整块全屏里。
@@ -818,20 +932,17 @@ ipcMain.handle('strict:set-mini-mode', async (_event, enter: boolean, requestedH
         setTimeout(finish, 500);
       });
     }
-    window.setMinimumSize(360, 320);
-    window.setSize(420, miniHeight, true);
-    window.center();
+    applyMiniWindowLayout(window);
   } else {
-    window.setMinimumSize(1080, 700);
     const previous = preMiniWindowState;
     preMiniWindowState = null;
-    if (previous) {
-      window.setBounds(previous.bounds, true);
-      if (previous.maximized) window.maximize();
-      if (previous.fullScreen) window.setFullScreen(true);
-    } else {
-      window.setSize(1440, 900, true);
-    }
+    window.setAlwaysOnTop(previous?.alwaysOnTop ?? false);
+    applyMainWindowLayout(
+      window,
+      previous?.bounds ?? centeredDefaultMainWindowBounds(window),
+    );
+    if (previous?.maximized) window.maximize();
+    if (previous?.fullScreen) window.setFullScreen(true);
   }
   return { mini: enter };
 });
@@ -1074,6 +1185,9 @@ app.on('second-instance', () => {
 
 app.whenReady().then(async () => {
   try {
+    screen.on('display-added', reflowMiniWindow);
+    screen.on('display-removed', reflowMiniWindow);
+    screen.on('display-metrics-changed', reflowMiniWindow);
     convergeDuplicateMacInstallations();
     await startBackend();
     createWindow();

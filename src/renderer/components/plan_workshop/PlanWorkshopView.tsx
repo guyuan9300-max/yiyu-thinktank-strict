@@ -11,6 +11,10 @@ import {
   weekStartInputValue,
   type PlanningCycleType,
 } from '../../../shared/planningPeriods';
+import {
+  resolvePlanSplitPeriodOnOpen,
+  validatePlanSplitPeriod,
+} from '../../../shared/planSplitPeriodState';
 import type {
   OrgDepartmentPlanItemSettings,
   OrgDepartmentPlanSettings,
@@ -167,8 +171,8 @@ export function PlanWorkshopView({
   const [formError, setFormError] = useState('');
   const [aiOpen, setAiOpen] = useState(false);
   const [aiScopeId, setAiScopeId] = useState('');
-  const [aiCycle, setAiCycle] = useState<CycleType>('month');
-  const [aiPeriod, setAiPeriod] = useState(defaultPlanningPeriodKey('month'));
+  const [aiCycle, setAiCycle] = useRuntimeUiSessionState<CycleType>(`${uiSessionScopeKey}:ai-split-cycle`, 'month');
+  const [aiPeriod, setAiPeriod] = useRuntimeUiSessionState(`${uiSessionScopeKey}:ai-split-period`, () => defaultPlanningPeriodKey('month'));
   const [aiText, setAiText] = useState('');
   const [aiDrafts, setAiDrafts] = useState<AiPlanDraft[]>([]);
   const [aiBusy, setAiBusy] = useState(false);
@@ -332,9 +336,10 @@ export function PlanWorkshopView({
   const openAiSplit = () => {
     const fallback = rows.find((row) => scopeCanCreate(row));
     if (!fallback) return;
+    const periodSelection = resolvePlanSplitPeriodOnOpen({ cycleType: aiCycle, periodKey: aiPeriod });
     setAiScopeId(fallback.scopeId);
-    setAiCycle('month');
-    setAiPeriod(defaultPlanningPeriodKey('month'));
+    setAiCycle(periodSelection.cycleType);
+    setAiPeriod(periodSelection.periodKey);
     setAiText('');
     setAiDrafts([]);
     setAiError('');
@@ -344,6 +349,11 @@ export function PlanWorkshopView({
   const runAiSplit = async () => {
     if (!aiText.trim()) {
       setAiError('请先粘贴或输入需要拆解的计划内容');
+      return;
+    }
+    const periodError = validatePlanSplitPeriod({ cycleType: aiCycle, periodKey: aiPeriod });
+    if (periodError) {
+      setAiError(periodError);
       return;
     }
     const scope = rows.find((row) => row.scopeId === aiScopeId);
@@ -356,7 +366,7 @@ export function PlanWorkshopView({
         organizationName: value.organization?.name || '',
         scopeKind: scope.scopeKind,
         scopeName: scope.scopeName,
-        periodKey: aiPeriod,
+        periodKey: aiPeriod.trim(),
         cycleType: aiCycle,
       });
       const drafts = result.items.map((item, index) => ({
@@ -375,6 +385,11 @@ export function PlanWorkshopView({
 
   const saveAiPlans = async () => {
     if (!onSavePlan) return;
+    const periodError = validatePlanSplitPeriod({ cycleType: aiCycle, periodKey: aiPeriod });
+    if (periodError) {
+      setAiError(periodError);
+      return;
+    }
     const validDrafts = aiDrafts.filter((draft) => draft.title.trim());
     if (validDrafts.length === 0) {
       setAiError('至少保留一条计划');
@@ -389,7 +404,7 @@ export function PlanWorkshopView({
           ...makePlan(departmentId, aiCycle),
           id: `plan-ai-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`,
           clientId: null,
-          weekLabel: aiPeriod,
+          weekLabel: aiPeriod.trim(),
           title: draft.title.trim(),
           summary: draft.summary.trim(),
           status: 'active',
@@ -404,6 +419,8 @@ export function PlanWorkshopView({
       setAiBusy(false);
     }
   };
+
+  const aiPeriodValidationMessage = validatePlanSplitPeriod({ cycleType: aiCycle, periodKey: aiPeriod });
 
   if (isLoading) {
     return (
@@ -689,16 +706,21 @@ export function PlanWorkshopView({
             </div>
             <div className="space-y-5 p-6">
               <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-                <Field label="所属范围"><select value={aiScopeId} onChange={(event) => setAiScopeId(event.target.value)} className={FIELD_CLASS}>{rows.filter(scopeCanCreate).map((row) => <option key={row.scopeId} value={row.scopeId}>{row.scopeName}</option>)}</select></Field>
-                <Field label="周期类型"><select value={aiCycle} onChange={(event) => { const next = event.target.value as CycleType; setAiCycle(next); setAiPeriod(defaultPlanningPeriodKey(next)); }} className={FIELD_CLASS}>{CYCLE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></Field>
-                <Field label="计划周期">{aiCycle === 'week' ? <WeekPeriodInput value={aiPeriod} onChange={setAiPeriod} navigation /> : <input value={aiPeriod} onChange={(event) => setAiPeriod(event.target.value)} className={FIELD_CLASS} />}</Field>
+                <Field label="所属范围"><select value={aiScopeId} onChange={(event) => { setAiScopeId(event.target.value); setAiError(''); }} className={FIELD_CLASS}>{rows.filter(scopeCanCreate).map((row) => <option key={row.scopeId} value={row.scopeId}>{row.scopeName}</option>)}</select></Field>
+                <Field label="周期类型"><select value={aiCycle} onChange={(event) => { const next = event.target.value as CycleType; setAiCycle(next); setAiPeriod(defaultPlanningPeriodKey(next)); setAiError(''); }} className={FIELD_CLASS}>{CYCLE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></Field>
+                <Field label="计划周期">{aiCycle === 'week' ? <WeekPeriodInput value={aiPeriod} onChange={(next) => { setAiPeriod(next); setAiError(''); }} navigation /> : <input value={aiPeriod} onChange={(event) => { setAiPeriod(event.target.value); setAiError(''); }} className={FIELD_CLASS} />}</Field>
               </div>
-              <Field label="待拆解内容"><textarea value={aiText} onChange={(event) => setAiText(event.target.value)} className={`${FIELD_CLASS} min-h-32`} placeholder="例如：本月完成安卓端架构调整、登录与任务链路复刻，并准备内测…" /></Field>
+              <Field label="待拆解内容"><textarea value={aiText} onChange={(event) => { setAiText(event.target.value); setAiError(''); }} className={`${FIELD_CLASS} min-h-32`} placeholder="例如：本月完成安卓端架构调整、登录与任务链路复刻，并准备内测…" /></Field>
               <div className="flex justify-end"><button type="button" disabled={aiBusy} onClick={() => void runAiSplit()} className="inline-flex items-center gap-1.5 rounded-xl border border-[#5B7BFE]/30 px-4 py-2 text-[12px] font-bold text-[#4A66D8] disabled:opacity-50"><Sparkles size={14} />{aiBusy ? '拆解中…' : '开始拆解'}</button></div>
               {aiDrafts.length > 0 && <div className="space-y-3 border-t border-gray-100 pt-5">{aiDrafts.map((draft, index) => <div key={draft.id} className="rounded-xl border border-gray-200 p-4"><p className="mb-2 text-[10px] font-bold text-gray-400">独立计划 {index + 1}</p><input value={draft.title} onChange={(event) => setAiDrafts((current) => current.map((item) => item.id === draft.id ? { ...item, title: event.target.value } : item))} className={`${FIELD_CLASS} font-medium`} /><textarea value={draft.summary} onChange={(event) => setAiDrafts((current) => current.map((item) => item.id === draft.id ? { ...item, summary: event.target.value } : item))} className={`${FIELD_CLASS} mt-2 min-h-20`} /></div>)}</div>}
               {aiError && <p className="text-[12px] text-rose-600">{aiError}</p>}
             </div>
-            <div className="flex justify-end gap-2 border-t border-gray-100 px-6 py-4"><button type="button" onClick={() => setAiOpen(false)} className="rounded-lg border border-gray-200 px-4 py-2 text-[12px]">取消</button><button type="button" disabled={aiBusy || aiDrafts.length === 0} onClick={() => void saveAiPlans()} className="rounded-lg bg-[#5B7BFE] px-4 py-2 text-[12px] font-bold text-white disabled:opacity-50">{aiBusy ? '保存中…' : `保存 ${aiDrafts.length} 条计划`}</button></div>
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-gray-100 px-6 py-4">
+              <p className="min-w-0 text-[11px] text-gray-500">
+                {aiPeriodValidationMessage ? '请先确认周期类型与计划周期' : <>将保存为：<span className="font-bold text-gray-700">{rows.find((row) => row.scopeId === aiScopeId)?.scopeName || '当前范围'} · {formatPlanningPeriodLabel(aiPeriod)}</span></>}
+              </p>
+              <div className="flex shrink-0 items-center gap-2"><button type="button" onClick={() => setAiOpen(false)} className="rounded-lg border border-gray-200 px-4 py-2 text-[12px]">取消</button><button type="button" disabled={aiBusy || aiDrafts.length === 0 || Boolean(aiPeriodValidationMessage)} onClick={() => void saveAiPlans()} className="rounded-lg bg-[#5B7BFE] px-4 py-2 text-[12px] font-bold text-white disabled:opacity-50">{aiBusy ? '保存中…' : `保存 ${aiDrafts.length} 条计划`}</button></div>
+            </div>
           </div>
         </div>
       )}

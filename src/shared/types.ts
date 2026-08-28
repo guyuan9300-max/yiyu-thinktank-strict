@@ -2947,6 +2947,39 @@ export interface TaskTag {
   archivedAt?: string | null;
 }
 
+export interface TaskViewerSurfaces {
+  personalList: boolean;
+  personalCalendar: boolean;
+  collaborationInbox: boolean;
+  eventLineDetail: boolean;
+}
+
+export interface TaskViewerCapabilities {
+  canView: boolean;
+  canEdit: boolean;
+  canComplete: boolean;
+  canManageCollaborators: boolean;
+  canTrackTime?: boolean;
+}
+
+export interface TaskOwnerDepartment {
+  id: string;
+  name: string;
+}
+
+export type TaskOwnerDepartmentResolution = 'resolved' | 'unassigned' | 'ambiguous';
+
+export type TaskTimerState = 'idle' | 'running' | 'paused' | 'stopped';
+
+export interface TaskTimerSummary {
+  state: TaskTimerState;
+  elapsedSeconds: number;
+  activeStartedAt?: string | null;
+  latestRunId?: string | null;
+  version: number;
+  observedAt: string;
+}
+
 export interface Task {
   id: string;
   organizationId?: string | null;
@@ -2981,6 +3014,10 @@ export interface Task {
   projectFlowName?: string | null;
   ownerId?: string | null;
   ownerName: string;
+  ownerDepartmentId?: string | null;
+  ownerDepartmentName?: string | null;
+  ownerDepartmentResolution?: TaskOwnerDepartmentResolution;
+  ownerDepartments?: TaskOwnerDepartment[];
   sourceType: string;
   sourceId?: string | null;
   businessCategory?: string | null;
@@ -2995,6 +3032,9 @@ export interface Task {
   collaborationSummary: Record<string, number>;
   viewerInboxStatus?: CollaboratorInboxStatus | null;
   viewerCollaborationRole?: 'owner' | 'collaborator' | null;
+  viewerSurfaces?: TaskViewerSurfaces;
+  viewerCapabilities?: TaskViewerCapabilities;
+  timer?: TaskTimerSummary | null;
   orgContext?: TaskOrgContext | null;
   projectContext?: TaskProjectContext | null;
   memoryHints?: string[];
@@ -5057,6 +5097,21 @@ export interface TaskSettings {
   updatedAt: string;
 }
 
+export interface OrganizationBrandSettings {
+  displayName: string;
+  logoDataUrl: string;
+  version: number;
+  expectedVersion: number;
+  updatedAt?: string;
+  effectiveScopeKind?: 'organization' | null;
+}
+
+export interface OrganizationBrandSettingsPayload {
+  displayName: string;
+  logoDataUrl: string;
+  expectedVersion: number;
+}
+
 export interface ClientDnaModule {
   clientId: string;
   moduleKey: OrganizationDnaModuleKey;
@@ -5381,6 +5436,26 @@ export interface OfficialPushUpdatePayload {
   userNotes?: Record<string, string[]>;
   organizationCode?: string | null;
   relation: 'upgrade' | 'downgrade' | 'switch-custom' | 'different' | 'unknown';
+}
+
+export type OfficialUpdateOperationStatus =
+  | 'downloading'
+  | 'ready-to-install'
+  | 'installer-opened'
+  | 'failed';
+
+export interface OfficialUpdateStatusSnapshot {
+  operationId: string;
+  status: OfficialUpdateOperationStatus;
+  update: OfficialPushUpdatePayload;
+  version: string;
+  fileName: string;
+  transferred: number;
+  total: number;
+  percent: number;
+  canResume: boolean;
+  message?: string | null;
+  updatedAt: string;
 }
 
 export interface ReleaseVersionMetadata {
@@ -9094,7 +9169,9 @@ declare global {
       }): Promise<{ ok: boolean; count: number }>;
       checkForUpdates?(): Promise<{ ok: boolean; version?: string | null; reason?: string; officialPush?: OfficialPushUpdatePayload | null }>;
       getCurrentReleaseMetadata?(): Promise<ReleaseVersionMetadata | null>;
-      installOfficialPushUpdate?(): Promise<{ ok: boolean; version?: string | null; reason?: string; fileName?: string | null }>;
+      getOfficialUpdateStatus?(): Promise<OfficialUpdateStatusSnapshot | null>;
+      downloadOfficialPushUpdate?(): Promise<{ ok: boolean; version?: string | null; reason?: string; fileName?: string | null; status?: OfficialUpdateStatusSnapshot | null }>;
+      installDownloadedOfficialUpdate?(): Promise<{ ok: boolean; version?: string | null; reason?: string; fileName?: string | null; status?: OfficialUpdateStatusSnapshot | null }>;
       onUpdateEvent?(callback: (payload: UpdateEventPayload) => void): () => void;
     };
     strictDesktop: {
@@ -9110,6 +9187,9 @@ export interface UpdateEventPayload {
     | 'not-available'
     | 'download-progress'
     | 'downloaded'
+    | 'update-status'
+    | 'ready-to-install'
+    | 'installer-opened'
     | 'error'
     | 'official-push-available'
     | 'official-push-not-available';
@@ -9121,6 +9201,7 @@ export interface UpdateEventPayload {
   total?: number;
   message?: string;
   officialPush?: OfficialPushUpdatePayload | null;
+  updateStatus?: OfficialUpdateStatusSnapshot | null;
 }
 
 // P13-D 品牌镜子 LLM 画像 snapshot (后端 /api/v2/ui/intelligence/brand-mirror/analyze 返回结构)

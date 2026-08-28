@@ -71,6 +71,17 @@ runtime_python="$(readlink -f "$release_base/venvs"/*/bin/python | head -n 1)"
   verify "$release_dir" --expected-sha "$expected_sha"
 chown -R yiyu:yiyu "$release_dir"
 
+set -a
+. /etc/yiyu-strict-cloud/production.env
+set +a
+: "${YIYU_STRICT_CLOUD_DATA_DIR:?YIYU_STRICT_CLOUD_DATA_DIR is required}"
+: "${YIYU_STRICT_CLOUD_INSTANCE_ID:?YIYU_STRICT_CLOUD_INSTANCE_ID is required}"
+install -d -o yiyu -g yiyu "$YIYU_STRICT_CLOUD_DATA_DIR"
+runuser -u yiyu -- env PYTHONPATH="$release_dir" \
+  "$runtime_python" -m cloud_backend.app.provisioning \
+  --database "$YIYU_STRICT_CLOUD_DATA_DIR/strict-cloud.db" \
+  --cloud-instance-id "$YIYU_STRICT_CLOUD_INSTANCE_ID"
+
 ln -sfn "$release_dir" "$next_link"
 mv -Tf "$next_link" "$current_link"
 if ! systemctl restart "$service_name"; then
@@ -80,9 +91,6 @@ if ! systemctl restart "$service_name"; then
   exit 4
 fi
 
-set -a
-. /etc/yiyu-strict-cloud/production.env
-set +a
 healthy=0
 for _ in $(seq 1 30); do
   if health_json="$(curl -fsS \

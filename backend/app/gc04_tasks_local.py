@@ -22,6 +22,7 @@ _PROJECTION_TABLES = (
     "task_views",
     "task_collaborators",
     "calendar_entries",
+    "execution_runs",
 )
 _RESOURCE_KINDS = {
     "task_lists": "task_list",
@@ -223,7 +224,7 @@ class LocalGC04TaskProjection:
                 for table in ("task_lists", "tasks", "task_views"):
                     for row in normalized_rows[table]:
                         apply_row(table, row)
-                for table in ("task_collaborators", "calendar_entries"):
+                for table in ("task_collaborators", "calendar_entries", "execution_runs"):
                     for row in normalized_rows[table]:
                         apply_row(table, row)
                 has_deferred_rows = any(skipped.values())

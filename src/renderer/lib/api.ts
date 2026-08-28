@@ -240,6 +240,8 @@ import type {
   TaskPlanLinkUpsertPayload,
   TaskSettings,
   TaskSettingsPayload,
+  OrganizationBrandSettings,
+  OrganizationBrandSettingsPayload,
   TopicsSettings,
   TopicsSettingsPayload,
   UpdateProfilePayload,
@@ -2194,6 +2196,17 @@ export async function getTaskSettings() {
 
 export async function updateTaskSettings(payload: TaskSettingsPayload) {
   return request<TaskSettings>('/api/v2/ui/settings/tasks', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getOrganizationBrandSettings() {
+  return request<OrganizationBrandSettings>('/api/v2/ui/settings/organization-brand');
+}
+
+export async function updateOrganizationBrandSettings(payload: OrganizationBrandSettingsPayload) {
+  return request<OrganizationBrandSettings>('/api/v2/ui/settings/organization-brand', {
     method: 'POST',
     body: JSON.stringify(payload),
   });
@@ -6283,6 +6296,24 @@ export async function updateTask(id: string, payload: Partial<TaskMutationPayloa
     headers: workspaceScopedHeaders(options),
     body: JSON.stringify(payload),
   });
+}
+
+export type TaskTimerAction = 'start' | 'pause' | 'stop';
+
+export async function updateTaskTimer(
+  id: string,
+  action: TaskTimerAction,
+  expectedTimerVersion: number,
+  options?: WorkspaceScopedMutationOptions,
+) {
+  return request<Task>(
+    `/api/v2/ui/tasks/${encodeURIComponent(id)}/timer/${action}`,
+    {
+      method: 'POST',
+      headers: workspaceScopedHeaders(options),
+      body: JSON.stringify({ expectedTimerVersion }),
+    },
+  );
 }
 
 export async function deleteTask(id: string) {

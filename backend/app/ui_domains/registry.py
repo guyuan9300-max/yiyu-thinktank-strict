@@ -357,6 +357,8 @@ def build_default_registry() -> UiDomainRegistry:
     personal_runtime_allowed = {
         ("GET", r"settings/transcription-preference"),
         ("PUT", r"settings/transcription-preference"),
+        ("GET", r"settings/organization-brand"),
+        ("POST", r"settings/organization-brand"),
         ("GET", r"settings/tasks"),
         ("POST", r"settings/tasks"),
         ("GET", r"settings/client-workspace"),

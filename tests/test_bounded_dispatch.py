@@ -237,3 +237,33 @@ def test_document_ai_action_uses_dedicated_interactive_ai_lane(tmp_path: Path) -
         "POST",
         "clients/client-a/documents/ai-action",
     )
+
+
+def test_plan_parse_uses_dedicated_interactive_ai_lane(tmp_path: Path) -> None:
+    app = create_app(_config(tmp_path))
+    captured: dict[str, object] = {}
+
+    def interactive(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {"items": [], "lane": "interactive_ai"}
+
+    app.state.interactive_ai_dispatch._dispatch = interactive
+    app.state.ui_dispatch._dispatch = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("计划 AI 拆解不得进入普通20秒UI通道")
+    )
+    app.state.ui_compat.capture_dispatch_workspace = lambda *_args, **_kwargs: None
+    headers = {"X-Yiyu-Desktop-Token": "bounded-dispatch-token"}
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v2/ui/org-model/plans/parse",
+            headers=headers,
+            json={"text": "把组织季度重点拆解为多条平级计划"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["lane"] == "interactive_ai"
+    assert captured["args"][:2] == (
+        "POST",
+        "org-model/plans/parse",
+    )

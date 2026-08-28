@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from html import escape
 from typing import Annotated, Any
 from urllib.parse import urlparse
@@ -56,6 +58,86 @@ def _optional_expected_version(payload: dict[str, Any]) -> int | None:
     if normalized < 1:
         raise RepositoryError(422, "expected_version_invalid", "expectedVersion 无效")
     return normalized
+
+
+_ORGANIZATION_BRAND_CONFIGURATION_KIND = "organization_brand"
+_ORGANIZATION_BRAND_MAX_IMAGE_BYTES = 160 * 1024
+
+
+def _organization_brand_public_config(
+    payload: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, str]:
+    display_name = (
+        _text(payload, "displayName")
+        if "displayName" in payload
+        else _text(current, "displayName")
+    )
+    if len(display_name) > 32:
+        raise RepositoryError(
+            422,
+            "organization_brand_name_too_long",
+            "组织品牌名称不能超过 32 个字符",
+        )
+    if any(ord(character) < 32 for character in display_name):
+        raise RepositoryError(
+            422,
+            "organization_brand_name_invalid",
+            "组织品牌名称包含不可用字符",
+        )
+
+    logo_data_url = (
+        str(payload.get("logoDataUrl") or "").strip()
+        if "logoDataUrl" in payload
+        else _text(current, "logoDataUrl")
+    )
+    if logo_data_url:
+        header, separator, encoded = logo_data_url.partition(",")
+        supported_headers = {
+            "data:image/png;base64": "png",
+            "data:image/jpeg;base64": "jpeg",
+            "data:image/webp;base64": "webp",
+        }
+        image_kind = supported_headers.get(header.casefold())
+        if not separator or not image_kind or not encoded:
+            raise RepositoryError(
+                422,
+                "organization_brand_logo_invalid",
+                "Logo 仅支持 PNG、JPEG 或 WebP 图片",
+            )
+        try:
+            image_bytes = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise RepositoryError(
+                422,
+                "organization_brand_logo_invalid",
+                "Logo 图片内容无效",
+            ) from exc
+        if not image_bytes or len(image_bytes) > _ORGANIZATION_BRAND_MAX_IMAGE_BYTES:
+            raise RepositoryError(
+                413,
+                "organization_brand_logo_too_large",
+                "Logo 处理后不能超过 160 KB",
+            )
+        signature_matches = {
+            "png": image_bytes.startswith(b"\x89PNG\r\n\x1a\n"),
+            "jpeg": image_bytes.startswith(b"\xff\xd8\xff"),
+            "webp": (
+                len(image_bytes) >= 12
+                and image_bytes.startswith(b"RIFF")
+                and image_bytes[8:12] == b"WEBP"
+            ),
+        }
+        if not signature_matches[image_kind]:
+            raise RepositoryError(
+                422,
+                "organization_brand_logo_invalid",
+                "Logo 图片格式与文件内容不一致",
+            )
+    return {
+        "displayName": display_name,
+        "logoDataUrl": logo_data_url,
+    }
 
 
 _AI_ROUTING_PROFILE_KEYS = {
@@ -819,6 +901,13 @@ def register_routes(
         setting_name: str,
         identity: SessionIdentity = Depends(identity_dependency),
     ) -> dict[str, Any]:
+        if setting_name == "organization-brand":
+            return configurations.read_exact(
+                identity,
+                configuration_kind=_ORGANIZATION_BRAND_CONFIGURATION_KIND,
+                scope_kind="organization",
+                defaults={"displayName": "", "logoDataUrl": ""},
+            )
         if setting_name == "ai-routing":
             return read_ai_routing(identity)
         if setting_name == "system-admin":
@@ -857,6 +946,22 @@ def register_routes(
         identity: SessionIdentity = Depends(identity_dependency),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
+        if setting_name == "organization-brand":
+            current = configurations.read_exact(
+                identity,
+                configuration_kind=_ORGANIZATION_BRAND_CONFIGURATION_KIND,
+                scope_kind="organization",
+                defaults={"displayName": "", "logoDataUrl": ""},
+            )
+            return configurations.upsert(
+                identity,
+                configuration_kind=_ORGANIZATION_BRAND_CONFIGURATION_KIND,
+                scope_kind="organization",
+                provider="yiyu_organization_brand",
+                public_config=_organization_brand_public_config(payload, current),
+                expected_version=_expected_version(payload),
+                idempotency_key=idempotency_key or new_id(),
+            )
         if setting_name == "ai-routing":
             return save_ai_routing(
                 identity,

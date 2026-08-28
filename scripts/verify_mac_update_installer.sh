@@ -16,22 +16,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
-/bin/mkdir -p "$MOUNT_DIR" "$WORK_DIR/Applications"
+/bin/mkdir -p "$MOUNT_DIR" "$WORK_DIR/Applications" "$WORK_DIR/LegacyApplications"
 /usr/bin/codesign --verify "$DMG_PATH"
 /usr/bin/hdiutil attach -quiet "$DMG_PATH" -nobrowse -readonly -mountpoint "$MOUNT_DIR"
 MOUNTED=1
 
 INSTALLER="$MOUNT_DIR/安装或更新益语智库AI.app"
 PAYLOAD="$INSTALLER/Contents/Resources/Payload/益语智库AI（新版）.app"
+LEGACY_BRIDGE="$MOUNT_DIR/益语智库AI（新版）.app"
 TARGET="$WORK_DIR/Applications/益语智库AI（新版）.app"
+LEGACY_TARGET="$WORK_DIR/LegacyApplications/益语智库AI（新版）.app"
 [[ -d "$INSTALLER" && -d "$PAYLOAD" ]] || { echo "DMG 不是安装或更新结构。" >&2; exit 3; }
-[[ ! -e "$MOUNT_DIR/益语智库AI（新版）.app" ]] || { echo "禁止回退到拖拽安装结构。" >&2; exit 4; }
+[[ -d "$LEGACY_BRIDGE" && -f "$MOUNT_DIR/.yiyu-update-legacy-bridge" ]] || { echo "DMG 缺少 0.29.4 更新兼容载荷。" >&2; exit 4; }
+[[ ! -L "$MOUNT_DIR/Applications" ]] || { echo "DMG 不得提供拖拽安装链路。" >&2; exit 5; }
 
 /usr/bin/codesign --verify --deep --strict "$INSTALLER"
 /usr/bin/codesign --verify --deep --strict "$PAYLOAD"
+/usr/bin/codesign --verify --deep --strict "$LEGACY_BRIDGE"
 EXPECTED_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PAYLOAD/Contents/Info.plist")"
 EXPECTED_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PAYLOAD/Contents/Info.plist")"
+LEGACY_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$LEGACY_BRIDGE/Contents/Info.plist")"
+LEGACY_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$LEGACY_BRIDGE/Contents/Info.plist")"
 [[ "$EXPECTED_BUNDLE_ID" == "com.yiyu.thinktank.strict" ]] || { echo "软件身份错误：$EXPECTED_BUNDLE_ID" >&2; exit 5; }
+[[ "$LEGACY_BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] || { echo "兼容载荷软件身份错误：$LEGACY_BUNDLE_ID" >&2; exit 6; }
+[[ "$LEGACY_VERSION" == "$EXPECTED_VERSION" ]] || { echo "兼容载荷版本错误：$LEGACY_VERSION" >&2; exit 7; }
 
 # 在隔离目录造一个同身份旧版，调用 DMG 内真正的更新程序完成替换。
 # 这一步不接触本机 /Applications，也不会打开测试副本。
@@ -50,4 +58,13 @@ if /usr/bin/find "$WORK_DIR/Applications" -maxdepth 1 \( -name '.*.previous-*.ap
   exit 9
 fi
 /usr/bin/codesign --verify --deep --strict "$TARGET"
+
+# 精确覆盖旧版 0.29.4 更新器的固定读取契约：根目录必须能直接读取同名 App 的
+# Info.plist、签名、Bundle ID 和版本。这里在隔离目录验证，不触碰本机安装。
+/usr/bin/ditto "$LEGACY_BRIDGE" "$LEGACY_TARGET"
+[[ -f "$LEGACY_TARGET/Contents/Info.plist" ]] || { echo "0.29.4 兼容路径无法读取 Info.plist。" >&2; exit 10; }
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$LEGACY_TARGET/Contents/Info.plist")" == "$EXPECTED_BUNDLE_ID" ]] || exit 11
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$LEGACY_TARGET/Contents/Info.plist")" == "$EXPECTED_VERSION" ]] || exit 12
+/usr/bin/codesign --verify --deep --strict "$LEGACY_TARGET"
 echo "覆盖安装验证通过：0.0.0-verification -> $ACTUAL_VERSION"
+echo "0.29.4 更新兼容协议验证通过：根目录固定 App -> $LEGACY_VERSION"

@@ -25,6 +25,7 @@ def _requires_pinned_organization_workspace(request: UiRequest) -> bool:
         and request.path
         in {
             "settings",
+            "settings/organization-brand",
             "local-input-memory/ai",
             "local-input-memory/feishu",
         }
@@ -35,6 +36,32 @@ router = UiDomainRouter(
     "organization_access",
     pin_workspace=_requires_pinned_organization_workspace,
 )
+
+
+@router.get(r"settings/organization-brand")
+def get_organization_brand(
+    compatibility: Any,
+    _: UiRequest,
+    __: Any,
+) -> dict[str, Any]:
+    return compatibility.runtime.cloud_query(
+        "/api/v2/organization-access/settings/organization-brand"
+    )
+
+
+@router.post(r"settings/organization-brand")
+def save_organization_brand(
+    compatibility: Any,
+    request: UiRequest,
+    __: Any,
+) -> dict[str, Any]:
+    return _cloud_command(
+        compatibility,
+        request,
+        "POST",
+        "/api/v2/organization-access/settings/organization-brand",
+        refresh=False,
+    )
 
 
 def _local_ai_url(value: str) -> bool:

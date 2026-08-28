@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Check, ChevronLeft, ChevronRight, Maximize2, Plus } from 'lucide-react';
+import { Check, ChevronLeft, ChevronRight, Maximize2, Plus, Sparkles } from 'lucide-react';
 
 // ──────────────────────────────────────────────────────────────────────────
 // 益语智库 · 迷你面板 — 北欧极简风
@@ -27,6 +27,7 @@ export interface MiniPanelProps {
   onOpenTask?: (taskId: string) => void;
   onOpenEvent?: (eventId: string) => void;
   onQuickAdd?: (text: string) => void;
+  onAIQuickCreate?: () => void;
   onRestore?: () => void;
   /** 日历视图:把任务拖到某个日期格子→改期到那天(5/29) */
   onRescheduleTask?: (taskId: string, dateIso: string) => void;
@@ -58,10 +59,12 @@ function SectionLabel({ label, count }: { label: string; count?: number }) {
 function MiniHeader({
   view,
   onView,
+  onAIQuickCreate,
   onRestore,
 }: {
   view: MiniView;
   onView: (v: MiniView) => void;
+  onAIQuickCreate?: () => void;
   onRestore?: () => void;
 }) {
   const tab = (v: MiniView, label: string) => {
@@ -85,7 +88,17 @@ function MiniHeader({
         {tab('today', '今天')}
         {tab('calendar', '日历')}
       </div>
-      <div className="window-no-drag flex items-center gap-0.5 text-slate-300">
+      <div className="window-no-drag flex items-center gap-1 text-slate-300">
+        <button
+          type="button"
+          onClick={onAIQuickCreate}
+          aria-label="AI 快速建任务"
+          title="AI 快速建任务"
+          className="inline-flex h-7 items-center gap-1.5 rounded-lg px-2 text-[11px] font-medium text-[#5B7BFE] transition-colors hover:bg-[#F4F6FF]"
+        >
+          <Sparkles size={13} />
+          <span>AI 快速建任务</span>
+        </button>
         <button type="button" onClick={onRestore} title="还原完整窗口" className="inline-flex h-7 w-7 items-center justify-center rounded-lg transition-colors hover:bg-slate-100 hover:text-slate-500">
           <Maximize2 size={14} />
         </button>
@@ -317,7 +330,7 @@ export function MiniPanel(props: MiniPanelProps) {
   };
   return (
     <div className="animate-fade-in flex h-screen w-screen flex-col overflow-hidden rounded-[20px] border border-slate-200/70 bg-white/95 shadow-[0_10px_40px_rgba(15,23,42,0.10)] backdrop-blur-xl">
-      <MiniHeader view={view} onView={selectView} onRestore={props.onRestore} />
+      <MiniHeader view={view} onView={selectView} onAIQuickCreate={props.onAIQuickCreate} onRestore={props.onRestore} />
       <div className="min-h-0 flex-1">
         {view === 'today' ? (
           <TodayCard today={props.today} onToggleTask={props.onToggleTask} onOpenTask={props.onOpenTask} onOpenEvent={props.onOpenEvent} onQuickAdd={props.onQuickAdd} />

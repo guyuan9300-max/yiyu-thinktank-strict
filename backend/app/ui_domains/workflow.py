@@ -16,7 +16,11 @@ from ..local_asr.engine import transcribe_recording as run_recording_transcripti
 from ..local_asr.models import SENSE_VOICE_MODEL, model_ready
 from ..runtime import LocalRuntimeError
 from ..ui_idempotency import replayable_cloud_mutation
-from .gc04_tasks import _task_ui as _strict_task_ui
+from .gc04_tasks import (
+    _deterministic_context_narrative as _deterministic_task_story_narrative,
+    _relationship_is_clear as _task_story_relationship_is_clear,
+    _task_ui as _strict_task_ui,
+)
 from .routing import UiDomainRouter, UiRequest
 
 
@@ -439,27 +443,233 @@ def _project_match_key(value: Any) -> str:
 def _task_ai_project_match(
     compatibility: Any,
     guessed_name: str | None,
-) -> tuple[str | None, str | None, list[dict[str, Any]]]:
+    *,
+    project_rows: list[Any] | None = None,
+) -> tuple[str | None, str | None, list[dict[str, Any]], str | None]:
     match_key = _project_match_key(guessed_name)
-    if not match_key:
-        return None, None, []
     matches: list[dict[str, Any]] = []
-    projects = compatibility.runtime.cloud_query(
-        "/api/v2/domain/project-materials/projects"
-    ).get("projects") or []
+    projects = (
+        project_rows
+        if project_rows is not None
+        else compatibility.runtime.cloud_query(
+            "/api/v2/domain/project-materials/projects"
+        ).get("projects") or []
+    )
     for project in projects:
         if _text(project.get("lifecycleState")) not in {"", "active"}:
             continue
         labels = [project.get("name"), project.get("alias")]
-        if match_key not in {_project_match_key(label) for label in labels if _text(label)}:
+        if not match_key or match_key not in {
+            _project_match_key(label) for label in labels if _text(label)
+        }:
             continue
         project_id = _text(project.get("projectId"))
         project_name = _text(project.get("name"))
         if project_id and project_name:
             matches.append({"id": project_id, "name": project_name, "score": 1.0})
-    if len(matches) != 1:
-        return None, None, matches
-    return matches[0]["id"], matches[0]["name"], matches
+    if len(matches) == 1:
+        return matches[0]["id"], matches[0]["name"], matches, "explicit_match"
+    if len(matches) > 1:
+        return None, None, matches, None
+
+    if match_key:
+        return None, None, [], None
+
+    defaults = [
+        {
+            "id": _text(project.get("projectId")),
+            "name": _text(project.get("name")),
+        }
+        for project in projects
+        if _text(project.get("lifecycleState")) in {"", "active"}
+        and bool(project.get("isDefaultInternalProject"))
+        and _text(project.get("projectId"))
+        and _text(project.get("name"))
+    ]
+    if len(defaults) == 1:
+        return defaults[0]["id"], defaults[0]["name"], [], "organization_default"
+    return None, None, [], None
+
+
+def _task_ai_story_context(
+    compatibility: Any,
+    *,
+    project_id: str | None,
+    project_name: str | None,
+    project_selection_source: str | None,
+    title: str,
+    description: str,
+) -> tuple[str, dict[str, Any]]:
+    if not project_id:
+        return description, {
+            "state": "project_unresolved",
+            "projectId": None,
+            "projectName": None,
+            "projectSelectionSource": None,
+            "relationshipMode": None,
+            "usedSignals": [],
+            "materialBoundary": {},
+            "generationModel": None,
+            "message": "尚未确定任务所属项目，未引用项目 Story",
+        }
+
+    knowledge = compatibility.runtime.project_knowledge_context(project_id)
+    knowledge_state = _text(knowledge.get("state")).lower()
+    if knowledge_state not in {"ready", "empty"}:
+        raise LocalRuntimeError(
+            503,
+            "task_ai_story_context_unavailable",
+            f"项目 Story 当前不可用（{knowledge_state}），请稍后重试",
+        )
+    boundary = dict(knowledge.get("materialBoundary") or {})
+    raw_story = knowledge.get("projectStory")
+    story = dict(raw_story) if isinstance(raw_story, Mapping) else {}
+    story_state = _text(story.get("state")).lower() or "not_available"
+    if story_state != "ready":
+        messages = {
+            "not_available": "当前项目暂无唯一、已发布的正式 Story",
+            "authority_conflict": "当前项目存在多个正式 Story，已停止自动引用",
+            "invalid_authority": (
+                "当前项目 Story 缺少完整的权威来源信息，已停止自动引用"
+            ),
+        }
+        return description, {
+            "state": story_state,
+            "projectId": project_id,
+            "projectName": project_name,
+            "projectSelectionSource": project_selection_source,
+            "relationshipMode": None,
+            "usedSignals": [],
+            "materialBoundary": boundary,
+            "generationModel": None,
+            "message": messages.get(
+                story_state,
+                "当前项目 Story 尚未发布，未引用项目背景",
+            ),
+        }
+
+    story_project_id = _text(story.get("projectId"))
+    publication_state = _text(story.get("publicationState")).lower()
+    lifecycle_state = _text(story.get("lifecycleState")).lower()
+    availability_state = _text(story.get("availabilityState")).lower()
+    story_id = _text(story.get("storyId"))
+    content = _text(story.get("content"))
+    content_hash = _text(story.get("contentHash"))
+    source_set_id = _text(story.get("sourceSetId"))
+    published_at = _text(story.get("publishedAt"))
+    knowledge_cutoff = _text(story.get("knowledgeCutoff"))
+    generator_version = _text(story.get("generatorVersion"))
+    try:
+        story_version = int(story.get("version") or 0)
+    except (TypeError, ValueError):
+        story_version = 0
+    try:
+        published_time = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        cutoff_time = datetime.fromisoformat(
+            knowledge_cutoff.replace("Z", "+00:00")
+        )
+        timestamps_valid = (
+            published_time.tzinfo is not None
+            and cutoff_time.tzinfo is not None
+            and cutoff_time <= published_time <= datetime.now(timezone.utc)
+        )
+    except (TypeError, ValueError, OverflowError):
+        timestamps_valid = False
+    if knowledge_state != "ready":
+        invalid_state = "invalid_authority"
+        invalid_message = (
+            "项目知识投影与正式 Story 状态不一致，已停止自动引用"
+        )
+    elif story_project_id != project_id:
+        invalid_state = "project_mismatch"
+        invalid_message = (
+            "项目 Story 身份与当前任务项目不一致，已停止自动引用"
+        )
+    elif (
+        publication_state != "published"
+        or lifecycle_state != "active"
+        or availability_state != "ready"
+    ):
+        invalid_state = "unpublished"
+        invalid_message = "当前项目 Story 尚未正式发布，未引用项目背景"
+    elif (
+        not story_id
+        or not content
+        or not content_hash
+        or hashlib.sha256(content.encode("utf-8")).hexdigest() != content_hash
+        or not source_set_id
+        or story_version < 1
+        or not published_at
+        or not knowledge_cutoff
+        or not generator_version
+        or not timestamps_valid
+    ):
+        invalid_state = "invalid_authority"
+        invalid_message = (
+            "当前项目 Story 缺少完整的权威来源信息，已停止自动引用"
+        )
+    else:
+        invalid_state = ""
+        invalid_message = ""
+    if invalid_state:
+        return description, {
+            "state": invalid_state,
+            "projectId": project_id,
+            "projectName": project_name,
+            "projectSelectionSource": project_selection_source,
+            "relationshipMode": None,
+            "usedSignals": [],
+            "materialBoundary": boundary,
+            "generationModel": None,
+            "message": invalid_message,
+        }
+
+    hint = {
+        "title": title,
+        "description": description,
+        "clientName": project_name or "",
+        "eventLineName": "",
+    }
+    story_title = _text(story.get("title")) or "项目 Story"
+    selected = [
+        {
+            "sourceId": story_id,
+            "title": story_title,
+            "summary": content,
+            "sourceKind": "project_story",
+            "contentHash": content_hash,
+            "version": story_version,
+        }
+    ]
+
+    relationship_clear = _task_story_relationship_is_clear(selected, hint=hint)
+    brief = _deterministic_task_story_narrative(
+        hint=hint,
+        selected=selected,
+        relationship_clear=relationship_clear,
+    )
+    generation_model = "deterministic-authority-brief-v2"
+    story_state = "applied_authoritative_story"
+    story_message = "已依据唯一、已发布的正式 Story 补充任务背景"
+    enriched_description = f"{description.rstrip()}\n\n任务背景：{brief}".strip()
+    return enriched_description, {
+        "state": story_state,
+        "projectId": project_id,
+        "projectName": project_name,
+        "projectSelectionSource": project_selection_source,
+        "relationshipMode": (
+            "task_specific" if relationship_clear else "general_project_context"
+        ),
+        "usedSignals": [story_title],
+        "materialBoundary": boundary,
+        "generationModel": generation_model,
+        "storyId": story_id,
+        "storyVersion": story_version,
+        "storyContentHash": content_hash,
+        "sourceSetId": source_set_id,
+        "knowledgeCutoff": knowledge_cutoff,
+        "message": story_message,
+    }
 
 
 def _task_write_payload(
@@ -1867,7 +2077,15 @@ def _dispatch_unpinned(
                 "title 和 desc 为字符串；dueDate 为 YYYY-MM-DD 或 null；"
                 "dueTime 为 HH:MM 或 null；priority 只能是 low、normal、high；"
                 "clientName 只能从给定项目名称或别名中原样选择，无法确定时为 null。"
-                "不得编造日期、时间或项目。"
+                "标题规则：先识别原文的核心任务类型。原文明示开会、沟通、汇报、评审、拜访时，"
+                "title 必须保留该动作，不得把会议议题改写成已经承诺完成的执行任务。"
+                "会议类优先采用‘参与人+会议动作+核心议题’，多项议题压缩为一至两个主题；"
+                "原文已给出具体议题时，必须保留议题中的具体业务对象和阶段或结果，"
+                "不得改成‘相关工作’、‘重点事项’等泛称。"
+                "例如‘与A、B开会……AI运营后台交付、前台AI搜索规划’可写为"
+                "‘与A、B召开AI运营后台交付与前台搜索规划会’。"
+                "其他任务使用‘动作+对象或交付物’。title 应具体、可搜索，通常不超过32个汉字，"
+                "删去‘推进几项重点工作’等空泛表述；不得编造结果、日期、时间、人员、范围或项目。"
             ),
             prompt=json.dumps(
                 {
@@ -1898,13 +2116,28 @@ def _dispatch_unpinned(
                 "组织模型返回了无效的任务优先级，请重试",
             )
         guessed_client_name = _text(parsed.get("clientName")) or None
-        client_id, client_name, candidates = _task_ai_project_match(
+        (
+            client_id,
+            client_name,
+            candidates,
+            project_selection_source,
+        ) = _task_ai_project_match(
             compatibility,
             guessed_client_name,
+            project_rows=project_rows,
+        )
+        base_description = description or raw
+        enriched_description, story_context = _task_ai_story_context(
+            compatibility,
+            project_id=client_id,
+            project_name=client_name,
+            project_selection_source=project_selection_source,
+            title=title,
+            description=base_description,
         )
         return {
             "title": title[:300],
-            "desc": description or raw,
+            "desc": enriched_description,
             "dueDate": _task_ai_parse_date(parsed.get("dueDate")),
             "dueTime": _task_ai_parse_time(parsed.get("dueTime")),
             "priority": priority,
@@ -1912,6 +2145,7 @@ def _dispatch_unpinned(
             "clientName": client_name,
             "clientCandidates": candidates,
             "rawLlmGuessClientName": guessed_client_name,
+            "storyContext": story_context,
         }
     if request.method == "GET" and path in {"tasks/agent-execution", "tasks/agent-worklogs"}:
         projection = _agent_work_projection(

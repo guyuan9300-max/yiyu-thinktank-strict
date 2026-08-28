@@ -238,6 +238,19 @@ def _task_ui(
         "planningCycleId": row.get("planning_cycle_id"),
         "ownerId": owner.get("userId") if owner else None,
         "ownerName": owner.get("fullName") if owner else "未设置负责人",
+        "ownerDepartmentId": row.get("owner_department_id"),
+        "ownerDepartmentName": row.get("owner_department_name"),
+        "ownerDepartmentResolution": str(
+            row.get("owner_department_resolution") or "unassigned"
+        ),
+        "ownerDepartments": [
+            {
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or "未命名部门"),
+            }
+            for item in row.get("owner_departments") or []
+            if isinstance(item, Mapping) and item.get("id")
+        ],
         "sourceType": str(row.get("source_type") or "manual"),
         "sourceId": row.get("source_id"),
         "evidenceCount": len(attachments),
@@ -251,7 +264,9 @@ def _task_ui(
         "viewerSurfaces": {
             "personalList": bool(viewer_surfaces.get("personal_list")),
             "personalCalendar": bool(viewer_surfaces.get("personal_calendar")),
-            "collaborationInbox": bool(viewer_surfaces.get("collaboration_inbox")),
+            "collaborationInbox": bool(
+                viewer_surfaces.get("collaboration_inbox")
+            ),
             "eventLineDetail": bool(viewer_surfaces.get("event_line_detail")),
         },
         "viewerCapabilities": {
@@ -454,7 +469,11 @@ def update_task_timer(
         request,
         "POST",
         f"{_CLOUD_TASKS}/{quote(task_id, safe='')}/timer/{quote(action, safe='')}",
-        {"expectedTimerVersion": int(request.body.get("expectedTimerVersion") or 0)},
+        {
+            "expectedTimerVersion": int(
+                request.body.get("expectedTimerVersion") or 0
+            )
+        },
     )
     _apply(compatibility, result)
     return _task_ui(compatibility, result.get("task") or {})

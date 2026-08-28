@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type {
   DesktopRuntime,
   OfficialPushUpdatePayload,
+  OfficialUpdateStatusSnapshot,
   ReleaseVersionMetadata,
   RenderedOfficialWebsiteCapture,
   UpdateEventPayload,
@@ -97,12 +98,22 @@ contextBridge.exposeInMainWorld('yiyuWorkbench', {
   }> => ipcRenderer.invoke('yiyu-workbench:update.check'),
   getCurrentReleaseMetadata: (): Promise<ReleaseVersionMetadata | null> =>
     ipcRenderer.invoke('yiyu-workbench:update.currentReleaseMetadata'),
-  installOfficialPushUpdate: (): Promise<{
+  getOfficialUpdateStatus: (): Promise<OfficialUpdateStatusSnapshot | null> =>
+    ipcRenderer.invoke('yiyu-workbench:update.status'),
+  downloadOfficialPushUpdate: (): Promise<{
     ok: boolean;
     version?: string | null;
     reason?: string;
     fileName?: string | null;
-  }> => ipcRenderer.invoke('yiyu-workbench:update.installOfficialPush'),
+    status?: OfficialUpdateStatusSnapshot | null;
+  }> => ipcRenderer.invoke('yiyu-workbench:update.downloadOfficialPush'),
+  installDownloadedOfficialUpdate: (): Promise<{
+    ok: boolean;
+    version?: string | null;
+    reason?: string;
+    fileName?: string | null;
+    status?: OfficialUpdateStatusSnapshot | null;
+  }> => ipcRenderer.invoke('yiyu-workbench:update.installDownloadedOfficial'),
   onUpdateEvent: (callback: (payload: UpdateEventPayload) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, payload: UpdateEventPayload) => callback(payload);
     ipcRenderer.on('yiyu-workbench:update-event', handler);

@@ -5,10 +5,20 @@ import path from 'node:path';
 import { app, BrowserWindow, ipcMain, shell } from 'electron';
 import type {
   OfficialPushUpdatePayload,
+  OfficialUpdateStatusSnapshot,
   ReleaseVersionMetadata,
   UpdateEventPayload,
   UpdateOrgIdentity,
 } from '../shared/types.js';
+import {
+  advanceUpdateProgress,
+  createPersistedUpdateOperation,
+  normalizeUpdaterErrorMessage,
+  parsePersistedUpdaterState,
+  reconcilePersistedUpdaterState,
+  type PersistedUpdateOperation,
+  type PersistedUpdaterState,
+} from './officialUpdaterState.js';
 
 const RELEASE_SERVICE_BASE_URL = 'https://yiyu.love';
 const UPDATE_EVENT_CHANNEL = 'yiyu-workbench:update-event';
@@ -52,7 +62,19 @@ let currentIdentityKey: string | null = null;
 let lastOfficialPush: OfficialPushUpdatePayload | null = null;
 let lastSuccessfulCheckAt = 0;
 let automaticCheckInFlight: Promise<void> | null = null;
+let downloadInFlight: Promise<{ targetPath: string; fileName: string; status: OfficialUpdateStatusSnapshot }> | null = null;
 let intervalTimer: NodeJS.Timeout | null = null;
+let artifactProbeCache: {
+  targetPath: string;
+  sizeBytes: number;
+  mtimeMs: number;
+  sha512: string;
+} | null = null;
+let persistedState: PersistedUpdaterState = {
+  schemaVersion: 1,
+  lastSuccessfulCheckAt: null,
+  operation: null,
+};
 
 function updaterLog(message: string): void {
   try {
@@ -70,32 +92,77 @@ function statePath(): string {
 
 function loadState(): void {
   try {
-    const parsed = JSON.parse(fs.readFileSync(statePath(), 'utf8')) as { lastSuccessfulCheckAt?: string };
-    const timestamp = Date.parse(parsed.lastSuccessfulCheckAt || '');
+    persistedState = parsePersistedUpdaterState(JSON.parse(fs.readFileSync(statePath(), 'utf8')));
+    const timestamp = Date.parse(persistedState.lastSuccessfulCheckAt || '');
     lastSuccessfulCheckAt = Number.isFinite(timestamp) ? timestamp : 0;
   } catch {
+    persistedState = { schemaVersion: 1, lastSuccessfulCheckAt: null, operation: null };
     lastSuccessfulCheckAt = 0;
   }
 }
 
-function markSuccessfulCheck(): void {
-  lastSuccessfulCheckAt = Date.now();
+function persistState(): void {
   try {
     const target = statePath();
     fs.mkdirSync(path.dirname(target), { recursive: true });
     const temporary = `${target}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify({
-      lastSuccessfulCheckAt: new Date(lastSuccessfulCheckAt).toISOString(),
-    }), 'utf8');
+    fs.writeFileSync(temporary, JSON.stringify(persistedState, null, 2), 'utf8');
     fs.renameSync(temporary, target);
   } catch (error) {
     updaterLog(`state-persist-failed ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
+function markSuccessfulCheck(): void {
+  lastSuccessfulCheckAt = Date.now();
+  persistedState = {
+    ...persistedState,
+    lastSuccessfulCheckAt: new Date(lastSuccessfulCheckAt).toISOString(),
+  };
+  persistState();
+}
+
+function toStatusSnapshot(operation: PersistedUpdateOperation | null): OfficialUpdateStatusSnapshot | null {
+  if (!operation) return null;
+  return {
+    operationId: operation.operationId,
+    status: operation.status,
+    update: operation.update,
+    version: operation.update.version,
+    fileName: path.basename(operation.targetPath),
+    transferred: operation.transferred,
+    total: operation.total,
+    percent: operation.percent,
+    canResume: operation.status === 'failed' && operation.transferred > 0,
+    message: operation.lastError,
+    updatedAt: operation.updatedAt,
+  };
+}
+
+function setPersistedOperation(operation: PersistedUpdateOperation | null): OfficialUpdateStatusSnapshot | null {
+  persistedState = { ...persistedState, operation };
+  persistState();
+  return toStatusSnapshot(operation);
+}
+
 function broadcast(payload: UpdateEventPayload): void {
   if (!mainWindowRef || mainWindowRef.isDestroyed()) return;
   mainWindowRef.webContents.send(UPDATE_EVENT_CHANNEL, payload);
+}
+
+function broadcastStatus(kind: UpdateEventPayload['kind'] = 'update-status'): OfficialUpdateStatusSnapshot | null {
+  const updateStatus = toStatusSnapshot(persistedState.operation);
+  broadcast({
+    kind,
+    version: updateStatus?.version,
+    percent: updateStatus?.percent,
+    transferred: updateStatus?.transferred,
+    total: updateStatus?.total,
+    message: updateStatus?.message || undefined,
+    officialPush: updateStatus?.update || null,
+    updateStatus,
+  });
+  return updateStatus;
 }
 
 export function parseStrictVersion(value: string | null | undefined): [number, number, number] | null {
@@ -212,15 +279,7 @@ async function checkOfficialUpdate(broadcastResult: boolean): Promise<OfficialPu
 }
 
 function normalizeUpdateError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  const lower = message.toLowerCase();
-  if (lower.includes('abort') || lower.includes('timeout') || lower.includes('enotfound') || lower.includes('econn')) {
-    return '当前网络无法连接益语智库官网，软件会在联网后自动重试。';
-  }
-  if (lower.includes('sha512') || lower.includes('校验')) {
-    return '更新包校验信息不完整或不正确，已停止更新。';
-  }
-  return message;
+  return normalizeUpdaterErrorMessage(error);
 }
 
 async function automaticCheck(): Promise<void> {
@@ -278,28 +337,149 @@ function safeInstallerName(value: string | null | undefined, version: string): s
   return safe || `yiyu-thinktank-strict-${version}.${INSTALLER_EXTENSION}`;
 }
 
+function downloadPaths(update: OfficialPushUpdatePayload): { targetPath: string; temporaryPath: string; fileName: string } {
+  const fileName = safeInstallerName(update.fileName, update.version);
+  const directory = path.join(app.getPath('userData'), 'official-update-downloads');
+  return {
+    fileName,
+    targetPath: path.join(directory, fileName),
+    temporaryPath: path.join(directory, `${fileName}.download`),
+  };
+}
+
+async function sha512ForFile(filePath: string): Promise<string> {
+  const hash = crypto.createHash('sha512');
+  const stream = fs.createReadStream(filePath);
+  for await (const chunk of stream) hash.update(chunk as Buffer);
+  return hash.digest('base64');
+}
+
+async function probeDownloadedArtifact(targetPath: string): Promise<{ exists: boolean; sizeBytes: number; sha512: string | null }> {
+  try {
+    const stats = await fs.promises.stat(targetPath);
+    if (!stats.isFile()) return { exists: false, sizeBytes: 0, sha512: null };
+    if (artifactProbeCache
+      && artifactProbeCache.targetPath === targetPath
+      && artifactProbeCache.sizeBytes === stats.size
+      && artifactProbeCache.mtimeMs === stats.mtimeMs) {
+      return { exists: true, sizeBytes: stats.size, sha512: artifactProbeCache.sha512 };
+    }
+    const sha512 = await sha512ForFile(targetPath);
+    artifactProbeCache = { targetPath, sizeBytes: stats.size, mtimeMs: stats.mtimeMs, sha512 };
+    return { exists: true, sizeBytes: stats.size, sha512 };
+  } catch {
+    if (artifactProbeCache?.targetPath === targetPath) artifactProbeCache = null;
+    return { exists: false, sizeBytes: 0, sha512: null };
+  }
+}
+
+async function reconcileUpdateState(): Promise<OfficialUpdateStatusSnapshot | null> {
+  const operation = persistedState.operation;
+  if (operation) {
+    const expected = downloadPaths(operation.update);
+    const hasSafePaths = path.resolve(operation.targetPath) === path.resolve(expected.targetPath)
+      && path.resolve(operation.temporaryPath) === path.resolve(expected.temporaryPath);
+    if (!hasSafePaths) {
+      persistedState = { ...persistedState, operation: null };
+      persistState();
+      updaterLog(`discarded-unsafe-receipt operation=${operation.operationId}`);
+      return null;
+    }
+  }
+  const previous = JSON.stringify(persistedState);
+  persistedState = await reconcilePersistedUpdaterState(persistedState, app.getVersion(), probeDownloadedArtifact);
+  if (JSON.stringify(persistedState) !== previous) persistState();
+  return toStatusSnapshot(persistedState.operation);
+}
+
 async function writeChunk(stream: fs.WriteStream, chunk: Buffer): Promise<void> {
   if (!stream.write(chunk)) await once(stream, 'drain');
 }
 
-async function downloadInstaller(update: OfficialPushUpdatePayload): Promise<{ targetPath: string; fileName: string }> {
+async function downloadInstallerOnce(update: OfficialPushUpdatePayload): Promise<{
+  targetPath: string;
+  fileName: string;
+  status: OfficialUpdateStatusSnapshot;
+}> {
   const downloadUrl = String(update.downloadUrl || '').trim();
   if (!downloadUrl) throw new Error('官网没有返回安装包地址。');
-  const fileName = safeInstallerName(update.fileName, update.version);
-  const directory = path.join(app.getPath('userData'), 'official-update-downloads');
-  fs.mkdirSync(directory, { recursive: true });
-  const targetPath = path.join(directory, fileName);
-  const temporaryPath = `${targetPath}.download`;
-  fs.rmSync(temporaryPath, { force: true });
+  const { fileName, targetPath, temporaryPath } = downloadPaths(update);
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
 
-  const response = await fetch(downloadUrl, { cache: 'no-store', headers: { Accept: 'application/octet-stream' } });
-  if (!response.ok) throw new Error(`安装包下载失败：${response.status}`);
-  const expectedSize = Number(update.sizeBytes || response.headers.get('content-length') || 0);
-  const hash = crypto.createHash('sha512');
-  const stream = fs.createWriteStream(temporaryPath);
-  let transferred = 0;
+  const existingStatus = await reconcileUpdateState();
+  if (existingStatus?.operationId === createPersistedUpdateOperation(update, targetPath, temporaryPath).operationId
+    && (existingStatus.status === 'ready-to-install' || existingStatus.status === 'installer-opened')) {
+    return { targetPath, fileName, status: existingStatus };
+  }
+
+  let operation = createPersistedUpdateOperation(update, targetPath, temporaryPath);
+  let partialSize = 0;
   try {
+    const partialStats = await fs.promises.stat(temporaryPath);
+    partialSize = partialStats.isFile() ? partialStats.size : 0;
+  } catch {
+    partialSize = 0;
+  }
+  const expectedSize = Math.max(0, Number(update.sizeBytes || 0));
+  if (partialSize > 0 && expectedSize > 0 && partialSize >= expectedSize) {
+    await fs.promises.rm(temporaryPath, { force: true });
+    partialSize = 0;
+  }
+  operation = advanceUpdateProgress(operation, partialSize, expectedSize);
+  const previous = persistedState.operation;
+  if (previous?.operationId === operation.operationId) {
+    operation.etag = previous.etag;
+    operation.lastModified = previous.lastModified;
+    operation.createdAt = previous.createdAt;
+  }
+  setPersistedOperation(operation);
+  broadcastStatus('update-status');
+
+  const headers: Record<string, string> = { Accept: 'application/octet-stream' };
+  if (partialSize > 0) {
+    headers.Range = `bytes=${partialSize}-`;
+    const validator = operation.etag || operation.lastModified;
+    if (validator) headers['If-Range'] = validator;
+  }
+
+  let stream: fs.WriteStream | null = null;
+  try {
+    let response = await fetch(downloadUrl, { cache: 'no-store', headers });
+    if (partialSize > 0 && response.status === 416) {
+      await response.body?.cancel().catch(() => undefined);
+      await fs.promises.rm(temporaryPath, { force: true });
+      partialSize = 0;
+      operation = { ...operation, transferred: 0, percent: 0, etag: null, lastModified: null };
+      response = await fetch(downloadUrl, { cache: 'no-store', headers: { Accept: 'application/octet-stream' } });
+    }
+    if (!response.ok) throw new Error(`安装包下载失败：${response.status}`);
     if (!response.body) throw new Error('官网安装包没有可读取的数据流。');
+
+    let rangeStart = Number(response.headers.get('content-range')?.match(/^bytes\s+(\d+)-/i)?.[1] || -1);
+    if (partialSize > 0 && response.status === 206 && rangeStart !== partialSize) {
+      await response.body.cancel().catch(() => undefined);
+      await fs.promises.rm(temporaryPath, { force: true });
+      partialSize = 0;
+      operation = { ...operation, transferred: 0, percent: 0, etag: null, lastModified: null };
+      response = await fetch(downloadUrl, { cache: 'no-store', headers: { Accept: 'application/octet-stream' } });
+      if (!response.ok || !response.body) throw new Error(`安装包重新下载失败：${response.status}`);
+      rangeStart = -1;
+    }
+    const resumed = partialSize > 0 && response.status === 206 && rangeStart === partialSize;
+    if (partialSize > 0 && !resumed) {
+      await fs.promises.rm(temporaryPath, { force: true });
+      partialSize = 0;
+      operation = { ...operation, transferred: 0, percent: 0 };
+    }
+    operation = {
+      ...operation,
+      etag: response.headers.get('etag') || operation.etag,
+      lastModified: response.headers.get('last-modified') || operation.lastModified,
+    };
+    stream = fs.createWriteStream(temporaryPath, { flags: resumed ? 'a' : 'w' });
+    let transferred = partialSize;
+    let lastBroadcastAt = 0;
+    let lastPersistedPercent = Math.floor(operation.percent);
     const reader = response.body.getReader();
     for (;;) {
       const { done, value } = await reader.read();
@@ -307,39 +487,109 @@ async function downloadInstaller(update: OfficialPushUpdatePayload): Promise<{ t
       if (!value) continue;
       const chunk = Buffer.from(value);
       transferred += chunk.length;
-      hash.update(chunk);
       await writeChunk(stream, chunk);
-      broadcast({
-        kind: 'download-progress',
-        version: update.version,
-        percent: expectedSize > 0 ? (transferred / expectedSize) * 100 : undefined,
-        transferred,
-        total: expectedSize || undefined,
-      });
+      operation = advanceUpdateProgress(operation, transferred, expectedSize);
+      const now = Date.now();
+      const integerPercent = Math.floor(operation.percent);
+      if (integerPercent > lastPersistedPercent || now - lastBroadcastAt >= 1_000) {
+        persistedState = { ...persistedState, operation };
+        persistState();
+        lastPersistedPercent = integerPercent;
+        lastBroadcastAt = now;
+        broadcast({
+          kind: 'download-progress',
+          version: update.version,
+          percent: operation.percent,
+          transferred: operation.transferred,
+          total: operation.total || undefined,
+          officialPush: update,
+          updateStatus: toStatusSnapshot(operation),
+        });
+      }
     }
     await new Promise<void>((resolve, reject) => {
-      stream.once('error', reject);
-      stream.end(resolve);
+      stream!.once('error', reject);
+      stream!.end(resolve);
     });
+    stream = null;
+
+    const finalStats = await fs.promises.stat(temporaryPath);
+    if (expectedSize > 0 && finalStats.size !== expectedSize) {
+      throw new Error('安装包下载大小与官网清单不一致。');
+    }
+    const actualSha512 = await sha512ForFile(temporaryPath);
+    if (actualSha512 !== normalizeSha512(update.sha512)) {
+      await fs.promises.rm(temporaryPath, { force: true });
+      throw new Error('安装包 SHA512 校验失败，已删除不完整文件。');
+    }
+    await fs.promises.rm(targetPath, { force: true });
+    if (artifactProbeCache?.targetPath === targetPath) artifactProbeCache = null;
+    await fs.promises.rename(temporaryPath, targetPath);
+    const installedStats = await fs.promises.stat(targetPath);
+    artifactProbeCache = {
+      targetPath,
+      sizeBytes: installedStats.size,
+      mtimeMs: installedStats.mtimeMs,
+      sha512: actualSha512,
+    };
+    operation = {
+      ...operation,
+      status: 'ready-to-install',
+      transferred: finalStats.size,
+      total: expectedSize || finalStats.size,
+      percent: 100,
+      lastError: null,
+      updatedAt: new Date().toISOString(),
+    };
+    const status = setPersistedOperation(operation)!;
+    broadcast({
+      kind: 'downloaded',
+      version: update.version,
+      percent: 100,
+      transferred: status.transferred,
+      total: status.total,
+      officialPush: update,
+      updateStatus: status,
+    });
+    broadcastStatus('ready-to-install');
+    updaterLog(`download-ready operation=${operation.operationId} version=${update.version} file=${fileName} bytes=${finalStats.size}`);
+    return { targetPath, fileName, status };
   } catch (error) {
-    stream.destroy();
-    fs.rmSync(temporaryPath, { force: true });
-    throw error;
+    stream?.destroy();
+    let retainedBytes = 0;
+    try {
+      retainedBytes = (await fs.promises.stat(temporaryPath)).size;
+    } catch {
+      retainedBytes = 0;
+    }
+    const message = normalizeUpdateError(error);
+    operation = {
+      ...operation,
+      status: 'failed',
+      transferred: retainedBytes,
+      percent: expectedSize > 0 ? Math.min(99, (retainedBytes / expectedSize) * 100) : operation.percent,
+      lastError: retainedBytes > 0 ? `${message} 已保留下载进度，可重试。` : message,
+      updatedAt: new Date().toISOString(),
+    };
+    setPersistedOperation(operation);
+    broadcastStatus('update-status');
+    updaterLog(`download-failed operation=${operation.operationId} detail=${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(operation.lastError || message);
   }
-  if (expectedSize > 0 && transferred !== expectedSize) {
-    fs.rmSync(temporaryPath, { force: true });
-    throw new Error('安装包下载大小与官网清单不一致。');
+}
+
+async function downloadInstaller(update: OfficialPushUpdatePayload): Promise<{
+  targetPath: string;
+  fileName: string;
+  status: OfficialUpdateStatusSnapshot;
+}> {
+  if (downloadInFlight) return downloadInFlight;
+  downloadInFlight = downloadInstallerOnce(update);
+  try {
+    return await downloadInFlight;
+  } finally {
+    downloadInFlight = null;
   }
-  const actualSha512 = hash.digest('base64');
-  if (actualSha512 !== normalizeSha512(update.sha512)) {
-    fs.rmSync(temporaryPath, { force: true });
-    throw new Error('安装包 SHA512 校验失败，已删除不完整文件。');
-  }
-  fs.rmSync(targetPath, { force: true });
-  fs.renameSync(temporaryPath, targetPath);
-  broadcast({ kind: 'downloaded', version: update.version });
-  updaterLog(`download-ready version=${update.version} file=${fileName} bytes=${transferred}`);
-  return { targetPath, fileName };
 }
 
 async function currentReleaseMetadata(): Promise<ReleaseVersionMetadata | null> {
@@ -355,6 +605,9 @@ export function setupOfficialUpdater(mainWindow: BrowserWindow): void {
   if (setupDone) return;
   setupDone = true;
   loadState();
+  void reconcileUpdateState()
+    .then(() => broadcastStatus('update-status'))
+    .catch((error) => updaterLog(`state-reconcile-failed ${error instanceof Error ? error.message : String(error)}`));
 
   ipcMain.handle('yiyu-workbench:update.check', async () => {
     if (!UPDATE_PLATFORM) return { ok: false, reason: '当前系统暂不支持官网更新。' };
@@ -370,15 +623,61 @@ export function setupOfficialUpdater(mainWindow: BrowserWindow): void {
 
   ipcMain.handle('yiyu-workbench:update.currentReleaseMetadata', currentReleaseMetadata);
 
-  ipcMain.handle('yiyu-workbench:update.installOfficialPush', async () => {
-    if (!app.isPackaged) return { ok: false, reason: '开发版只验证更新发现；请在安装版下载并打开正式安装包。' };
+  ipcMain.handle('yiyu-workbench:update.status', async () => {
+    const status = await reconcileUpdateState();
+    if (status) lastOfficialPush = status.update;
+    return status;
+  });
+
+  ipcMain.handle('yiyu-workbench:update.downloadOfficialPush', async () => {
+    if (!app.isPackaged) return { ok: false, reason: '开发版只验证更新发现；请在正式安装版中下载更新。' };
     try {
-      const officialPush = await checkOfficialUpdate(true) || lastOfficialPush;
+      const restoredStatus = await reconcileUpdateState();
+      if (restoredStatus && (restoredStatus.status === 'ready-to-install' || restoredStatus.status === 'installer-opened')) {
+        return {
+          ok: true,
+          version: restoredStatus.version,
+          fileName: restoredStatus.fileName,
+          status: restoredStatus,
+        };
+      }
+      const officialPush = await checkOfficialUpdate(true) || lastOfficialPush || restoredStatus?.update;
       if (!officialPush) return { ok: false, reason: '当前没有高于本机版本的正式安装包。' };
       const downloaded = await downloadInstaller(officialPush);
-      const openError = await shell.openPath(downloaded.targetPath);
-      if (openError) return { ok: false, version: officialPush.version, fileName: downloaded.fileName, reason: `安装包已下载但无法打开：${openError}` };
-      return { ok: true, version: officialPush.version, fileName: downloaded.fileName };
+      return {
+        ok: true,
+        version: officialPush.version,
+        fileName: downloaded.fileName,
+        status: downloaded.status,
+      };
+    } catch (error) {
+      return { ok: false, reason: normalizeUpdateError(error) };
+    }
+  });
+
+  ipcMain.handle('yiyu-workbench:update.installDownloadedOfficial', async () => {
+    if (!app.isPackaged) return { ok: false, reason: '开发版不会打开正式更新安装包。' };
+    try {
+      const status = await reconcileUpdateState();
+      const operation = persistedState.operation;
+      if (!status || !operation || (status.status !== 'ready-to-install' && status.status !== 'installer-opened')) {
+        return { ok: false, reason: status?.message || '尚未完成安装包下载，请先下载最新版。', status };
+      }
+      const openError = await shell.openPath(operation.targetPath);
+      if (openError) {
+        updaterLog(`installer-open-failed operation=${operation.operationId} detail=${openError}`);
+        return { ok: false, version: status.version, fileName: status.fileName, reason: normalizeUpdateError(new Error(openError)), status };
+      }
+      const openedOperation: PersistedUpdateOperation = {
+        ...operation,
+        status: 'installer-opened',
+        lastError: null,
+        updatedAt: new Date().toISOString(),
+      };
+      const openedStatus = setPersistedOperation(openedOperation)!;
+      broadcastStatus('installer-opened');
+      updaterLog(`installer-opened operation=${operation.operationId} version=${status.version}`);
+      return { ok: true, version: status.version, fileName: status.fileName, status: openedStatus };
     } catch (error) {
       return { ok: false, reason: normalizeUpdateError(error) };
     }

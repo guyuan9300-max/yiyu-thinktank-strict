@@ -27,13 +27,15 @@ class CloudConfig:
             raise RuntimeError("YIYU_STRICT_CLOUD_BOOTSTRAP_TOKEN is required")
         if not master_key:
             raise RuntimeError("YIYU_STRICT_CLOUD_MASTER_KEY is required")
+        cloud_instance_id = os.environ.get(
+            "YIYU_STRICT_CLOUD_INSTANCE_ID", ""
+        ).strip()
+        if not cloud_instance_id:
+            raise RuntimeError("YIYU_STRICT_CLOUD_INSTANCE_ID is required")
         return cls(
             data_dir=resolved,
             database_path=resolved / "strict-cloud.db",
             bootstrap_token=bootstrap_token,
             master_key=master_key,
-            cloud_instance_id=(
-                os.environ.get("YIYU_STRICT_CLOUD_INSTANCE_ID", "").strip() or None
-            ),
+            cloud_instance_id=cloud_instance_id,
         )
-

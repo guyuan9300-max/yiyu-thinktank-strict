@@ -2343,6 +2343,45 @@ class LocalProjectMaterialsRepository:
             ),
         }
 
+    def _primary_processor_kind(self, entry: Mapping[str, Any]) -> str:
+        del entry
+        return "local_text_extraction"
+
+    def _include_in_pending_processing_batch(
+        self,
+        entry: Mapping[str, Any],
+    ) -> bool:
+        """Keep unsupported audio away from the generic text processor.
+
+        A domain repository that owns an authoritative audio processor can
+        override this hook.  Filtering here preserves the single processing
+        highway while avoiding a second audio-specific batch implementation.
+        """
+        media_type = str(entry.get("mediaType") or "").casefold()
+        suffix = Path(
+            str(entry.get("fileName") or entry.get("managedPath") or "")
+        ).suffix.casefold()
+        return not media_type.startswith("audio/") and suffix not in {
+            ".m4a",
+            ".mp3",
+            ".wav",
+            ".aac",
+            ".flac",
+            ".ogg",
+            ".webm",
+            ".mp4",
+            ".mov",
+        }
+
+    def _processing_state_for_entry(
+        self,
+        entry: Mapping[str, Any],
+        source_asset_ids: list[str],
+        attempts: Mapping[tuple[str, str], Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        del entry
+        return self._processing_state_result(source_asset_ids, attempts)
+
     def processing_states(
         self,
         entries: Iterable[Mapping[str, Any]],
@@ -2390,12 +2429,21 @@ class LocalProjectMaterialsRepository:
             )
             if all_source_ids:
                 placeholders = ",".join("?" for _ in all_source_ids)
+                processor_kinds = list(
+                    dict.fromkeys(
+                        [
+                            *(self._primary_processor_kind(entry) for entry in normalized),
+                            "local_wiki_projection",
+                        ]
+                    )
+                )
+                processor_placeholders = ",".join("?" for _ in processor_kinds)
                 rows = connection.execute(
                     "SELECT * FROM processing_attempts "
                     f"WHERE scope_id=? AND source_asset_id IN ({placeholders}) "
-                    "AND processor_kind IN ('local_text_extraction','local_wiki_projection') "
+                    f"AND processor_kind IN ({processor_placeholders}) "
                     "ORDER BY attempt_no DESC, started_at DESC, id DESC",
-                    (scope_id, *all_source_ids),
+                    (scope_id, *all_source_ids, *processor_kinds),
                 ).fetchall()
                 for row in rows:
                     item = dict(row)
@@ -2404,7 +2452,8 @@ class LocalProjectMaterialsRepository:
                         item,
                     )
         return [
-            self._processing_state_result(
+            self._processing_state_for_entry(
+                entry,
                 self._source_asset_candidates(entry, source_ids_by_hash=source_ids_by_hash),
                 attempts,
             )
@@ -3644,24 +3693,13 @@ class LocalProjectMaterialsRepository:
     ) -> dict[str, Any]:
         state = self._load_project_state(project_id)
         requested = {str(value) for value in document_ids if str(value)}
-        audio_suffixes = {
-            ".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg", ".webm", ".mp4", ".mov"
-        }
-
-        def is_audio_document(raw: Any) -> bool:
-            if not isinstance(raw, Mapping):
-                return False
-            media_type = str(raw.get("mediaType") or "")
-            suffix = Path(
-                str(raw.get("fileName") or raw.get("managedPath") or "")
-            ).suffix.lower()
-            return media_type.startswith("audio/") or suffix in audio_suffixes
 
         selected = [
             str(document_id)
             for document_id, raw in dict(state.get("documents") or {}).items()
             if (not requested or str(document_id) in requested)
-            and not is_audio_document(raw)
+            and isinstance(raw, Mapping)
+            and self._include_in_pending_processing_batch(raw)
         ]
         # Queue only documents whose *text extraction* actually needs to run.
         # A ready text body may still need Wiki/retrieval/shared-summary work,
@@ -3672,7 +3710,7 @@ class LocalProjectMaterialsRepository:
         batch_started_at = utc_now()
         context = self._context()
         work_items: list[tuple[str, str]] = []
-        queued: list[tuple[str, str, int, str | None]] = []
+        queued: list[tuple[str, str, int, str, str | None]] = []
         for document_id in selected:
             _, document_state, entry = self._document_entry(document_id)
             if str(document_state.get("projectId") or "") != project_id:
@@ -3681,9 +3719,10 @@ class LocalProjectMaterialsRepository:
                 project_id=project_id,
                 entry=entry,
             )
+            processor_kind = self._primary_processor_kind(entry)
             current = self._latest_processing_attempt(
                 source_id,
-                processor_kind="local_text_extraction",
+                processor_kind=processor_kind,
             )
             work_items.append((document_id, source_id))
             current_status = str((current or {}).get("status") or "not_requested")
@@ -3695,6 +3734,7 @@ class LocalProjectMaterialsRepository:
                         document_id,
                         source_id,
                         int((current or {}).get("attempt_no") or 1),
+                        str((current or {}).get("processor_kind") or processor_kind),
                         str((current or {}).get("id") or "") or None,
                     )
                 )
@@ -3704,6 +3744,7 @@ class LocalProjectMaterialsRepository:
                     document_id,
                     source_id,
                     int((current or {}).get("attempt_no") or 0) + 1,
+                    processor_kind,
                     None,
                 )
             )
@@ -3714,7 +3755,13 @@ class LocalProjectMaterialsRepository:
                     context.sandbox_id,
                 )
                 connection.execute("BEGIN IMMEDIATE")
-                for _, source_id, attempt_no, queued_attempt_id in queued:
+                for (
+                    _,
+                    source_id,
+                    attempt_no,
+                    processor_kind,
+                    queued_attempt_id,
+                ) in queued:
                     if queued_attempt_id:
                         connection.execute(
                             """
@@ -3737,7 +3784,7 @@ class LocalProjectMaterialsRepository:
                                 error_message_safe, next_retry_at, started_at,
                                 finished_at, authority_role, origin_instance_id
                             ) VALUES (?, ?, NULL, ?, NULL, ?, 'queued', NULL,
-                                      'local_text_extraction', NULL, NULL, NULL, ?,
+                                      ?, NULL, NULL, NULL, ?,
                                       NULL, 'local', ?)
                             """,
                             (
@@ -3745,6 +3792,7 @@ class LocalProjectMaterialsRepository:
                                 scope_id,
                                 source_id,
                                 attempt_no,
+                                processor_kind,
                                 batch_started_at,
                                 context.sandbox_id,
                             ),

@@ -599,18 +599,19 @@ def event_line_detail(
             (identity.scope_id, event_line_id),
         ).fetchall()
         task_repository = GC04TaskRepository(repository)
-        task_payloads = []
-        for item in tasks:
-            task_payload = task_repository._task_payload(  # noqa: SLF001
+        owner_departments_by_task = task_repository._owner_departments_by_task(  # noqa: SLF001
+            connection, identity, (str(item["id"]) for item in tasks)
+        )
+        task_payloads = [
+            task_repository._task_payload(  # noqa: SLF001
                 connection,
                 identity,
                 item,
+                owner_departments_by_task=owner_departments_by_task,
+                event_line_detail=True,
             )
-            task_payload["viewer_surfaces"] = {
-                **dict(task_payload.get("viewer_surfaces") or {}),
-                "event_line_detail": True,
-            }
-            task_payloads.append(task_payload)
+            for item in tasks
+        ]
         return {
             "eventLine": _event_line_payload(connection, row),
             "activities": [_activity_payload(item) for item in activities],

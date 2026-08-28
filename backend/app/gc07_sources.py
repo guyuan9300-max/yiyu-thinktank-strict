@@ -13,7 +13,7 @@ import threading
 import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from xml.etree import ElementTree
 
 from strict_common.ids import utc_now
@@ -202,36 +202,59 @@ class GC07LocalProjectMaterialsRepository(LocalProjectMaterialsRepository):
         media_type = str(entry.get("mediaType") or "").casefold()
         return media_type.startswith("audio/") or path.suffix.casefold() in _AUDIO_SUFFIXES
 
-    def processing_state(self, entry: dict[str, Any]) -> dict[str, Any]:
-        try:
-            _project_id, _state, current = self._document_entry(
-                str(entry.get("documentId") or entry.get("cloudDocumentId") or entry.get("localSourceId") or "")
+    @classmethod
+    def _entry_is_audio(cls, entry: Mapping[str, Any]) -> bool:
+        media_type = str(entry.get("mediaType") or "").casefold()
+        candidate_path = Path(
+            str(
+                entry.get("managedPath")
+                or entry.get("path")
+                or entry.get("fileName")
+                or entry.get("name")
+                or entry.get("title")
+                or ""
             )
-        except LocalRuntimeError:
-            current = entry
-        try:
-            path, _row = self._source_path(current, sandbox_id=self._context().sandbox_id)
-        except LocalRuntimeError:
-            return super().processing_state(entry)
-        if not self._is_audio(dict(current), path):
-            return super().processing_state(entry)
-        source_ids = list(dict.fromkeys(
-            str(value).strip()
-            for value in (
-                current.get("cloudDocumentId"),
-                current.get("documentId"),
-                current.get("localSourceId"),
+        )
+        return (
+            media_type.startswith("audio/")
+            or candidate_path.suffix.casefold() in _AUDIO_SUFFIXES
+        )
+
+    def _primary_processor_kind(self, entry: Mapping[str, Any]) -> str:
+        if self._entry_is_audio(entry):
+            return "local_audio_transcription"
+        return super()._primary_processor_kind(entry)
+
+    def _include_in_pending_processing_batch(
+        self,
+        entry: Mapping[str, Any],
+    ) -> bool:
+        # This repository owns both the generic text processor and the single
+        # authoritative audio-transcription processor, so either kind can use
+        # the same durable batch/attempt highway.
+        del entry
+        return True
+
+    def _processing_state_for_entry(
+        self,
+        entry: Mapping[str, Any],
+        source_asset_ids: list[str],
+        attempts: Mapping[tuple[str, str], Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        if not self._entry_is_audio(entry):
+            return super()._processing_state_for_entry(
+                entry,
+                source_asset_ids,
+                attempts,
             )
-            if str(value or "").strip() and not str(value).startswith("local-pending:")
-        ))
-        attempt = None
-        for source_id in source_ids:
-            attempt = self._latest_processing_attempt(
-                source_id,
-                processor_kind="local_audio_transcription",
-            )
-            if attempt is not None:
-                break
+        attempt = next(
+            (
+                attempts.get((source_id, "local_audio_transcription"))
+                for source_id in source_asset_ids
+                if attempts.get((source_id, "local_audio_transcription")) is not None
+            ),
+            None,
+        )
         if attempt is None:
             return {
                 "parseStatus": "not_requested",
@@ -250,13 +273,16 @@ class GC07LocalProjectMaterialsRepository(LocalProjectMaterialsRepository):
             "wikiStatus": "not_requested",
             "processingAttemptId": str(attempt.get("id") or ""),
             "processingAttemptNo": int(attempt.get("attempt_no") or 0),
+            "processingBatchStartedAt": attempt.get("started_at") or None,
             "processingStage": "audio_transcription",
             "processingErrorCode": attempt.get("error_code") or None,
             "processingMessage": attempt.get("error_message_safe") or None,
             "processingRetryable": status in {"not_requested", "failed_retryable", "blocked"},
             "processedAt": attempt.get("finished_at") or attempt.get("started_at"),
-            "transcriptDocumentId": current.get("transcriptDocumentId"),
-            "originalAudioAvailable": path.is_file(),
+            "transcriptDocumentId": entry.get("transcriptDocumentId"),
+            "originalAudioAvailable": Path(
+                str(entry.get("managedPath") or entry.get("path") or "")
+            ).is_file(),
         }
 
     def process_document(
@@ -283,28 +309,43 @@ class GC07LocalProjectMaterialsRepository(LocalProjectMaterialsRepository):
             processor_kind="local_audio_transcription",
         )
         if current is not None and not force and str(current.get("status") or "") in {
-            "queued", "processing", "ready", "blocked"
+            "processing", "ready", "blocked"
         }:
             return {"documentId": document_id, **self.processing_state(entry)}
         model_root = self.runtime.database_path.parent / "models"
-        attempt_no = int((current or {}).get("attempt_no") or 0) + 1
-        initial_status = "queued" if model_ready(model_root, SENSE_VOICE_MODEL) else "blocked"
-        initial_code = None if initial_status == "queued" else "local_audio_asr_not_ready"
-        initial_message = (
-            "等待本机转写"
-            if initial_status == "queued"
-            else "本机 ASR 模型未就绪；录音原件已保留，可在系统设置安装后重试"
+        queued_attempt = (
+            current
+            if current is not None and str(current.get("status") or "") == "queued"
+            else None
         )
-        attempt_id = self.create_local_processing_attempt(
-            source_asset_id=source_id,
-            processor_kind="local_audio_transcription",
-            status=initial_status,
-            error_code=initial_code,
-            error_message=initial_message,
-            attempt_no=attempt_no,
-        )
-        if initial_status == "blocked":
+        if queued_attempt is not None:
+            attempt_id = str(queued_attempt.get("id") or "")
+        else:
+            attempt_id = self.create_local_processing_attempt(
+                source_asset_id=source_id,
+                processor_kind="local_audio_transcription",
+                status="queued",
+                error_code=None,
+                error_message="等待本机转写",
+                attempt_no=int((current or {}).get("attempt_no") or 0) + 1,
+            )
+        if not model_ready(model_root, SENSE_VOICE_MODEL):
+            self.update_local_processing_attempt(
+                attempt_id=attempt_id,
+                status="blocked",
+                error_code="local_audio_asr_not_ready",
+                message="本机 ASR 模型未就绪；录音原件已保留，可在系统设置安装后重试",
+                finished=True,
+            )
             return {"documentId": document_id, **self.processing_state(entry)}
+
+        self.update_local_processing_attempt(
+            attempt_id=attempt_id,
+            status="processing",
+            error_code=None,
+            message="准备本机转写",
+            finished=False,
+        )
 
         pinned_sandbox = self.runtime.capture_sandbox_context()
 

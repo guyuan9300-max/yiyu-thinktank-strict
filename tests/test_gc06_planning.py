@@ -996,6 +996,58 @@ def test_planning_cycle_delete_and_archive_are_mutually_exclusive(tmp_path: Path
     assert archived["lifecycleState"] == "archived"
 
 
+def test_planning_cycle_update_can_correct_period_without_recreating_record(tmp_path: Path) -> None:
+    repository, identity, _ = _repository(tmp_path)
+    monthly = create_planning_cycle(
+        repository,
+        identity,
+        payload={
+            "planningCycleId": "misclassified_monthly_plan",
+            "recordKind": "organization_plan",
+            "period": "2026-08",
+            "periodKind": "month",
+            "periodStart": "2026-08-01",
+            "periodEnd": "2026-08-31",
+            "timezone": "Asia/Shanghai",
+            "title": "误识别为月度的组织计划",
+            "status": "published",
+        },
+        idempotency_key="create-misclassified-monthly-plan",
+    )["planningCycle"]
+
+    payload = {
+        "expectedVersion": monthly["version"],
+        "period": "2026-Q4",
+        "periodKind": "quarter",
+        "periodStart": "2026-10-01",
+        "periodEnd": "2026-12-31",
+        "timezone": "Asia/Shanghai",
+    }
+    updated = update_planning_cycle(
+        repository,
+        identity,
+        planning_cycle_id=monthly["id"],
+        payload=payload,
+        idempotency_key="correct-misclassified-monthly-plan",
+    )["planningCycle"]
+
+    assert updated["id"] == monthly["id"]
+    assert updated["version"] == monthly["version"] + 1
+    assert updated["period"] == "2026-Q4"
+    assert updated["periodKind"] == "quarter"
+    assert updated["periodStart"] == "2026-10-01"
+    assert updated["periodEnd"] == "2026-12-31"
+
+    replay = update_planning_cycle(
+        repository,
+        identity,
+        planning_cycle_id=monthly["id"],
+        payload=payload,
+        idempotency_key="correct-misclassified-monthly-plan",
+    )["planningCycle"]
+    assert replay == updated
+
+
 def _seed_task(
     repository,
     identity,

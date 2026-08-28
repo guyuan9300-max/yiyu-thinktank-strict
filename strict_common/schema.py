@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -143,7 +144,22 @@ def _verify_identity(identity: DatabaseIdentity, role: DatabaseRole) -> None:
 def initialize_database(path: Path, role: DatabaseRole) -> DatabaseIdentity:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    existed = path.exists()
+    # The lock file is intentionally persistent.  Removing it would create an
+    # inode race in which a late process can lock a different file while an
+    # earlier initializer still owns the original lock.
+    lock_path = Path(f"{path}.init.lock")
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            return _initialize_database_locked(path, role)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _initialize_database_locked(
+    path: Path,
+    role: DatabaseRole,
+) -> DatabaseIdentity:
     connection = sqlite3.connect(path)
     try:
         _configure(connection)
@@ -159,11 +175,6 @@ def initialize_database(path: Path, role: DatabaseRole) -> DatabaseIdentity:
                     f"strict {role} database has {len(violations)} foreign key violations"
                 )
             return identity
-
-        if existed and path.stat().st_size > 0:
-            raise RuntimeError(
-                f"refusing to initialize non-empty database without strict tables: {path}"
-            )
 
         now = utc_now()
         build_id = new_id()
@@ -274,12 +285,6 @@ def initialize_database(path: Path, role: DatabaseRole) -> DatabaseIdentity:
     except Exception:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
-        if not existed and path.exists():
-            connection.close()
-            path.unlink(missing_ok=True)
-            Path(f"{path}-wal").unlink(missing_ok=True)
-            Path(f"{path}-shm").unlink(missing_ok=True)
-            raise
         raise
     finally:
         try:

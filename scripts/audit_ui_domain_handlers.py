@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -31,6 +31,61 @@ def renderer_operations() -> list[dict[str, Any]]:
 
 def sample_path(template: str) -> str:
     return re.sub(r":[^/]+", "sample", template)
+
+
+def _route_sample_path(pattern: str) -> str | None:
+    """Build one valid concrete path from the route regex subset we register."""
+
+    value = re.sub(
+        r"\(\?P<[^>]+>([^()]*)\)",
+        lambda match: (
+            "sample"
+            if match.group(1) == "[^/]+"
+            else match.group(1).split("|", 1)[0]
+        ),
+        pattern,
+    )
+    value = value.replace("([^/]+)", "sample")
+    value = re.sub(
+        r"\(([A-Za-z0-9_/-]+(?:\|[A-Za-z0-9_/-]+)+)\)",
+        lambda match: match.group(1).split("|", 1)[0],
+        value,
+    )
+    return None if any(token in value for token in ("(", ")", "[", "]")) else value
+
+
+def _template_accepts_path(template: str, path: str) -> bool:
+    segments = [
+        r"[^/]+" if segment.startswith(":") else re.escape(segment)
+        for segment in template.split("/")
+    ]
+    return re.fullmatch("/".join(segments), path) is not None
+
+
+def matching_registered_routes(
+    route_specs: Iterable[Any],
+    *,
+    method: str,
+    template: str,
+) -> list[Any]:
+    """Return routes whose regex language overlaps a renderer path template."""
+
+    direct_path = sample_path(template)
+    matches: list[Any] = []
+    for route in route_specs:
+        if route.method != method:
+            continue
+        if route.regex.fullmatch(direct_path):
+            matches.append(route)
+            continue
+        route_sample = _route_sample_path(route.pattern)
+        if (
+            route_sample is not None
+            and route.regex.fullmatch(route_sample)
+            and _template_accepts_path(template, route_sample)
+        ):
+            matches.append(route)
+    return matches
 
 
 def main() -> int:
@@ -59,12 +114,11 @@ def main() -> int:
     registered = 0
     for operation in operations:
         method = str(operation["method"])
-        path = sample_path(str(operation["path"]))
-        matching_routes = [
-            route
-            for route in route_specs
-            if route.method == method and route.regex.fullmatch(path)
-        ]
+        matching_routes = matching_registered_routes(
+            route_specs,
+            method=method,
+            template=str(operation["path"]),
+        )
         if any(
             route.handler.__name__ != "_gap"
             for route in matching_routes

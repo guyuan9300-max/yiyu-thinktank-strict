@@ -447,6 +447,15 @@ export function validateTaskScheduleStartEnd(input: TaskScheduleStartEnd): TaskS
   return { valid: true };
 }
 
+export interface TaskScheduleMoveUpdate {
+  dueDate: string;
+  deadlineAt: null;
+  scheduledStartAt: string;
+  scheduledEndAt: string;
+  startDate: string;
+  durationMinutes: number;
+}
+
 function combineScheduleDateTime(date: string, time: string): string {
   return `${date}T${time}`;
 }
@@ -456,6 +465,45 @@ function parseScheduleLocalDateTime(value: string): Date | null {
   if (!m) return null;
   const parsed = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]));
   return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function formatScheduleLocalDateTime(value: Date): string {
+  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}T${String(value.getHours()).padStart(2, '0')}:${String(value.getMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * 将任务的开始时刻移动到新的日期/时间，同时保留原时长。
+ * 行内编辑、拖拽和其他快速排期入口应复用同一组排期字段，避免只改 dueDate 造成日历投影错位。
+ */
+export function buildTaskScheduleMoveUpdate(
+  task: Pick<Task, 'startDate' | 'dueDate' | 'durationMinutes' | 'deadlineAt' | 'scheduledStartAt' | 'scheduledEndAt'>,
+  input: { startDate: string; startTime: string },
+): TaskScheduleMoveUpdate {
+  const startDate = input.startDate.trim();
+  const startTime = normalizeTaskTimeInput(input.startTime);
+  const nextScheduledStartAt = startDate && startTime
+    ? combineScheduleDateTime(startDate, startTime)
+    : '';
+  const nextStart = nextScheduledStartAt ? parseScheduleLocalDateTime(nextScheduledStartAt) : null;
+  if (!nextStart) throw new Error('请选择有效的任务日期和时间。');
+
+  const currentRange = getTaskScheduleRange(task);
+  const durationFromRange = currentRange
+    ? Math.round((currentRange.end.getTime() - currentRange.start.getTime()) / 60_000)
+    : DEFAULT_TIMED_DURATION_MINUTES;
+  const durationMinutes = Math.max(MIN_DURATION_MINUTES, task.durationMinutes || durationFromRange);
+  const scheduledEndAt = formatScheduleLocalDateTime(
+    new Date(nextStart.getTime() + durationMinutes * 60_000),
+  );
+
+  return {
+    dueDate: nextScheduledStartAt,
+    deadlineAt: null,
+    scheduledStartAt: nextScheduledStartAt,
+    scheduledEndAt,
+    startDate: nextScheduledStartAt,
+    durationMinutes,
+  };
 }
 
 /** 由"开始日/时间 + 结束日/时间"推导任务排期字段（支持跨天）。 */

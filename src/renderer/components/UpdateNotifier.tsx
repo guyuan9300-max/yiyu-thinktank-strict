@@ -1,5 +1,9 @@
 import { useEffect } from 'react';
-import type { OfficialPushUpdatePayload, UpdateEventPayload } from '../../shared/types';
+import type {
+  OfficialPushUpdatePayload,
+  OfficialUpdateStatusSnapshot,
+  UpdateEventPayload,
+} from '../../shared/types';
 
 /**
  * 订阅官网更新事件并缓存当前版本提示。发现新版时由 App 显示站内通知；
@@ -9,7 +13,7 @@ import type { OfficialPushUpdatePayload, UpdateEventPayload } from '../../shared
 export const UPDATE_STATE_KEY = '__yiyuUpdateState__';
 export const OFFICIAL_PUSH_STATE_EVENT = 'yiyu-official-push-state-changed';
 
-interface CachedUpdateState {
+export interface CachedUpdateState {
   lastEvent: UpdateEventPayload | null;
   latestVersion: string | null;
   downloadedVersion: string | null;
@@ -17,6 +21,7 @@ interface CachedUpdateState {
   isDownloading: boolean;
   lastError: string | null;
   officialPush: OfficialPushUpdatePayload | null;
+  status: OfficialUpdateStatusSnapshot | null;
 }
 
 declare global {
@@ -35,6 +40,7 @@ function ensureSlot(): CachedUpdateState {
       isDownloading: false,
       lastError: null,
       officialPush: null,
+      status: null,
     };
   }
   return window[UPDATE_STATE_KEY]!;
@@ -59,14 +65,31 @@ export function setCachedOfficialPush(push: OfficialPushUpdatePayload | null): v
   notifyOfficialPushStateChanged(push);
 }
 
+export function setCachedUpdateStatus(status: OfficialUpdateStatusSnapshot | null): void {
+  const slot = ensureSlot();
+  slot.status = status;
+  if (status) {
+    slot.officialPush = status.update;
+    slot.latestVersion = status.version;
+    slot.downloadedVersion = status.status === 'ready-to-install' || status.status === 'installer-opened'
+      ? status.version
+      : null;
+    slot.isDownloaded = status.status === 'ready-to-install' || status.status === 'installer-opened';
+    slot.isDownloading = status.status === 'downloading';
+    slot.lastError = status.status === 'failed' ? status.message || '更新未完成' : null;
+  }
+  notifyOfficialPushStateChanged(slot.officialPush);
+}
+
 export function UpdateNotifier(): null {
   useEffect(() => {
     const subscribe = window.yiyuWorkbench?.onUpdateEvent;
-    if (typeof subscribe !== 'function') return;
+    let active = true;
 
-    const unsubscribe = subscribe((payload: UpdateEventPayload) => {
+    const handleEvent = (payload: UpdateEventPayload) => {
       const slot = ensureSlot();
       slot.lastEvent = payload;
+      if (payload.updateStatus !== undefined) setCachedUpdateStatus(payload.updateStatus);
       switch (payload.kind) {
         case 'official-push-available':
           setCachedOfficialPush(payload.officialPush ?? null);
@@ -76,7 +99,12 @@ export function UpdateNotifier(): null {
           console.log('[updater] official push available:', payload.officialPush?.title || payload.version);
           return;
         case 'official-push-not-available':
-          setCachedOfficialPush(null);
+          if (slot.status?.status === 'ready-to-install' || slot.status?.status === 'installer-opened') {
+            slot.officialPush = slot.status.update;
+            notifyOfficialPushStateChanged(slot.officialPush);
+          } else {
+            setCachedOfficialPush(null);
+          }
           slot.isDownloading = false;
           return;
         case 'available':
@@ -89,11 +117,18 @@ export function UpdateNotifier(): null {
           slot.isDownloading = true;
           return;
         case 'downloaded':
+        case 'ready-to-install':
           slot.downloadedVersion = payload.version ?? slot.latestVersion;
           slot.isDownloaded = true;
           slot.isDownloading = false;
           slot.lastError = null;
           console.log('[updater] installer downloaded:', payload.version);
+          return;
+        case 'installer-opened':
+          slot.isDownloaded = true;
+          slot.isDownloading = false;
+          return;
+        case 'update-status':
           return;
         case 'not-available':
           slot.isDownloading = false;
@@ -107,9 +142,19 @@ export function UpdateNotifier(): null {
         default:
           return;
       }
-    });
+    };
+    const unsubscribe = typeof subscribe === 'function' ? subscribe(handleEvent) : undefined;
 
-    return unsubscribe;
+    void window.yiyuWorkbench?.getOfficialUpdateStatus?.()
+      .then((status) => {
+        if (active && status) setCachedUpdateStatus(status);
+      })
+      .catch(() => undefined);
+
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
   }, []);
 
   return null;

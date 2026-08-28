@@ -400,6 +400,7 @@ class WorkspaceRuntime:
             if path in {
                 "/api/v2/organization-access/model",
                 "/api/v2/organization-access/settings/transcription-preference",
+                "/api/v2/organization-access/settings/organization-brand",
                 "/api/v2/organization-access/settings/tasks",
                 "/api/v2/organization-access/settings/client-workspace",
                 "/api/v2/organization-access/settings/topics",
@@ -568,6 +569,7 @@ class WorkspaceRuntime:
                     "/api/v2/agent-skills",
                     "/api/v2/ai-proposals",
                     "/api/v2/organization-access/settings/transcription-preference",
+                    "/api/v2/organization-access/settings/organization-brand",
                     "/api/v2/organization-access/settings/tasks",
                     "/api/v2/organization-access/settings/client-workspace",
                     "/api/v2/organization-access/settings/topics",

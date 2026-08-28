@@ -45,13 +45,24 @@ test('app asar contains no source backend, database, or build intermediates', ()
     || entry.startsWith('/contracts')
   ));
   assert.deepEqual(forbidden, []);
+  const mainRuntimeEntries = entries.filter((entry) => entry.startsWith('/build/main/main/') && entry.endsWith('.js'));
+  const allowedMainRuntimeEntries = new Set([
+    '/build/main/main/main.js',
+    '/build/main/main/officialUpdater.js',
+    '/build/main/main/officialUpdaterState.js',
+    '/build/main/main/preload.js',
+    '/build/main/main/strictCollabGit.js',
+  ]);
+  assert.deepEqual(
+    mainRuntimeEntries.filter((entry) => !allowedMainRuntimeEntries.has(entry)),
+    [],
+    'app.asar contains an unreviewed main-process runtime module',
+  );
   assert.deepEqual(entries, [
     '/build',
     '/build/main',
     '/build/main/main',
-    '/build/main/main/main.js',
-    '/build/main/main/preload.js',
-    '/build/main/main/strictCollabGit.js',
+    ...mainRuntimeEntries,
     '/build/main/shared',
     '/build/main/shared/types.js',
     '/dist',

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 
+import cloud_backend.app.repositories.gc04_tasks as gc04_tasks_repository
 from backend.app.gc04_tasks_local import LocalGC04TaskProjection
+from backend.app.runtime import WorkspaceRuntime
 from backend.app.ui_domains.gc04_tasks import (
     _deterministic_context_narrative,
     _relationship_is_clear,
@@ -853,9 +856,171 @@ def test_gc04_detached_cloud_routes_register_without_shared_main(
     register_gc04_task_routes(app, repository, current_identity)
     paths = {route.path for route in app.routes}
     assert "/api/v2/domain/tasks" in paths
+    assert "/api/v2/domain/tasks/{task_id}/timer/{action}" in paths
     assert "/api/v2/domain/tasks/{task_id}/agent-proposals" in paths
     assert "/api/v2/domain/task-bulk/preflight" in paths
     assert "/api/v2/domain/task-bulk/{bulk_operation_id}/commit" in paths
+
+
+def test_task_timer_cloud_commands_are_on_the_connected_golden_chain() -> None:
+    for action in ("start", "pause", "stop"):
+        assert WorkspaceRuntime._connected_cloud_path_allowed(
+            "POST", f"/api/v2/domain/tasks/task-1/timer/{action}"
+        )
+    assert not WorkspaceRuntime._connected_cloud_path_allowed(
+        "POST", "/api/v2/domain/tasks/task-1/timer/reset"
+    )
+
+
+def test_task_timer_uses_execution_runs_and_is_idempotent(tmp_path: Path) -> None:
+    repository, identity, _ = _repository(tmp_path)
+    domain = GC04TaskRepository(repository)
+    task = _create(domain, identity, "timer-task-create", "记录真实投入时间")
+    task_id = str(task["task"]["id"])
+
+    assert task["task"]["task_timer"]["state"] == "idle"
+    assert task["task"]["task_timer"]["version"] == 0
+
+    started = domain.update_task_timer(
+        identity,
+        task_id=task_id,
+        action="start",
+        expected_timer_version=0,
+        idempotency_key="timer-start-1",
+    )
+    replay = domain.update_task_timer(
+        identity,
+        task_id=task_id,
+        action="start",
+        expected_timer_version=0,
+        idempotency_key="timer-start-1",
+    )
+    assert replay == started
+    assert started["taskTimer"]["state"] == "running"
+    assert started["taskTimer"]["version"] == 1
+
+    ten_seconds_ago = (
+        datetime.now(timezone.utc) - timedelta(seconds=10)
+    ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        connection.execute(
+            "UPDATE execution_runs SET started_at=? WHERE id=?",
+            (ten_seconds_ago, started["taskTimer"]["latestRunId"]),
+        )
+        connection.commit()
+
+    paused = domain.update_task_timer(
+        identity,
+        task_id=task_id,
+        action="pause",
+        expected_timer_version=1,
+        idempotency_key="timer-pause-1",
+    )
+    assert paused["taskTimer"]["state"] == "paused"
+    assert paused["taskTimer"]["version"] == 2
+    assert paused["taskTimer"]["elapsedSeconds"] >= 9
+
+    resumed = domain.update_task_timer(
+        identity,
+        task_id=task_id,
+        action="start",
+        expected_timer_version=2,
+        idempotency_key="timer-resume-1",
+    )
+    stopped = domain.update_task_timer(
+        identity,
+        task_id=task_id,
+        action="stop",
+        expected_timer_version=3,
+        idempotency_key="timer-stop-1",
+    )
+    assert resumed["taskTimer"]["state"] == "running"
+    assert stopped["taskTimer"]["state"] == "stopped"
+    assert stopped["taskTimer"]["version"] == 4
+    assert stopped["taskTimer"]["elapsedSeconds"] >= paused["taskTimer"]["elapsedSeconds"]
+
+    peer = _second_member(repository, identity)
+    with pytest.raises(RepositoryError) as error:
+        domain.update_task_timer(
+            peer,
+            task_id=task_id,
+            action="start",
+            expected_timer_version=0,
+            idempotency_key="timer-peer-forbidden",
+        )
+    # Non-participants must not learn that the task exists through the timer API.
+    assert error.value.code == "task_missing"
+
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM execution_runs WHERE task_id=? AND run_kind='task_focus_session'",
+            (task_id,),
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM commands WHERE aggregate_id=? "
+            "AND command_type LIKE 'task.timer_%'",
+            (task_id,),
+        ).fetchone()[0] == 4
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE target_resource_id=? "
+            "AND action LIKE 'task.timer_%'",
+            (task_id,),
+        ).fetchone()[0] == 4
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_task_timer_keeps_rapid_segments_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, identity, _ = _repository(tmp_path)
+    domain = GC04TaskRepository(repository)
+    task = _create(domain, identity, "timer-rapid-create", "快速暂停恢复")
+    task_id = str(task["task"]["id"])
+    fixed_now = "2026-08-24T10:00:00.000Z"
+    monkeypatch.setattr(gc04_tasks_repository, "utc_now", lambda: fixed_now)
+
+    started = domain.update_task_timer(
+        identity,
+        task_id=task_id,
+        action="start",
+        expected_timer_version=0,
+        idempotency_key="timer-rapid-start",
+    )
+    paused = domain.update_task_timer(
+        identity,
+        task_id=task_id,
+        action="pause",
+        expected_timer_version=int(started["taskTimer"]["version"]),
+        idempotency_key="timer-rapid-pause",
+    )
+    resumed = domain.update_task_timer(
+        identity,
+        task_id=task_id,
+        action="start",
+        expected_timer_version=int(paused["taskTimer"]["version"]),
+        idempotency_key="timer-rapid-resume",
+    )
+    stopped = domain.update_task_timer(
+        identity,
+        task_id=task_id,
+        action="stop",
+        expected_timer_version=int(resumed["taskTimer"]["version"]),
+        idempotency_key="timer-rapid-stop",
+    )
+
+    assert resumed["taskTimer"]["state"] == "running"
+    assert stopped["taskTimer"]["state"] == "stopped"
+    assert stopped["taskTimer"]["version"] == 4
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        created_at = [
+            str(row["created_at"])
+            for row in connection.execute(
+                "SELECT created_at FROM execution_runs WHERE task_id=? "
+                "ORDER BY created_at,id",
+                (task_id,),
+            ).fetchall()
+        ]
+    assert created_at == [fixed_now, "2026-08-24T10:00:00.001Z"]
 
 
 class _ProjectionRuntime:
@@ -985,9 +1150,25 @@ def test_gc04_local_projection_uses_stable_ids_and_marks_missing_snapshot_stale(
                 "generated_at": now,
             }
         ],
+        "execution_runs": [
+            {
+                "id": "task_focus_gc04_projection",
+                "scope_id": "cloud_scope_must_not_leak",
+                "task_id": task_id,
+                "status": "running",
+                "initiator_membership_id": "membership_gc04_local",
+                "run_kind": "task_focus_session",
+                "started_at": now,
+                "version": 1,
+                "lifecycle_state": "active",
+                "created_at": now,
+                "updated_at": now,
+            }
+        ],
     }
     applied = projector.apply(projection)
     assert applied["counts"]["tasks"] == 1
+    assert applied["counts"]["execution_runs"] == 1
     assert projector.task_version(task_id) == 3
     with runtime_connection(database, "local") as connection:
         row = connection.execute(

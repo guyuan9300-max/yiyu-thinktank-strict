@@ -8,7 +8,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildTaskScheduleFromStartEnd, validateTaskScheduleStartEnd } from './taskTimeline.js';
+import {
+  buildTaskScheduleFromStartEnd,
+  buildTaskScheduleMoveUpdate,
+  validateTaskScheduleStartEnd,
+} from './taskTimeline.js';
 
 test('无开始日 → 清空全部排期', () => {
   const r = buildTaskScheduleFromStartEnd({ startDate: null, startTime: null, endDate: null, endTime: null });
@@ -117,4 +121,57 @@ test('跨年边界 → 正确计算', () => {
   });
   assert.equal(r.scheduledEndAt, '2027-01-01T02:00');
   assert.equal(r.durationMinutes, 240);
+});
+
+test('行内修改开始时间 → 同步移动结束时间并保留原时长', () => {
+  const r = buildTaskScheduleMoveUpdate({
+    startDate: '2026-08-13T09:00',
+    dueDate: '2026-08-13T09:00',
+    deadlineAt: null,
+    scheduledStartAt: '2026-08-13T09:00',
+    scheduledEndAt: '2026-08-13T10:30',
+    durationMinutes: 90,
+  }, {
+    startDate: '2026-08-20',
+    startTime: '14:15',
+  });
+  assert.deepEqual(r, {
+    dueDate: '2026-08-20T14:15',
+    deadlineAt: null,
+    scheduledStartAt: '2026-08-20T14:15',
+    scheduledEndAt: '2026-08-20T15:45',
+    startDate: '2026-08-20T14:15',
+    durationMinutes: 90,
+  });
+});
+
+test('行内修改跨午夜任务 → 结束时间正确进入次日', () => {
+  const r = buildTaskScheduleMoveUpdate({
+    startDate: '2026-08-13T22:30',
+    dueDate: '2026-08-13T22:30',
+    deadlineAt: null,
+    scheduledStartAt: '2026-08-13T22:30',
+    scheduledEndAt: '2026-08-14T00:30',
+    durationMinutes: 120,
+  }, {
+    startDate: '2026-12-31',
+    startTime: '23:30',
+  });
+  assert.equal(r.scheduledStartAt, '2026-12-31T23:30');
+  assert.equal(r.scheduledEndAt, '2027-01-01T01:30');
+  assert.equal(r.durationMinutes, 120);
+});
+
+test('行内修改拒绝无效时间，不产生半套排期字段', () => {
+  assert.throws(() => buildTaskScheduleMoveUpdate({
+    startDate: null,
+    dueDate: null,
+    deadlineAt: null,
+    scheduledStartAt: null,
+    scheduledEndAt: null,
+    durationMinutes: 60,
+  }, {
+    startDate: '2026-08-20',
+    startTime: '25:00',
+  }), /有效的任务日期和时间/);
 });

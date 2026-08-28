@@ -18,7 +18,7 @@
     "build": "npm run build:main && npm run build:renderer && npm run build:python && npm run build:backend-runtime",
     "test:python": "uv run pytest -q",
     "test:main": "tsx --test src/main/*.test.ts",
-    "test:renderer": "tsx --test tests/frontend-entry-contract.test.mjs tests/repository-identity-contract.test.mjs tests/markdown-answer-renderer.test.tsx src/renderer/lib/organizationEmployeeFilters.test.ts src/renderer/lib/scopedAsyncGate.test.ts src/shared/*.test.ts src/shared/*.test.mts",
+    "test:renderer": "tsx --test tests/frontend-entry-contract.test.mjs tests/repository-identity-contract.test.mjs tests/markdown-answer-renderer.test.tsx src/renderer/lib/brandSettingsUnlock.test.ts src/renderer/lib/organizationEmployeeFilters.test.ts src/renderer/lib/scopedAsyncGate.test.ts src/shared/*.test.ts src/shared/*.test.mts",
     "test:packaged": "node --test tests/packaged-candidate-contract.test.mjs",
     "test:strict": "npm run test:python && npm run test:main && npm run test:renderer",
     "audit:strict": "uv run python scripts/audit_strict_candidate.py",

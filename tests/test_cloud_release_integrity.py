@@ -45,6 +45,19 @@ def test_cloud_release_inventory_includes_contract_hash_companions() -> None:
     assert "contracts/strict-local-schema-manifest.v1.canonical.sha256" in files
 
 
+def test_deployment_provisions_stable_cloud_identity_before_restart() -> None:
+    deployment = (REPOSITORY_ROOT / "scripts/deploy_strict_cloud_release.sh").read_text(
+        encoding="utf-8"
+    )
+
+    provision = deployment.index("cloud_backend.app.provisioning")
+    activate = deployment.index('ln -sfn "$release_dir" "$next_link"')
+    restart = deployment.index('systemctl restart "$service_name"')
+
+    assert "YIYU_STRICT_CLOUD_INSTANCE_ID" in deployment
+    assert provision < activate < restart
+
+
 def test_release_verifier_rejects_a_capability_regression(tmp_path: Path) -> None:
     runtime_file = tmp_path / "cloud_backend" / "app" / "main.py"
     runtime_file.parent.mkdir(parents=True)

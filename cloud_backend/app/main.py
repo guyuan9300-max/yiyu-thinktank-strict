@@ -141,7 +141,7 @@ def create_app(config: CloudConfig | None = None) -> FastAPI:
             "该功能尚未接入严格新版数据合同",
         )
 
-    @app.post("/api/v2/auth/bootstrap-organization", status_code=status.HTTP_201_CREATED)
+    @app.post("/api/v2/auth/bootstrap-organization")
     def bootstrap_organization(
         payload: BootstrapOrganizationRequest,
     ) -> dict[str, Any]:
@@ -150,12 +150,10 @@ def create_app(config: CloudConfig | None = None) -> FastAPI:
             resolved.bootstrap_token,
         ):
             raise RepositoryError(403, "bootstrap_denied", "组织创建授权无效")
-        return repository.bootstrap_organization(
-            organization_name=payload.organization_name,
-            display_name=payload.display_name,
-            email=payload.email,
-            phone=payload.phone,
-            password=payload.password,
+        raise RepositoryError(
+            501,
+            "organization_bootstrap_not_connected",
+            "严格新版尚未接通创建组织；请登录已有组织",
         )
 
     @app.post("/api/v2/auth/login")

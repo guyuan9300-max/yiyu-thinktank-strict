@@ -1259,11 +1259,66 @@ class GC04TaskRepository:
             for row in rows
         ]
 
+    def _owner_departments_by_task(
+        self,
+        connection: sqlite3.Connection,
+        identity: SessionIdentity,
+        task_ids: Iterable[str],
+    ) -> dict[str, list[dict[str, str]]]:
+        ids = sorted({_text(item) for item in task_ids} - {None})
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = connection.execute(
+            f"""
+            SELECT collaborator.task_id,
+                   department.id AS department_id,
+                   department.name AS department_name
+            FROM task_collaborators AS collaborator
+            LEFT JOIN organization_memberships AS assignment
+              ON assignment.scope_id=collaborator.scope_id
+             AND assignment.parent_membership_id=collaborator.subject_membership_id
+             AND assignment.record_kind='department_assignment'
+             AND assignment.status='active'
+             AND assignment.lifecycle_state='active'
+            LEFT JOIN organizations AS department
+              ON department.id=assignment.department_id
+             AND department.record_kind='department'
+             AND department.lifecycle_state='active'
+            WHERE collaborator.scope_id=?
+              AND collaborator.task_id IN ({placeholders})
+              AND collaborator.role_key='owner'
+              AND collaborator.assignment_state='assigned'
+              AND collaborator.inbox_status='accepted'
+              AND collaborator.lifecycle_state='active'
+            ORDER BY collaborator.task_id, department.name, department.id
+            """,
+            (identity.scope_id, *ids),
+        ).fetchall()
+        result: dict[str, list[dict[str, str]]] = {task_id: [] for task_id in ids}
+        seen: dict[str, set[str]] = {task_id: set() for task_id in ids}
+        for row in rows:
+            task_id = str(row["task_id"] or "")
+            department_id = str(row["department_id"] or "")
+            if not task_id or not department_id or department_id in seen[task_id]:
+                continue
+            seen[task_id].add(department_id)
+            result[task_id].append(
+                {
+                    "id": department_id,
+                    "name": str(row["department_name"] or "未命名部门"),
+                }
+            )
+        return result
+
     def _task_payload(
         self,
         connection: sqlite3.Connection,
         identity: SessionIdentity,
         row: sqlite3.Row,
+        *,
+        owner_departments_by_task: Mapping[str, list[dict[str, str]]] | None = None,
+        event_line_detail: bool = False,
     ) -> dict[str, Any]:
         task = self._row_dict(row)
         creator = connection.execute(
@@ -1348,11 +1403,17 @@ class GC04TaskRepository:
             ),
             None,
         )
-        accepted_participant = any(
+        personal_surface_participant = any(
             item.get("subject_membership_id") == identity.membership_id
             and item.get("assignment_state") == "assigned"
-            and item.get("inbox_status") == "accepted"
             and item.get("role_key") in {"owner", "collaborator"}
+            and (
+                item.get("inbox_status") == "accepted"
+                or (
+                    item.get("role_key") == "collaborator"
+                    and item.get("inbox_status") == "pending"
+                )
+            )
             for item in task["collaborators"]
         )
         pending_participant = any(
@@ -1363,10 +1424,12 @@ class GC04TaskRepository:
             for item in task["collaborators"]
         )
         task["viewer_surfaces"] = {
-            "personal_list": accepted_participant,
-            "personal_calendar": accepted_participant,
+            # 负责人待确认会阻塞正式分配；普通协作者的“待阅”只是通知确认，
+            # 任务已分配后仍属于其个人列表/月历，不能因此造成日历数据消失。
+            "personal_list": personal_surface_participant,
+            "personal_calendar": personal_surface_participant,
             "collaboration_inbox": pending_participant,
-            "event_line_detail": False,
+            "event_line_detail": event_line_detail,
         }
         can_write = self._can_write_task(connection, identity, row)
         task["viewer_capabilities"] = {
@@ -1381,6 +1444,22 @@ class GC04TaskRepository:
         task["task_timer"] = self._task_timer_summary(
             connection, identity, str(row["id"])
         )
+        owner_departments = list(
+            (owner_departments_by_task or {}).get(str(row["id"]), [])
+        )
+        task["owner_departments"] = owner_departments
+        if len(owner_departments) == 1:
+            task["owner_department_resolution"] = "resolved"
+            task["owner_department_id"] = owner_departments[0]["id"]
+            task["owner_department_name"] = owner_departments[0]["name"]
+        elif owner_departments:
+            task["owner_department_resolution"] = "ambiguous"
+            task["owner_department_id"] = None
+            task["owner_department_name"] = None
+        else:
+            task["owner_department_resolution"] = "unassigned"
+            task["owner_department_id"] = None
+            task["owner_department_name"] = None
         task["returned_to_creator"] = (
             str(row["creator_membership_id"] or "") == identity.membership_id
             and any(
@@ -1691,8 +1770,17 @@ class GC04TaskRepository:
                 (identity.scope_id,),
             ).fetchall()
             visible_ids = {str(row["id"]) for row in visible}
+            owner_departments_by_task = self._owner_departments_by_task(
+                connection, identity, visible_ids
+            )
             task_payloads = [
-                self._task_payload(connection, identity, row) for row in visible
+                self._task_payload(
+                    connection,
+                    identity,
+                    row,
+                    owner_departments_by_task=owner_departments_by_task,
+                )
+                for row in visible
             ]
             # 待接收协作任务必须只进入协作收件箱。任务本体仍随 board
             # 返回，供收件箱呈现和接受/退回；但在当前成员接受前，不得进入
@@ -2096,6 +2184,8 @@ class GC04TaskRepository:
                         timezone.utc
                     )
                     if latest_created is not None and started_at <= latest_created:
+                        # utc_now is millisecond-based. Keep focus segments strictly
+                        # ordered even when pause/resume lands in the same millisecond.
                         started_at = latest_created + timedelta(milliseconds=1)
                     now = started_at.isoformat(timespec="milliseconds").replace(
                         "+00:00", "Z"

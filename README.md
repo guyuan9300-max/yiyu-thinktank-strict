@@ -26,10 +26,20 @@ npm run dev
 严格云候选：
 
 ```bash
-YIYU_STRICT_CLOUD_BOOTSTRAP_TOKEN=change-me \
-YIYU_STRICT_CLOUD_MASTER_KEY="$(uv run python scripts/generate_cloud_key.py)" \
+export YIYU_STRICT_CLOUD_DATA_DIR="$(pwd)/tmp/cloud"
+export YIYU_STRICT_CLOUD_INSTANCE_ID="strict-cloud-development"
+export YIYU_STRICT_CLOUD_BOOTSTRAP_TOKEN=change-me
+export YIYU_STRICT_CLOUD_MASTER_KEY="$(uv run python scripts/generate_cloud_key.py)"
+uv run python -m cloud_backend.app.provisioning \
+  --database "$YIYU_STRICT_CLOUD_DATA_DIR/strict-cloud.db" \
+  --cloud-instance-id "$YIYU_STRICT_CLOUD_INSTANCE_ID"
 uv run python -m cloud_backend.app.main --data-dir ./tmp/cloud
 ```
+
+`YIYU_STRICT_CLOUD_INSTANCE_ID` 是云实例的稳定身份：首次部署显式写入现有
+`state_registry`，后续发布必须沿用同一值。应用启动只核验，不会自动创建、选择
+或修复云实例身份。创建组织、加入陌生组织和邀请审批当前仍按 GC-01 合同显示
+`not_connected`；现阶段只支持登录已有组织。
 
 ## 验证
 

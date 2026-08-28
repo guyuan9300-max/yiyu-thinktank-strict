@@ -10,6 +10,10 @@ import {
   isTaskInCurrentWeek,
   isTaskOverdue,
   isTaskToday,
+  resolveTaskEditorDueTime,
+  resolveTaskEditorDueTimeAfterDateChange,
+  resolveTaskEditorTimeCommit,
+  resolveTaskEditorTimeDisplay,
   splitTaskDateTime,
 } from './taskTime.js';
 import type { Task } from './types.js';
@@ -157,11 +161,23 @@ test('task display time is hidden when task has no date', () => {
   assert.equal(getTaskDisplayTime(record), null);
 });
 
-test('card label does not invent a start time for a date-only task', () => {
+test('date-only task card does not pretend that the user set 09:00', () => {
   const record = task({ dueDate: '2026-08-14', deadlineAt: '2026-08-14' });
 
   assert.equal(formatTaskCardScheduleLabel(record), '');
   assert.equal(formatTaskCardScheduleLabel(record, true), '2026/08/14');
+});
+
+test('task editor keeps 09:00 as presentation only until a time is explicit', () => {
+  assert.equal(resolveTaskEditorDueTime('2026-08-14'), '');
+  assert.equal(resolveTaskEditorDueTime('2026-08-14T09:00'), '09:00');
+  assert.equal(resolveTaskEditorDueTimeAfterDateChange('2026-08-15', ''), '');
+  assert.equal(resolveTaskEditorDueTimeAfterDateChange('2026-08-15', '14:30'), '14:30');
+  assert.equal(resolveTaskEditorDueTimeAfterDateChange('', '14:30'), '');
+  assert.equal(resolveTaskEditorTimeDisplay('', '09:00'), '09:00');
+  assert.equal(resolveTaskEditorTimeDisplay('14:30', '09:00'), '14:30');
+  assert.equal(resolveTaskEditorTimeCommit('09:00', false), null);
+  assert.equal(resolveTaskEditorTimeCommit('09:00', true), '09:00');
 });
 
 test('card label shows the full range for a cross-day task', () => {
