@@ -32,6 +32,21 @@ class LocalGC06PlanningProjection:
         context = self.runtime._current_context(require_ready=True)  # noqa: SLF001
         return context, context.sandbox_id
 
+    def client_name(self, client_id: str) -> str | None:
+        """Read one verified project label from the local cloud projection."""
+
+        normalized = str(client_id or "").strip()
+        if not normalized:
+            return None
+        context, sandbox_id = self._context()
+        with self.runtime._connection() as connection:  # noqa: SLF001
+            row = connection.execute(
+                "SELECT name FROM clients WHERE id=? AND scope_id=? AND sandbox_id=? "
+                "AND lifecycle_state!='deleted' AND projection_state!='stale'",
+                (normalized, context.scope_id, sandbox_id),
+            ).fetchone()
+        return str(row["name"] or "").strip() if row is not None else None
+
     def _weekly_overview_identity(
         self,
         *,

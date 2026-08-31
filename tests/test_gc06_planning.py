@@ -13,6 +13,7 @@ from backend.app.ui_domains.gc06_planning import (
     _basic_review_dashboard,
     _apply_weekly_event_grouping_overrides,
     _enforce_weekly_explicit_event_groups,
+    _event_line_ui,
     _event_line_narrative,
     _event_line_timeline_nodes,
     _merge_review_task_entries,
@@ -87,6 +88,27 @@ def _create_line(repository, identity, client_id: str, *, suffix: str = "one"):
         },
         idempotency_key=f"gc06-event-line-{suffix}",
     )["eventLine"]
+
+
+def _seed_event_line_participant(repository, identity, *, suffix: str) -> str:
+    principal_id = f"principal_event_line_{suffix}"
+    membership_id = f"membership_event_line_{suffix}"
+    now = utc_now()
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        connection.execute(
+            "INSERT INTO principals (id,status,identity_version,updated_at,principal_kind,"
+            "display_name,version,lifecycle_state,created_at,deleted_at) VALUES "
+            "(?,'active',1,?,'person',?,1,'active',?,NULL)",
+            (principal_id, now, f"事件线参与者 {suffix}", now),
+        )
+        connection.execute(
+            "INSERT INTO organization_memberships (id,scope_id,principal_id,role_key,status,"
+            "version,record_kind,visibility_scope,lifecycle_state,created_at,updated_at,deleted_at) "
+            "VALUES (?,?,?,'member','active',1,'membership','organization','active',?,?,NULL)",
+            (membership_id, identity.scope_id, principal_id, now, now),
+        )
+        connection.commit()
+    return membership_id
 
 
 def test_retained_review_dashboard_uses_only_strict_review_plan_and_task_facts() -> None:
@@ -694,7 +716,20 @@ def test_event_line_reparent_moves_formal_task_to_target_client(tmp_path: Path) 
 def test_event_line_merge_moves_task_and_archives_source(tmp_path: Path) -> None:
     repository, identity, seed = _repository(tmp_path)
     target = _create_line(repository, identity, seed["projectId"], suffix="merge_target")
-    source = _create_line(repository, identity, seed["projectId"], suffix="merge_source")
+    participant_id = _seed_event_line_participant(repository, identity, suffix="merge")
+    source = create_event_line(
+        repository,
+        identity,
+        payload={
+            "eventLineId": "event_line_gc06_merge_source",
+            "clientId": seed["projectId"],
+            "name": "GC-06 事件线 merge_source",
+            "goal": "完成计划闭环",
+            "participantMembershipIds": [participant_id],
+        },
+        idempotency_key="gc06-event-line-merge_source",
+    )["eventLine"]
+    assert source["participantMembershipIds"] == [participant_id]
     task = GC04TaskRepository(repository).create_task(
         identity,
         payload={"title": "合并迁移任务", "clientId": seed["projectId"]},
@@ -720,6 +755,7 @@ def test_event_line_merge_moves_task_and_archives_source(tmp_path: Path) -> None
         task_command_port=GC04_FORMAL_TASK_COMMAND_PORT,
     )
     assert result["moved"]["tasks"] == 1
+    assert result["eventLine"]["participantMembershipIds"] == [participant_id]
     with runtime_connection(repository.database_path, "cloud") as connection:
         assert connection.execute(
             "SELECT event_line_id FROM tasks WHERE id=?", (task["id"],)
@@ -727,6 +763,73 @@ def test_event_line_merge_moves_task_and_archives_source(tmp_path: Path) -> None
         assert connection.execute(
             "SELECT lifecycle_state FROM event_lines WHERE id=?", (source["id"],)
         ).fetchone()[0] == "archived"
+
+
+def test_event_line_creator_can_add_and_remove_persisted_participants(tmp_path: Path) -> None:
+    repository, identity, seed = _repository(tmp_path)
+    participant_id = _seed_event_line_participant(repository, identity, suffix="manage")
+    invited_id = _seed_event_line_participant(repository, identity, suffix="invited")
+    created = create_event_line(
+        repository,
+        identity,
+        payload={
+            "eventLineId": "event_line_gc06_participants",
+            "clientId": seed["projectId"],
+            "name": "协作事件线",
+            "participantIds": [participant_id],
+        },
+        idempotency_key="gc06-event-line-participants-create",
+    )["eventLine"]
+    assert created["createdByMembershipId"] == identity.membership_id
+    assert created["participantMembershipIds"] == [participant_id]
+    assert event_line_detail(
+        repository, identity, event_line_id=created["id"]
+    )["eventLine"]["participantMembershipIds"] == [participant_id]
+
+    participant_identity = replace(
+        identity,
+        principal_id="principal_event_line_manage",
+        membership_id=participant_id,
+        system_role="member",
+        display_name="事件线参与者 manage",
+    )
+    assert created["id"] in {
+        item["id"] for item in list_event_lines(repository, participant_identity)
+    }
+    assert event_line_detail(
+        repository, participant_identity, event_line_id=created["id"]
+    )["eventLine"]["participantMembershipIds"] == [participant_id]
+    invited = update_event_line(
+        repository,
+        participant_identity,
+        event_line_id=created["id"],
+        payload={
+            "expectedVersion": created["version"],
+            "participantIds": [participant_id, invited_id],
+        },
+        idempotency_key="gc06-event-line-participants-invite",
+    )["eventLine"]
+    assert invited["participantMembershipIds"] == [invited_id, participant_id]
+    with pytest.raises(RepositoryError, match="只有事件线创建人可以移除参与者"):
+        update_event_line(
+            repository,
+            participant_identity,
+            event_line_id=created["id"],
+            payload={
+                "expectedVersion": invited["version"],
+                "participantIds": [participant_id],
+            },
+            idempotency_key="gc06-event-line-participants-remove-forbidden",
+        )
+
+    updated = update_event_line(
+        repository,
+        identity,
+        event_line_id=created["id"],
+        payload={"expectedVersion": invited["version"], "participantIds": []},
+        idempotency_key="gc06-event-line-participants-remove",
+    )["eventLine"]
+    assert updated["participantMembershipIds"] == []
 
 
 def test_visible_event_line_ai_draft_buttons_use_organization_model(
@@ -2090,6 +2193,12 @@ def test_gc06_detached_cloud_and_ui_registrars_are_complete(tmp_path: Path) -> N
     assert WorkspaceRuntime._connected_cloud_path_allowed(
         "POST", "/api/v2/gc06/meetings/meeting_gc06/migrate-to-task"
     )
+    assert WorkspaceRuntime._connected_cloud_path_allowed(
+        "POST", "/api/v2/gc06/event-lines/line_gc06/reparent"
+    )
+    assert WorkspaceRuntime._connected_cloud_path_allowed(
+        "POST", "/api/v2/gc06/event-lines/line_gc06/merge"
+    )
     assert cloud_paths.index("/api/v2/gc06/event-lines/{event_line_id}/activities") < (
         cloud_paths.index("/api/v2/gc06/event-lines/{event_line_id}/{transition}")
     )
@@ -2155,6 +2264,69 @@ def test_gc06_detached_cloud_and_ui_registrars_are_complete(tmp_path: Path) -> N
             r"(?P<task_id>[^/]+)/milestone",
         ),
     }
+
+
+def test_retained_event_line_adapter_resolves_creator_project_and_permissions() -> None:
+    class ClientRow:
+        def execute(self, statement, params):
+            assert "FROM clients" in statement
+            assert params == ("project_yiyu", "scope_yiyu", "sandbox_yiyu")
+            return self
+
+        def fetchone(self):
+            return {"name": "益语智库"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Runtime:
+        def _current_context(self, *, require_ready):
+            assert require_ready is True
+            return SimpleNamespace(scope_id="scope_yiyu", sandbox_id="sandbox_yiyu")
+
+        def _connection(self):
+            return ClientRow()
+
+    class Compatibility:
+        runtime = Runtime()
+
+        def _member_names(self):
+            return {"membership_creator": "顾源源"}
+
+        def auth_state(self):
+            return {
+                "user": {
+                    "id": "membership_creator",
+                    "primaryRole": "member",
+                    "fullName": "顾源源",
+                },
+            }
+
+    mapped = _event_line_ui(Compatibility(), {
+        "id": "line_yiyu",
+        "clientId": "project_yiyu",
+        "name": "产品迭代",
+        "goal": "完成新版本验证",
+        "background": "围绕任务体验持续优化",
+        "taskCount": 2,
+        "activityCount": 1,
+        "createdByMembershipId": "membership_creator",
+        "participantMembershipIds": ["membership_colleague"],
+        "version": 3,
+    })
+
+    assert mapped["createdByName"] == "顾源源"
+    assert mapped["ownerName"] == "顾源源"
+    assert mapped["primaryClientName"] == "益语智库"
+    assert mapped["readinessLevel"] == "substantial"
+    assert mapped["participantIds"] == ["membership_colleague"]
+    assert mapped["viewerCapabilities"]["canManageStructure"] is True
+    assert mapped["viewerCapabilities"]["canReparentProject"] is True
+    assert mapped["viewerCapabilities"]["canAddParticipants"] is True
+    assert mapped["viewerCapabilities"]["canManageParticipants"] is True
 
 
 def test_department_signals_reject_personal_scope_before_querying_data() -> None:

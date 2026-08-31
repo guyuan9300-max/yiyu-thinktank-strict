@@ -102,8 +102,8 @@ export function normalizeTaskTimeInput(timePart?: string | null) {
 }
 
 /**
- * 编辑器草稿只继承权威数据里明确存在的钟点。界面可以预显 09:00，
- * 但日期型任务不能因此被保存成一个虚构的 09:00 日程。
+ * 编辑器草稿只继承权威数据里明确存在的钟点。局部入口即使提供预览值，
+ * 也不能因此把日期型任务保存成一个虚构的钟点日程。
  */
 export function resolveTaskEditorDueTime(value?: string | null) {
   return splitTaskDateTime(value).time;

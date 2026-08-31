@@ -704,7 +704,7 @@ class WorkspaceRuntime:
                 )
                 or bool(
                     re.fullmatch(
-                        r"/api/v2/gc06/(?:event-lines(?:/[^/]+/(?:activities|tasks/[^/]+|archive|reopen|delete))?|planning-cycles|weekly-reviews/draft|weekly-reviews/[^/]+/(?:submit|return|reopen)|decision-actions(?:/[^/]+/primary-task)?|meetings(?:/[^/]+/(?:migrate-to-task|collaboration/(?:accept|reject)))?)",
+                        r"/api/v2/gc06/(?:event-lines(?:/[^/]+/(?:activities|tasks/[^/]+|archive|reopen|delete|reparent|merge))?|planning-cycles|weekly-reviews/draft|weekly-reviews/[^/]+/(?:submit|return|reopen)|decision-actions(?:/[^/]+/primary-task)?|meetings(?:/[^/]+/(?:migrate-to-task|collaboration/(?:accept|reject)))?)",
                         path,
                     )
                 )

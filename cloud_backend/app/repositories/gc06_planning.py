@@ -38,6 +38,7 @@ ACTION_TRANSITIONS = {
     "dropped": frozenset({"dropped"}),
 }
 MEETING_STATUSES = frozenset({"scheduled", "completed", "cancelled"})
+EVENT_LINE_COLLABORATION_SCHEMA = "yiyu.event-line-collaboration.v1"
 MEETING_COLLABORATION_SCHEMA = "yiyu.meeting-collaboration.v1"
 MEETING_PLAN_LINK_PURPOSE = "meeting_plan_link"
 MAX_TEXT = 100_000
@@ -367,6 +368,171 @@ def _event_line_row(
     return row
 
 
+def _event_line_collaboration_payload(
+    connection: sqlite3.Connection,
+    *,
+    scope_id: str,
+    event_line_id: str,
+    fallback_creator_membership_id: str | None,
+) -> tuple[str | None, list[str]]:
+    rows = connection.execute(
+        "SELECT subject_membership_id,capability_set FROM object_grants "
+        "WHERE scope_id=? AND secured_resource_id=? "
+        "AND capability_set_schema_version=? AND lifecycle_state='active' "
+        "AND status!='revoked' ORDER BY created_at,id",
+        (scope_id, event_line_id, EVENT_LINE_COLLABORATION_SCHEMA),
+    ).fetchall()
+    creator_membership_id = fallback_creator_membership_id
+    participants: list[str] = []
+    for grant in rows:
+        membership_id = str(grant["subject_membership_id"] or "").strip()
+        if not membership_id:
+            continue
+        try:
+            capabilities = json.loads(str(grant["capability_set"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            capabilities = {}
+        if str(capabilities.get("roleKey") or "") == "creator":
+            creator_membership_id = membership_id
+        elif membership_id not in participants:
+            participants.append(membership_id)
+    return creator_membership_id, sorted(participants)
+
+
+def _event_line_collaboration_capabilities(
+    connection: sqlite3.Connection,
+    identity: SessionIdentity,
+    *,
+    event_line_id: str,
+) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT capability_set FROM object_grants WHERE scope_id=? "
+        "AND secured_resource_id=? AND subject_membership_id=? "
+        "AND capability_set_schema_version=? AND status='active' "
+        "AND lifecycle_state='active' ORDER BY version DESC,updated_at DESC,id DESC LIMIT 1",
+        (
+            identity.scope_id,
+            event_line_id,
+            identity.membership_id,
+            EVENT_LINE_COLLABORATION_SCHEMA,
+        ),
+    ).fetchone()
+    if row is None:
+        return {}
+    try:
+        payload = json.loads(str(row["capability_set"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _require_event_line_read_access(
+    repository: CloudRepository,
+    connection: sqlite3.Connection,
+    identity: SessionIdentity,
+    *,
+    event_line: sqlite3.Row,
+) -> None:
+    try:
+        repository._require_project_access(  # noqa: SLF001
+            connection,
+            identity,
+            project_id=str(event_line["client_id"]),
+        )
+        return
+    except RepositoryError as project_error:
+        capabilities = _event_line_collaboration_capabilities(
+            connection,
+            identity,
+            event_line_id=str(event_line["id"]),
+        )
+        if bool(capabilities.get("read")):
+            return
+        raise project_error
+
+
+def _sync_event_line_participants(
+    repository: CloudRepository,
+    connection: sqlite3.Connection,
+    identity: SessionIdentity,
+    *,
+    event_line_id: str,
+    creator_membership_id: str,
+    participant_membership_ids: Sequence[str],
+    now: str,
+) -> None:
+    existing = connection.execute(
+        "SELECT * FROM object_grants WHERE scope_id=? AND secured_resource_id=? "
+        "AND capability_set_schema_version=? ORDER BY version DESC,updated_at DESC,id DESC",
+        (identity.scope_id, event_line_id, EVENT_LINE_COLLABORATION_SCHEMA),
+    ).fetchall()
+    existing_by_member: dict[str, sqlite3.Row] = {}
+    for row in existing:
+        membership_id = str(row["subject_membership_id"] or "")
+        if membership_id and membership_id not in existing_by_member:
+            existing_by_member[membership_id] = row
+    desired_roles = {creator_membership_id: "creator"}
+    for raw_membership_id in participant_membership_ids:
+        membership_id = _text(raw_membership_id, limit=200)
+        if membership_id and membership_id != creator_membership_id:
+            desired_roles[membership_id] = "participant"
+    membership_rows = {
+        membership_id: _membership_row(connection, identity, membership_id)
+        for membership_id in desired_roles
+    }
+    for membership_id, row in existing_by_member.items():
+        if membership_id not in desired_roles:
+            connection.execute(
+                "UPDATE object_grants SET status='revoked',lifecycle_state='archived',"
+                "revoked_at=?,updated_at=?,version=version+1 WHERE id=?",
+                (now, now, str(row["id"])),
+            )
+    for membership_id, role_key in desired_roles.items():
+        member = membership_rows[membership_id]
+        current = existing_by_member.get(membership_id)
+        capability_set = canonical_json({
+            "roleKey": role_key,
+            "read": True,
+            "contribute": True,
+            "inviteParticipants": True,
+            "manage": role_key == "creator",
+            "invitedByMembershipId": identity.membership_id,
+        })
+        if current is None:
+            grant_id = repository._record_id(  # noqa: SLF001
+                "grant", event_line_id, f"event-line:{membership_id}"
+            )
+            connection.execute(
+                """
+                INSERT INTO object_grants (
+                    id,scope_id,secured_resource_id,policy_version_id,
+                    subject_principal_id,subject_membership_id,
+                    capability_set_schema_version,capability_set,grant_generation,
+                    status,grant_source_set_id,created_at,updated_at,revoked_at,
+                    version,lifecycle_state,deleted_at
+                ) VALUES (?,?,?,NULL,?,?,?, ?,1,'active',NULL,?,?,NULL,1,'active',NULL)
+                """,
+                (
+                    grant_id,
+                    identity.scope_id,
+                    event_line_id,
+                    member["principal_id"],
+                    membership_id,
+                    EVENT_LINE_COLLABORATION_SCHEMA,
+                    capability_set,
+                    now,
+                    now,
+                ),
+            )
+        else:
+            connection.execute(
+                "UPDATE object_grants SET subject_principal_id=?,capability_set=?,"
+                "status='active',lifecycle_state='active',revoked_at=NULL,deleted_at=NULL,"
+                "updated_at=?,version=version+1 WHERE id=?",
+                (member["principal_id"], capability_set, now, str(current["id"])),
+            )
+
+
 def _event_line_payload(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
     task_count = int(
         connection.execute(
@@ -391,6 +557,12 @@ def _event_line_payload(connection: sqlite3.Connection, row: sqlite3.Row) -> dic
         ).fetchone()[0]
     )
     lifecycle = str(row["lifecycle_state"] or "active")
+    creator_membership_id, participant_membership_ids = _event_line_collaboration_payload(
+        connection,
+        scope_id=str(row["scope_id"]),
+        event_line_id=str(row["id"]),
+        fallback_creator_membership_id=str(row["created_by_membership_id"] or "") or None,
+    )
     return {
         "id": str(row["id"]),
         "clientId": str(row["client_id"]),
@@ -405,7 +577,8 @@ def _event_line_payload(connection: sqlite3.Connection, row: sqlite3.Row) -> dic
         "taskCount": task_count,
         "meetingCount": meeting_count,
         "activityCount": activity_count,
-        "createdByMembershipId": row["created_by_membership_id"],
+        "createdByMembershipId": creator_membership_id,
+        "participantMembershipIds": participant_membership_ids,
         "createdAt": str(row["created_at"]),
         "updatedAt": str(row["updated_at"]),
         "deletedAt": row["deleted_at"],
@@ -560,10 +733,11 @@ def list_event_lines(
         visible: list[dict[str, Any]] = []
         for row in rows:
             try:
-                repository._require_project_access(  # noqa: SLF001
+                _require_event_line_read_access(
+                    repository,
                     connection,
                     identity,
-                    project_id=str(row["client_id"]),
+                    event_line=row,
                 )
             except RepositoryError:
                 continue
@@ -579,8 +753,11 @@ def event_line_detail(
 ) -> dict[str, Any]:
     with repository._connection() as connection:  # noqa: SLF001
         row = _event_line_row(connection, identity, event_line_id)
-        repository._require_project_access(  # noqa: SLF001
-            connection, identity, project_id=str(row["client_id"])
+        _require_event_line_read_access(
+            repository,
+            connection,
+            identity,
+            event_line=row,
         )
         activities = connection.execute(
             "SELECT * FROM event_lines WHERE scope_id=? AND parent_event_line_id=? "
@@ -647,6 +824,15 @@ def create_event_line(
         "background": _text(payload.get("background") or payload.get("summary")),
         "visibilityScope": _text(payload.get("visibilityScope"), limit=40)
         or "project_public",
+        "participantMembershipIds": sorted({
+            _text(item, limit=200)
+            for item in (
+                payload.get("participantMembershipIds")
+                or payload.get("participantIds")
+                or []
+            )
+            if _text(item, limit=200) and _text(item, limit=200) != identity.membership_id
+        }),
     }
     payload_hash = sha256_text(canonical_json(normalized))
     now = utc_now()
@@ -717,6 +903,15 @@ def create_event_line(
                     now,
                 ),
             )
+            _sync_event_line_participants(
+                repository,
+                connection,
+                identity,
+                event_line_id=event_line_id,
+                creator_membership_id=identity.membership_id,
+                participant_membership_ids=normalized["participantMembershipIds"],
+                now=now,
+            )
             row = require_active_event_line(
                 connection,
                 scope_id=identity.scope_id,
@@ -764,6 +959,19 @@ def update_event_line(
         "goal": _text(payload.get("goal") or payload.get("intent")),
         "background": _text(payload.get("background") or payload.get("summary")),
         "visibilityScope": _text(payload.get("visibilityScope"), limit=40),
+        "participantMembershipIds": (
+            sorted({
+                _text(item, limit=200)
+                for item in (
+                    payload.get("participantMembershipIds")
+                    or payload.get("participantIds")
+                    or []
+                )
+                if _text(item, limit=200)
+            })
+            if "participantMembershipIds" in payload or "participantIds" in payload
+            else None
+        ),
     }
     payload_hash = sha256_text(canonical_json(normalized))
     now = utc_now()
@@ -790,14 +998,51 @@ def update_event_line(
                 scope_id=identity.scope_id,
                 event_line_id=event_line_id,
             )
-            repository._require_project_access(  # noqa: SLF001
-                connection,
-                identity,
-                project_id=str(row["client_id"]),
-                capability="project_write",
-            )
             if int(row["version"]) != expected:
                 raise RepositoryError(409, "event_line_version_conflict", "事件线已被其他成员更新")
+            participant_only_update = (
+                normalized["participantMembershipIds"] is not None
+                and set(payload).issubset({
+                    "expectedVersion",
+                    "participantMembershipIds",
+                    "participantIds",
+                })
+            )
+            collaboration_capabilities = _event_line_collaboration_capabilities(
+                connection,
+                identity,
+                event_line_id=event_line_id,
+            )
+            can_invite_from_event_line = bool(
+                participant_only_update
+                and collaboration_capabilities.get("inviteParticipants")
+            )
+            if not can_invite_from_event_line:
+                repository._require_project_access(  # noqa: SLF001
+                    connection,
+                    identity,
+                    project_id=str(row["client_id"]),
+                    capability="project_write",
+                )
+            if normalized["participantMembershipIds"] is not None:
+                creator_membership_id, existing_participants = _event_line_collaboration_payload(
+                    connection,
+                    scope_id=identity.scope_id,
+                    event_line_id=event_line_id,
+                    fallback_creator_membership_id=str(row["created_by_membership_id"] or "") or None,
+                )
+                creator_membership_id = creator_membership_id or str(row["created_by_membership_id"] or "")
+                can_manage_participants = identity.is_admin or identity.membership_id == creator_membership_id
+                desired_participants = {
+                    item
+                    for item in normalized["participantMembershipIds"]
+                    if item and item != creator_membership_id
+                }
+                if not can_manage_participants:
+                    if identity.membership_id not in existing_participants:
+                        raise RepositoryError(403, "event_line_participant_forbidden", "只有事件线参与者可以邀请其他成员")
+                    if not set(existing_participants).issubset(desired_participants):
+                        raise RepositoryError(403, "event_line_participant_remove_forbidden", "只有事件线创建人可以移除参与者")
             target_client = normalized["clientId"] or str(row["client_id"])
             if target_client != str(row["client_id"]):
                 require_active_client(
@@ -854,6 +1099,16 @@ def update_event_line(
                     "WHERE scope_id=? AND parent_event_line_id=? "
                     "AND record_kind='activity' AND lifecycle_state!='deleted'",
                     (target_client, now, identity.scope_id, event_line_id),
+                )
+            if normalized["participantMembershipIds"] is not None:
+                _sync_event_line_participants(
+                    repository,
+                    connection,
+                    identity,
+                    event_line_id=event_line_id,
+                    creator_membership_id=str(row["created_by_membership_id"] or ""),
+                    participant_membership_ids=normalized["participantMembershipIds"],
+                    now=now,
                 )
             connection.execute(
                 "UPDATE secured_resources SET version=version+1, resource_type_key=?, "
@@ -1437,10 +1692,39 @@ def merge_event_lines(
             expected_version=int(source_line["version"]),
             idempotency_key=f"{idempotency_key}:source:{source_index}:archive",
         )
+    final_target = event_line_detail(
+        repository, identity, event_line_id=target_event_line_id
+    )["eventLine"]
+    merged_participant_ids = {
+        str(item)
+        for item in (final_target.get("participantMembershipIds") or [])
+        if str(item)
+    }
+    target_creator_id = str(final_target.get("createdByMembershipId") or "")
+    for detail in source_details:
+        source_line = detail["eventLine"]
+        source_creator_id = str(source_line.get("createdByMembershipId") or "")
+        if source_creator_id and source_creator_id != target_creator_id:
+            merged_participant_ids.add(source_creator_id)
+        merged_participant_ids.update(
+            str(item)
+            for item in (source_line.get("participantMembershipIds") or [])
+            if str(item) and str(item) != target_creator_id
+        )
+    normalized_participants = sorted(merged_participant_ids)
+    if normalized_participants != sorted(final_target.get("participantMembershipIds") or []):
+        final_target = update_event_line(
+            repository,
+            identity,
+            event_line_id=target_event_line_id,
+            payload={
+                "expectedVersion": int(final_target["version"]),
+                "participantMembershipIds": normalized_participants,
+            },
+            idempotency_key=f"{idempotency_key}:participants",
+        )["eventLine"]
     return {
-        "eventLine": event_line_detail(
-            repository, identity, event_line_id=target_event_line_id
-        )["eventLine"],
+        "eventLine": final_target,
         "sourceEventLineIds": source_ids,
         "moved": {
             "tasks": moved_tasks,

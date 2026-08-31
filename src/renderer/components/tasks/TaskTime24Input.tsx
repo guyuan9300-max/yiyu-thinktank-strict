@@ -81,7 +81,7 @@ export function TaskTime24Input({
             }
             userHasEditedRef.current = false;
           }}
-          className="w-[1.75rem] min-w-0 appearance-none bg-transparent px-0 py-1 text-center text-[11px] font-semibold tabular-nums outline-none disabled:opacity-60"
+          className="w-[1.75rem] min-w-0 appearance-none bg-transparent px-0 py-1 text-center text-sm font-semibold tabular-nums outline-none disabled:opacity-60"
         />
         <span className="w-[0.75rem] select-none text-center text-slate-400" aria-hidden>：</span>
         <input
@@ -112,7 +112,7 @@ export function TaskTime24Input({
             }
             userHasEditedRef.current = false;
           }}
-          className="w-[1.75rem] min-w-0 appearance-none bg-transparent px-0 py-1 text-center text-[11px] font-semibold tabular-nums outline-none disabled:opacity-60"
+          className="w-[1.75rem] min-w-0 appearance-none bg-transparent px-0 py-1 text-center text-sm font-semibold tabular-nums outline-none disabled:opacity-60"
         />
       </div>
     </div>

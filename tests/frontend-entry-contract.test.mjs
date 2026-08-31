@@ -95,6 +95,11 @@ test('task collaboration return goes back to the creator and time controls stay 
   assert.match(appSource, /负责人已退回/);
   assert.match(appSource, />修改</);
   assert.match(appSource, /TaskTime24Input/);
+  assert.doesNotMatch(
+    appSource,
+    /label="开始"\s+value=\{editingTask\.dueTime\}\s+previewValue=/,
+    '新建任务的开始时间不得带隐式预览默认值',
+  );
   assert.match(appSource, /inputMode="numeric"/);
   assert.equal(/type=["']time["']/.test(source), false);
   assert.match(mainSource, /appendSwitch\('lang', 'zh-CN'\)/);

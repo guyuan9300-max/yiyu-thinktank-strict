@@ -23697,7 +23697,7 @@ export default function App() {
                     <p className="text-[11px] font-bold text-blue-700">创建人</p>
                     <p className="mt-2 text-[14px] font-semibold text-gray-900">{currentSessionUser?.fullName || '当前账号'}</p>
                     <p className="mt-2 text-[11px] leading-5 text-gray-500">
-                      默认允许管理层、本部门成员及右侧参与者查看和协作。
+                      创建人可以管理所属项目和参与者；参与者也可以继续邀请其他成员。
                     </p>
                   </div>
                   <div>
@@ -23927,7 +23927,7 @@ export default function App() {
                   <button type="button" onClick={() => { setActiveEventLine(null); setEventLineStructureDraft(null); setEventLineReparentPreview(null); }} className="text-gray-400 hover:text-gray-700 transition-colors">
                     <X size={20} />
                   </button>
-                  <span className="text-[11px] text-gray-400">创建人、归属部门在创建时冻结</span>
+                  <span className="text-[11px] text-gray-400">创建人随事件线保留，所属项目可按权限调整</span>
                 </div>
 
                 {/* Event line name */}
@@ -25125,7 +25125,6 @@ export default function App() {
                         <TaskTime24Input
                           label="开始"
                           value={editingTask.dueTime}
-                          previewValue="09:00"
                           onChange={applyEditingTaskStartTime}
                         />
                       </div>

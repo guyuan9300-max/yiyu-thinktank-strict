@@ -36,11 +36,53 @@ def _material_store(compatibility: Any) -> GC07LocalProjectMaterialsRepository:
     return GC07LocalProjectMaterialsRepository(compatibility.runtime)
 
 
-def _event_line_ui(row: Mapping[str, Any]) -> dict[str, Any]:
+def _event_line_ui(compatibility: Any, row: Mapping[str, Any]) -> dict[str, Any]:
     """Translate the strict event-line authority into the retained renderer shape."""
 
     lifecycle = str(row.get("lifecycleState") or "active")
     status = "archived" if lifecycle == "archived" else lifecycle
+    creator_id = str(row.get("createdByMembershipId") or "").strip()
+    client_id = str(row.get("clientId") or "").strip()
+    names: dict[str, str] = {}
+    client_name: str | None = None
+    viewer_id = ""
+    is_admin = False
+    try:
+        names = compatibility._member_names()  # noqa: SLF001
+    except (AttributeError, TypeError):
+        pass
+    if client_id:
+        try:
+            client_name = _planning_projector(compatibility).client_name(client_id)
+        except (AttributeError, TypeError, LocalRuntimeError):
+            pass
+    try:
+        user = compatibility.auth_state().get("user") or {}
+        viewer_id = str(user.get("membershipId") or user.get("id") or "").strip()
+        is_admin = str(user.get("primaryRole") or user.get("systemRole") or "") == "admin"
+        if creator_id == viewer_id and not names.get(creator_id):
+            names[creator_id] = str(user.get("fullName") or user.get("displayName") or "").strip()
+    except (AttributeError, TypeError):
+        pass
+    participant_ids = sorted({
+        str(item).strip()
+        for item in (row.get("participantMembershipIds") or [])
+        if str(item).strip() and str(item).strip() != creator_id
+    })
+    can_manage = bool(is_admin or (creator_id and creator_id == viewer_id))
+    is_participant = bool(viewer_id and viewer_id in participant_ids)
+    can_add_participants = bool(can_manage or is_participant)
+    can_contribute = bool(can_manage or is_participant)
+    missing: list[str] = []
+    if not str(row.get("goal") or "").strip():
+        missing.append("目标")
+    if not str(row.get("background") or "").strip():
+        missing.append("背景")
+    if int(row.get("taskCount") or 0) == 0:
+        missing.append("关联任务")
+    if int(row.get("activityCount") or 0) == 0:
+        missing.append("推进记录")
+    readiness = "substantial" if not missing else "general" if len(missing) <= 2 else "incomplete"
     return {
         "id": str(row.get("id") or ""),
         "name": str(row.get("name") or ""),
@@ -49,19 +91,19 @@ def _event_line_ui(row: Mapping[str, Any]) -> dict[str, Any]:
         "visibilityScope": str(row.get("visibilityScope") or "project_public"),
         "summary": str(row.get("background") or ""),
         "intent": str(row.get("goal") or ""),
-        "evidenceCount": 0,
+        "evidenceCount": int(row.get("attachmentCount") or 0),
         "taskCount": int(row.get("taskCount") or 0),
-        "attachmentCount": 0,
+        "attachmentCount": int(row.get("attachmentCount") or 0),
         "activityCount": int(row.get("activityCount") or 0),
-        "ownerId": row.get("createdByMembershipId"),
-        "ownerName": None,
-        "createdByUserId": row.get("createdByMembershipId"),
-        "createdByName": None,
-        "primaryClientId": row.get("clientId"),
-        "primaryClientName": None,
+        "ownerId": creator_id or None,
+        "ownerName": names.get(creator_id) or None,
+        "createdByUserId": creator_id or None,
+        "createdByName": names.get(creator_id) or None,
+        "primaryClientId": client_id or None,
+        "primaryClientName": client_name,
         "primaryDepartmentId": None,
         "primaryDepartmentName": None,
-        "participantIds": [],
+        "participantIds": participant_ids,
         "materialRequirements": [],
         "closedAt": row.get("updatedAt") if lifecycle == "archived" else None,
         "closedByUserId": None,
@@ -69,28 +111,28 @@ def _event_line_ui(row: Mapping[str, Any]) -> dict[str, Any]:
         "cloudId": row.get("id"),
         "pendingSyncAction": None,
         "lastSyncError": None,
-        "readinessLevel": "incomplete",
-        "readinessMissingItems": [],
+        "readinessLevel": readiness,
+        "readinessMissingItems": missing,
         "version": int(row.get("version") or 1),
         "viewerCapabilities": {
             "canView": True,
-            "canContribute": True,
-            "canManageStructure": True,
+            "canContribute": can_contribute,
+            "canManageStructure": can_add_participants,
             "canAssignOwner": False,
-            "canArchive": True,
-            "canReparentProject": True,
-            "canAddParticipants": False,
-            "canManageParticipants": False,
-            "canSetMilestone": True,
+            "canArchive": can_manage,
+            "canReparentProject": can_manage,
+            "canAddParticipants": can_add_participants,
+            "canManageParticipants": can_manage,
+            "canSetMilestone": can_contribute,
         },
         "createdAt": str(row.get("createdAt") or ""),
         "updatedAt": str(row.get("updatedAt") or ""),
     }
 
 
-def _event_line_detail_ui(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _event_line_detail_ui(compatibility: Any, payload: Mapping[str, Any]) -> dict[str, Any]:
     return {
-        "eventLine": _event_line_ui(payload.get("eventLine") or {}),
+        "eventLine": _event_line_ui(compatibility, payload.get("eventLine") or {}),
         "tasks": [
             _task_ui(item)
             for item in payload.get("tasks") or []
@@ -2125,7 +2167,7 @@ def list_event_lines_legacy_surface(
     )
     _planning_projector(compatibility).apply_event_lines(rows)
     return [
-        _event_line_ui(item)
+        _event_line_ui(compatibility, item)
         for item in rows or []
         if isinstance(item, Mapping)
     ]
@@ -2137,7 +2179,7 @@ def create_event_line_legacy_surface(
 ) -> dict[str, Any]:
     result = _command(compatibility, request, "POST", "event-lines")
     _planning_projector(compatibility).apply_event_lines([result["eventLine"]])
-    return _event_line_ui(result.get("eventLine") or {})
+    return _event_line_ui(compatibility, result.get("eventLine") or {})
 
 
 def _strict_event_line_detail(
@@ -2173,11 +2215,11 @@ def event_line_report_snapshot(
         if isinstance(collaborator, Mapping) and collaborator.get("display_name")
     })
     attachments = _event_line_report_attachments(compatibility, result)
-    event_line = _event_line_ui(result.get("eventLine") or {})
+    event_line = _event_line_ui(compatibility, result.get("eventLine") or {})
     archived = event_line.get("status") == "archived"
     return {
         "eventLine": event_line,
-        "activities": _event_line_detail_ui(result)["activities"],
+        "activities": _event_line_detail_ui(compatibility, result)["activities"],
         "tasks": [
             _task_ui(item)
             for item in result.get("tasks") or []
@@ -2815,7 +2857,7 @@ def event_line_detail_legacy_surface(
     projector = _planning_projector(compatibility)
     projector.apply_event_lines([result["eventLine"]])
     projector.apply_event_activities(result.get("activities") or [])
-    return _event_line_detail_ui(result)
+    return _event_line_detail_ui(compatibility, result)
 
 
 @router.patch(r"event-lines/(?P<event_line_id>[^/]+)")
@@ -2827,7 +2869,7 @@ def update_event_line_legacy_surface(
         compatibility, request, "PATCH", f"event-lines/{event_line_id}"
     )
     _planning_projector(compatibility).apply_event_lines([result["eventLine"]])
-    return _event_line_ui(result.get("eventLine") or {})
+    return _event_line_ui(compatibility, result.get("eventLine") or {})
 
 
 def _transition_legacy_event_line(
@@ -2843,7 +2885,7 @@ def _transition_legacy_event_line(
         f"event-lines/{quote(event_line_id, safe='')}/{transition}",
     )
     _planning_projector(compatibility).apply_event_lines([result["eventLine"]])
-    event_line = _event_line_ui(result.get("eventLine") or {})
+    event_line = _event_line_ui(compatibility, result.get("eventLine") or {})
     return {
         "status": event_line["status"],
         "version": event_line["version"],
@@ -2898,7 +2940,7 @@ def delete_event_line_legacy_surface(
         f"event-lines/{quote(event_line_id, safe='')}/delete",
     )
     _planning_projector(compatibility).apply_event_lines([result["eventLine"]])
-    event_line = _event_line_ui(result.get("eventLine") or {})
+    event_line = _event_line_ui(compatibility, result.get("eventLine") or {})
     return {"status": event_line["status"], "counts": {}}
 
 
@@ -2924,7 +2966,7 @@ def attach_task_legacy_surface(
     _planning_projector(compatibility).apply_event_lines([result["eventLine"]])
     return {
         **result,
-        "eventLine": _event_line_ui(result.get("eventLine") or {}),
+        "eventLine": _event_line_ui(compatibility, result.get("eventLine") or {}),
         "task": _task_ui(result.get("task") or {}),
     }
 
@@ -2984,17 +3026,17 @@ def set_event_line_task_milestone(
     activity = next(
         (
             item
-            for item in _event_line_detail_ui(updated)["activities"]
+            for item in _event_line_detail_ui(compatibility, updated)["activities"]
             if str(item.get("sourceId") or "") == task_id
         ),
         None,
     )
     if activity is None:
-        activity = _event_line_detail_ui({
+        activity = _event_line_detail_ui(compatibility, {
             "activities": [result.get("activity") or {}],
         })["activities"][0]
     return {
-        "eventLine": _event_line_ui(updated.get("eventLine") or {}),
+        "eventLine": _event_line_ui(compatibility, updated.get("eventLine") or {}),
         "task": _task_ui(task),
         "activity": activity,
     }
@@ -3050,7 +3092,7 @@ def reparent_event_line_legacy_surface(
             if isinstance(projection, Mapping):
                 _task_projector(compatibility).apply(projection)
     _planning_projector(compatibility).apply_event_lines([result["eventLine"]])
-    return _event_line_ui(result.get("eventLine") or {})
+    return _event_line_ui(compatibility, result.get("eventLine") or {})
 
 
 @router.post(r"event-lines/(?P<event_line_id>[^/]+)/merge-preview")
@@ -3126,4 +3168,4 @@ def merge_event_lines_legacy_surface(
             if isinstance(projection, Mapping):
                 _task_projector(compatibility).apply(projection)
     _planning_projector(compatibility).apply_event_lines([result["eventLine"]])
-    return _event_line_ui(result.get("eventLine") or {})
+    return _event_line_ui(compatibility, result.get("eventLine") or {})
