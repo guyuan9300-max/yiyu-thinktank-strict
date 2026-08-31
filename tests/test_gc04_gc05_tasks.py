@@ -903,6 +903,16 @@ def test_task_timer_uses_execution_runs_and_is_idempotent(tmp_path: Path) -> Non
     assert started["taskTimer"]["state"] == "running"
     assert started["taskTimer"]["version"] == 1
 
+    repeated_start = domain.update_task_timer(
+        identity,
+        task_id=task_id,
+        action="start",
+        expected_timer_version=0,
+        idempotency_key="timer-start-repeated-click",
+    )
+    assert repeated_start["taskTimer"]["state"] == "running"
+    assert repeated_start["taskTimer"]["version"] == 1
+
     ten_seconds_ago = (
         datetime.now(timezone.utc) - timedelta(seconds=10)
     ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -964,12 +974,12 @@ def test_task_timer_uses_execution_runs_and_is_idempotent(tmp_path: Path) -> Non
             "SELECT COUNT(*) FROM commands WHERE aggregate_id=? "
             "AND command_type LIKE 'task.timer_%'",
             (task_id,),
-        ).fetchone()[0] == 4
+        ).fetchone()[0] == 5
         assert connection.execute(
             "SELECT COUNT(*) FROM audit_events WHERE target_resource_id=? "
             "AND action LIKE 'task.timer_%'",
             (task_id,),
-        ).fetchone()[0] == 4
+        ).fetchone()[0] == 5
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

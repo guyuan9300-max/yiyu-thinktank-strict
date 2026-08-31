@@ -1,5 +1,7 @@
 import type { TaskTimerSummary } from './types';
 
+export type TaskTimerAction = 'start' | 'pause' | 'stop';
+
 function wholeSeconds(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 }
@@ -23,4 +25,25 @@ export function projectedTaskTimerSeconds(
   const observedAtMs = Date.parse(String(timer.observedAt || ''));
   if (!Number.isFinite(observedAtMs) || !Number.isFinite(nowMs)) return confirmed;
   return confirmed + wholeSeconds((nowMs - observedAtMs) / 1000);
+}
+
+export function taskTimerActionReached(
+  timer: TaskTimerSummary | null | undefined,
+  action: TaskTimerAction,
+): boolean {
+  if (!timer) return false;
+  if (action === 'start') return timer.state === 'running';
+  if (action === 'pause') return timer.state === 'paused';
+  return timer.state === 'stopped';
+}
+
+export function preferNewestTaskTimer(
+  previous: TaskTimerSummary | null | undefined,
+  incoming: TaskTimerSummary | null | undefined,
+): TaskTimerSummary | null | undefined {
+  if (!previous) return incoming;
+  if (!incoming) return previous;
+  return Number(previous.version || 0) > Number(incoming.version || 0)
+    ? previous
+    : incoming;
 }

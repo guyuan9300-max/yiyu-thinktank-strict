@@ -2170,25 +2170,26 @@ class GC04TaskRepository:
                     connection, identity, task_id, observed_at=now
                 )
                 current_version = int(current_timer["version"] or 0)
-                if current_version != expected_timer_version:
+                current_state = str(current_timer["state"] or "idle")
+                action_already_applied = (
+                    (normalized_action == "start" and current_state == "running")
+                    or (normalized_action == "pause" and current_state == "paused")
+                    or (normalized_action == "stop" and current_state == "stopped")
+                )
+                if current_version != expected_timer_version and not action_already_applied:
                     raise RepositoryError(
                         409,
                         "task_timer_version_conflict",
-                        "任务计时状态已更新，请刷新后重试",
+                        "任务计时状态已变化，请按当前状态继续操作",
                     )
-                current_state = str(current_timer["state"] or "idle")
-                if normalized_action == "start":
+                if action_already_applied:
+                    pass
+                elif normalized_action == "start":
                     if task_row["completed_at"]:
                         raise RepositoryError(
                             409,
                             "task_timer_completed",
                             "已完成任务不能重新开始计时",
-                        )
-                    if current_state == "running":
-                        raise RepositoryError(
-                            409,
-                            "task_timer_already_running",
-                            "该任务已经在计时",
                         )
                     latest_created_row = connection.execute(
                         "SELECT MAX(created_at) AS created_at FROM execution_runs "
@@ -2275,7 +2276,7 @@ class GC04TaskRepository:
                         raise RepositoryError(
                             409,
                             "task_timer_version_conflict",
-                            "任务计时状态已更新，请刷新后重试",
+                            "任务计时状态已变化，请按当前状态继续操作",
                         )
                     cursor = connection.execute(
                         "UPDATE execution_runs SET status=?,"
@@ -2299,7 +2300,7 @@ class GC04TaskRepository:
                         raise RepositoryError(
                             409,
                             "task_timer_version_conflict",
-                            "任务计时状态已更新，请刷新后重试",
+                            "任务计时状态已变化，请按当前状态继续操作",
                         )
                 timer = self._task_timer_summary(
                     connection, identity, task_id, observed_at=now

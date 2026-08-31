@@ -335,6 +335,10 @@ import {
 } from '../shared/taskAggregation';
 import { shouldLoadTaskContextBrief } from '../shared/taskContextBriefPolicy';
 import {
+  preferNewestTaskTimer,
+  taskTimerActionReached,
+} from '../shared/taskTimer';
+import {
   parseWorkspaceThreadPreference,
   pickWorkspaceCurrentThreadId,
   type WorkspaceThreadPreference,
@@ -11812,7 +11816,16 @@ export default function App() {
         syncStatus: task.syncStatus || 'syncing',
       };
     });
-    setTasks([...pendingOptimistic, ...mutationSafeTasks]);
+    setTasks((previous) => {
+      const previousById = new Map(previous.map((task) => [task.id, task]));
+      const timerSafeTasks = mutationSafeTasks.map((task) => {
+        const previousTask = previousById.get(task.id);
+        if (!previousTask) return task;
+        const timer = preferNewestTaskTimer(previousTask.timer, task.timer);
+        return timer === task.timer ? task : { ...task, timer };
+      });
+      return [...pendingOptimistic, ...timerSafeTasks];
+    });
     if (meetingLoad.error) {
       console.warn('[gc06-meetings] optional calendar load failed', meetingLoad.error);
     } else {
@@ -19335,16 +19348,40 @@ export default function App() {
         throw new Error('任务正在保存，稍后再开始计时。');
       }
       const sandboxId = currentTaskSandboxId();
-      const updatedTask = await updateTaskTimer(
-        task.id,
-        action,
-        Number(task.timer?.version || 0),
-        { sandboxId },
-      );
-      if (!sandboxId || sandboxId === currentTaskSandboxId()) {
-        setTasks((previous) => previous.map((item) => (
-          item.id === task.id ? { ...item, ...updatedTask } : item
-        )));
+      try {
+        const updatedTask = await updateTaskTimer(
+          task.id,
+          action,
+          Number(task.timer?.version || 0),
+          { sandboxId },
+        );
+        if (!sandboxId || sandboxId === currentTaskSandboxId()) {
+          setTasks((previous) => previous.map((item) => (
+            item.id === task.id ? { ...item, ...updatedTask } : item
+          )));
+        }
+      } catch (error) {
+        const isTimerConflict = error instanceof ApiRequestError
+          && error.statusCode === 409
+          && error.code.startsWith('task_timer_');
+        if (!isTimerConflict) throw error;
+        try {
+          const latestBoard = await getTaskBoard({ syncMode: 'blocking' });
+          const latestTask = latestBoard.tasks.find((item) => item.id === task.id);
+          if (latestTask && (!sandboxId || sandboxId === currentTaskSandboxId())) {
+            setTasks((previous) => previous.map((item) => (
+              item.id === task.id ? { ...item, ...latestTask } : item
+            )));
+          }
+          if (latestTask && taskTimerActionReached(latestTask.timer, action)) return;
+          if (latestTask) {
+            throw new Error('计时状态已自动同步，请按当前显示的按钮继续操作。');
+          }
+        } catch (syncError) {
+          if (!(syncError instanceof ApiRequestError)) throw syncError;
+          console.warn('[task-timer] conflict refresh failed', syncError);
+        }
+        throw new Error('计时状态暂时无法同步，请稍后重试。');
       }
     };
 

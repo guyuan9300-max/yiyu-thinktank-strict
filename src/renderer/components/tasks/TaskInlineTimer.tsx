@@ -41,6 +41,7 @@ export function TaskInlineTimer({
 
   useEffect(() => {
     setNowMs(Date.now());
+    setError('');
     if (current.state !== 'running') return undefined;
     const interval = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => window.clearInterval(interval);
@@ -60,6 +61,11 @@ export function TaskInlineTimer({
       : current.state === 'stopped'
         ? '计时已停止'
         : '尚未计时';
+  const compactLabel = current.state === 'running'
+    ? `我的 · 计时中 ${elapsedLabel}`
+    : current.state === 'paused'
+      ? `我的 · 已暂停 ${elapsedLabel}`
+      : `我的用时 ${elapsedLabel}`;
 
   const runAction = async (action: TaskTimerAction) => {
     setBusyAction(action);
@@ -92,7 +98,7 @@ export function TaskInlineTimer({
         aria-label={`${taskTitle}，${stateLabel}，累计 ${elapsedLabel}`}
       >
         <span
-          className="inline-flex min-w-[88px] items-center gap-1.5 px-2 text-[11px] font-semibold tabular-nums text-slate-600"
+          className="inline-flex min-w-[118px] items-center gap-1.5 px-2 text-[11px] font-semibold tabular-nums text-slate-600"
           title={`我的用时 · ${stateLabel} · 累计 ${elapsedLabel}`}
         >
           {busyAction ? (
@@ -104,7 +110,7 @@ export function TaskInlineTimer({
               aria-hidden="true"
             />
           )}
-          <span>我的 {elapsedLabel}</span>
+          <span>{compactLabel}</span>
         </span>
         <span className="h-4 w-px bg-slate-200" aria-hidden="true" />
         <button
