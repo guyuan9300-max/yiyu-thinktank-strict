@@ -1,6 +1,6 @@
 {
   "name": "yiyu-thinktank-strict",
-  "version": "0.29.7",
+  "version": "0.29.8",
   "private": true,
   "description": "益语智库AI严格数据库候选",
   "type": "commonjs",

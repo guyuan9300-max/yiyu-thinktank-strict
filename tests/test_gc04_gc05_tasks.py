@@ -76,6 +76,40 @@ def _second_member(repository: object, identity: SessionIdentity) -> SessionIden
     )
 
 
+def _assign_department(
+    repository: object,
+    identity: SessionIdentity,
+    *,
+    department_id: str = "department_gc04_timer",
+    department_name: str = "计时测试部",
+) -> None:
+    now = utc_now()
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        connection.execute(
+            "INSERT INTO organizations (id,lifecycle_state,version,updated_at,"
+            "record_kind,parent_record_id,name,created_at,deleted_at) VALUES "
+            "(?,'active',1,?,'department',?,?,?,NULL)",
+            (department_id, now, identity.organization_id, department_name, now),
+        )
+        connection.execute(
+            "INSERT INTO organization_memberships (id,scope_id,principal_id,role_key,"
+            "status,version,record_kind,parent_membership_id,department_id,"
+            "visibility_scope,lifecycle_state,created_at,updated_at,deleted_at) VALUES "
+            "(?,?,?,'member','active',1,'department_assignment',?,?,"
+            "'department','active',?,?,NULL)",
+            (
+                f"department_assignment_{identity.membership_id}",
+                identity.scope_id,
+                identity.principal_id,
+                identity.membership_id,
+                department_id,
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+
+
 def _grant_read_only_project_access(
     repository: object,
     identity: SessionIdentity,
@@ -878,12 +912,15 @@ def test_task_timer_cloud_commands_are_on_the_connected_golden_chain() -> None:
 
 def test_task_timer_uses_execution_runs_and_is_idempotent(tmp_path: Path) -> None:
     repository, identity, _ = _repository(tmp_path)
+    _assign_department(repository, identity)
     domain = GC04TaskRepository(repository)
     task = _create(domain, identity, "timer-task-create", "记录真实投入时间")
     task_id = str(task["task"]["id"])
 
     assert task["task"]["task_timer"]["state"] == "idle"
     assert task["task"]["task_timer"]["version"] == 0
+    assert task["task"]["owner_department_resolution"] == "resolved"
+    assert task["task"]["owner_department_name"] == "计时测试部"
 
     started = domain.update_task_timer(
         identity,
@@ -902,6 +939,8 @@ def test_task_timer_uses_execution_runs_and_is_idempotent(tmp_path: Path) -> Non
     assert replay == started
     assert started["taskTimer"]["state"] == "running"
     assert started["taskTimer"]["version"] == 1
+    assert started["task"]["owner_department_resolution"] == "resolved"
+    assert started["task"]["owner_department_name"] == "计时测试部"
 
     repeated_start = domain.update_task_timer(
         identity,
@@ -933,6 +972,8 @@ def test_task_timer_uses_execution_runs_and_is_idempotent(tmp_path: Path) -> Non
     assert paused["taskTimer"]["state"] == "paused"
     assert paused["taskTimer"]["version"] == 2
     assert paused["taskTimer"]["elapsedSeconds"] >= 9
+    assert paused["task"]["owner_department_resolution"] == "resolved"
+    assert paused["task"]["owner_department_name"] == "计时测试部"
 
     resumed = domain.update_task_timer(
         identity,

@@ -19357,7 +19357,16 @@ export default function App() {
         );
         if (!sandboxId || sandboxId === currentTaskSandboxId()) {
           setTasks((previous) => previous.map((item) => (
-            item.id === task.id ? { ...item, ...updatedTask } : item
+            item.id === task.id
+              ? {
+                  ...item,
+                  ...updatedTask,
+                  ownerDepartmentId: item.ownerDepartmentId,
+                  ownerDepartmentName: item.ownerDepartmentName,
+                  ownerDepartmentResolution: item.ownerDepartmentResolution,
+                  ownerDepartments: item.ownerDepartments,
+                }
+              : item
           )));
         }
       } catch (error) {

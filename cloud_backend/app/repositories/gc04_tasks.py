@@ -1328,6 +1328,13 @@ class GC04TaskRepository:
         event_line_detail: bool = False,
     ) -> dict[str, Any]:
         task = self._row_dict(row)
+        task_id = str(row["id"])
+        if owner_departments_by_task is None:
+            owner_departments_by_task = self._owner_departments_by_task(
+                connection,
+                identity,
+                [task_id],
+            )
         creator = connection.execute(
             """
             SELECT principal.display_name
@@ -1341,7 +1348,7 @@ class GC04TaskRepository:
             str(creator["display_name"] or "") if creator is not None else ""
         )
         task["collaborators"] = self._collaborators(
-            connection, identity, str(row["id"])
+            connection, identity, task_id
         )
         list_row = None
         if row["task_list_id"]:
@@ -1449,10 +1456,10 @@ class GC04TaskRepository:
             ),
         }
         task["task_timer"] = self._task_timer_summary(
-            connection, identity, str(row["id"])
+            connection, identity, task_id
         )
         owner_departments = list(
-            (owner_departments_by_task or {}).get(str(row["id"]), [])
+            owner_departments_by_task.get(task_id, [])
         )
         task["owner_departments"] = owner_departments
         if len(owner_departments) == 1:
