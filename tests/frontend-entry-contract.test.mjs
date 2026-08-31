@@ -31,6 +31,10 @@ const taskMediaPanelSource = fs.readFileSync(
   path.join(root, 'src', 'renderer', 'components', 'tasks', 'TaskMediaPanel.tsx'),
   'utf8',
 );
+const eventLineReportSource = fs.readFileSync(
+  path.join(root, 'src', 'renderer', 'components', 'tasks', 'EventLineReportPanel.tsx'),
+  'utf8',
+);
 const uiCompatSource = fs.readFileSync(
   path.join(root, 'backend', 'app', 'ui_compat.py'),
   'utf8',
@@ -81,6 +85,16 @@ test('all frozen user-facing entry points remain present', () => {
   assert.ok(appSource.includes('<FeishuOrgIntegrationPanel'));
   assert.ok(apiSource.includes("'/api/v2/ui/org-integrations/feishu'"));
   assert.ok(apiSource.includes("'/api/v2/ui/me/feishu-authorization'"));
+});
+
+test('event-line task search supports select-all and batch reference through the same authority command', () => {
+  assert.ok(eventLineReportSource.includes('全选可引用任务'));
+  assert.ok(eventLineReportSource.includes('批量引用'));
+  assert.ok(eventLineReportSource.includes('selectedTaskCandidateIds'));
+  assert.match(
+    eventLineReportSource,
+    /for \(const candidate of selected\)[\s\S]{0,1200}await linkTaskToEventLine\(/,
+  );
 });
 
 test('renderer only calls v2 and never calls legacy endpoints', () => {

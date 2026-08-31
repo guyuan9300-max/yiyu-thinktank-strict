@@ -1350,6 +1350,18 @@ type Props = {
   onDownloadReport?: (localPath: string, fileName: string) => Promise<void>;
 };
 
+function taskCandidateAlreadyIncluded(
+  candidate: EventLineTaskCandidate,
+  eventLineId: string,
+  cloudEventLineId?: string | null,
+) {
+  return Boolean(
+    candidate.alreadyReferenced
+    || candidate.eventLineId === eventLineId
+    || (cloudEventLineId && candidate.eventLineId === cloudEventLineId)
+  );
+}
+
 export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onClose, onOpenSavedReport, onOpenTask, onDownloadReport }: Props) {
   const [snapshot, setSnapshot] = useState<EventLineReportSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1394,6 +1406,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
   const [backgroundDraftWarning, setBackgroundDraftWarning] = useState<string | null>(null);
   const [expandedNarrativeNodes, setExpandedNarrativeNodes] = useState<Set<string>>(new Set());
   const [taskCandidates, setTaskCandidates] = useState<EventLineTaskCandidate[]>([]);
+  const [selectedTaskCandidateIds, setSelectedTaskCandidateIds] = useState<Set<string>>(new Set());
   const [taskSearch, setTaskSearch] = useState('');
   const [taskSearchScope, setTaskSearchScope] = useState<'client' | 'organization'>('client');
   const [taskCandidateState, setTaskCandidateState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -1568,6 +1581,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
     setBackgroundDraftWarning(null);
     setExpandedNarrativeNodes(new Set());
     setTaskCandidates([]);
+    setSelectedTaskCandidateIds(new Set());
     setTaskSearch('');
     setTaskSearchScope('client');
     setTaskCandidateState('idle');
@@ -1828,13 +1842,50 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
         limit: 60,
       });
       setTaskCandidates(items);
+      const cloudEventLineId = snapshot.eventLine.cloudId || snapshot.eventLine.id;
+      const selectableIds = new Set(
+        items
+          .filter((item) => !taskCandidateAlreadyIncluded(item, eventLineId, cloudEventLineId))
+          .map((item) => item.id),
+      );
+      setSelectedTaskCandidateIds((current) => new Set(
+        [...current].filter((id) => selectableIds.has(id)),
+      ));
       setTaskCandidateState('ready');
     } catch (err) {
       setTaskCandidates([]);
+      setSelectedTaskCandidateIds(new Set());
       setTaskCandidateState('error');
       setTaskCandidateError(err instanceof Error ? err.message : '任务查找失败');
     }
-  }, [eventLineId, snapshot?.canEdit, taskCandidateState, taskSearch, taskSearchScope]);
+  }, [eventLineId, snapshot, taskCandidateState, taskSearch, taskSearchScope]);
+
+  const selectableTaskCandidates = useMemo(() => {
+    const cloudEventLineId = snapshot?.eventLine.cloudId || snapshot?.eventLine.id;
+    return taskCandidates.filter(
+      (candidate) => !taskCandidateAlreadyIncluded(candidate, eventLineId, cloudEventLineId),
+    );
+  }, [eventLineId, snapshot?.eventLine.cloudId, snapshot?.eventLine.id, taskCandidates]);
+
+  const allTaskCandidatesSelected = selectableTaskCandidates.length > 0
+    && selectableTaskCandidates.every((candidate) => selectedTaskCandidateIds.has(candidate.id));
+
+  const toggleTaskCandidateSelection = useCallback((taskId: string) => {
+    setSelectedTaskCandidateIds((current) => {
+      const next = new Set(current);
+      if (next.has(taskId)) next.delete(taskId);
+      else next.add(taskId);
+      return next;
+    });
+  }, []);
+
+  const toggleAllTaskCandidates = useCallback(() => {
+    setSelectedTaskCandidateIds(
+      allTaskCandidatesSelected
+        ? new Set()
+        : new Set(selectableTaskCandidates.map((candidate) => candidate.id)),
+    );
+  }, [allTaskCandidatesSelected, selectableTaskCandidates]);
 
   const handleLinkCandidate = useCallback(async (candidate: EventLineTaskCandidate) => {
     if (!snapshot?.canEdit || linkingTaskId) return;
@@ -1886,6 +1937,91 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
       setLinkingTaskId(null);
     }
   }, [applyUpdatedEventLine, eventLineId, linkingTaskId, loadSnapshot, loadTaskCandidates, snapshot]);
+
+  const handleBatchLinkCandidates = useCallback(async () => {
+    if (!snapshot?.canEdit || linkingTaskId || selectedTaskCandidateIds.size === 0) return;
+    const currentCloudId = snapshot.eventLine.cloudId || snapshot.eventLine.id;
+    const selected = selectableTaskCandidates.filter(
+      (candidate) => selectedTaskCandidateIds.has(candidate.id),
+    );
+    if (selected.length === 0) return;
+    const reassigning = selected.filter((candidate) => (
+      candidate.relationMode === 'formal'
+      && candidate.eventLineId
+      && candidate.eventLineId !== currentCloudId
+      && candidate.eventLineId !== eventLineId
+    ));
+    if (reassigning.length > 0) {
+      const names = reassigning.slice(0, 3).map((candidate) => `“${candidate.title}”`).join('、');
+      const suffix = reassigning.length > 3 ? `等 ${reassigning.length} 条任务` : '';
+      const approved = window.confirm(
+        `${names}${suffix}已在其他事件线中；批量引用会将这些本人负责的同项目任务改挂到当前事件线，是否继续？`,
+      );
+      if (!approved) return;
+    }
+
+    setLinkingTaskId('__batch__');
+    setTaskLinkError(null);
+    setTaskLinkMessage(null);
+    let formalCount = 0;
+    let referenceCount = 0;
+    const failures: Array<{ candidate: EventLineTaskCandidate; message: string }> = [];
+    try {
+      for (const candidate of selected) {
+        try {
+          const allowReassign = Boolean(
+            candidate.relationMode === 'formal'
+            && candidate.eventLineId
+            && candidate.eventLineId !== currentCloudId
+            && candidate.eventLineId !== eventLineId
+          );
+          const result = await linkTaskToEventLine(
+            eventLineId,
+            candidate.id,
+            candidate.taskVersion,
+            eventLineVersionRef.current,
+            allowReassign,
+          );
+          applyUpdatedEventLine(result.eventLine);
+          if (result.relationMode === 'formal') formalCount += 1;
+          else referenceCount += 1;
+        } catch (err) {
+          failures.push({
+            candidate,
+            message: err instanceof Error ? err.message : '引用失败',
+          });
+        }
+      }
+      await loadSnapshot();
+      await loadTaskCandidates();
+      if (failures.length > 0) {
+        const succeeded = formalCount + referenceCount;
+        const detail = failures.slice(0, 3)
+          .map(({ candidate, message }) => `${candidate.title}：${message}`)
+          .join('；');
+        setTaskLinkError(
+          `${succeeded > 0 ? `已成功引用 ${succeeded} 条；` : ''}${failures.length} 条失败。${detail}${failures.length > 3 ? '；其余失败项请刷新后重试' : ''}`,
+        );
+      } else {
+        const parts = [
+          formalCount > 0 ? `${formalCount} 条已按细化规则纳入项目与事件线` : '',
+          referenceCount > 0 ? `${referenceCount} 条仅作引用、未修改原任务` : '',
+        ].filter(Boolean);
+        setTaskLinkMessage(`批量引用完成：${parts.join('；')}。`);
+      }
+    } finally {
+      setLinkingTaskId(null);
+    }
+  }, [
+    applyUpdatedEventLine,
+    eventLineId,
+    linkingTaskId,
+    loadSnapshot,
+    loadTaskCandidates,
+    selectableTaskCandidates,
+    selectedTaskCandidateIds,
+    snapshot,
+  ]);
 
   const humanMilestoneTaskIds = useMemo(() => new Set(
     (snapshot?.activities || [])
@@ -2896,16 +3032,54 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                     </p>
                   )}
                   {taskCandidates.length > 0 && (
-                    <div className="mt-3 max-h-52 space-y-1 overflow-y-auto">
-                      {taskCandidates.map((candidate) => {
-                        const alreadyLinked = (
-                          candidate.eventLineId === currentEventLineIdentity
-                          || candidate.eventLineId === eventLineId
-                          || candidate.alreadyReferenced
-                        );
-                        return (
-                          <div key={`candidate:${candidate.id}`} className="flex items-center justify-between gap-3 rounded-md px-2 py-2 hover:bg-gray-50">
-                            <div className="min-w-0">
+                    <div className="mt-3">
+                      <div className="mb-2 flex flex-wrap items-center justify-between gap-2 border-b border-gray-100 pb-2">
+                        <label className="inline-flex cursor-pointer items-center gap-2 text-[10.5px] text-gray-600">
+                          <input
+                            type="checkbox"
+                            checked={allTaskCandidatesSelected}
+                            aria-checked={
+                              selectedTaskCandidateIds.size > 0 && !allTaskCandidatesSelected
+                                ? 'mixed'
+                                : allTaskCandidatesSelected
+                            }
+                            onChange={toggleAllTaskCandidates}
+                            disabled={selectableTaskCandidates.length === 0 || Boolean(linkingTaskId)}
+                            className="h-3.5 w-3.5 rounded border-gray-300 text-[#4D6BFE] focus:ring-[#4D6BFE] disabled:opacity-40"
+                          />
+                          全选可引用任务
+                          {selectedTaskCandidateIds.size > 0 && (
+                            <span className="text-gray-400">已选 {selectedTaskCandidateIds.size} 条</span>
+                          )}
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => void handleBatchLinkCandidates()}
+                          disabled={selectedTaskCandidateIds.size === 0 || Boolean(linkingTaskId)}
+                          className="inline-flex h-7 items-center gap-1.5 rounded-md bg-[#4D6BFE] px-3 text-[10.5px] font-medium text-white transition hover:bg-[#4059d7] disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          {linkingTaskId === '__batch__' ? <RefreshCw size={11} className="animate-spin" /> : <Link2 size={11} />}
+                          {linkingTaskId === '__batch__' ? '批量引用中' : `批量引用${selectedTaskCandidateIds.size > 0 ? `（${selectedTaskCandidateIds.size}）` : ''}`}
+                        </button>
+                      </div>
+                      <div className="max-h-52 space-y-1 overflow-y-auto">
+                        {taskCandidates.map((candidate) => {
+                          const alreadyLinked = taskCandidateAlreadyIncluded(
+                            candidate,
+                            eventLineId,
+                            currentEventLineIdentity,
+                          );
+                          return (
+                            <div key={`candidate:${candidate.id}`} className="flex items-center justify-between gap-3 rounded-md px-2 py-2 hover:bg-gray-50">
+                              <input
+                                type="checkbox"
+                                checked={selectedTaskCandidateIds.has(candidate.id)}
+                                onChange={() => toggleTaskCandidateSelection(candidate.id)}
+                                disabled={alreadyLinked || Boolean(linkingTaskId)}
+                                aria-label={`选择任务：${candidate.title}`}
+                                className="h-3.5 w-3.5 shrink-0 rounded border-gray-300 text-[#4D6BFE] focus:ring-[#4D6BFE] disabled:opacity-30"
+                              />
+                              <div className="min-w-0 flex-1">
                               <p className="truncate text-[11px] font-medium text-gray-700">{candidate.title}</p>
                               <p className="mt-0.5 truncate text-[9.5px] text-gray-400">
                                 {candidate.clientName || '未关联项目'}{candidate.eventLineName ? ` · 已关联 ${candidate.eventLineName}` : ''}
@@ -2919,19 +3093,20 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                                     : '仅引用，不修改原任务信息'}
                                 </p>
                               )}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => void handleLinkCandidate(candidate)}
+                                disabled={alreadyLinked || Boolean(linkingTaskId)}
+                                className="inline-flex shrink-0 items-center gap-1 text-[10.5px] font-medium text-[#4D6BFE] disabled:text-gray-300"
+                              >
+                                {alreadyLinked ? <Check size={11} /> : <Link2 size={11} />}
+                                {alreadyLinked ? '已引用' : linkingTaskId === candidate.id ? '引用中' : '引用'}
+                              </button>
                             </div>
-                            <button
-                              type="button"
-                              onClick={() => void handleLinkCandidate(candidate)}
-                              disabled={alreadyLinked || Boolean(linkingTaskId)}
-                              className="inline-flex shrink-0 items-center gap-1 text-[10.5px] font-medium text-[#4D6BFE] disabled:text-gray-300"
-                            >
-                              {alreadyLinked ? <Check size={11} /> : <Link2 size={11} />}
-                              {alreadyLinked ? '已引用' : linkingTaskId === candidate.id ? '引用中' : '引用'}
-                            </button>
-                          </div>
-                        );
-                      })}
+                          );
+                        })}
+                      </div>
                     </div>
                   )}
                   {taskLinkError && <p className="mt-2 text-[10.5px] text-rose-600">{taskLinkError}</p>}
