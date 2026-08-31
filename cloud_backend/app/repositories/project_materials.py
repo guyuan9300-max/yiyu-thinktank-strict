@@ -2452,16 +2452,14 @@ class GC07ProjectMaterialsRepository:
                         """
                         SELECT * FROM source_assets
                         WHERE scope_id=? AND client_id=? AND record_kind='asset'
-                          AND content_hash=? AND source_kind=?
-                          AND COALESCE(source_locator_nonlocal,'')=?
-                          AND lifecycle_state='active'
+                          AND content_hash=? AND lifecycle_state='active'
+                        ORDER BY created_at,id
+                        LIMIT 1
                         """,
                         (
                             identity.scope_id,
                             project_id,
                             content_hash,
-                            material["sourceKind"],
-                            (f"{material['relationKind']}:{material['relationId']}" if material["relationKind"] else ""),
                         ),
                     ).fetchone()
                     if existing is not None:

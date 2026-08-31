@@ -1083,6 +1083,8 @@ class LocalProjectMaterialsRepository:
                             key: existing.get(key)
                             for key in (
                                 "taskId",
+                                "relatedTaskId",
+                                "eventLineId",
                                 "meetingId",
                                 "sourceKind",
                                 "transcriptionStatus",
@@ -1126,6 +1128,47 @@ class LocalProjectMaterialsRepository:
             }
         state["documents"] = documents
         self._write_project_state(project_id, state)
+
+    def bind_event_line_attachment(
+        self,
+        *,
+        project_id: str,
+        document_id: str,
+        event_line_id: str,
+        related_task_id: str = "",
+    ) -> dict[str, Any]:
+        """Keep an event-line evidence relation without posing as a task attachment."""
+        state = self._load_project_state(project_id)
+        documents = dict(state.get("documents") or {})
+        entry = documents.get(document_id)
+        if not isinstance(entry, Mapping):
+            matched = next(
+                (
+                    (candidate_id, candidate)
+                    for candidate_id, candidate in documents.items()
+                    if isinstance(candidate, Mapping)
+                    and str(candidate.get("localSourceId") or "") == document_id
+                ),
+                None,
+            )
+            if matched is not None:
+                document_id, entry = str(matched[0]), matched[1]
+        if not isinstance(entry, Mapping):
+            raise LocalRuntimeError(404, "event_line_attachment_missing", "事件线材料不存在")
+        normalized = {
+            **dict(entry),
+            "eventLineId": event_line_id,
+            "relatedTaskId": related_task_id or None,
+            "sourceKind": "event_line_attachment",
+        }
+        documents[document_id] = normalized
+        state["documents"] = documents
+        self._write_project_state(project_id, state)
+        return {
+            **normalized,
+            "documentId": document_id,
+            "relatedTaskId": related_task_id or None,
+        }
 
     def bind_pending_materials(
         self,
@@ -7512,6 +7555,9 @@ class LocalProjectMaterialsRepository:
                     "mediaType": entry.get("mediaType") or "application/octet-stream",
                     "localSourceId": entry.get("localSourceId"),
                     "taskId": entry.get("taskId"),
+                    "relatedTaskId": entry.get("relatedTaskId"),
+                    "eventLineId": entry.get("eventLineId"),
+                    "sourceKind": entry.get("sourceKind"),
                     "transcriptionStatus": entry.get("transcriptionStatus"),
                     "transcriptObjectId": entry.get("transcriptObjectId"),
                     "sharedSummaryState": (

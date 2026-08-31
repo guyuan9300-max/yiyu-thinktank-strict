@@ -201,7 +201,7 @@ def _event_line_report_attachments(
             continue
         result.append({
             "id": source_id,
-            "taskId": "",
+            "taskId": str(document.get("relatedTaskId") or ""),
             "documentId": source_id,
             "sourceKind": "event_line_attachment",
             "title": str(activity.get("title") or document.get("title") or "事件线材料"),
@@ -2647,12 +2647,29 @@ def upload_event_line_attachment(
     client_id = str((detail.get("eventLine") or {}).get("clientId") or "")
     if not client_id:
         raise LocalRuntimeError(409, "event_line_client_missing", "事件线缺少客户项目归属")
+    related_task_id = str(request.body.get("relatedTaskId") or "").strip()
+    if related_task_id and related_task_id not in {
+        str(item.get("id") or "")
+        for item in detail.get("tasks") or []
+        if isinstance(item, Mapping)
+    }:
+        raise LocalRuntimeError(
+            409,
+            "event_line_attachment_task_mismatch",
+            "所选任务不属于当前事件线，无法归入该任务",
+        )
     store, local = _uploaded_event_line_material(
         compatibility,
         request,
         client_id=client_id,
     )
     store.bind_pending_materials(project_id=client_id, local_materials=[local])
+    store.bind_event_line_attachment(
+        project_id=client_id,
+        document_id=str(local.get("localSourceId") or ""),
+        event_line_id=event_line_id,
+        related_task_id=related_task_id,
+    )
     registered = compatibility.runtime.cloud_command(
         "POST",
         f"/api/v2/domain/project-materials/projects/{quote(client_id, safe='')}"

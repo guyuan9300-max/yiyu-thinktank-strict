@@ -898,6 +898,7 @@ def test_event_line_evidence_upload_keeps_body_local_and_registers_safe_metadata
         "_strict_event_line_detail",
         lambda *_args, **_kwargs: {
             "eventLine": {"id": "line_upload", "clientId": "client_upload"},
+            "tasks": [{"id": "task_upload"}],
             "activities": [],
         },
     )
@@ -922,6 +923,9 @@ def test_event_line_evidence_upload_keeps_body_local_and_registers_safe_metadata
 
         def bind_cloud_documents(self, **kwargs):
             self.bound.append(("cloud", kwargs))
+
+        def bind_event_line_attachment(self, **kwargs):
+            self.bound.append(("event-line", kwargs))
 
         def process_pending_documents(self, **kwargs):
             return {"items": [{"parseStatus": "ready"}]}
@@ -955,7 +959,12 @@ def test_event_line_evidence_upload_keeps_body_local_and_registers_safe_metadata
         method="POST",
         path="event-lines/line_upload/attachments",
         query={},
-        body={"file": upload, "title": "试点证据", "purpose": "核验试点"},
+        body={
+            "file": upload,
+            "title": "试点证据",
+            "purpose": "核验试点",
+            "relatedTaskId": "task_upload",
+        },
         idempotency_key="event-evidence-upload",
     )
     result = gc06_ui_domain.upload_event_line_attachment(
@@ -973,6 +982,45 @@ def test_event_line_evidence_upload_keeps_body_local_and_registers_safe_metadata
         "cloudMetadataState": "ready",
     }
     assert runtime.commands[-1][1].endswith("/event-lines/line_upload/activities")
+    relation = next(item for kind, item in store.bound if kind == "event-line")
+    assert relation == {
+        "project_id": "client_upload",
+        "document_id": "local_event_evidence",
+        "event_line_id": "line_upload",
+        "related_task_id": "task_upload",
+    }
+
+
+def test_event_line_report_attachment_keeps_related_task_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Store:
+        @staticmethod
+        def documents(_project_id):
+            return [{
+                "id": "source_asset_event_evidence",
+                "title": "里程碑截图",
+                "relatedTaskId": "task_upload",
+                "sourceKind": "event_line_attachment",
+                "path": "/tmp/milestone.png",
+                "parseStatus": "ready",
+            }]
+
+    monkeypatch.setattr(gc06_ui_domain, "_material_store", lambda _: Store())
+    result = gc06_ui_domain._event_line_report_attachments(
+        SimpleNamespace(runtime=SimpleNamespace(database_path=Path("/tmp/test.db"))),
+        {
+            "eventLine": {"clientId": "client_upload"},
+            "activities": [{
+                "sourceId": "source_asset_event_evidence",
+                "title": "里程碑截图",
+                "summary": "证明里程碑结果",
+                "happenedAt": "2026-08-31T08:00:00Z",
+            }],
+        },
+    )
+    assert result[0]["taskId"] == "task_upload"
+    assert result[0]["sourceKind"] == "event_line_attachment"
 
 
 def test_retained_event_line_reads_build_only_traceable_fact_views() -> None:

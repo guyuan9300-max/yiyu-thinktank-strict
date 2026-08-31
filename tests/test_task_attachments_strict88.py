@@ -387,6 +387,56 @@ def test_task_attachment_registers_only_safe_project_metadata(tmp_path: Path) ->
     assert replayed["alreadyDeleted"] is True
 
 
+def test_material_metadata_reuses_same_project_content_across_relations(
+    tmp_path: Path,
+) -> None:
+    repository, identity, payload = _repository(tmp_path)
+    task_domain = GC04TaskRepository(repository)
+    task = task_domain.create_task(
+        identity,
+        payload={"title": "已有资料任务", "clientId": payload["projectId"]},
+        idempotency_key="same-content-task-create",
+    )["task"]
+    materials = GC07ProjectMaterialsRepository(repository)
+    first = materials.register_local_material_metadata(
+        identity,
+        project_id=payload["projectId"],
+        materials=[{
+            "localSourceId": "local-task-copy",
+            "fileName": "已有规划.docx",
+            "contentHash": "e" * 64,
+            "byteSize": 1024,
+            "mediaType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "relationKind": "task",
+            "relationId": task["id"],
+        }],
+        idempotency_key="same-content-first",
+    )
+    second = materials.register_local_material_metadata(
+        identity,
+        project_id=payload["projectId"],
+        materials=[{
+            "localSourceId": "local-event-line-copy",
+            "fileName": "已有规划.docx",
+            "contentHash": "e" * 64,
+            "byteSize": 1024,
+            "mediaType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        }],
+        idempotency_key="same-content-second",
+    )
+
+    assert second["documents"][0]["documentId"] == first["documents"][0]["documentId"]
+    assert second["importedCount"] == 0
+    assert second["skippedCount"] == 1
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM source_assets WHERE scope_id=? AND client_id=? "
+            "AND content_hash=? AND lifecycle_state='active'",
+            (identity.scope_id, payload["projectId"], "e" * 64),
+        ).fetchone()[0] == 1
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_task_attachment_delete_accepts_cloud_only_placeholder(
     monkeypatch,
     tmp_path: Path,

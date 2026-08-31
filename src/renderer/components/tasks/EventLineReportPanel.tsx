@@ -16,6 +16,7 @@ import {
   Check,
   Link2,
   Search,
+  ChevronDown,
 } from 'lucide-react';
 import type {
   EventLineReportSnapshot,
@@ -1375,6 +1376,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
   const [materialUploadName, setMaterialUploadName] = useState('');
   const [materialUploadPurpose, setMaterialUploadPurpose] = useState('');
   const [materialUploadFile, setMaterialUploadFile] = useState<File | null>(null);
+  const [expandedEvidenceTaskIds, setExpandedEvidenceTaskIds] = useState<Set<string>>(new Set());
   const eventLineVersionRef = useRef(1);
 
   /* Local editable draft — built from immutable cloud snapshot */
@@ -2099,12 +2101,16 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
     setUploadingMaterial(true);
     setMaterialActionError(null);
     try {
+      const uploadedTaskId = materialUploadTaskId;
       await uploadEventLineAttachment(eventLineId, materialUploadFile, {
         title,
         purpose,
-        relatedTaskId: materialUploadTaskId || null,
+        relatedTaskId: uploadedTaskId || null,
       });
       await loadSnapshot({ silent: true });
+      if (uploadedTaskId) {
+        setExpandedEvidenceTaskIds((previous) => new Set(previous).add(uploadedTaskId));
+      }
       setMaterialUploadOpen(false);
       setMaterialUploadFile(null);
       setMaterialUploadName('');
@@ -3447,18 +3453,31 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                 </div>
                 {evidenceTaskRows.length > 0 ? (
                   <div className="mt-3 divide-y divide-gray-100 rounded-md border border-gray-100 bg-white px-3">
-                    {evidenceTaskRows.map((row) => (
+                    {evidenceTaskRows.map((row) => {
+                      const isExpanded = expandedEvidenceTaskIds.has(row.task.id);
+                      return (
                         <div key={`task-evidence:${row.task.id}`} className="py-3">
                           <div className="flex items-start justify-between gap-4">
-                            <div className="min-w-0">
-                              <div className="flex flex-wrap items-center gap-2">
                             <button
                               type="button"
-                              onClick={() => onOpenTask?.(row.task)}
-                              className="block max-w-full truncate text-left text-[11.5px] font-medium text-gray-800 hover:text-gray-950"
+                              onClick={() => setExpandedEvidenceTaskIds((previous) => {
+                                const next = new Set(previous);
+                                if (next.has(row.task.id)) next.delete(row.task.id);
+                                else next.add(row.task.id);
+                                return next;
+                              })}
+                              className="flex min-w-0 flex-1 items-start gap-2 text-left"
+                              aria-expanded={isExpanded}
                             >
-                              {row.task.title}
-                            </button>
+                              <ChevronDown
+                                size={14}
+                                className={`mt-0.5 shrink-0 text-gray-400 transition-transform ${isExpanded ? '' : '-rotate-90'}`}
+                              />
+                              <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="block max-w-full truncate text-[11.5px] font-medium text-gray-800">
+                                  {row.task.title}
+                                </span>
                                 {row.isMilestone && (
                                   <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[9.5px] font-medium text-amber-700">人工里程碑</span>
                                 )}
@@ -3466,18 +3485,30 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                               <p className="mt-1 text-[10.5px] text-gray-400">
                                 {row.happenedAt ? formatTs(row.happenedAt) : '时间未填写'} · {row.attachments.length} 份材料
                               </p>
-                            </div>
-                            {row.isMilestone && row.attachments.length === 0 && snapshot.canEdit && (
+                              </div>
+                            </button>
+                            <div className="flex shrink-0 items-center gap-2">
+                              {onOpenTask && (
+                                <button
+                                  type="button"
+                                  onClick={() => onOpenTask(row.task)}
+                                  className="rounded-md px-2 py-1 text-[10.5px] font-medium text-gray-500 hover:bg-gray-50 hover:text-gray-700"
+                                >
+                                  查看任务
+                                </button>
+                              )}
+                              {row.isMilestone && snapshot.canEdit && (
                               <button
                                 type="button"
                                 onClick={() => openMaterialUpload(row.task)}
                                 className="shrink-0 rounded-md border border-gray-200 bg-white px-2.5 py-1 text-[10.5px] font-medium text-gray-700 hover:border-gray-300"
                               >
-                                上传证据材料
+                                {row.attachments.length > 0 ? '继续补充' : '上传证据材料'}
                               </button>
-                            )}
+                              )}
+                            </div>
                           </div>
-                          {row.attachments.length > 0 && (
+                          {isExpanded && row.attachments.length > 0 && (
                             <div className="mt-2 space-y-1.5">
                               {row.attachments.map((attachment) => (
                                 <div key={attachment.id} className="flex items-start justify-between gap-3 rounded-md bg-gray-50 px-2.5 py-2">
@@ -3506,7 +3537,8 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                             </div>
                           )}
                         </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ) : (
                   <div className="mt-3 rounded-md border border-dashed border-gray-200 bg-white px-3 py-4 text-center text-[11px] text-gray-400">
