@@ -16,8 +16,6 @@ import {
   Check,
   Link2,
   Search,
-  ChevronDown,
-  ChevronUp,
 } from 'lucide-react';
 import type {
   EventLineReportSnapshot,
@@ -27,7 +25,6 @@ import type {
   EventLineTimelineNodeKind as BackendEventLineTimelineNodeKind,
   EventLineTaskCandidate,
   EventLineDraft,
-  EventLineReadinessAnalysis,
   ReportArtifactSummary,
   ReportFileFormat,
   ReportRunSummary,
@@ -35,7 +32,6 @@ import type {
 } from '../../../shared/types.js';
 import {
   draftEventLineBackground,
-  analyzeEventLineReadiness,
   getEventLineTaskCandidates,
   linkTaskToEventLine,
   getEventLineReportSnapshot,
@@ -1396,10 +1392,6 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
   const [backgroundFailedAction, setBackgroundFailedAction] = useState<'draft' | 'save' | null>(null);
   const [backgroundDraftCitations, setBackgroundDraftCitations] = useState<EventLineDraft['citations']>([]);
   const [backgroundDraftWarning, setBackgroundDraftWarning] = useState<string | null>(null);
-  const [readinessAnalysis, setReadinessAnalysis] = useState<EventLineReadinessAnalysis | null>(null);
-  const [readinessAnalysisLoading, setReadinessAnalysisLoading] = useState(false);
-  const [readinessAnalysisError, setReadinessAnalysisError] = useState<string | null>(null);
-  const [readinessAnalysisExpanded, setReadinessAnalysisExpanded] = useState(true);
   const [expandedNarrativeNodes, setExpandedNarrativeNodes] = useState<Set<string>>(new Set());
   const [taskCandidates, setTaskCandidates] = useState<EventLineTaskCandidate[]>([]);
   const [taskSearch, setTaskSearch] = useState('');
@@ -1570,10 +1562,6 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
     setBackgroundFailedAction(null);
     setBackgroundDraftCitations([]);
     setBackgroundDraftWarning(null);
-    setReadinessAnalysis(null);
-    setReadinessAnalysisLoading(false);
-    setReadinessAnalysisError(null);
-    setReadinessAnalysisExpanded(true);
     setExpandedNarrativeNodes(new Set());
     setTaskCandidates([]);
     setTaskSearch('');
@@ -1907,20 +1895,6 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
       setMilestoneTaskId(null);
     }
   }, [applyMilestoneMutationResult, eventLineId, humanMilestoneTaskIds, loadSnapshot, milestoneTaskId, snapshot?.eventLine.viewerCapabilities.canSetMilestone]);
-
-  const handleAnalyzeReadiness = useCallback(async () => {
-    if (readinessAnalysisLoading) return;
-    setReadinessAnalysisLoading(true);
-    setReadinessAnalysisError(null);
-    try {
-      setReadinessAnalysis(await analyzeEventLineReadiness(eventLineId));
-      setReadinessAnalysisExpanded(true);
-    } catch (err) {
-      setReadinessAnalysisError(err instanceof Error ? err.message : 'AI 报告缺口分析失败');
-    } finally {
-      setReadinessAnalysisLoading(false);
-    }
-  }, [eventLineId, readinessAnalysisLoading]);
 
   const goalConfirmed = Boolean(snapshot?.eventLine.intent?.trim());
   const backgroundConfirmed = Boolean(snapshot?.eventLine.summary?.trim());
@@ -2589,58 +2563,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
             ) : (
               <span className="text-gray-400">目标、里程碑和关键证据已具备</span>
             )}
-            <button
-              type="button"
-              onClick={() => void handleAnalyzeReadiness()}
-              disabled={readinessAnalysisLoading}
-              className="ml-auto inline-flex h-7 items-center gap-1.5 rounded-md border border-gray-200 bg-white px-2.5 text-[10.5px] font-medium text-gray-600 hover:border-gray-300 hover:bg-gray-50 disabled:opacity-50"
-            >
-              {readinessAnalysisLoading ? <RefreshCw size={11} className="animate-spin" /> : <Sparkles size={11} />}
-              {readinessAnalysisLoading ? '正在快速分析…' : 'AI分析报告还缺什么'}
-            </button>
           </div>
-          {readinessAnalysisLoading && (
-            <div className="mt-3 flex items-center gap-2 rounded-lg border border-blue-100 bg-blue-50/40 px-3 py-2.5 text-[10.5px] text-blue-700">
-              <RefreshCw size={12} className="animate-spin" />
-              正在检查当前目标、里程碑和证据，不会影响其他操作。
-            </div>
-          )}
-          {readinessAnalysis && (
-            <div className="mt-3 rounded-lg border border-blue-100 bg-blue-50/40 px-3 py-2.5">
-              <div className="flex items-start justify-between gap-3">
-                <p className="min-w-0 text-[11px] font-medium leading-5 text-gray-700">{readinessAnalysis.summary}</p>
-                <button
-                  type="button"
-                  onClick={() => setReadinessAnalysisExpanded((current) => !current)}
-                  className="inline-flex h-6 shrink-0 items-center gap-1 rounded px-1.5 text-[10px] font-medium text-blue-700 hover:bg-blue-100/70"
-                  aria-expanded={readinessAnalysisExpanded}
-                >
-                  {readinessAnalysisExpanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
-                  {readinessAnalysisExpanded ? '收起' : '展开'}
-                </button>
-              </div>
-              {readinessAnalysisExpanded && readinessAnalysis.findings.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {readinessAnalysis.findings.map((finding, index) => (
-                    <div key={`${finding.title}-${index}`} className="rounded-md border border-blue-100 bg-white px-2.5 py-1.5 text-[10.5px] leading-5 text-gray-600">
-                      <span className="font-semibold text-gray-800">{finding.title}</span>
-                      {finding.reason && <span> · {finding.reason}</span>}
-                      {finding.suggestion && <span className="text-blue-700"> · {finding.suggestion}</span>}
-                    </div>
-                  ))}
-                </div>
-              )}
-              {readinessAnalysisExpanded && (
-                <p className="mt-2 text-[10px] text-gray-400">AI分析仅供补充材料时参考，不会自动修改事件线。</p>
-              )}
-            </div>
-          )}
-          {readinessAnalysisError && (
-            <div className="mt-2 flex items-center justify-between gap-3 text-[10.5px] text-rose-600">
-              <span>{readinessAnalysisError}</span>
-              <button type="button" onClick={() => void handleAnalyzeReadiness()} className="shrink-0 font-medium underline">重试</button>
-            </div>
-          )}
           {snapshotRefreshError && (
             <div className="mt-2 flex items-center justify-between gap-3 text-[10.5px] text-rose-600">
               <span>事件线最新状态刷新失败：{snapshotRefreshError}</span>
