@@ -20,6 +20,14 @@ _CLOUD_TASK_PLANNING = "/api/v2/domain/task-planning"
 _LIST_COLOR = "#5B7BFE"
 _TASK_VIEW_PROJECTION_SCHEMA = "yiyu.task-viewer-projection.v1"
 _TASK_VIEW_PROJECTION_SCHEMA_VERSION = 1
+_TASK_VIEW_PROJECTION_REQUIRED_FIELDS = {
+    "viewer_surfaces",
+    "viewer_capabilities",
+    "owner_department_resolution",
+    "owner_department_id",
+    "owner_department_name",
+    "owner_departments",
+}
 
 
 def _projector(compatibility: Any) -> LocalGC04TaskProjection:
@@ -36,19 +44,30 @@ def _require_task_view_projection_contract(payload: Mapping[str, Any]) -> None:
         isinstance(contract, Mapping)
         and str(contract.get("schema") or "") == _TASK_VIEW_PROJECTION_SCHEMA
         and contract.get("schemaVersion") == _TASK_VIEW_PROJECTION_SCHEMA_VERSION
+        and _TASK_VIEW_PROJECTION_REQUIRED_FIELDS.issubset(
+            {
+                str(item)
+                for item in contract.get("requiredTaskFields") or []
+            }
+        )
     )
     tasks = payload.get("tasks")
     fields_valid = isinstance(tasks, list) and all(
         isinstance(item, Mapping)
         and isinstance(item.get("viewer_surfaces"), Mapping)
         and isinstance(item.get("viewer_capabilities"), Mapping)
+        and item.get("owner_department_resolution")
+        in {"resolved", "unassigned", "ambiguous"}
+        and "owner_department_id" in item
+        and "owner_department_name" in item
+        and isinstance(item.get("owner_departments"), list)
         for item in tasks
     )
     if not contract_valid or not fields_valid:
         raise LocalRuntimeError(
             502,
             "task_view_projection_contract_mismatch",
-            "组织云任务查看权限协议不兼容，请完成云端升级并重试",
+            "组织云任务投影协议不兼容，请完成云端升级并重试",
         )
 
 
@@ -240,9 +259,7 @@ def _task_ui(
         "ownerName": owner.get("fullName") if owner else "未设置负责人",
         "ownerDepartmentId": row.get("owner_department_id"),
         "ownerDepartmentName": row.get("owner_department_name"),
-        "ownerDepartmentResolution": str(
-            row.get("owner_department_resolution") or "unassigned"
-        ),
+        "ownerDepartmentResolution": str(row.get("owner_department_resolution")),
         "ownerDepartments": [
             {
                 "id": str(item.get("id") or ""),
@@ -477,6 +494,19 @@ def update_task_timer(
     )
     _apply(compatibility, result)
     return _task_ui(compatibility, result.get("task") or {})
+
+
+@router.post(r"tasks/timers/pause-running")
+def pause_running_task_timers(
+    compatibility: Any, request: UiRequest, _: Any
+) -> dict[str, Any]:
+    return _command(
+        compatibility,
+        request,
+        "POST",
+        f"{_CLOUD_TASKS}/timers/pause-running",
+        {"reason": str(request.body.get("reason") or "app_closed")},
+    )
 
 
 def _task_patch_command(

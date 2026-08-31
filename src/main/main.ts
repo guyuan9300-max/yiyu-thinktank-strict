@@ -54,6 +54,7 @@ import {
   resolveMainWindowMinimumSize,
 } from './mainWindowLayout.js';
 import { buildMiniWindowBounds } from './miniWindowLayout.js';
+import { requestPauseRunningTaskTimers } from './taskTimerShutdown.js';
 import type {
   FastForwardMainPayload,
   PublishCollabBranchPayload,
@@ -77,6 +78,34 @@ let mainWindowResizeGuardTimer: ReturnType<typeof setTimeout> | null = null;
 let backendProcess: ChildProcess | null = null;
 let backendPort = 0;
 let desktopToken = '';
+let isAppQuitting = false;
+let allowMainWindowClose = false;
+let mainWindowClosePausePending = false;
+let timerPauseRequest: Promise<void> | null = null;
+let lastSuccessfulTimerPauseAt = 0;
+
+async function pausePersonalTaskTimersBeforeClose(
+  reason: 'app_quit' | 'window_closed',
+): Promise<void> {
+  if (Date.now() - lastSuccessfulTimerPauseAt < 2_000) return;
+  if (timerPauseRequest) return timerPauseRequest;
+  if (!backendProcess || backendPort <= 0 || !desktopToken) return;
+  timerPauseRequest = requestPauseRunningTaskTimers({
+    port: backendPort,
+    desktopToken,
+    reason,
+  }).then(() => {
+    lastSuccessfulTimerPauseAt = Date.now();
+  }).catch((error) => {
+    console.warn(
+      '[task-timer] pause before desktop close failed',
+      error instanceof Error ? error.message : String(error),
+    );
+  }).finally(() => {
+    timerPauseRequest = null;
+  });
+  return timerPauseRequest;
+}
 
 // Keep Chromium/native controls deterministic across colleagues' macOS region
 // settings. Business timestamps remain ISO values; this only fixes the UI
@@ -726,6 +755,8 @@ async function startBackend(): Promise<void> {
 
 function createWindow(): void {
   const developmentUrl = process.env.VITE_DEV_SERVER_URL;
+  allowMainWindowClose = false;
+  mainWindowClosePausePending = false;
   mainWindow = new BrowserWindow({
     title: APP_NAME,
     width: MAIN_WINDOW_DEFAULT_SIZE.width,
@@ -752,6 +783,19 @@ function createWindow(): void {
     return { action: 'deny' };
   });
   setupOfficialUpdater(mainWindow);
+  const createdWindow = mainWindow;
+  createdWindow.on('close', (event) => {
+    if (isAppQuitting || allowMainWindowClose) return;
+    event.preventDefault();
+    if (mainWindowClosePausePending) return;
+    mainWindowClosePausePending = true;
+    void pausePersonalTaskTimersBeforeClose('window_closed').finally(() => {
+      mainWindowClosePausePending = false;
+      if (createdWindow.isDestroyed()) return;
+      allowMainWindowClose = true;
+      createdWindow.close();
+    });
+  });
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
   });
@@ -1226,7 +1270,16 @@ app.on('activate', () => {
   }
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  if (isAppQuitting) return;
+  event.preventDefault();
+  isAppQuitting = true;
+  void pausePersonalTaskTimersBeforeClose('app_quit').finally(() => {
+    app.quit();
+  });
+});
+
+app.on('will-quit', () => {
   backendProcess?.kill('SIGTERM');
   backendProcess = null;
 });

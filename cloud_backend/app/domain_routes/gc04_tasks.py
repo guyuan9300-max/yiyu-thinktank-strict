@@ -390,19 +390,15 @@ def register_gc04_task_routes(
             idempotency_key=idempotency_key,
         )
 
-    @app.post("/api/v2/domain/tasks/{task_id}/timer/{action}")
-    def update_task_timer(
-        task_id: str,
-        action: str,
+    @app.post("/api/v2/domain/tasks/timers/pause-running")
+    def pause_running_task_timers(
         payload: Annotated[dict[str, Any], Body()],
         identity: Identity,
         idempotency_key: IdempotencyKey,
     ) -> dict[str, Any]:
-        return domain.update_task_timer(
+        return domain.pause_running_task_timers(
             identity,
-            task_id=task_id,
-            action=action,
-            expected_timer_version=int(payload.get("expectedTimerVersion") or 0),
+            reason=str(payload.get("reason") or "app_closed"),
             idempotency_key=idempotency_key,
         )
 

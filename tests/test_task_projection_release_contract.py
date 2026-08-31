@@ -55,6 +55,10 @@ def test_local_adapter_preserves_projection_timer_and_command_route() -> None:
                 "event_line_detail": True,
             },
             "viewer_capabilities": {"can_view": True, "can_track_time": True},
+            "owner_department_resolution": "unassigned",
+            "owner_department_id": None,
+            "owner_department_name": None,
+            "owner_departments": [],
             "task_timer": {"state": "paused", "elapsedSeconds": 42, "version": 2},
         }
     )
@@ -78,7 +82,14 @@ def test_board_contract_keeps_calendar_projection_and_timer_together(
     assert board["viewerProjectionContract"] == {
         "schema": "yiyu.task-viewer-projection.v1",
         "schemaVersion": 1,
-        "requiredTaskFields": ["viewer_surfaces", "viewer_capabilities"],
+        "requiredTaskFields": [
+            "viewer_surfaces",
+            "viewer_capabilities",
+            "owner_department_resolution",
+            "owner_department_id",
+            "owner_department_name",
+            "owner_departments",
+        ],
     }
     task = next(item for item in board["tasks"] if item["id"] == task_id)
     assert task["viewer_surfaces"]["personal_list"] is True
@@ -121,5 +132,8 @@ def test_timer_route_and_idempotent_command_remain_in_the_same_release(
 
     register_gc04_task_routes(app, repository, current_identity)
     assert "/api/v2/domain/tasks/{task_id}/timer/{action}" in {
+        route.path for route in app.routes
+    }
+    assert "/api/v2/domain/tasks/timers/pause-running" in {
         route.path for route in app.routes
     }

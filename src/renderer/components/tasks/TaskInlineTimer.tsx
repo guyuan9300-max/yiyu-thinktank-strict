@@ -93,7 +93,7 @@ export function TaskInlineTimer({
       >
         <span
           className="inline-flex min-w-[88px] items-center gap-1.5 px-2 text-[11px] font-semibold tabular-nums text-slate-600"
-          title={`${stateLabel} · 累计用时 ${elapsedLabel}`}
+          title={`我的用时 · ${stateLabel} · 累计 ${elapsedLabel}`}
         >
           {busyAction ? (
             <Loader2 size={13} className="shrink-0 animate-spin text-[#5B7BFE]" aria-hidden="true" />
@@ -104,7 +104,7 @@ export function TaskInlineTimer({
               aria-hidden="true"
             />
           )}
-          <span>{elapsedLabel}</span>
+          <span>我的 {elapsedLabel}</span>
         </span>
         <span className="h-4 w-px bg-slate-200" aria-hidden="true" />
         <button

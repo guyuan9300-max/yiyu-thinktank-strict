@@ -857,6 +857,7 @@ def test_gc04_detached_cloud_routes_register_without_shared_main(
     paths = {route.path for route in app.routes}
     assert "/api/v2/domain/tasks" in paths
     assert "/api/v2/domain/tasks/{task_id}/timer/{action}" in paths
+    assert "/api/v2/domain/tasks/timers/pause-running" in paths
     assert "/api/v2/domain/tasks/{task_id}/agent-proposals" in paths
     assert "/api/v2/domain/task-bulk/preflight" in paths
     assert "/api/v2/domain/task-bulk/{bulk_operation_id}/commit" in paths
@@ -869,6 +870,9 @@ def test_task_timer_cloud_commands_are_on_the_connected_golden_chain() -> None:
         )
     assert not WorkspaceRuntime._connected_cloud_path_allowed(
         "POST", "/api/v2/domain/tasks/task-1/timer/reset"
+    )
+    assert WorkspaceRuntime._connected_cloud_path_allowed(
+        "POST", "/api/v2/domain/tasks/timers/pause-running"
     )
 
 
@@ -1021,6 +1025,126 @@ def test_task_timer_keeps_rapid_segments_in_order(
             ).fetchall()
         ]
     assert created_at == [fixed_now, "2026-08-24T10:00:00.001Z"]
+
+
+def test_desktop_close_pauses_only_current_members_running_timers(
+    tmp_path: Path,
+) -> None:
+    repository, owner, _ = _repository(tmp_path)
+    peer = _second_member(repository, owner)
+    domain = GC04TaskRepository(repository)
+    created = _create(
+        domain,
+        owner,
+        "timer-close-create",
+        "退出软件时暂停个人用时",
+        ownerMembershipId=owner.membership_id,
+        collaboratorMembershipIds=[peer.membership_id],
+        visibilityScope="participants",
+    )
+    task_id = str(created["task"]["id"])
+    peer_assignment = next(
+        item
+        for item in created["task"]["collaborators"]
+        if item["subject_membership_id"] == peer.membership_id
+    )
+    domain.handle_inbox(
+        peer,
+        task_id=task_id,
+        action="accept",
+        expected_version=int(peer_assignment["version"]),
+        reason=None,
+        idempotency_key="timer-close-peer-accept",
+    )
+    domain.update_task_timer(
+        owner,
+        task_id=task_id,
+        action="start",
+        expected_timer_version=0,
+        idempotency_key="timer-close-owner-start",
+    )
+    domain.update_task_timer(
+        peer,
+        task_id=task_id,
+        action="start",
+        expected_timer_version=0,
+        idempotency_key="timer-close-peer-start",
+    )
+
+    paused = domain.pause_running_task_timers(
+        owner,
+        reason="app_quit",
+        idempotency_key="timer-close-owner-pause",
+    )
+    replay = domain.pause_running_task_timers(
+        owner,
+        reason="app_quit",
+        idempotency_key="timer-close-owner-pause",
+    )
+
+    assert replay == paused
+    assert paused["pausedCount"] == 1
+    assert paused["taskIds"] == [task_id]
+    assert domain.task_detail(owner, task_id=task_id)["task"]["task_timer"]["state"] == "paused"
+    assert domain.task_detail(peer, task_id=task_id)["task"]["task_timer"]["state"] == "running"
+
+
+def test_completing_task_pauses_every_running_personal_timer(
+    tmp_path: Path,
+) -> None:
+    repository, owner, _ = _repository(tmp_path)
+    peer = _second_member(repository, owner)
+    domain = GC04TaskRepository(repository)
+    created = _create(
+        domain,
+        owner,
+        "timer-complete-create",
+        "完成任务时收口个人用时",
+        ownerMembershipId=owner.membership_id,
+        collaboratorMembershipIds=[peer.membership_id],
+        visibilityScope="participants",
+    )
+    task_id = str(created["task"]["id"])
+    peer_assignment = next(
+        item
+        for item in created["task"]["collaborators"]
+        if item["subject_membership_id"] == peer.membership_id
+    )
+    domain.handle_inbox(
+        peer,
+        task_id=task_id,
+        action="accept",
+        expected_version=int(peer_assignment["version"]),
+        reason=None,
+        idempotency_key="timer-complete-peer-accept",
+    )
+    domain.update_task_timer(
+        owner,
+        task_id=task_id,
+        action="start",
+        expected_timer_version=0,
+        idempotency_key="timer-complete-owner-start",
+    )
+    domain.update_task_timer(
+        peer,
+        task_id=task_id,
+        action="start",
+        expected_timer_version=0,
+        idempotency_key="timer-complete-peer-start",
+    )
+    current = domain.task_detail(owner, task_id=task_id)["task"]
+    domain.update_task(
+        owner,
+        task_id=task_id,
+        payload={
+            "expectedVersion": int(current["version"]),
+            "progressStatus": "done",
+        },
+        idempotency_key="timer-complete-task",
+    )
+
+    assert domain.task_detail(owner, task_id=task_id)["task"]["task_timer"]["state"] == "paused"
+    assert domain.task_detail(peer, task_id=task_id)["task"]["task_timer"]["state"] == "paused"
 
 
 class _ProjectionRuntime:

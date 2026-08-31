@@ -35,12 +35,24 @@ def test_local_adapter_accepts_task_projection_contract_v1() -> None:
             "viewerProjectionContract": {
                 "schema": "yiyu.task-viewer-projection.v1",
                 "schemaVersion": 1,
+                "requiredTaskFields": [
+                    "viewer_surfaces",
+                    "viewer_capabilities",
+                    "owner_department_resolution",
+                    "owner_department_id",
+                    "owner_department_name",
+                    "owner_departments",
+                ],
             },
             "tasks": [
                 {
                     "id": "task_v1",
                     "viewer_surfaces": {},
                     "viewer_capabilities": {},
+                    "owner_department_resolution": "unassigned",
+                    "owner_department_id": None,
+                    "owner_department_name": None,
+                    "owner_departments": [],
                 }
             ],
         }

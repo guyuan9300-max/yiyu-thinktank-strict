@@ -593,6 +593,7 @@ class WorkspaceRuntime:
                     "/api/v2/domain/tasks",
                     "/api/v2/domain/tasks/lists",
                     "/api/v2/domain/tasks/tags",
+                    "/api/v2/domain/tasks/timers/pause-running",
                     "/api/v2/domain/task-bulk/preflight",
                     "/api/v2/workbench/analysis-jobs",
                     "/api/v2/workbench/strategic-thoughts/refresh",

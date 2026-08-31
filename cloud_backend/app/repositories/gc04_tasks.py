@@ -25,7 +25,14 @@ ACTIVE_INBOX_STATES = frozenset({"pending", "accepted"})
 TASK_VIEW_PROJECTION_CONTRACT = {
     "schema": "yiyu.task-viewer-projection.v1",
     "schemaVersion": 1,
-    "requiredTaskFields": ["viewer_surfaces", "viewer_capabilities"],
+    "requiredTaskFields": [
+        "viewer_surfaces",
+        "viewer_capabilities",
+        "owner_department_resolution",
+        "owner_department_id",
+        "owner_department_name",
+        "owner_departments",
+    ],
 }
 TASK_FOCUS_RUN_KIND = "task_focus_session"
 TASK_TIMER_STATES = frozenset({"running", "paused", "stopped"})
@@ -2009,6 +2016,23 @@ class GC04TaskRepository:
         )
         if updated.rowcount != 1:
             raise RepositoryError(409, "task_version_conflict", "任务已更新，请刷新后重试")
+        if patch.get("completed_at") and not row["completed_at"]:
+            # Completion is the terminal boundary of the current work session.
+            # Close every participant's running focus segment in the same
+            # transaction so an app/device that has not refreshed cannot keep
+            # accumulating time after the task is complete.
+            connection.execute(
+                "UPDATE execution_runs SET status='paused',finished_at=?,"
+                "version=version+1,updated_at=? WHERE scope_id=? AND task_id=? "
+                "AND run_kind=? AND status='running' AND lifecycle_state='active'",
+                (
+                    now,
+                    now,
+                    identity.scope_id,
+                    row["id"],
+                    TASK_FOCUS_RUN_KIND,
+                ),
+            )
         if collaborator_patch:
             if "owner_membership_id" in collaborator_patch:
                 owner_id = str(collaborator_patch["owner_membership_id"])
@@ -2299,6 +2323,99 @@ class GC04TaskRepository:
                     aggregate_id=task_id,
                     aggregate_version=int(timer["version"] or 1),
                     expected_version=expected_timer_version or None,
+                    result=result,
+                    now=now,
+                )
+                connection.commit()
+                return result
+            except Exception:
+                connection.rollback()
+                raise
+
+    def pause_running_task_timers(
+        self,
+        identity: SessionIdentity,
+        *,
+        reason: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        normalized_reason = str(reason or "app_closed").strip()[:80] or "app_closed"
+        normalized = {
+            "membershipId": identity.membership_id,
+            "reason": normalized_reason,
+        }
+        payload_hash = _payload_hash(normalized)
+        with self.repository._connection() as connection:  # noqa: SLF001
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                replay = self._receipt(
+                    connection,
+                    identity,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                )
+                if replay is not None:
+                    connection.rollback()
+                    return replay
+                now = utc_now()
+                rows = connection.execute(
+                    "SELECT id,task_id FROM execution_runs WHERE scope_id=? "
+                    "AND initiator_membership_id=? AND run_kind=? "
+                    "AND status='running' AND lifecycle_state='active' "
+                    "ORDER BY created_at,id",
+                    (
+                        identity.scope_id,
+                        identity.membership_id,
+                        TASK_FOCUS_RUN_KIND,
+                    ),
+                ).fetchall()
+                run_ids = [str(row["id"]) for row in rows]
+                task_ids = sorted({str(row["task_id"]) for row in rows})
+                if run_ids:
+                    placeholders = ",".join("?" for _ in run_ids)
+                    connection.execute(
+                        f"UPDATE execution_runs SET status='paused',finished_at=?,"
+                        f"version=version+1,updated_at=? WHERE id IN ({placeholders}) "
+                        "AND scope_id=? AND initiator_membership_id=? "
+                        "AND run_kind=? AND status='running' "
+                        "AND lifecycle_state='active'",
+                        (
+                            now,
+                            now,
+                            *run_ids,
+                            identity.scope_id,
+                            identity.membership_id,
+                            TASK_FOCUS_RUN_KIND,
+                        ),
+                    )
+                version_row = connection.execute(
+                    "SELECT COALESCE(SUM(version),0) AS version FROM execution_runs "
+                    "WHERE scope_id=? AND initiator_membership_id=? AND run_kind=? "
+                    "AND lifecycle_state='active'",
+                    (
+                        identity.scope_id,
+                        identity.membership_id,
+                        TASK_FOCUS_RUN_KIND,
+                    ),
+                ).fetchone()
+                aggregate_version = int(version_row["version"] or 0)
+                result = {
+                    "state": "paused",
+                    "pausedCount": len(run_ids),
+                    "taskIds": task_ids,
+                    "reason": normalized_reason,
+                    "observedAt": now,
+                }
+                self._record_command(
+                    connection,
+                    identity,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                    command_type="task.timer_pause_running",
+                    aggregate_type="task_timer_session",
+                    aggregate_id=identity.membership_id,
+                    aggregate_version=aggregate_version,
+                    expected_version=None,
                     result=result,
                     now=now,
                 )
