@@ -69,6 +69,8 @@ contextBridge.exposeInMainWorld('yiyuWorkbench', {
     }
   },
   readTextFile: (targetPath: string) => ipcRenderer.invoke('strict:read-text-file', targetPath),
+  readLocalImageDataUrl: (targetPath: string) =>
+    ipcRenderer.invoke('strict:read-local-image-data-url', targetPath),
   openPath: (targetPath: string) => ipcRenderer.invoke('strict:open-path', targetPath),
   openExternalUrl: (targetUrl: string) => ipcRenderer.invoke('strict:open-external-url', targetUrl),
   renderOfficialWebsite: (targetUrl: string): Promise<RenderedOfficialWebsiteCapture> =>

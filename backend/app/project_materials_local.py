@@ -25,7 +25,6 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from xml.etree import ElementTree
-from xml.sax.saxutils import escape
 
 from strict_common.ids import canonical_json, new_id, utc_now
 
@@ -8630,6 +8629,7 @@ class LocalProjectMaterialsRepository:
         title: str,
         markdown: str,
         output_format: str,
+        image_sources: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         if output_format not in {"md", "docx"}:
             raise LocalRuntimeError(
@@ -8651,56 +8651,84 @@ class LocalProjectMaterialsRepository:
             media_type = "text/markdown"
         else:
             file_name = f"{safe_title}-v{report_version}.docx"
-            document_xml = (
-                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                '<w:document xmlns:w="http://schemas.openxmlformats.org/'
-                'wordprocessingml/2006/main"><w:body>'
-                + "".join(
-                    (
-                        "<w:p><w:r><w:t xml:space=\"preserve\">"
-                        + escape(line)
-                        + "</w:t></w:r></w:p>"
-                    )
-                    for line in markdown.splitlines()
-                )
-                + (
-                    '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
-                    '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" '
-                    'w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>'
-                    "</w:sectPr></w:body></w:document>"
-                )
-            )
-            content_types = (
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-                '<Default Extension="xml" ContentType="application/xml"/>'
-                '<Override PartName="/word/document.xml" '
-                'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
-                "</Types>"
-            )
-            relationships = (
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                '<Relationship Id="rId1" '
-                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
-                'Target="word/document.xml"/>'
-                "</Relationships>"
-            )
-            target = self._managed_path(f"{prefix}.{object_id}.building")
-            target.parent.mkdir(parents=True, exist_ok=True)
             try:
-                with zipfile.ZipFile(
-                    target,
-                    mode="w",
-                    compression=zipfile.ZIP_DEFLATED,
-                ) as package:
-                    package.writestr("[Content_Types].xml", content_types)
-                    package.writestr("_rels/.rels", relationships)
-                    package.writestr("word/document.xml", document_xml)
-                data = target.read_bytes()
-            finally:
-                target.unlink(missing_ok=True)
+                from docx import Document
+                from docx.enum.text import WD_ALIGN_PARAGRAPH
+                from docx.shared import Cm, Pt
+            except ImportError as exc:
+                raise LocalRuntimeError(
+                    503,
+                    "report_docx_dependency_missing",
+                    "Word 报告组件尚未安装，请重新安装当前版本",
+                ) from exc
+            document = Document()
+            section = document.sections[0]
+            section.top_margin = Cm(2.2)
+            section.bottom_margin = Cm(2.2)
+            section.left_margin = Cm(2.4)
+            section.right_margin = Cm(2.4)
+            for style_name, size in (("Normal", 10.5), ("Title", 20), ("Heading 1", 15), ("Heading 2", 12.5)):
+                style = document.styles[style_name]
+                style.font.name = "PingFang SC"
+                style.font.size = Pt(size)
+            sources = dict(image_sources or {})
+            for raw_line in markdown.splitlines():
+                line = raw_line.rstrip()
+                if not line:
+                    document.add_paragraph()
+                    continue
+                heading = re.match(r"^(#{1,3})\s+(.+)$", line)
+                if heading:
+                    level = len(heading.group(1))
+                    text = heading.group(2).strip()
+                    paragraph = (
+                        document.add_heading(text, level=0)
+                        if level == 1
+                        else document.add_heading(text, level=min(2, level - 1))
+                    )
+                    if level == 1:
+                        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    continue
+                image = re.match(
+                    r"^\s*-?\s*!\[([^\]]*)\]\(yiyu-evidence://([^\)]+)\)\s*$",
+                    line,
+                )
+                if image:
+                    image_title, evidence_id = image.groups()
+                    image_path = sources.get(evidence_id)
+                    if image_path and Path(image_path).is_file():
+                        try:
+                            document.add_picture(image_path, width=Cm(15.0))
+                            caption = document.add_paragraph(image_title or "证据图片")
+                            caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                            caption.runs[0].italic = True
+                            caption.runs[0].font.size = Pt(9)
+                            continue
+                        except Exception:
+                            pass
+                    document.add_paragraph(f"图片：《{image_title or '证据材料'}》", style="List Bullet")
+                    continue
+                if line.startswith("> "):
+                    paragraph = document.add_paragraph(line[2:].strip())
+                    paragraph.paragraph_format.left_indent = Cm(0.7)
+                    for run in paragraph.runs:
+                        run.italic = True
+                    continue
+                bullet = re.match(r"^\s*-\s+(.+)$", line)
+                if bullet:
+                    text = bullet.group(1).strip()
+                    paragraph = document.add_paragraph(style="List Bullet")
+                    bold = re.match(r"^\*\*([^*]+)\*\*(.*)$", text)
+                    if bold:
+                        paragraph.add_run(bold.group(1)).bold = True
+                        paragraph.add_run(bold.group(2))
+                    else:
+                        paragraph.add_run(text.replace("**", ""))
+                    continue
+                document.add_paragraph(line.replace("**", ""))
+            stream = BytesIO()
+            document.save(stream)
+            data = stream.getvalue()
             media_type = (
                 "application/vnd.openxmlformats-officedocument."
                 "wordprocessingml.document"

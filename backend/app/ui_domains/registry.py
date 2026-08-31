@@ -607,6 +607,7 @@ def build_default_registry() -> UiDomainRegistry:
         ("PATCH", r"reports/([^/]+)/blueprint"),
         ("POST", r"reports/([^/]+)/draft-sections"),
         ("POST", r"reports/([^/]+)/save"),
+        ("POST", r"reports/([^/]+)/render"),
     }
     gc09_report_router = UiDomainRouter("gc09_versioned_reports", pin_workspace=True)
     for route in workbench_outputs_router.routes:

@@ -307,6 +307,7 @@ def test_event_line_report_run_renders_from_local_draft(
                 "title": "事件线报告",
                 "markdown": "# 正文",
                 "output_format": "docx",
+                "image_sources": {},
             }
             return {
                 "artifact_id": "report-local-1",
@@ -333,6 +334,131 @@ def test_event_line_report_run_renders_from_local_draft(
         re.match(r"reports/([^/]+)/render", "reports/report-local-1/render"),
     )
     assert result["file_name"] == "事件线报告-v2.docx"
+
+
+def test_structured_event_line_report_keeps_tasks_milestones_and_evidence_distinct() -> None:
+    blueprint = {
+        "title": "新版软件测试阶段报告",
+        "subtitle": "2026-08-01 至 2026-08-31",
+        "sections": [
+            {"title": "本阶段完成了什么"},
+            {"title": "仍需验证什么"},
+        ],
+    }
+    formal_mainline = {
+        "nodes": [
+            {
+                "id": "node-1",
+                "title": "飞书链路验收",
+                "time": "2026-08-20",
+                "linkedTaskIds": ["task-1", "task-2"],
+                "linkedActivityIds": [],
+                "linkedAttachmentIds": ["image-1", "file-1"],
+            },
+            {
+                "id": "node-2",
+                "title": "日期交互收口",
+                "time": "2026-08-28",
+                "linkedTaskIds": ["task-3"],
+                "linkedActivityIds": [],
+                "linkedAttachmentIds": [],
+            },
+        ],
+    }
+    source_pack = {
+        "tasks": [
+            {
+                "id": "task-1",
+                "title": "完成飞书打开链路验证",
+                "relation": "formal",
+                "isHumanMilestone": True,
+                "status": "done",
+                "businessDate": "2026-08-20",
+            },
+            {
+                "id": "task-2",
+                "title": "修复容器外部链接",
+                "relation": "formal",
+                "isHumanMilestone": False,
+                "status": "done",
+                "businessDate": "2026-08-21",
+            },
+        ],
+        "referencedTasks": [
+            {
+                "id": "task-3",
+                "title": "验证无日期任务",
+                "relation": "reference",
+                "isHumanMilestone": False,
+                "status": "in_progress",
+                "businessDate": "2026-08-28",
+            }
+        ],
+        "businessActivities": [],
+    }
+    evidence_by_id = {
+        "image-1": {
+            "id": "image-1",
+            "taskId": "task-1",
+            "fileName": "飞书验收截图.png",
+            "isImage": True,
+            "localPath": "/tmp/飞书验收截图.png",
+        },
+        "file-1": {
+            "id": "file-1",
+            "taskId": "",
+            "fileName": "验收说明.docx",
+            "isImage": False,
+            "localPath": "/tmp/验收说明.docx",
+        },
+    }
+    allocations = {
+        "sections": [
+            {"sectionIndex": 0, "mainlineNodeIds": ["node-1"]},
+            {"sectionIndex": 1, "mainlineNodeIds": ["node-2"]},
+        ]
+    }
+    written = {
+        "summary": "本阶段完成了飞书外部链路与关键交互的集中验证，当前工作已从功能接入转向稳定性收口。",
+        "sections": [
+            {
+                "sectionIndex": 0,
+                "overview": "核心链路已经形成可核对结果。",
+                "stageNotes": [{"nodeId": "node-1", "text": "飞书链路已完成从问题定位到验收的闭环。"}],
+            },
+            {
+                "sectionIndex": 1,
+                "overview": "日期交互仍需覆盖边界场景。",
+                "stageNotes": [{"nodeId": "node-2", "text": "后续重点是把无日期与跨日场景验证完整。"}],
+            },
+        ],
+    }
+
+    document = workbench_outputs._build_structured_report_document(
+        blueprint=blueprint,
+        formal_mainline=formal_mainline,
+        allocations=allocations,
+        written=written,
+        source_pack=source_pack,
+        evidence_by_id=evidence_by_id,
+    )
+    markdown = workbench_outputs._render_structured_report_markdown(document)
+    workbench_outputs._validate_structured_report_document(
+        document,
+        body_markdown=markdown,
+        required_node_ids=["node-1", "node-2"],
+        required_task_ids=["task-1", "task-2", "task-3"],
+        required_evidence_ids=["image-1", "file-1"],
+    )
+
+    assert "**里程碑｜完成飞书打开链路验证**" in markdown
+    assert "**任务｜修复容器外部链接**" in markdown
+    assert "**引用任务｜验证无日期任务**" in markdown
+    assert "![飞书验收截图](yiyu-evidence://image-1)" in markdown
+    assert "证据：《验收说明》" in markdown
+    assert markdown.count("完成飞书打开链路验证") == 1
+    assert markdown.count("修复容器外部链接") == 1
+    assert markdown.count("验证无日期任务") == 1
 
 
 def test_answer_export_replay_reuses_local_material_intent(

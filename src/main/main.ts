@@ -1135,6 +1135,29 @@ ipcMain.handle(
 ipcMain.handle('strict:read-text-file', async (_event, targetPath: string) =>
   readFile(targetPath, 'utf8'));
 
+ipcMain.handle('strict:read-local-image-data-url', async (_event, targetPath: string) => {
+  const managedRoot = realpathSync(app.getPath('userData'));
+  const resolved = realpathSync(targetPath);
+  if (resolved !== managedRoot && !resolved.startsWith(`${managedRoot}${path.sep}`)) {
+    throw new Error('只允许预览当前软件受管目录中的图片');
+  }
+  const info = lstatSync(resolved);
+  if (!info.isFile() || info.size > 20 * 1024 * 1024) {
+    throw new Error('图片不存在或超过 20MB，无法在报告中预览');
+  }
+  const mimeType = ({
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.bmp': 'image/bmp',
+  } as Record<string, string>)[path.extname(resolved).toLowerCase()];
+  if (!mimeType) throw new Error('该文件不是支持预览的图片');
+  const bytes = await readFile(resolved);
+  return `data:${mimeType};base64,${bytes.toString('base64')}`;
+});
+
 ipcMain.handle('strict:open-path', async (_event, targetPath: string) => {
   const error = await shell.openPath(targetPath);
   return error.length === 0;

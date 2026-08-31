@@ -4093,11 +4093,20 @@ def document_ai_action(
                 }
             )
     started = perf_counter()
+    report_mode = str(request.body.get("reportMode") or "").strip()
+    report_editing_guard = (
+        "\n当前内容是事件线项目报告。修改时必须保留标题层级、任务/里程碑标签、证据书名号和"
+        "yiyu-evidence 图片引用；不得把任务列表扩写成长篇散文，不得重复已经出现的事实。"
+        "没有新增信息时优先删减和合并，不能用一般项目知识填充篇幅。"
+        if report_mode == "event_line_report"
+        else ""
+    )
     result = compatibility.runtime.private_ai_completion(
         system_prompt=(
             "你是益语智库的本机文档编辑助手。只处理用户明确提供的文字；"
             "只在下方明确提供引用资料时使用它们。保持事实边界，直接返回可替换的正文，"
             "不要解释处理过程。"
+            + report_editing_guard
             + (
                 "\n写作风格要求：\n" + writing_style[:6000]
                 if writing_style

@@ -147,6 +147,8 @@ export type RichTextDocumentEditorProps = {
   triggerOpenAiPromptKey?: number;
   /** 事件线报告已有独立的保存和下载区时，可隐藏会造成共享语义歧义的“文档”页。 */
   showDocumentTab?: boolean;
+  /** 把受管证据 URL 映射为只用于预览的图片地址；正文仍保留稳定 URL。 */
+  imagePreviewHandler?: (src: string) => Promise<string>;
 };
 
 export type RichTextDocumentEditorWorkingDoc = {
@@ -201,6 +203,7 @@ export const RichTextDocumentEditor = React.forwardRef<MDXEditorMethods, RichTex
       onRemoveWorkingDocument,
       triggerOpenAiPromptKey,
       showDocumentTab = true,
+      imagePreviewHandler,
     },
     ref,
   ) {
@@ -235,7 +238,7 @@ export const RichTextDocumentEditor = React.forwardRef<MDXEditorMethods, RichTex
             linkPlugin(),
             linkDialogPlugin(),
             tablePlugin(),
-            imagePlugin(),
+            imagePlugin({ imagePreviewHandler }),
             markdownShortcutPlugin(),
             toolbarPlugin({
               toolbarClassName:

@@ -5528,6 +5528,7 @@ export async function documentAiAction(
     reportArtifactId?: string;
     reportArtifactVersion?: number;
     reportSourceSetId?: string;
+    reportMode?: 'event_line_report';
   },
 ) {
   return request<DocumentAiActionResponse>(

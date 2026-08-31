@@ -8644,6 +8644,32 @@ export interface RenderedReportArtifactFile {
   file_name: string;
 }
 
+export interface ReportGenerationProgress {
+  phase: 'collecting' | 'planning' | 'writing' | 'formatting' | 'completed' | 'failed' | string;
+  label: string;
+  completed: number;
+  total: number;
+  started_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface StructuredReportEvidence {
+  id: string;
+  taskId?: string | null;
+  title: string;
+  isImage: boolean;
+  localPath?: string | null;
+}
+
+export interface StructuredReportDocument {
+  schemaVersion: number;
+  title: string;
+  periodLabel?: string | null;
+  summary: string;
+  sections: Array<Record<string, unknown>>;
+  evidence: StructuredReportEvidence[];
+}
+
 export interface ReportRunSummary {
   id: string;
   client_id: string;
@@ -8673,6 +8699,8 @@ export interface ReportRunSummary {
   active_skill_ids?: string[];
   source_manifest?: Array<Record<string, unknown>>;
   agent_manifest?: Array<Record<string, unknown>>;
+  generation_progress?: ReportGenerationProgress | null;
+  report_document?: StructuredReportDocument | null;
 }
 
 
@@ -9154,6 +9182,7 @@ declare global {
       }>;
       getDroppedFilePath(file: File): string | null;
       readTextFile(targetPath: string): Promise<string>;
+      readLocalImageDataUrl?(targetPath: string): Promise<string>;
       openPath(targetPath: string): Promise<boolean>;
       openExternalUrl(targetUrl: string): Promise<boolean>;
       renderOfficialWebsite(targetUrl: string): Promise<RenderedOfficialWebsiteCapture>;

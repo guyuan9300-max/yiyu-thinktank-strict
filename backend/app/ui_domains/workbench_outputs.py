@@ -4840,12 +4840,22 @@ def render_report_run(
         raise LocalRuntimeError(409, "report_body_not_ready", "请先生成报告正文")
     output_format = _string(request.query.get("format")) or "docx"
     blueprint = draft.get("blueprint") or {}
+    report_document = draft.get("report_document") or {}
+    image_sources = {
+        _string(item.get("id")): _string(item.get("localPath"))
+        for item in report_document.get("evidence") or []
+        if isinstance(item, Mapping)
+        and bool(item.get("isImage"))
+        and _string(item.get("id"))
+        and _string(item.get("localPath"))
+    }
     return store.render_report(
         report_id=_string(draft.get("id")),
         report_version=max(1, int(draft.get("local_save_version") or 1)),
         title=_string(blueprint.get("title")) or "项目报告",
         markdown=markdown,
         output_format=output_format,
+        image_sources=image_sources,
     )
 
 
@@ -7082,6 +7092,437 @@ def draft_report_blueprint(
     ).save_report_draft(project_id, draft)
 
 
+def _report_json_object(raw: Any, *, code: str, message: str) -> Mapping[str, Any]:
+    text = _string(raw)
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S)
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        match = re.search(r"\{[\s\S]*\}", text)
+        try:
+            parsed = json.loads(match.group(0)) if match else None
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LocalRuntimeError(502, code, message) from exc
+    if not isinstance(parsed, Mapping):
+        raise LocalRuntimeError(502, code, message)
+    return parsed
+
+
+def _normalize_report_allocations(
+    raw: Mapping[str, Any],
+    *,
+    section_count: int,
+    required_node_ids: list[str],
+    required_task_ids: list[str],
+    required_evidence_ids: list[str],
+    task_to_node: Mapping[str, str],
+    evidence_to_node: Mapping[str, str],
+) -> dict[str, Any]:
+    sections = [
+        {
+            "sectionIndex": index,
+            "analysisFocus": "",
+            "mainlineNodeIds": [],
+            "taskIds": [],
+            "evidenceIds": [],
+        }
+        for index in range(section_count)
+    ]
+    valid_nodes = set(required_node_ids)
+    used_nodes: set[str] = set()
+    for item in raw.get("sections") or []:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            index = int(item.get("sectionIndex"))
+        except (TypeError, ValueError):
+            continue
+        if index < 0 or index >= section_count:
+            continue
+        sections[index]["analysisFocus"] = _string(item.get("analysisFocus"))[:240]
+        for value in item.get("mainlineNodeIds") or []:
+            node_id = _string(value)
+            if node_id in valid_nodes and node_id not in used_nodes:
+                sections[index]["mainlineNodeIds"].append(node_id)
+                used_nodes.add(node_id)
+    if used_nodes != valid_nodes:
+        raise LocalRuntimeError(
+            502,
+            "report_allocation_nodes_incomplete",
+            "Agent 编排时遗漏或重复了主线阶段，请重试",
+        )
+    node_to_section = {
+        node_id: int(section["sectionIndex"])
+        for section in sections
+        for node_id in section["mainlineNodeIds"]
+    }
+    for task_id in required_task_ids:
+        node_id = _string(task_to_node.get(task_id))
+        if node_id not in node_to_section:
+            raise LocalRuntimeError(
+                502,
+                "report_allocation_task_orphan",
+                "正式主线中的任务没有可用阶段，请重新生成正式主线",
+            )
+        sections[node_to_section[node_id]]["taskIds"].append(task_id)
+    for evidence_id in required_evidence_ids:
+        node_id = _string(evidence_to_node.get(evidence_id))
+        if node_id not in node_to_section:
+            raise LocalRuntimeError(
+                502,
+                "report_allocation_evidence_orphan",
+                "正式主线中的证据没有可用阶段，请重新生成正式主线",
+            )
+        sections[node_to_section[node_id]]["evidenceIds"].append(evidence_id)
+    return {
+        "summaryFocus": _string(raw.get("summaryFocus"))[:300],
+        "sections": sections,
+    }
+
+
+def _normalize_report_written_content(
+    raw: Mapping[str, Any],
+    *,
+    section_count: int,
+    valid_node_ids: set[str],
+) -> dict[str, Any]:
+    sections = [
+        {"sectionIndex": index, "overview": "", "stageNotes": []}
+        for index in range(section_count)
+    ]
+    used_notes: set[str] = set()
+    for item in raw.get("sections") or []:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            index = int(item.get("sectionIndex"))
+        except (TypeError, ValueError):
+            continue
+        if index < 0 or index >= section_count:
+            continue
+        sections[index]["overview"] = _string(item.get("overview"))[:320]
+        for note in item.get("stageNotes") or []:
+            if not isinstance(note, Mapping):
+                continue
+            node_id = _string(note.get("nodeId"))
+            text = _string(note.get("text"))[:180]
+            if node_id not in valid_node_ids or node_id in used_notes or not text:
+                continue
+            sections[index]["stageNotes"].append({"nodeId": node_id, "text": text})
+            used_notes.add(node_id)
+    summary = _string(raw.get("summary"))[:420]
+    if not summary:
+        raise LocalRuntimeError(502, "report_summary_empty", "Agent 没有形成报告摘要，请重试")
+    return {"summary": summary, "sections": sections}
+
+
+def _report_task_status_label(value: Any) -> str:
+    status = _string(value).lower()
+    return {
+        "done": "已完成",
+        "completed": "已完成",
+        "in_progress": "进行中",
+        "doing": "进行中",
+        "pending": "待推进",
+        "todo": "待推进",
+        "cancelled": "已取消",
+        "canceled": "已取消",
+    }.get(status, "")
+
+
+def _report_evidence_title(item: Mapping[str, Any]) -> str:
+    raw = _string(item.get("fileName") or item.get("title")) or "证据材料"
+    raw = re.sub(r"^(?:上传附件|证据材料|事件线材料)[：:]\s*", "", raw)
+    suffix = Path(raw).suffix
+    return Path(raw).stem if suffix else raw
+
+
+def _build_structured_report_document(
+    *,
+    blueprint: Mapping[str, Any],
+    formal_mainline: Mapping[str, Any],
+    allocations: Mapping[str, Any],
+    written: Mapping[str, Any],
+    source_pack: Mapping[str, Any],
+    evidence_by_id: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    task_rows = [
+        dict(item)
+        for bucket in ("tasks", "referencedTasks")
+        for item in source_pack.get(bucket) or []
+        if isinstance(item, Mapping)
+    ]
+    task_by_id = {_string(item.get("id")): item for item in task_rows}
+    activity_by_id = {
+        _string(item.get("id")): dict(item)
+        for item in source_pack.get("businessActivities") or []
+        if isinstance(item, Mapping) and _string(item.get("id"))
+    }
+    node_by_id = {
+        _string(item.get("id")): dict(item)
+        for item in formal_mainline.get("nodes") or []
+        if isinstance(item, Mapping) and _string(item.get("id"))
+    }
+    written_sections = {
+        int(item.get("sectionIndex")): item
+        for item in written.get("sections") or []
+        if isinstance(item, Mapping)
+    }
+    note_by_node = {
+        _string(note.get("nodeId")): _string(note.get("text"))
+        for item in written.get("sections") or []
+        if isinstance(item, Mapping)
+        for note in item.get("stageNotes") or []
+        if isinstance(note, Mapping)
+    }
+    plans = list(blueprint.get("sections") or [])
+    sections: list[dict[str, Any]] = []
+    used_evidence: set[str] = set()
+    for allocation in allocations.get("sections") or []:
+        index = int(allocation.get("sectionIndex") or 0)
+        plan = plans[index]
+        stage_blocks: list[dict[str, Any]] = []
+        for node_id in allocation.get("mainlineNodeIds") or []:
+            node = node_by_id.get(_string(node_id)) or {}
+            task_ids = [
+                _string(value)
+                for value in node.get("linkedTaskIds") or []
+                if _string(value) in task_by_id
+            ]
+            node_evidence_ids = [
+                _string(value)
+                for value in node.get("linkedAttachmentIds") or []
+                if _string(value) in evidence_by_id
+            ]
+            node_evidence_ids.extend(
+                evidence_id
+                for evidence_id, evidence in evidence_by_id.items()
+                if _string(evidence.get("taskId")) in task_ids
+                and evidence_id not in node_evidence_ids
+            )
+            evidence_rows = []
+            for evidence_id in node_evidence_ids:
+                if evidence_id in used_evidence:
+                    continue
+                evidence = evidence_by_id[evidence_id]
+                evidence_rows.append({
+                    "id": evidence_id,
+                    "taskId": _string(evidence.get("taskId")),
+                    "title": _report_evidence_title(evidence),
+                    "isImage": bool(evidence.get("isImage")),
+                    "localPath": _string(evidence.get("localPath")) or None,
+                })
+                used_evidence.add(evidence_id)
+            tasks = []
+            for task_id in task_ids:
+                task = task_by_id[task_id]
+                tasks.append({
+                    "id": task_id,
+                    "title": _string(task.get("title")) or "未命名任务",
+                    "relation": _string(task.get("relation")) or "formal",
+                    "isMilestone": bool(task.get("isHumanMilestone")),
+                    "statusLabel": _report_task_status_label(task.get("status")),
+                    "dateLabel": _string(task.get("businessDate"))[:10],
+                    "evidenceIds": [
+                        item["id"]
+                        for item in evidence_rows
+                        if _string(item.get("taskId")) == task_id
+                    ],
+                })
+            activities = [
+                {
+                    "id": activity_id,
+                    "title": _string(activity_by_id[activity_id].get("title")),
+                    "dateLabel": _string(activity_by_id[activity_id].get("happenedAt"))[:10],
+                }
+                for activity_id in node.get("linkedActivityIds") or []
+                if _string(activity_id) in activity_by_id
+            ]
+            stage_blocks.append({
+                "id": _string(node.get("id")),
+                "title": _string(node.get("title")) or "推进阶段",
+                "time": _string(node.get("time")),
+                "note": note_by_node.get(_string(node.get("id")))
+                or _string(node.get("narrative"))[:180],
+                "tasks": tasks,
+                "activities": activities,
+                "evidence": evidence_rows,
+            })
+        section = {
+            "sectionIndex": index,
+            "title": _string(plan.get("title")) or f"第 {index + 1} 部分",
+            "overview": _string(written_sections.get(index, {}).get("overview")),
+            "stages": stage_blocks,
+        }
+        sections.append(section)
+    return {
+        "schemaVersion": 1,
+        "title": _string(blueprint.get("title")) or "项目报告",
+        "periodLabel": _string(blueprint.get("subtitle")),
+        "summary": _string(written.get("summary")),
+        "sections": sections,
+        "evidence": [
+            evidence
+            for section in sections
+            for stage in section.get("stages") or []
+            for evidence in stage.get("evidence") or []
+        ],
+    }
+
+
+def _render_structured_report_section(section: Mapping[str, Any]) -> str:
+    lines = [f"## {_string(section.get('title'))}"]
+    overview = _string(section.get("overview"))
+    if overview:
+        lines.extend(["", overview])
+    for stage in section.get("stages") or []:
+        if not isinstance(stage, Mapping):
+            continue
+        stage_title = _string(stage.get("title")) or "推进阶段"
+        stage_time = _string(stage.get("time"))
+        lines.extend(["", f"### {stage_title}" + (f" · {stage_time}" if stage_time else "")])
+        note = _string(stage.get("note"))
+        if note:
+            lines.extend(["", note])
+        evidence_rows = {
+            _string(item.get("id")): item
+            for item in stage.get("evidence") or []
+            if isinstance(item, Mapping)
+        }
+        task_evidence: set[str] = set()
+        for task in stage.get("tasks") or []:
+            if not isinstance(task, Mapping):
+                continue
+            label = (
+                "里程碑"
+                if bool(task.get("isMilestone"))
+                else "引用任务"
+                if _string(task.get("relation")) == "reference"
+                else "任务"
+            )
+            meta = " · ".join(
+                value
+                for value in (
+                    _string(task.get("statusLabel")),
+                    _string(task.get("dateLabel")),
+                )
+                if value
+            )
+            line = f"- **{label}｜{_string(task.get('title'))}**"
+            lines.append(line + (f" · {meta}" if meta else ""))
+            for evidence_id in task.get("evidenceIds") or []:
+                evidence = evidence_rows.get(_string(evidence_id))
+                if not evidence:
+                    continue
+                task_evidence.add(_string(evidence_id))
+                title = _string(evidence.get("title")) or "证据材料"
+                if bool(evidence.get("isImage")) and _string(evidence.get("localPath")):
+                    lines.append(f"  - ![{title}](yiyu-evidence://{evidence_id})")
+                else:
+                    lines.append(f"  - 证据：《{title}》")
+        for activity in stage.get("activities") or []:
+            if not isinstance(activity, Mapping):
+                continue
+            meta = _string(activity.get("dateLabel"))
+            lines.append(
+                f"- **推进记录｜{_string(activity.get('title'))}**"
+                + (f" · {meta}" if meta else "")
+            )
+        for evidence_id, evidence in evidence_rows.items():
+            if evidence_id in task_evidence:
+                continue
+            title = _string(evidence.get("title")) or "证据材料"
+            if bool(evidence.get("isImage")) and _string(evidence.get("localPath")):
+                lines.append(f"- ![{title}](yiyu-evidence://{evidence_id})")
+            else:
+                lines.append(f"- 证据：《{title}》")
+    return "\n".join(lines).strip()
+
+
+def _render_structured_report_markdown(document: Mapping[str, Any]) -> str:
+    lines = [f"# {_string(document.get('title'))}"]
+    period_label = _string(document.get("periodLabel"))
+    if period_label:
+        lines.extend(["", f"> 时间范围：{period_label}"])
+    lines.extend(["", "## 摘要", "", _string(document.get("summary"))])
+    for section in document.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        markdown = _render_structured_report_section(section)
+        section["markdown"] = markdown
+        lines.extend(["", markdown])
+    return "\n".join(lines).strip()
+
+
+def _validate_structured_report_document(
+    document: Mapping[str, Any],
+    *,
+    body_markdown: str,
+    required_node_ids: list[str],
+    required_task_ids: list[str],
+    required_evidence_ids: list[str],
+) -> None:
+    sections = [item for item in document.get("sections") or [] if isinstance(item, Mapping)]
+    node_ids = [
+        _string(stage.get("id"))
+        for section in sections
+        for stage in section.get("stages") or []
+        if isinstance(stage, Mapping)
+    ]
+    task_ids = [
+        _string(task.get("id"))
+        for section in sections
+        for stage in section.get("stages") or []
+        if isinstance(stage, Mapping)
+        for task in stage.get("tasks") or []
+        if isinstance(task, Mapping)
+    ]
+    evidence_ids = [
+        _string(evidence.get("id"))
+        for section in sections
+        for stage in section.get("stages") or []
+        if isinstance(stage, Mapping)
+        for evidence in stage.get("evidence") or []
+        if isinstance(evidence, Mapping)
+    ]
+    for label, actual, required in (
+        ("主线阶段", node_ids, required_node_ids),
+        ("任务", task_ids, required_task_ids),
+        ("证据", evidence_ids, required_evidence_ids),
+    ):
+        if len(actual) != len(set(actual)) or set(actual) != set(required):
+            raise LocalRuntimeError(
+                502,
+                "report_structure_source_mismatch",
+                f"报告中的{label}出现遗漏或重复，请重试",
+            )
+    paragraph_keys = [
+        re.sub(r"[\W_]+", "", paragraph).casefold()
+        for paragraph in re.split(r"\n\s*\n", body_markdown)
+        if len(_string(paragraph)) >= 60 and not paragraph.lstrip().startswith(("#", "-", ">"))
+    ]
+    if len(paragraph_keys) != len(set(paragraph_keys)):
+        raise LocalRuntimeError(502, "report_body_repetitive", "报告出现重复段落，请重新生成")
+    max_chars = min(
+        3_600,
+        max(
+            2_200,
+            900
+            + len(required_node_ids) * 140
+            + len(required_task_ids) * 80
+            + len(required_evidence_ids) * 60
+            + len(sections) * 150,
+        ),
+    )
+    if len(body_markdown) > max_chars:
+        raise LocalRuntimeError(
+            502,
+            "report_body_too_verbose",
+            f"Agent 生成的报告仍然过长（{len(body_markdown)} 字），请重新生成",
+        )
+
+
 @router.post(r"reports/([^/]+)/draft-sections")
 def draft_report_sections(
     compatibility: Any,
@@ -7094,7 +7535,6 @@ def draft_report_sections(
     blueprint = draft.get("blueprint") or {}
     project_id = _string(draft.get("client_id"))
     _require_project_read(compatibility, project_id)
-    context = compatibility.runtime.project_knowledge_context(project_id)
     event_line_id = _string(draft.get("event_line_id"))
     formal_mainline = (
         LocalGC06PlanningProjection(compatibility.runtime).load_event_line_narrative(
@@ -7118,231 +7558,301 @@ def draft_report_sections(
             "report_blueprint_mainline_changed",
             "正式主线已经变化，请先重新生成报告骨架",
         )
-    working_document_ids = [
-        _string(value)
-        for value in draft.get("working_document_ids") or []
-        if _string(value)
-    ][:8]
-    source_manifest: list[dict[str, Any]] = []
-    source_manifest.append(
-        {
-            "sourceId": _string(formal_mainline.get("sourceSetId")) or event_line_id,
-            "sourceType": "formal_mainline",
-            "title": _string(formal_mainline.get("headline")) or "正式主线",
-            "version": int(formal_mainline.get("rev") or 1),
-            "contentHash": _string(formal_mainline.get("sourceSetId")) or None,
-        }
-    )
-    local_documents: list[dict[str, Any]] = []
-    for document_id in working_document_ids:
-        local = store.document_text(document_id)
-        if _string(local.get("projectId")) != project_id:
-            raise LocalRuntimeError(
-                409,
-                "report_document_project_mismatch",
-                "报告引用资料不属于当前项目，请刷新后重试",
-            )
-        content = _string(local.get("content"))
-        if not content:
-            continue
-        local_documents.append({**local, "content": content})
-        source_manifest.append(
-            {
-                "sourceId": document_id,
-                "sourceType": "member_local_document",
-                "title": _string(local.get("title")) or document_id,
-                "version": 1,
-                "contentHash": local.get("contentHash"),
-                "materialBoundary": "local_body_not_uploaded",
-            }
-        )
-    agent_skills: list[dict[str, Any]] = []
-    for skill_id in [
-        _string(value)
-        for value in draft.get("active_skill_ids") or []
-        if _string(value)
-    ][:5]:
-        _legacy_style, agent_skill = _selected_style_or_agent_skill(
-            compatibility,
-            skill_id,
-        )
-        if agent_skill is None:
-            raise LocalRuntimeError(
-                409,
-                "report_agent_skill_invalid",
-                "项目报告只能使用已启用的项目工作台 Skill",
-            )
-        agent_skills.append(agent_skill)
-    agent_manifest = [
-        {
-            "sourceId": _string(item.get("skillId")),
-            "sourceType": "agent_skill",
-            "title": _string(item.get("shortName")),
-            "version": int(item.get("version") or 1),
-            "contentHash": item.get("contentHash"),
-        }
-        for item in agent_skills
-    ]
     plans = list(blueprint.get("sections") or [])
-    sections = list(draft.get("sections") or [])
-    statuses = list(draft.get("sections_status") or [])
-    sections.extend([None] * max(0, len(plans) - len(sections)))
-    statuses.extend(["pending"] * max(0, len(plans) - len(statuses)))
-    raw_indices = request.body.get("section_indices")
-    indices = (
-        [int(value) for value in raw_indices]
-        if isinstance(raw_indices, list)
-        else list(range(len(plans)))
-    )
-    if any(index < 0 or index >= len(plans) for index in indices):
-        raise LocalRuntimeError(
-            422,
-            "report_section_index_invalid",
-            "报告章节序号无效",
-        )
+    if len(plans) < 1:
+        raise LocalRuntimeError(409, "report_blueprint_empty", "报告骨架没有可用章节")
     overall_feedback = _string(request.body.get("overall_feedback"))
-    section_feedback = request.body.get("section_feedback") or {}
-    if not isinstance(section_feedback, Mapping):
-        section_feedback = {}
-    for index in indices:
-        plan = plans[index]
-        statuses[index] = "drafting"
+    previous_body = _string(draft.get("body_markdown"))
+    generation_started_at = _now()
+
+    def save_progress(
+        phase: str,
+        label: str,
+        completed: int,
+        *,
+        status: str = "drafting",
+    ) -> dict[str, Any]:
+        return store.save_report_draft(
+            project_id,
+            {
+                **draft,
+                "status": status,
+                "body_markdown": previous_body,
+                "generation_progress": {
+                    "phase": phase,
+                    "label": label,
+                    "completed": completed,
+                    "total": 4,
+                    "started_at": generation_started_at,
+                    "updated_at": _now(),
+                },
+                "error_message": None,
+            },
+        )
+
+    try:
+        save_progress("collecting", "正在整理主线、任务与证据", 0)
+        from .gc06_planning import (
+            _event_line_narrative_source_pack,
+            _event_line_report_attachments,
+            _strict_event_line_detail,
+        )
+
+        detail = _strict_event_line_detail(
+            compatibility,
+            event_line_id,
+            request,
+        )
+        attachments = _event_line_report_attachments(compatibility, detail)
+        source_pack = _event_line_narrative_source_pack(
+            compatibility,
+            detail,
+            attachments,
+        )
+        evidence_by_id = {
+            _string(item.get("id")): {
+                **dict(item),
+                "isImage": (
+                    _string(item.get("mimeType")).lower().startswith("image/")
+                    or Path(_string(item.get("fileName") or item.get("title"))).suffix.lower()
+                    in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+                ),
+            }
+            for item in attachments
+            if _string(item.get("id"))
+        }
+        model_source_pack = {
+            **source_pack,
+            "evidence": [
+                {
+                    **dict(item),
+                    "fileName": _string(evidence_by_id.get(_string(item.get("id")), {}).get("fileName")),
+                    "kind": _string(evidence_by_id.get(_string(item.get("id")), {}).get("kind")),
+                    "isImage": bool(evidence_by_id.get(_string(item.get("id")), {}).get("isImage")),
+                }
+                for item in source_pack.get("evidence") or []
+                if isinstance(item, Mapping)
+            ],
+        }
+        task_rows = [
+            dict(item)
+            for bucket in ("tasks", "referencedTasks")
+            for item in model_source_pack.get(bucket) or []
+            if isinstance(item, Mapping) and _string(item.get("id"))
+        ]
+        task_by_id = {_string(item.get("id")): item for item in task_rows}
+        node_rows = [
+            dict(item)
+            for item in formal_mainline.get("nodes") or []
+            if isinstance(item, Mapping) and _string(item.get("id"))
+        ]
+        node_by_id = {_string(item.get("id")): item for item in node_rows}
+        required_task_ids = list(dict.fromkeys(
+            _string(task_id)
+            for node in node_rows
+            for task_id in node.get("linkedTaskIds") or []
+            if _string(task_id) in task_by_id
+        ))
+        required_node_ids = list(node_by_id)
+        task_to_node = {
+            _string(task_id): _string(node.get("id"))
+            for node in node_rows
+            for task_id in node.get("linkedTaskIds") or []
+            if _string(task_id) in task_by_id
+        }
+        evidence_to_node = {
+            _string(evidence_id): _string(node.get("id"))
+            for node in node_rows
+            for evidence_id in node.get("linkedAttachmentIds") or []
+            if _string(evidence_id) in evidence_by_id
+        }
+        required_evidence_ids = list(dict.fromkeys(
+            _string(evidence_id)
+            for node in node_rows
+            for evidence_id in node.get("linkedAttachmentIds") or []
+            if _string(evidence_id) in evidence_by_id
+        ))
+
+        save_progress("planning", "Agent 正在编排报告内容", 1)
+        allocation_result = compatibility.runtime.private_ai_completion(
+            system_prompt=(
+                "你是益语智库的项目报告编排 Agent。先分配信息，不写正文。报告骨架决定读者问题，"
+                "正式主线决定叙事顺序。每个主线节点、任务和证据必须且只能分配到一个章节；"
+                "背景型、判断型章节可以不分配任务。不得补造ID，不得把附件当推进事件。"
+                "只输出JSON：{\"summaryFocus\":\"摘要重点\",\"sections\":["
+                "{\"sectionIndex\":0,\"analysisFocus\":\"本章只回答什么\","
+                "\"mainlineNodeIds\":[\"...\"],\"taskIds\":[\"...\"],"
+                "\"evidenceIds\":[\"...\"]}]}。不要输出解释。"
+            ),
+            prompt=json.dumps(
+                {
+                    "blueprint": blueprint,
+                    "formalMainline": formal_mainline,
+                    "eventLineFacts": model_source_pack,
+                    "requiredMainlineNodeIds": required_node_ids,
+                    "requiredTaskIds": required_task_ids,
+                    "requiredEvidenceIds": required_evidence_ids,
+                    "reportIntent": draft.get("intent_hint"),
+                    "additionalRequirement": overall_feedback,
+                },
+                ensure_ascii=False,
+            )[:56_000],
+            creativity_mode="strict",
+            capability="event_line_report_allocation",
+            read_timeout_seconds=100.0,
+            max_output_tokens=2_500,
+        )
+        allocation = _report_json_object(
+            allocation_result.get("content"),
+            code="report_allocation_invalid",
+            message="Agent 没有形成可用的报告内容地图，请重试",
+        )
+        normalized_allocations = _normalize_report_allocations(
+            allocation,
+            section_count=len(plans),
+            required_node_ids=required_node_ids,
+            required_task_ids=required_task_ids,
+            required_evidence_ids=required_evidence_ids,
+            task_to_node=task_to_node,
+            evidence_to_node=evidence_to_node,
+        )
+
+        save_progress("writing", "Agent 正在按内容地图撰写整稿", 2)
+        writing_result = compatibility.runtime.private_ai_completion(
+            system_prompt=(
+                "你是益语智库的项目报告撰写 Agent。整份报告一次写完，保持简明、可核对、有判断，"
+                "不要把任务清单扩写成长篇散文。任务、里程碑和证据由系统按真实ID排版，你只写摘要、"
+                "各章概述和每个主线阶段的一两句判断；不要在文字里重复任务标题。全文避免反复解释背景，"
+                "避免连续使用‘首先、其次、再次、总体来看’，不要用官网介绍或一般项目知识填充篇幅。"
+                "摘要150至260个汉字；每章概述40至220字；每个阶段判断30至120字。"
+                "没有足够事实时宁可少写。只输出JSON：{\"summary\":\"...\",\"sections\":["
+                "{\"sectionIndex\":0,\"overview\":\"...\",\"stageNotes\":["
+                "{\"nodeId\":\"...\",\"text\":\"...\"}]}]}。不要输出Markdown或解释。"
+            ),
+            prompt=json.dumps(
+                {
+                    "blueprint": blueprint,
+                    "contentMap": normalized_allocations,
+                    "formalMainline": formal_mainline,
+                    "eventLineFacts": model_source_pack,
+                    "reportIntent": draft.get("intent_hint"),
+                    "additionalRequirement": overall_feedback,
+                },
+                ensure_ascii=False,
+            )[:60_000],
+            creativity_mode="strict",
+            capability="event_line_report_compose",
+            read_timeout_seconds=120.0,
+            max_output_tokens=4_000,
+        )
+        written = _report_json_object(
+            writing_result.get("content"),
+            code="report_body_agent_invalid",
+            message="Agent 没有返回可用的整稿，请重试",
+        )
+        normalized_written = _normalize_report_written_content(
+            written,
+            section_count=len(plans),
+            valid_node_ids=set(required_node_ids),
+        )
+
+        save_progress("formatting", "正在排版任务、里程碑与证据", 3)
+        report_document = _build_structured_report_document(
+            blueprint=blueprint,
+            formal_mainline=formal_mainline,
+            allocations=normalized_allocations,
+            written=normalized_written,
+            source_pack=model_source_pack,
+            evidence_by_id=evidence_by_id,
+        )
+        body_markdown = _render_structured_report_markdown(report_document)
+        _validate_structured_report_document(
+            report_document,
+            body_markdown=body_markdown,
+            required_node_ids=required_node_ids,
+            required_task_ids=required_task_ids,
+            required_evidence_ids=required_evidence_ids,
+        )
+        section_markdown = report_document.get("sections") or []
+        sections = [
+            {
+                "plan": plans[index],
+                "markdown": _string(item.get("markdown")),
+                "citations": [],
+                "charts": [],
+                "data_source_annotation": "正式主线、任务详情与事件线证据",
+                "confidence": 0.8,
+                "warnings": [],
+            }
+            for index, item in enumerate(section_markdown)
+        ]
+        source_manifest = [
+            {
+                "sourceId": _string(formal_mainline.get("sourceSetId")) or event_line_id,
+                "sourceType": "formal_mainline",
+                "title": _string(formal_mainline.get("headline")) or "正式主线",
+                "version": int(formal_mainline.get("rev") or 1),
+            },
+            *[
+                {
+                    "sourceId": task_id,
+                    "sourceType": "event_line_task",
+                    "title": _string(task_by_id.get(task_id, {}).get("title")),
+                    "version": 1,
+                }
+                for task_id in required_task_ids
+            ],
+            *[
+                {
+                    "sourceId": evidence_id,
+                    "sourceType": "event_line_evidence",
+                    "title": _string(evidence_by_id.get(evidence_id, {}).get("title")),
+                    "version": 1,
+                }
+                for evidence_id in required_evidence_ids
+            ],
+        ]
+        return store.save_report_draft(
+            project_id,
+            {
+                **draft,
+                "status": "body_ready",
+                "sections": sections,
+                "sections_status": ["done" for _ in plans],
+                "body_markdown": body_markdown,
+                "report_document": report_document,
+                "generation_progress": {
+                    "phase": "completed",
+                    "label": "报告已完成",
+                    "completed": 4,
+                    "total": 4,
+                    "started_at": generation_started_at,
+                    "updated_at": _now(),
+                },
+                "error_message": None,
+                "source_manifest": source_manifest,
+                "agent_manifest": [],
+            },
+        )
+    except Exception as exc:
         store.save_report_draft(
             project_id,
             {
                 **draft,
-                "status": "drafting",
-                "sections": sections,
-                "sections_status": statuses,
+                "status": "failed",
+                "body_markdown": previous_body,
+                "generation_progress": {
+                    "phase": "failed",
+                    "label": "报告生成失败",
+                    "completed": 0,
+                    "total": 4,
+                    "started_at": generation_started_at,
+                    "updated_at": _now(),
+                },
+                "error_message": str(exc),
             },
         )
-        feedback = _string(
-            section_feedback.get(index)
-            or section_feedback.get(str(index))
-        )
-        try:
-            query = " ".join(
-                value
-                for value in (
-                    _string(blueprint.get("title")),
-                    _string(blueprint.get("inferred_theme")),
-                    _string(plan.get("title")),
-                    _string(plan.get("goal")),
-                    overall_feedback,
-                    feedback,
-                )
-                if value
-            )
-            local_context_parts: list[str] = []
-            remaining = 36_000
-            for local in local_documents:
-                if remaining <= 0:
-                    break
-                excerpt = store.select_relevant_excerpt(
-                    _string(local.get("content")),
-                    query,
-                    max_chars=min(8_000, remaining),
-                )
-                if not excerpt:
-                    continue
-                remaining -= len(excerpt)
-                local_context_parts.append(
-                    f"【本机原件：{_string(local.get('title'))}】\n{excerpt}"
-                )
-            skill_context = "\n\n".join(
-                f"【写作模板：{_string(item.get('shortName'))}】\n"
-                f"{_string(item.get('renderedInstruction'))}"
-                for item in agent_skills
-                if _string(item.get("renderedInstruction"))
-            )
-            result = compatibility.runtime.private_ai_completion(
-                system_prompt=(
-                    "你是益语智库的项目工作台 Agent。正式主线是整份报告唯一的叙事骨架，"
-                    "正文必须沿主线的阶段、转折和当前所处位置展开，不能另起炉灶。只写指定章节；依据下方明确"
-                    "提供的本机原件片段、组织共享知识与客户档案，明确区分事实、"
-                    "判断和建议，不声称读取未提供的源文件。"
-                    + ("\n本次启用写作模板：\n" + skill_context if skill_context else "")
-                ),
-                prompt=(
-                    "整份报告蓝图：\n"
-                    + json.dumps(blueprint, ensure_ascii=False)
-                    + "\n本章计划：\n"
-                    + json.dumps(plan, ensure_ascii=False)
-                    + "\n正式主线：\n"
-                    + json.dumps(formal_mainline, ensure_ascii=False)
-                    + "\n整稿修改意见：\n"
-                    + overall_feedback
-                    + "\n本章修改意见：\n"
-                    + feedback
-                    + "\n项目知识上下文：\n"
-                    + json.dumps(context, ensure_ascii=False)
-                    + (
-                        "\n本机原件相关片段（正文只在本机进入模型，不上传组织云）：\n"
-                        + "\n\n".join(local_context_parts)
-                        if local_context_parts
-                        else "\n本次未选择本机原件，只能使用组织共享知识。"
-                    )
-                    + "\n请只输出本章 Markdown 正文，不重复章节标题。"
-                ),
-                creativity_mode="strict",
-                read_timeout_seconds=100.0,
-            )
-            markdown = _string(result.get("content"))
-            if not markdown:
-                raise LocalRuntimeError(
-                    502,
-                    "report_section_empty",
-                    f"第 {index + 1} 章未生成正文",
-                )
-            sections[index] = {
-                "plan": plan,
-                "markdown": markdown,
-                "citations": [],
-                "charts": [],
-                "data_source_annotation": "严格项目知识上下文",
-                "confidence": 0.6,
-                "warnings": [],
-            }
-            statuses[index] = "done"
-        except Exception:
-            statuses[index] = "failed"
-            store.save_report_draft(
-                project_id,
-                {
-                    **draft,
-                    "status": "failed",
-                    "sections": sections,
-                    "sections_status": statuses,
-                    "error_message": f"第 {index + 1} 章生成失败",
-                },
-            )
-            raise
-    body_markdown = "\n\n".join(
-        (
-            f"## {_string(item.get('plan', {}).get('title'))}\n\n"
-            f"{_string(item.get('markdown'))}"
-        )
-        for item in sections
-        if isinstance(item, Mapping)
-    )
-    status = (
-        "body_ready"
-        if statuses and all(value == "done" for value in statuses)
-        else "drafting"
-    )
-    return store.save_report_draft(
-        project_id,
-        {
-            **draft,
-            "status": status,
-            "sections": sections,
-            "sections_status": statuses,
-            "body_markdown": body_markdown,
-            "error_message": None,
-            "source_manifest": source_manifest + agent_manifest,
-            "agent_manifest": agent_manifest,
-        },
-    )
+        raise
 
 
 @router.post(r"analysis-tools/runs")

@@ -1054,9 +1054,12 @@ def test_event_line_report_attachment_keeps_related_task_projection(
             return [{
                 "id": "source_asset_event_evidence",
                 "title": "里程碑截图",
+                "fileName": "里程碑截图.png",
                 "relatedTaskId": "task_upload",
                 "sourceKind": "event_line_attachment",
-                "path": "/tmp/milestone.png",
+                "managedPath": "/tmp/milestone.png",
+                "mediaType": "image/png",
+                "byteSize": 128,
                 "parseStatus": "ready",
             }]
 
@@ -1075,6 +1078,10 @@ def test_event_line_report_attachment_keeps_related_task_projection(
     )
     assert result[0]["taskId"] == "task_upload"
     assert result[0]["sourceKind"] == "event_line_attachment"
+    assert result[0]["fileName"] == "里程碑截图.png"
+    assert result[0]["mimeType"] == "image/png"
+    assert result[0]["sizeBytes"] == 128
+    assert result[0]["localPath"] == "/tmp/milestone.png"
 
 
 def test_event_line_report_readiness_checks_current_six_dimensions() -> None:
