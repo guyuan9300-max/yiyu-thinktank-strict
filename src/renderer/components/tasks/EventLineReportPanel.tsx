@@ -51,6 +51,7 @@ import {
   uploadEventLineAttachment,
 } from '../../lib/api.js';
 import type { EventLineTimelineNarrative, EventLineNarrativeNode } from '../../../shared/types';
+import { getTaskReportPeriod, splitTaskDateTime } from '../../../shared/taskTime.js';
 import AIReportGeneratorModal from '../reports/AIReportGeneratorModal.js';
 
 const EVENT_LINE_READINESS_DIMENSIONS = ['目标', '背景', '人工里程碑', '推进事实', '关键证据', '时间顺序'];
@@ -261,7 +262,9 @@ function isBootstrapActivity(activity: EditableActivity): boolean {
 
 function formatTs(iso: string) {
   if (!iso) return '';
-  return iso.slice(0, 16).replace('T', ' ');
+  const { date, time } = splitTaskDateTime(iso);
+  if (!date) return '';
+  return time ? `${date} ${time}` : date;
 }
 
 function formatDateLabel(iso?: string | null) {
@@ -2252,6 +2255,13 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
     () => [...(snapshot?.referencedTasks || [])].sort(compareTasksByBusinessDate),
     [snapshot?.referencedTasks],
   );
+  const reportDefaultPeriod = useMemo(
+    () => getTaskReportPeriod([
+      ...(snapshot?.tasks || []),
+      ...(snapshot?.referencedTasks || []),
+    ]),
+    [snapshot?.referencedTasks, snapshot?.tasks],
+  );
   // 这里只展示可重建的证据读模型；正式证据资格仍由云端 source set 裁决。
   const evidenceTaskRows = useMemo<EvidenceTaskRow[]>(() => {
     const tasks = snapshot?.tasks || [];
@@ -3121,7 +3131,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                     <div className="flex items-center gap-3 text-[10px] text-gray-400">
                       <span>rev {timelineNarrative.rev}</span>
                       <span>·</span>
-                      <span>{timelineNarrative.updatedAt.slice(0, 16).replace('T', ' ')}</span>
+                      <span>{formatTs(timelineNarrative.updatedAt)}</span>
                       {timelineNarrative.availabilityStatus === 'blocked'
                         ? <span className="text-rose-300">暂不可用</span>
                         : timelineNarrative.isStale && <span className="text-amber-300">输入已变化</span>}
@@ -3249,6 +3259,8 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                   initialRun={reportDraft}
                   eventLineId={eventLineId}
                   eventLineName={draft.eventLineName}
+                  defaultPeriodStart={reportDefaultPeriod?.start}
+                  defaultPeriodEnd={reportDefaultPeriod?.end}
                   clientName={snapshot.eventLine.primaryClientName || undefined}
                   onDownload={onDownloadReport}
                   onOpenSmartEditor={(artifact) => onOpenSavedReport?.(artifact)}

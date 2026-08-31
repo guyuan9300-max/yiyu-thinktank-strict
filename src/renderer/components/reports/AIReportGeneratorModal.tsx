@@ -52,6 +52,8 @@ interface AIReportGeneratorModalProps {
   onSaved?: (artifact: ReportArtifactSummary, reportRunId: string) => void;
   embedded?: boolean;
   initialRun?: ReportRunSummary | null;
+  defaultPeriodStart?: string;
+  defaultPeriodEnd?: string;
   workingDocuments?: Array<{ documentId: string; title: string }>;
   activeAgentSkills?: Array<{ skillId: string; shortName: string }>;
 }
@@ -89,6 +91,8 @@ export default function AIReportGeneratorModal({
   onSaved,
   embedded = false,
   initialRun = null,
+  defaultPeriodStart,
+  defaultPeriodEnd,
   workingDocuments = [],
   activeAgentSkills = [],
 }: AIReportGeneratorModalProps): JSX.Element {
@@ -96,8 +100,8 @@ export default function AIReportGeneratorModal({
   const [intent, setIntent] = useState<IntentForm>(() => {
     const period = defaultPeriod();
     return {
-      periodStart: period.start,
-      periodEnd: period.end,
+      periodStart: defaultPeriodStart || period.start,
+      periodEnd: defaultPeriodEnd || period.end,
       intentHint: '',
       audienceHint: '客户决策层',
       toneHint: '客观、克制、可执行',

@@ -25,9 +25,10 @@ const DEFAULT_DURATION_MINUTES = 60;
 const MIN_DURATION_MINUTES = 15;
 const LOCAL_DRAFT_PREFIX = 'local-draft:';
 
-type TaskTimeInput = {
+export type TaskTimeInput = {
   id?: string | null;
   status?: Task['status'] | null;
+  ddl?: string | null;
   startDate?: string | null;
   dueDate?: string | null;
   durationMinutes?: number | null;
@@ -246,6 +247,54 @@ export function getTaskScheduleRange(task: TaskTimeInput): TaskScheduleRange | n
 
 export function getTaskExecutionDate(task: TaskTimeInput) {
   return getTaskScheduleRange(task)?.start || getTaskDeadline(task);
+}
+
+export type TaskReportPeriod = {
+  start: string;
+  end: string;
+};
+
+/**
+ * 报告期间只采用任务自身的业务时间，不用创建/更新时间扩大报告范围。
+ * 日期型排期的 range.end 是次日零点（右开区间），因此要还原为用户填写的
+ * 最后一个自然日；带钟点的排期则保留真实结束时刻所在的自然日。
+ */
+export function getTaskReportPeriod(tasks: readonly TaskTimeInput[]): TaskReportPeriod | null {
+  let earliest: Date | null = null;
+  let latest: Date | null = null;
+
+  const include = (start: Date, end: Date) => {
+    const startDay = startOfTaskDay(start);
+    const endDay = startOfTaskDay(end);
+    if (!earliest || startDay < earliest) earliest = startDay;
+    if (!latest || endDay > latest) latest = endDay;
+  };
+
+  for (const task of tasks) {
+    const range = getTaskScheduleRange(task);
+    if (range) {
+      const hasClockTime = Boolean(
+        hasExplicitTaskTime(task.scheduledStartAt)
+        || hasExplicitTaskTime(task.scheduledEndAt)
+        || hasExplicitTaskTime(task.startDate)
+        || hasExplicitTaskTime(task.dueDate),
+      );
+      const inclusiveEnd = hasClockTime
+        ? range.end
+        : new Date(Math.max(range.start.getTime(), range.end.getTime() - 1));
+      include(range.start, inclusiveEnd);
+      continue;
+    }
+
+    const singleDate = getTaskDeadline(task) || parseTaskDateValue(task.ddl);
+    if (singleDate) include(singleDate, singleDate);
+  }
+
+  if (!earliest || !latest) return null;
+  return {
+    start: formatDateInputValue(earliest),
+    end: formatDateInputValue(latest),
+  };
 }
 
 function parseTaskDateTimeOrDate(value?: string | null) {

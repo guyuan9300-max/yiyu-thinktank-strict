@@ -6,6 +6,7 @@ import {
   getTaskCalendarPlacement,
   getTaskDeadline,
   getTaskDisplayTime,
+  getTaskReportPeriod,
   getTaskScheduleRange,
   isTaskInCurrentWeek,
   isTaskOverdue,
@@ -187,4 +188,33 @@ test('card label shows the full range for a cross-day task', () => {
   });
 
   assert.equal(formatTaskCardScheduleLabel(record), '2026/08/14 15:00 – 2026/08/16 10:00');
+});
+
+test('report period spans the earliest and latest business dates across tasks', () => {
+  const period = getTaskReportPeriod([
+    task({ scheduledStartAt: '2026-08-08T09:30', scheduledEndAt: '2026-08-08T11:00' }),
+    task({ id: 'task-2', dueDate: '2026-08-31', deadlineAt: '2026-08-31' }),
+    task({ id: 'task-3', dueDate: null, deadlineAt: null, ddl: '待确认' }),
+  ]);
+
+  assert.deepEqual(period, { start: '2026-08-08', end: '2026-08-31' });
+});
+
+test('report period keeps a date-only multi-day task end inclusive', () => {
+  const period = getTaskReportPeriod([
+    task({ startDate: '2026-08-05', dueDate: '2026-08-07', deadlineAt: null }),
+  ]);
+
+  assert.deepEqual(period, { start: '2026-08-05', end: '2026-08-07' });
+});
+
+test('report period converts timezone-aware task times to Asia Shanghai dates', () => {
+  const period = getTaskReportPeriod([
+    task({
+      scheduledStartAt: '2026-08-31T16:30:00Z',
+      scheduledEndAt: '2026-08-31T17:30:00Z',
+    }),
+  ]);
+
+  assert.deepEqual(period, { start: '2026-09-01', end: '2026-09-01' });
 });
