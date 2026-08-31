@@ -226,6 +226,84 @@ def _event_line_report_attachments(
     return result
 
 
+def _event_line_report_readiness(
+    payload: Mapping[str, Any],
+    attachments: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Describe current report completeness without reviving retired fields."""
+    event_line = payload.get("eventLine") or {}
+    tasks = [
+        item for item in payload.get("tasks") or []
+        if isinstance(item, Mapping)
+    ]
+    activities = [
+        item for item in payload.get("activities") or []
+        if isinstance(item, Mapping)
+    ]
+    milestone_task_ids = {
+        str(item.get("sourceId") or "")
+        for item in activities
+        if str(item.get("sourceType") or "") == "task"
+        and str(item.get("title") or "").startswith("里程碑任务：")
+        and str(item.get("sourceId") or "")
+    }
+    has_progress_fact = any(
+        str(item.get("desc") or item.get("description") or "").strip()
+        or str(item.get("completedAt") or "").strip()
+        or str(item.get("status") or "") in {"done", "completed"}
+        for item in tasks
+    ) or any(
+        str(item.get("summary") or "").strip()
+        and str(item.get("sourceType") or "")
+        not in {"manual_note", "task_reference"}
+        for item in activities
+    )
+    has_key_evidence = bool(attachments) or any(
+        any(isinstance(value, Mapping) for value in item.get("attachments") or [])
+        for item in tasks
+    ) or any(
+        str(item.get("sourceType") or "") in {"meeting_minute", "weekly_review"}
+        and bool(str(item.get("summary") or "").strip())
+        for item in activities
+    )
+    dated_facts = {
+        str(item.get("happenedAt") or "").strip()
+        for item in activities
+        if str(item.get("happenedAt") or "").strip()
+    }
+    dated_facts.update(
+        str(value).strip()
+        for item in tasks
+        for value in (
+            item.get("completedAt"),
+            item.get("scheduledStartAt"),
+            item.get("scheduledEndAt"),
+            item.get("dueDate"),
+            item.get("createdAt"),
+        )
+        if str(value or "").strip()
+    )
+    checks = (
+        ("目标", bool(str(event_line.get("goal") or "").strip())),
+        ("背景", bool(str(event_line.get("background") or "").strip())),
+        ("人工里程碑", bool(milestone_task_ids)),
+        ("推进事实", has_progress_fact),
+        ("关键证据", has_key_evidence),
+        ("时间顺序", len(dated_facts) >= 2),
+    )
+    missing = [label for label, ready in checks if not ready]
+    return {
+        "level": (
+            "substantial"
+            if not missing
+            else "general"
+            if len(missing) <= 2
+            else "incomplete"
+        ),
+        "missingItems": missing,
+    }
+
+
 def _event_line_timeline_nodes(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     referenced_tasks = {
@@ -2254,6 +2332,9 @@ def event_line_report_snapshot(
     })
     attachments = _event_line_report_attachments(compatibility, result)
     event_line = _event_line_ui(compatibility, result.get("eventLine") or {})
+    readiness = _event_line_report_readiness(result, attachments)
+    event_line["readinessLevel"] = readiness["level"]
+    event_line["readinessMissingItems"] = readiness["missingItems"]
     archived = event_line.get("status") == "archived"
     return {
         "eventLine": event_line,

@@ -1023,6 +1023,57 @@ def test_event_line_report_attachment_keeps_related_task_projection(
     assert result[0]["sourceKind"] == "event_line_attachment"
 
 
+def test_event_line_report_readiness_checks_current_six_dimensions() -> None:
+    payload = {
+        "eventLine": {
+            "goal": "用于最小真实闭环验收",
+            "background": "",
+        },
+        "tasks": [{
+            "id": "task_acceptance",
+            "title": "黄金链验收任务",
+            "desc": "验证会议属于项目并形成日历投影",
+            "status": "done",
+            "completedAt": "2026-08-26T02:37:55Z",
+            "dueDate": "2026-08-19T07:00:00Z",
+            "attachments": [],
+        }],
+        "activities": [{
+            "sourceType": "weekly_review",
+            "sourceId": "review_acceptance",
+            "title": "周复盘已提交",
+            "summary": "",
+            "happenedAt": "2026-08-07T09:00:00Z",
+        }, {
+            "sourceType": "decision_action",
+            "sourceId": "action_acceptance",
+            "title": "由验收复盘形成正式任务",
+            "summary": "只产生一条真实业务记录",
+            "happenedAt": "2026-08-08T09:00:00Z",
+        }],
+    }
+
+    readiness = gc06_ui_domain._event_line_report_readiness(payload, [])
+    assert readiness == {
+        "level": "incomplete",
+        "missingItems": ["背景", "人工里程碑", "关键证据"],
+    }
+
+    payload["eventLine"]["background"] = "来自当前项目与任务事实"
+    payload["activities"].append({
+        "sourceType": "task",
+        "sourceId": "task_acceptance",
+        "title": "里程碑任务：黄金链验收任务",
+        "summary": "",
+        "happenedAt": "2026-08-09T09:00:00Z",
+    })
+    complete = gc06_ui_domain._event_line_report_readiness(
+        payload,
+        [{"id": "evidence_acceptance"}],
+    )
+    assert complete == {"level": "substantial", "missingItems": []}
+
+
 def test_retained_event_line_reads_build_only_traceable_fact_views() -> None:
     detail = {
         "eventLine": {

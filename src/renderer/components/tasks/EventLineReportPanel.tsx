@@ -2732,7 +2732,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                 主要缺：{(snapshot.eventLine.readinessMissingItems || []).slice(0, 4).join('、')}{(snapshot.eventLine.readinessMissingItems || []).length > 4 ? '…' : ''}
               </span>
             ) : (
-              <span className="text-gray-400">目标、里程碑和关键证据已具备</span>
+              <span className="text-gray-400">目标、背景、人工里程碑、推进事实、关键证据和时间顺序已具备</span>
             )}
           </div>
           {snapshotRefreshError && (
