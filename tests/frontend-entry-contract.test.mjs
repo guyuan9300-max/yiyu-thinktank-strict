@@ -103,6 +103,7 @@ test('event-line task search supports select-all and batch reference through the
 
 test('event-line report inherits its project without redundant setup copy', () => {
   assert.ok(eventLineReportSource.includes('clientId={snapshot.eventLine.primaryClientId || undefined}'));
+  assert.ok(reportGeneratorSource.includes('<Field label="时间范围">'));
   assert.equal(reportGeneratorSource.includes('本次使用：'), false);
   assert.equal(reportGeneratorSource.includes('报告模板：'), false);
 });

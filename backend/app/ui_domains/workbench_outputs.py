@@ -6824,7 +6824,7 @@ def draft_report_blueprint(
             "不是报告标题。标题必须是自然、正式、简明的报告名称，不得照抄问题，不得写成"
             "问句或操作指令。根据报告意图、目标读者和基调，生成2至6个有真实逻辑顺序的"
             "章节；每章说明该章要基于主线回答什么，不预写正文。只输出JSON："
-            '{"title":"报告标题","subtitle":"可为空","inferredTheme":"核心主题",'
+            '{"title":"报告标题","inferredTheme":"核心主题",'
             '"sections":[{"title":"章节标题","goal":"本章要回答的问题"}],'
             '"openQuestions":[]}。不要输出代码围栏或解释。'
         ),
@@ -6928,9 +6928,14 @@ def draft_report_blueprint(
             "模型没有形成完整的报告骨架，请重试",
         )
     now = _now()
+    period_label = (
+        f"{period_start} 至 {period_end}"
+        if period_start and period_end
+        else period_start or period_end or ""
+    )
     blueprint = {
         "title": title,
-        "subtitle": _string(parsed_blueprint.get("subtitle"))[:120] or None,
+        "subtitle": period_label or None,
         "report_kind": "strategy_report",
         "audience": audience_hint,
         "tone": tone_hint,

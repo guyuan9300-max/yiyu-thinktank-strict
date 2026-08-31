@@ -111,7 +111,6 @@ def test_report_blueprint_inherits_authoritative_event_line_project(
                 "content": json.dumps(
                     {
                         "title": "新版软件链路验收报告",
-                        "subtitle": "从交互修复到正式验收",
                         "inferredTheme": "新版软件验收",
                         "sections": [
                             {"title": "链路修复脉络", "goal": "沿正式主线说明关键修复"},
@@ -179,6 +178,7 @@ def test_report_blueprint_inherits_authoritative_event_line_project(
     assert result["event_line_id"] == "line-report-1"
     assert result["blueprint"]["client_id"] == "project-report-1"
     assert result["blueprint"]["title"] == "新版软件链路验收报告"
+    assert result["blueprint"]["subtitle"] == "2026-08-01 至 2026-08-31"
     assert result["source_set_id"] == "source-set-1"
     assert "新版链路逐步验收" in Runtime.blueprint_prompt
     assert "项目知识只补充解释" in Runtime.blueprint_prompt

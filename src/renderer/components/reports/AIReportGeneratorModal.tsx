@@ -505,7 +505,7 @@ function BlueprintEditor({ blueprint, onChange, overallFeedback, onOverallFeedba
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-3">
         <Field label="报告标题"><input value={blueprint.title} onChange={(e) => onChange({ ...blueprint, title: e.target.value })} className="w-full rounded-md border border-gray-200 px-3 py-2 text-xs" /></Field>
-        <Field label="副标题"><input value={blueprint.subtitle || ''} onChange={(e) => onChange({ ...blueprint, subtitle: e.target.value || null })} className="w-full rounded-md border border-gray-200 px-3 py-2 text-xs" /></Field>
+        <Field label="时间范围"><input value={blueprint.subtitle || ''} onChange={(e) => onChange({ ...blueprint, subtitle: e.target.value || null })} className="w-full rounded-md border border-gray-200 px-3 py-2 text-xs" /></Field>
         <Field label="目标读者"><input value={blueprint.audience} onChange={(e) => onChange({ ...blueprint, audience: e.target.value })} className="w-full rounded-md border border-gray-200 px-3 py-2 text-xs" /></Field>
         <Field label="语气"><input value={blueprint.tone} onChange={(e) => onChange({ ...blueprint, tone: e.target.value })} className="w-full rounded-md border border-gray-200 px-3 py-2 text-xs" /></Field>
       </div>
