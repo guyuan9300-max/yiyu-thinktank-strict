@@ -2670,10 +2670,26 @@ def event_line_private_report_drafts(
 
 @router.get(r"event-lines/(?P<event_line_id>[^/]+)/report-draft")
 def event_line_report_draft(
-    _: Any,
-    __: UiRequest,
-    ___: Any,
-) -> None:
+    compatibility: Any,
+    request: UiRequest,
+    match: Any,
+) -> dict[str, Any] | None:
+    event_line_id = unquote(match.group("event_line_id"))
+    detail = _strict_event_line_detail(compatibility, event_line_id, request)
+    client_id = str((detail.get("eventLine") or {}).get("clientId") or "").strip()
+    if not client_id:
+        raise LocalRuntimeError(409, "event_line_client_missing", "事件线缺少项目归属")
+    drafts = LocalProjectMaterialsRepository(
+        compatibility.runtime
+    ).report_drafts(client_id, event_line_id=event_line_id)
+    for draft in drafts:
+        template = draft.get("template_manifest") or {}
+        if (
+            isinstance(template, Mapping)
+            and template.get("templateId") == "event_line_mainline_report_v2"
+            and str(draft.get("source_set_id") or "").strip()
+        ):
+            return draft
     return None
 
 

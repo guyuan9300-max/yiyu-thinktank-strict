@@ -20,6 +20,7 @@ from backend.app.ui_domains.gc06_planning import (
     _merge_review_task_entries,
     _normalize_weekly_event_cards,
     _weekly_review_evidence_packs,
+    event_line_report_draft,
     router as gc06_ui_router,
 )
 from backend.app.ui_domains.workflow import router as workflow_ui_router
@@ -67,6 +68,57 @@ from strict_common.ids import sha256_text, utc_now
 from strict_common.schema import initialize_database, runtime_connection
 from tests.test_gc04_gc05_tasks import _ProjectionRuntime
 from tests.test_gc14_workbench_answer import _repository
+
+
+def test_event_line_report_draft_returns_latest_private_blueprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        gc06_ui_domain,
+        "_strict_event_line_detail",
+        lambda *_args, **_kwargs: {
+            "eventLine": {"id": "line-report-draft", "clientId": "project-report-draft"}
+        },
+    )
+
+    class Store:
+        @staticmethod
+        def report_drafts(project_id: str, *, event_line_id: str) -> list[dict[str, Any]]:
+            assert project_id == "project-report-draft"
+            assert event_line_id == "line-report-draft"
+            return [
+                {
+                    "id": "report-draft-latest",
+                    "client_id": project_id,
+                    "event_line_id": event_line_id,
+                    "status": "blueprint_confirmed",
+                    "source_set_id": "source-set-report-draft",
+                    "template_manifest": {
+                        "templateId": "event_line_mainline_report_v2",
+                        "templateVersion": 2,
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(
+        gc06_ui_domain,
+        "LocalProjectMaterialsRepository",
+        lambda _runtime: Store(),
+    )
+    result = event_line_report_draft(
+        SimpleNamespace(runtime=object()),
+        UiRequest(
+            method="GET",
+            path="event-lines/line-report-draft/report-draft",
+            query={},
+            body={},
+            idempotency_key=None,
+        ),
+        SimpleNamespace(group=lambda _index: "line-report-draft"),
+    )
+
+    assert result is not None
+    assert result["id"] == "report-draft-latest"
 
 
 def _schema_fingerprint(connection) -> str:

@@ -2204,12 +2204,17 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
   }, [eventLineId]);
 
   useEffect(() => {
-    if (viewMode !== 'blueprint' || reportDraftState !== 'idle') return;
+    if (!['blueprint', 'report'].includes(viewMode) || reportDraftState !== 'idle') return;
     void loadReportDraft();
     // reportDraftState deliberately is not a dependency: changing to loading
     // must not cancel the in-flight request that will settle this state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [eventLineId, loadReportDraft, viewMode]);
+
+  const handleReportRunChange = useCallback((run: ReportRunSummary) => {
+    setReportDraft(run);
+    setReportDraftState('ready');
+  }, []);
 
   const handleDownloadSavedReport = useCallback(async (
     artifact: ReportArtifactSummary,
@@ -3256,12 +3261,15 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                 <AIReportGeneratorModal
                   key={`${eventLineId}:${reportDraft?.id || 'new'}`}
                   embedded
+                  blueprintOnly
                   initialRun={reportDraft}
                   eventLineId={eventLineId}
                   eventLineName={draft.eventLineName}
+                  clientId={snapshot.eventLine.primaryClientId || undefined}
                   defaultPeriodStart={reportDefaultPeriod?.start}
                   defaultPeriodEnd={reportDefaultPeriod?.end}
                   clientName={snapshot.eventLine.primaryClientName || undefined}
+                  onRunChange={handleReportRunChange}
                   onDownload={onDownloadReport}
                   onOpenSmartEditor={(artifact) => onOpenSavedReport?.(artifact)}
                   onSaved={(artifact) => {
@@ -3276,6 +3284,32 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
 
           {viewMode === 'report' ? (
             <div className="space-y-5 pb-6">
+              {reportDraftState === 'loading' && (
+                <div className="flex items-center justify-center gap-2 py-8 text-[12px] text-gray-400">
+                  <RefreshCw size={13} className="animate-spin" /> 正在恢复报告骨架与生成进度…
+                </div>
+              )}
+
+              {reportDraftState === 'ready' && reportDraft && reportDraft.status !== 'saved' && (
+                <AIReportGeneratorModal
+                  key={`${eventLineId}:${reportDraft.id}:report`}
+                  embedded
+                  initialRun={reportDraft}
+                  eventLineId={eventLineId}
+                  eventLineName={draft?.eventLineName}
+                  clientId={snapshot?.eventLine.primaryClientId || undefined}
+                  clientName={snapshot?.eventLine.primaryClientName || undefined}
+                  onRunChange={handleReportRunChange}
+                  onDownload={onDownloadReport}
+                  onOpenSmartEditor={(artifact) => onOpenSavedReport?.(artifact)}
+                  onSaved={(artifact) => {
+                    setReportArtifacts((current) => [artifact, ...current.filter((item) => item.id !== artifact.id)]);
+                    setReportListState('ready');
+                    setReportDraft(null);
+                  }}
+                />
+              )}
+
               {reportListError && (
                 <div className="flex items-start justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
                   <p className="text-[11.5px] leading-5 text-rose-700">{reportListError}</p>
@@ -3289,7 +3323,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                 </div>
               )}
 
-              {reportListState === 'ready' && reportArtifacts.length === 0 && (
+              {reportListState === 'ready' && reportArtifacts.length === 0 && !reportDraft && (
                 <div className="rounded-xl border border-dashed border-gray-200 py-10 text-center">
                   <FileText size={22} className="mx-auto text-gray-300" />
                   <p className="mt-3 text-[13px] font-medium text-gray-600">还没有已保存的项目报告</p>

@@ -35,6 +35,10 @@ const eventLineReportSource = fs.readFileSync(
   path.join(root, 'src', 'renderer', 'components', 'tasks', 'EventLineReportPanel.tsx'),
   'utf8',
 );
+const reportGeneratorSource = fs.readFileSync(
+  path.join(root, 'src', 'renderer', 'components', 'reports', 'AIReportGeneratorModal.tsx'),
+  'utf8',
+);
 const uiCompatSource = fs.readFileSync(
   path.join(root, 'backend', 'app', 'ui_compat.py'),
   'utf8',
@@ -95,6 +99,12 @@ test('event-line task search supports select-all and batch reference through the
     eventLineReportSource,
     /for \(const candidate of selected\)[\s\S]{0,1200}await linkTaskToEventLine\(/,
   );
+});
+
+test('event-line report inherits its project without redundant setup copy', () => {
+  assert.ok(eventLineReportSource.includes('clientId={snapshot.eventLine.primaryClientId || undefined}'));
+  assert.equal(reportGeneratorSource.includes('本次使用：'), false);
+  assert.equal(reportGeneratorSource.includes('报告模板：'), false);
 });
 
 test('renderer only calls v2 and never calls legacy endpoints', () => {

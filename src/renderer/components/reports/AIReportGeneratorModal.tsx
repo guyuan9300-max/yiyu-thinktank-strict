@@ -50,7 +50,9 @@ interface AIReportGeneratorModalProps {
   onDownload?: (localPath: string, fileName: string) => Promise<void>;
   onOpenSmartEditor?: (artifact: ReportArtifactSummary, reportRunId: string) => void;
   onSaved?: (artifact: ReportArtifactSummary, reportRunId: string) => void;
+  onRunChange?: (run: ReportRunSummary) => void;
   embedded?: boolean;
+  blueprintOnly?: boolean;
   initialRun?: ReportRunSummary | null;
   defaultPeriodStart?: string;
   defaultPeriodEnd?: string;
@@ -89,7 +91,9 @@ export default function AIReportGeneratorModal({
   onDownload,
   onOpenSmartEditor,
   onSaved,
+  onRunChange,
   embedded = false,
+  blueprintOnly = false,
   initialRun = null,
   defaultPeriodStart,
   defaultPeriodEnd,
@@ -116,7 +120,14 @@ export default function AIReportGeneratorModal({
   const [pollEnabled, setPollEnabled] = useState(false);
   const [versions, setVersions] = useState<ReportArtifactVersionSummary[]>([]);
   const [versionsOpen, setVersionsOpen] = useState(false);
+  const [blueprintSaving, setBlueprintSaving] = useState(false);
+  const [blueprintDirty, setBlueprintDirty] = useState(false);
   const pollRef = useRef<number | null>(null);
+  const onRunChangeRef = useRef(onRunChange);
+
+  useEffect(() => {
+    onRunChangeRef.current = onRunChange;
+  }, [onRunChange]);
 
   const handleStart = useCallback(async () => {
     setBusy(true);
@@ -135,6 +146,8 @@ export default function AIReportGeneratorModal({
       });
       setRun(result);
       setBlueprintDraft(result.blueprint);
+      setBlueprintDirty(false);
+      onRunChangeRef.current?.(result);
       setPhase(result.status === 'failed' ? 'failed' : 'reviewing-blueprint');
       if (result.status === 'failed') setErrorMsg(result.error_message || '报告骨架生成失败');
     } catch (error) {
@@ -156,6 +169,7 @@ export default function AIReportGeneratorModal({
         section_feedback: sectionFeedback,
       });
       setRun(drafting);
+      onRunChangeRef.current?.(drafting);
       setPhase('drafting-sections');
       setPollEnabled(true);
     } catch (error) {
@@ -177,6 +191,7 @@ export default function AIReportGeneratorModal({
         section_feedback: sectionFeedback,
       });
       setRun(result);
+      onRunChangeRef.current?.(result);
       setPhase('drafting-sections');
       setPollEnabled(true);
     } catch (error) {
@@ -196,6 +211,7 @@ export default function AIReportGeneratorModal({
         change_summary: '人工确认并首次保存',
       });
       setRun(saved);
+      onRunChangeRef.current?.(saved);
       setPhase('saved');
       if (saved.artifact) onSaved?.(saved.artifact, saved.id);
     } catch (error) {
@@ -260,6 +276,7 @@ export default function AIReportGeneratorModal({
       try {
         const updated = await getReportRun(runId);
         setRun(updated);
+        onRunChangeRef.current?.(updated);
         const running = updated.sections_status.some((status) => status === 'drafting' || status === 'pending');
         if (!running) {
           setPollEnabled(false);
@@ -281,11 +298,34 @@ export default function AIReportGeneratorModal({
   }, [pollEnabled, run?.id]);
 
   useEffect(() => {
+    if (!blueprintOnly || !blueprintDirty || phase !== 'reviewing-blueprint' || !run || !blueprintDraft) return undefined;
+    const timer = window.setTimeout(async () => {
+      setBlueprintSaving(true);
+      setErrorMsg(null);
+      try {
+        const updated = await updateReportBlueprint(run.id, blueprintDraft);
+        setRun(updated);
+        setBlueprintDirty(false);
+        onRunChangeRef.current?.(updated);
+      } catch (error) {
+        setErrorMsg(getErrorMessage(error));
+      } finally {
+        setBlueprintSaving(false);
+      }
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [blueprintDraft, blueprintDirty, blueprintOnly, phase, run?.id]);
+
+  useEffect(() => {
     if (!initialRun) return;
     setRun(initialRun);
     setBlueprintDraft(initialRun.blueprint);
+    setBlueprintDirty(false);
     setErrorMsg(initialRun.error_message || null);
-    if (initialRun.artifact) {
+    if (blueprintOnly && initialRun.blueprint) {
+      setPhase('reviewing-blueprint');
+      setPollEnabled(false);
+    } else if (initialRun.artifact) {
       setPhase('saved');
       setPollEnabled(false);
     } else if (initialRun.status === 'drafting') {
@@ -301,7 +341,7 @@ export default function AIReportGeneratorModal({
       setPhase('reviewing-blueprint');
       setPollEnabled(false);
     }
-  }, [eventLineId, initialRun?.id, initialRun?.updated_at]);
+  }, [blueprintOnly, eventLineId, initialRun?.id, initialRun?.updated_at]);
 
   const allSectionsDone = useMemo(
     () => !!run?.sections_status.length && run.sections_status.every((status) => status === 'done'),
@@ -314,7 +354,7 @@ export default function AIReportGeneratorModal({
           <div className="flex items-start gap-3">
             <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-600 text-white"><Sparkles size={18} /></div>
             <div>
-              <h2 className="text-[15px] font-bold text-gray-900">{embedded ? '报告骨架与正文' : '生成项目报告'}</h2>
+              <h2 className="text-[15px] font-bold text-gray-900">{blueprintOnly ? '报告骨架' : '生成项目报告'}</h2>
               <p className="mt-0.5 text-[12px] text-gray-500">
                 {eventLineName || clientName || '当前项目'}{eventLineName && clientName ? ` · ${clientName}` : ''} · {phaseLabel(phase)}
               </p>
@@ -327,21 +367,21 @@ export default function AIReportGeneratorModal({
           {errorMsg && <ErrorBanner message={errorMsg} onDismiss={() => setErrorMsg(null)} />}
           {phase === 'intent' && (
             <>
-              <div className="rounded-lg border border-indigo-100 bg-indigo-50/50 px-3 py-2.5 text-[11px] leading-5 text-slate-600">
-                <div>本次使用：项目共享知识{workingDocuments.length > 0 ? ` ＋ ${workingDocuments.length} 份已选本机资料` : ''}</div>
-                <div>报告模板：项目分析报告 v1{activeAgentSkills.length > 0 ? ` · Skill：${activeAgentSkills.map((item) => item.shortName).join(' ＋ ')}` : ' · 未选择 Skill'}</div>
-              </div>
               <IntentBlock intent={intent} onChange={setIntent} onSubmit={handleStart} busy={busy} />
             </>
           )}
           {phase === 'reviewing-blueprint' && blueprintDraft && (
-            <BlueprintEditor
-              blueprint={blueprintDraft}
-              onChange={setBlueprintDraft}
-              overallFeedback={overallFeedback}
-              onOverallFeedbackChange={setOverallFeedback}
-              onGenerate={() => void handleGenerateBody()}
-              busy={busy}
+              <BlueprintEditor
+                blueprint={blueprintDraft}
+                onChange={(value) => {
+                  setBlueprintDraft(value);
+                  setBlueprintDirty(true);
+                }}
+                overallFeedback={overallFeedback}
+                onOverallFeedbackChange={setOverallFeedback}
+                onGenerate={blueprintOnly ? undefined : () => void handleGenerateBody()}
+                blueprintSaving={blueprintSaving}
+                busy={busy}
             />
           )}
           {phase === 'drafting-sections' && run?.blueprint && <DraftingBlock run={run} />}
@@ -426,7 +466,7 @@ function IntentBlock({ intent, onChange, onSubmit, busy }: {
   const inputClass = 'w-full rounded-md border border-gray-200 px-3 py-2 text-[12px] outline-none focus:border-blue-500';
   return (
     <div className="space-y-4">
-      <p className="text-[12.5px] leading-6 text-gray-600">先基于已确认的主线和证据生成报告骨架，确认骨架后才会撰写正文。</p>
+      <p className="text-[12.5px] leading-6 text-gray-600">Agent 会沿已确认的正式主线，结合报告意图、读者和基调直接生成可编辑骨架；项目知识只补充背景与证据。</p>
       <div className="grid grid-cols-2 gap-3">
         <Field label="报告期间起"><input type="date" value={intent.periodStart} onChange={(e) => onChange({ ...intent, periodStart: e.target.value })} className={inputClass} /></Field>
         <Field label="报告期间止"><input type="date" value={intent.periodEnd} onChange={(e) => onChange({ ...intent, periodEnd: e.target.value })} className={inputClass} /></Field>
@@ -436,17 +476,18 @@ function IntentBlock({ intent, onChange, onSubmit, busy }: {
         <Field label="目标读者"><input value={intent.audienceHint} onChange={(e) => onChange({ ...intent, audienceHint: e.target.value })} className={inputClass} /></Field>
         <Field label="期望基调"><input value={intent.toneHint} onChange={(e) => onChange({ ...intent, toneHint: e.target.value })} className={inputClass} /></Field>
       </div>
-      <div className="flex justify-end border-t border-gray-100 pt-4"><button type="button" onClick={onSubmit} disabled={busy || !intent.periodStart || !intent.periodEnd} className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-4 py-2 text-xs font-medium text-white disabled:bg-gray-300">{busy && <Loader2 size={14} className="animate-spin" />}生成报告骨架</button></div>
+      <div className="flex justify-end border-t border-gray-100 pt-4"><button type="button" onClick={onSubmit} disabled={busy || !intent.periodStart || !intent.periodEnd} className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-4 py-2 text-xs font-medium text-white disabled:bg-gray-300">{busy && <Loader2 size={14} className="animate-spin" />}{busy ? 'Agent 正在梳理骨架' : '生成报告骨架'}</button></div>
     </div>
   );
 }
 
-function BlueprintEditor({ blueprint, onChange, overallFeedback, onOverallFeedbackChange, onGenerate, busy }: {
+function BlueprintEditor({ blueprint, onChange, overallFeedback, onOverallFeedbackChange, onGenerate, blueprintSaving, busy }: {
   blueprint: ReportBlueprint;
   onChange: (value: ReportBlueprint) => void;
   overallFeedback: string;
   onOverallFeedbackChange: (value: string) => void;
-  onGenerate: () => void;
+  onGenerate?: () => void;
+  blueprintSaving?: boolean;
   busy: boolean;
 }) {
   const updateSection = (index: number, patch: Partial<ReportBlueprint['sections'][number]>) => {
@@ -485,8 +526,16 @@ function BlueprintEditor({ blueprint, onChange, overallFeedback, onOverallFeedba
           ))}
         </div>
       </div>
-      <Field label="整份报告的补充要求"><textarea rows={3} value={overallFeedback} onChange={(e) => onOverallFeedbackChange(e.target.value)} className="w-full resize-none rounded-md border border-gray-200 px-3 py-2 text-xs" placeholder="例如：重点说明对组织方法的影响，不夸大尚未验证的成果" /></Field>
-      <div className="flex justify-end border-t border-gray-100 pt-4"><button type="button" onClick={onGenerate} disabled={busy || !blueprint.title.trim() || blueprint.sections.some((section) => !section.title.trim())} className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-4 py-2 text-xs font-medium text-white disabled:bg-gray-300">{busy && <Loader2 size={14} className="animate-spin" />}确认骨架，生成报告</button></div>
+      {onGenerate ? (
+        <>
+          <Field label="整份报告的补充要求"><textarea rows={3} value={overallFeedback} onChange={(e) => onOverallFeedbackChange(e.target.value)} className="w-full resize-none rounded-md border border-gray-200 px-3 py-2 text-xs" placeholder="例如：重点说明对组织方法的影响，不夸大尚未验证的成果" /></Field>
+          <div className="flex justify-end border-t border-gray-100 pt-4"><button type="button" onClick={onGenerate} disabled={busy || !blueprint.title.trim() || blueprint.sections.some((section) => !section.title.trim())} className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-4 py-2 text-xs font-medium text-white disabled:bg-gray-300">{busy && <Loader2 size={14} className="animate-spin" />}按当前骨架生成项目报告</button></div>
+        </>
+      ) : (
+        <p className="border-t border-gray-100 pt-3 text-right text-[10.5px] text-gray-400">
+          {blueprintSaving ? '正在保存修改…' : '骨架已保存；完整正文请在“项目报告”中生成'}
+        </p>
+      )}
     </div>
   );
 }

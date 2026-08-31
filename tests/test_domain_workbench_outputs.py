@@ -77,6 +77,143 @@ def test_answer_export_title_uses_fast_ai_and_has_question_fallback() -> None:
     ) == "提炼这份文件的核心内容"
 
 
+def test_report_blueprint_inherits_authoritative_event_line_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Runtime:
+        blueprint_prompt = ""
+
+        @staticmethod
+        def cloud_query(path: str, *, query=None):
+            assert query is None
+            if path == "/api/v2/gc06/event-lines/line-report-1":
+                return {
+                    "eventLine": {
+                        "id": "line-report-1",
+                        "clientId": "project-report-1",
+                        "name": "新版软件测试",
+                        "goal": "完成新版链路验收",
+                        "background": "基于正式主线形成报告",
+                        "version": 3,
+                    }
+                }
+            assert path == "/api/v2/domain/project-materials/projects/project-report-1"
+            return {"project": {"id": "project-report-1", "name": "测试项目"}}
+
+        @staticmethod
+        def project_knowledge_context(_project_id: str) -> dict:
+            return {"summaryExcerpts": ["项目知识只补充解释"]}
+
+        @classmethod
+        def private_ai_completion(cls, **kwargs: object) -> dict[str, str]:
+            cls.blueprint_prompt = str(kwargs.get("prompt") or "")
+            return {
+                "content": json.dumps(
+                    {
+                        "title": "新版软件链路验收报告",
+                        "subtitle": "从交互修复到正式验收",
+                        "inferredTheme": "新版软件验收",
+                        "sections": [
+                            {"title": "链路修复脉络", "goal": "沿正式主线说明关键修复"},
+                            {"title": "当前验收位置", "goal": "说明已完成事项与当前状态"},
+                        ],
+                        "openQuestions": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                "modelName": "test-model",
+            }
+
+    class Projection:
+        @staticmethod
+        def load_event_line_narrative(_event_line_id: str) -> dict:
+            return {
+                "outputKind": "formal_mainline",
+                "availabilityStatus": "ready",
+                "isStale": False,
+                "eventLineVersion": 3,
+                "sourceSetId": "source-set-1",
+                "rev": 2,
+                "headline": "新版链路逐步验收",
+                "opening": "先修复交互，再完成链路验收。",
+                "nodes": [
+                    {"title": "交互修复", "narrative": "完成关键交互调整。"},
+                    {"title": "链路验收", "narrative": "进入正式验收阶段。"},
+                ],
+                "closing": "当前处于验收收口阶段。",
+            }
+
+    class Store:
+        @staticmethod
+        def save_report_draft(project_id: str, draft: dict) -> dict:
+            assert project_id == "project-report-1"
+            return draft
+
+    monkeypatch.setattr(
+        workbench_outputs,
+        "LocalProjectMaterialsRepository",
+        lambda _runtime: Store(),
+    )
+    monkeypatch.setattr(
+        workbench_outputs,
+        "LocalGC06PlanningProjection",
+        lambda _runtime: Projection(),
+    )
+    result = workbench_outputs.draft_report_blueprint(
+        SimpleNamespace(runtime=Runtime()),
+        UiRequest(
+            method="POST",
+            path="reports/draft-blueprint",
+            query={},
+            body={
+                "event_line_id": "line-report-1",
+                "period_start": "2026-08-01",
+                "period_end": "2026-08-31",
+            },
+            idempotency_key="report-blueprint-1",
+        ),
+        None,
+    )
+
+    assert result["client_id"] == "project-report-1"
+    assert result["event_line_id"] == "line-report-1"
+    assert result["blueprint"]["client_id"] == "project-report-1"
+    assert result["blueprint"]["title"] == "新版软件链路验收报告"
+    assert result["source_set_id"] == "source-set-1"
+    assert "新版链路逐步验收" in Runtime.blueprint_prompt
+    assert "项目知识只补充解释" in Runtime.blueprint_prompt
+
+
+def test_report_blueprint_rejects_mismatched_event_line_project() -> None:
+    class Runtime:
+        @staticmethod
+        def cloud_query(path: str, *, query=None):
+            assert query is None
+            assert path == "/api/v2/gc06/event-lines/line-report-2"
+            return {
+                "eventLine": {
+                    "id": "line-report-2",
+                    "clientId": "project-authoritative",
+                }
+            }
+
+    with pytest.raises(LocalRuntimeError, match="事件线所属项目已经变化"):
+        workbench_outputs.draft_report_blueprint(
+            SimpleNamespace(runtime=Runtime()),
+            UiRequest(
+                method="POST",
+                path="reports/draft-blueprint",
+                query={},
+                body={
+                    "event_line_id": "line-report-2",
+                    "client_id": "project-stale",
+                },
+                idempotency_key="report-blueprint-2",
+            ),
+            None,
+        )
+
+
 def test_answer_export_replay_reuses_local_material_intent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

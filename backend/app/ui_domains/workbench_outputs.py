@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from urllib.parse import quote
 
 from strict_common.ids import canonical_json, new_id, sha256_text
 
@@ -6734,6 +6735,33 @@ def draft_report_blueprint(
         request.body.get("client_id") or request.body.get("clientId")
     )
     event_line_id = _string(request.body.get("event_line_id"))
+    event_line: Mapping[str, Any] = {}
+    if event_line_id:
+        event_line_result = compatibility.runtime.cloud_query(
+            f"/api/v2/gc06/event-lines/{quote(event_line_id, safe='')}"
+        )
+        event_line = (
+            event_line_result.get("eventLine")
+            if isinstance(event_line_result, Mapping)
+            else None
+        )
+        event_line_project_id = _string(
+            (event_line or {}).get("clientId")
+            or (event_line or {}).get("primaryClientId")
+        )
+        if not event_line_project_id:
+            raise LocalRuntimeError(
+                409,
+                "report_event_line_project_missing",
+                "当前事件线没有可用的所属项目，请刷新事件线后重试",
+            )
+        if project_id and project_id != event_line_project_id:
+            raise LocalRuntimeError(
+                409,
+                "report_event_line_project_mismatch",
+                "事件线所属项目已经变化，请刷新事件线后重试",
+            )
+        project_id = event_line_project_id
     if not project_id:
         raise LocalRuntimeError(
             422,
@@ -6746,42 +6774,177 @@ def draft_report_blueprint(
     project = project_result.get("project") if isinstance(project_result, Mapping) else None
     if project is None:
         raise LocalRuntimeError(404, "project_missing", "当前工作空间没有该项目")
-    title = (
-        _string(request.body.get("intent_hint"))
-        or f"{project.get('name') or '项目'}分析报告"
+    if not event_line_id:
+        raise LocalRuntimeError(
+            422,
+            "report_event_line_required",
+            "请从事件线生成报告骨架",
+        )
+    narrative = LocalGC06PlanningProjection(
+        compatibility.runtime
+    ).load_event_line_narrative(event_line_id)
+    if (
+        not isinstance(narrative, Mapping)
+        or narrative.get("outputKind") != "formal_mainline"
+        or narrative.get("availabilityStatus") == "blocked"
+        or bool(narrative.get("isStale"))
+    ):
+        raise LocalRuntimeError(
+            409,
+            "report_formal_mainline_required",
+            "请先生成有效的正式主线，再生成报告骨架",
+        )
+    narrative_event_line_version = int(narrative.get("eventLineVersion") or 0)
+    current_event_line_version = int(event_line.get("version") or 0)
+    if (
+        narrative_event_line_version
+        and current_event_line_version
+        and narrative_event_line_version != current_event_line_version
+    ):
+        raise LocalRuntimeError(
+            409,
+            "report_formal_mainline_stale",
+            "事件线内容已经变化，请先重新生成正式主线",
+        )
+    intent_hint = _string(request.body.get("intent_hint"))
+    audience_hint = _string(request.body.get("audience_hint")) or "项目团队"
+    tone_hint = _string(request.body.get("tone_hint")) or "专业、准确"
+    period_start = _string(request.body.get("period_start"))
+    period_end = _string(request.body.get("period_end"))
+    try:
+        project_knowledge = compatibility.runtime.project_knowledge_context(project_id)
+    except (AttributeError, LocalRuntimeError):
+        project_knowledge = {}
+    completion = compatibility.runtime.private_ai_completion(
+        system_prompt=(
+            "你是益语智库的项目报告骨架 Agent。正式主线是报告骨架唯一的叙事骨架："
+            "章节必须沿主线中的阶段、转折和当前所处位置展开，不能另起一套项目叙事。"
+            "事件线目标、背景与项目知识只用于帮助理解主线和补足章节关注点，不得覆盖、"
+            "改写或绕开主线；不得补造事实。用户填写的‘这份报告需要回答什么’是报告意图，"
+            "不是报告标题。标题必须是自然、正式、简明的报告名称，不得照抄问题，不得写成"
+            "问句或操作指令。根据报告意图、目标读者和基调，生成2至6个有真实逻辑顺序的"
+            "章节；每章说明该章要基于主线回答什么，不预写正文。只输出JSON："
+            '{"title":"报告标题","subtitle":"可为空","inferredTheme":"核心主题",'
+            '"sections":[{"title":"章节标题","goal":"本章要回答的问题"}],'
+            '"openQuestions":[]}。不要输出代码围栏或解释。'
+        ),
+        prompt=json.dumps(
+            {
+                "project": {
+                    "id": project_id,
+                    "name": project.get("name"),
+                },
+                "eventLine": {
+                    "id": event_line_id,
+                    "name": event_line.get("name"),
+                    "goal": event_line.get("goal"),
+                    "background": event_line.get("background"),
+                },
+                "formalMainline": {
+                    "headline": narrative.get("headline"),
+                    "opening": narrative.get("opening"),
+                    "nodes": narrative.get("nodes") or [],
+                    "closing": narrative.get("closing"),
+                },
+                "reportRequest": {
+                    "periodStart": period_start,
+                    "periodEnd": period_end,
+                    "questionToAnswer": intent_hint,
+                    "audience": audience_hint,
+                    "tone": tone_hint,
+                },
+                "projectKnowledgeSupplement": project_knowledge,
+            },
+            ensure_ascii=False,
+        )[:48_000],
+        creativity_mode="strict",
+        capability="event_line_report_blueprint",
+        read_timeout_seconds=120.0,
+        max_output_tokens=2_500,
     )
+    raw_blueprint = _string(completion.get("content"))
+    if raw_blueprint.startswith("```"):
+        raw_blueprint = re.sub(
+            r"^```(?:json)?\s*|\s*```$", "", raw_blueprint, flags=re.I | re.S
+        )
+    try:
+        parsed_blueprint = json.loads(raw_blueprint)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        match = re.search(r"\{[\s\S]*\}", raw_blueprint)
+        try:
+            parsed_blueprint = json.loads(match.group(0)) if match else None
+        except (TypeError, ValueError, json.JSONDecodeError) as nested_exc:
+            raise LocalRuntimeError(
+                502,
+                "report_blueprint_agent_invalid",
+                "模型没有返回可用的报告骨架，请重试",
+            ) from nested_exc
+        if not isinstance(parsed_blueprint, Mapping):
+            raise LocalRuntimeError(
+                502,
+                "report_blueprint_agent_invalid",
+                "模型没有返回可用的报告骨架，请重试",
+            ) from exc
+    if not isinstance(parsed_blueprint, Mapping):
+        raise LocalRuntimeError(
+            502,
+            "report_blueprint_agent_invalid",
+            "模型没有返回可用的报告骨架，请重试",
+        )
+    title = _string(parsed_blueprint.get("title"))[:80]
+    if not title or (intent_hint and title == intent_hint):
+        raise LocalRuntimeError(
+            502,
+            "report_blueprint_title_invalid",
+            "模型没有形成合适的报告标题，请重试",
+        )
+    sections: list[dict[str, Any]] = []
+    for raw_section in list(parsed_blueprint.get("sections") or [])[:6]:
+        if not isinstance(raw_section, Mapping):
+            continue
+        section_title = _string(raw_section.get("title"))[:80]
+        section_goal = _string(raw_section.get("goal"))[:240]
+        if not section_title or not section_goal:
+            continue
+        sections.append(
+            {
+                "level": 1,
+                "title": section_title,
+                "goal": section_goal,
+                "data_sources": [
+                    "formal_mainline",
+                    "event_line_evidence",
+                    "project_knowledge_context",
+                ],
+                "chart_hints": [],
+                "citation_budget": 5,
+                "estimated_words": 800,
+            }
+        )
+    if len(sections) < 2:
+        raise LocalRuntimeError(
+            502,
+            "report_blueprint_sections_invalid",
+            "模型没有形成完整的报告骨架，请重试",
+        )
     now = _now()
     blueprint = {
         "title": title,
-        "subtitle": None,
+        "subtitle": _string(parsed_blueprint.get("subtitle"))[:120] or None,
         "report_kind": "strategy_report",
-        "audience": _string(request.body.get("audience_hint")) or "项目团队",
-        "tone": _string(request.body.get("tone_hint")) or "专业、准确",
-        "period_start": _string(request.body.get("period_start")),
-        "period_end": _string(request.body.get("period_end")),
-        "sections": [
-            {
-                "level": 1,
-                "title": "项目背景与当前状态",
-                "goal": "基于严格项目知识说明背景和现状",
-                "data_sources": ["project_knowledge_context"],
-                "chart_hints": [],
-                "citation_budget": 5,
-                "estimated_words": 800,
-            },
-            {
-                "level": 1,
-                "title": "关键判断与下一步",
-                "goal": "区分事实、判断和建议",
-                "data_sources": ["tasks", "narrative_outputs"],
-                "chart_hints": [],
-                "citation_budget": 5,
-                "estimated_words": 800,
-            },
+        "audience": audience_hint,
+        "tone": tone_hint,
+        "period_start": period_start,
+        "period_end": period_end,
+        "sections": sections,
+        "inferred_theme": _string(parsed_blueprint.get("inferredTheme"))[:120]
+        or title,
+        "confidence": 0.8,
+        "open_questions_for_human": [
+            _string(value)[:160]
+            for value in list(parsed_blueprint.get("openQuestions") or [])[:3]
+            if _string(value)
         ],
-        "inferred_theme": title,
-        "confidence": 0.6,
-        "open_questions_for_human": [],
         "event_line_id": event_line_id or None,
         "client_id": project_id,
         "generated_at": now,
@@ -6814,10 +6977,10 @@ def draft_report_blueprint(
         "sections": [None for _ in blueprint["sections"]],
         "body_markdown": "",
         "warnings": [],
-        "source_set_id": "",
+        "source_set_id": _string(narrative.get("sourceSetId")),
         "narrative_id": report_id,
-        "narrative_rev": 0,
-        "event_line_version": 0,
+        "narrative_rev": int(narrative.get("rev") or 0),
+        "event_line_version": current_event_line_version,
         "input_fingerprint": "",
         "artifact": None,
         "saved_at": None,
@@ -6827,8 +6990,8 @@ def draft_report_blueprint(
         "working_document_ids": working_document_ids,
         "active_skill_ids": active_skill_ids,
         "template_manifest": {
-            "templateId": "project_strategy_report_v1",
-            "templateVersion": 1,
+            "templateId": "event_line_mainline_report_v2",
+            "templateVersion": 2,
             "templateKind": "report_blueprint",
         },
         "source_manifest": [],
@@ -6854,12 +7017,44 @@ def draft_report_sections(
     project_id = _string(draft.get("client_id"))
     _require_project_read(compatibility, project_id)
     context = compatibility.runtime.project_knowledge_context(project_id)
+    event_line_id = _string(draft.get("event_line_id"))
+    formal_mainline = (
+        LocalGC06PlanningProjection(compatibility.runtime).load_event_line_narrative(
+            event_line_id
+        )
+        if event_line_id
+        else None
+    )
+    if not isinstance(formal_mainline, Mapping) or formal_mainline.get("outputKind") != "formal_mainline":
+        raise LocalRuntimeError(
+            409,
+            "report_formal_mainline_required",
+            "正式主线已不可用，请先重新生成报告骨架",
+        )
+    if (
+        _string(draft.get("source_set_id"))
+        and _string(formal_mainline.get("sourceSetId")) != _string(draft.get("source_set_id"))
+    ):
+        raise LocalRuntimeError(
+            409,
+            "report_blueprint_mainline_changed",
+            "正式主线已经变化，请先重新生成报告骨架",
+        )
     working_document_ids = [
         _string(value)
         for value in draft.get("working_document_ids") or []
         if _string(value)
     ][:8]
     source_manifest: list[dict[str, Any]] = []
+    source_manifest.append(
+        {
+            "sourceId": _string(formal_mainline.get("sourceSetId")) or event_line_id,
+            "sourceType": "formal_mainline",
+            "title": _string(formal_mainline.get("headline")) or "正式主线",
+            "version": int(formal_mainline.get("rev") or 1),
+            "contentHash": _string(formal_mainline.get("sourceSetId")) or None,
+        }
+    )
     local_documents: list[dict[str, Any]] = []
     for document_id in working_document_ids:
         local = store.document_text(document_id)
@@ -6984,7 +7179,8 @@ def draft_report_sections(
             )
             result = compatibility.runtime.private_ai_completion(
                 system_prompt=(
-                    "你是益语智库的项目工作台 Agent。只写指定章节；依据下方明确"
+                    "你是益语智库的项目工作台 Agent。正式主线是整份报告唯一的叙事骨架，"
+                    "正文必须沿主线的阶段、转折和当前所处位置展开，不能另起炉灶。只写指定章节；依据下方明确"
                     "提供的本机原件片段、组织共享知识与客户档案，明确区分事实、"
                     "判断和建议，不声称读取未提供的源文件。"
                     + ("\n本次启用写作模板：\n" + skill_context if skill_context else "")
@@ -6994,6 +7190,8 @@ def draft_report_sections(
                     + json.dumps(blueprint, ensure_ascii=False)
                     + "\n本章计划：\n"
                     + json.dumps(plan, ensure_ascii=False)
+                    + "\n正式主线：\n"
+                    + json.dumps(formal_mainline, ensure_ascii=False)
                     + "\n整稿修改意见：\n"
                     + overall_feedback
                     + "\n本章修改意见：\n"
