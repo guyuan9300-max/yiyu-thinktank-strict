@@ -1158,6 +1158,7 @@ def _seed_task(
     task_id: str,
     client_id: str | None,
     scheduled: bool = False,
+    owned_by_identity: bool = True,
 ) -> None:
     now = utc_now()
     with runtime_connection(repository.database_path, "cloud") as connection:
@@ -1186,7 +1187,191 @@ def _seed_task(
                 now,
             ),
         )
+        if owned_by_identity:
+            GC04TaskRepository(repository)._replace_collaborators(  # noqa: SLF001
+                connection,
+                identity,
+                task_id=task_id,
+                owner_membership_id=identity.membership_id,
+                collaborator_membership_ids=[],
+                creator_membership_id=identity.membership_id,
+                now=now,
+            )
         connection.commit()
+
+
+def test_task_reference_only_refines_owned_same_or_unassigned_tasks(
+    tmp_path: Path,
+) -> None:
+    repository, identity, seed = _repository(tmp_path)
+    line = _create_line(repository, identity, seed["projectId"], suffix="reference-policy")
+    other_project = GC07ProjectMaterialsRepository(repository).create_project(
+        identity,
+        payload={"name": "其他项目"},
+        idempotency_key="gc06-reference-other-project",
+    )["project"]
+
+    _seed_task(
+        repository,
+        identity,
+        task_id="task_owned_same_project",
+        client_id=seed["projectId"],
+    )
+    owned_same = attach_task_to_event_line(
+        repository,
+        identity,
+        event_line_id=line["id"],
+        task_id="task_owned_same_project",
+        expected_task_version=1,
+        allow_reassign=False,
+        idempotency_key="gc06-reference-owned-same",
+        task_command_port=GC04_FORMAL_TASK_COMMAND_PORT,
+    )
+    assert owned_same["relationMode"] == "formal"
+    assert owned_same["taskProjectAssigned"] is False
+
+    _seed_task(
+        repository,
+        identity,
+        task_id="task_owned_unassigned",
+        client_id=None,
+    )
+    owned_unassigned = attach_task_to_event_line(
+        repository,
+        identity,
+        event_line_id=line["id"],
+        task_id="task_owned_unassigned",
+        expected_task_version=1,
+        allow_reassign=False,
+        idempotency_key="gc06-reference-owned-unassigned",
+        task_command_port=GC04_FORMAL_TASK_COMMAND_PORT,
+    )
+    assert owned_unassigned["relationMode"] == "formal"
+    assert owned_unassigned["taskProjectAssigned"] is True
+
+    _seed_task(
+        repository,
+        identity,
+        task_id="task_owned_other_project",
+        client_id=other_project["projectId"],
+    )
+    owned_other = attach_task_to_event_line(
+        repository,
+        identity,
+        event_line_id=line["id"],
+        task_id="task_owned_other_project",
+        expected_task_version=1,
+        allow_reassign=False,
+        idempotency_key="gc06-reference-owned-other",
+        task_command_port=GC04_FORMAL_TASK_COMMAND_PORT,
+    )
+    assert owned_other["relationMode"] == "reference"
+
+    other_membership_id = _seed_event_line_participant(
+        repository, identity, suffix="task-owner"
+    )
+    _seed_task(
+        repository,
+        identity,
+        task_id="task_other_owner_same_project",
+        client_id=seed["projectId"],
+        owned_by_identity=False,
+    )
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        GC04TaskRepository(repository)._replace_collaborators(  # noqa: SLF001
+            connection,
+            identity,
+            task_id="task_other_owner_same_project",
+            owner_membership_id=other_membership_id,
+            collaborator_membership_ids=[],
+            creator_membership_id=identity.membership_id,
+            now=utc_now(),
+        )
+        connection.commit()
+    other_owner = attach_task_to_event_line(
+        repository,
+        identity,
+        event_line_id=line["id"],
+        task_id="task_other_owner_same_project",
+        expected_task_version=1,
+        allow_reassign=False,
+        idempotency_key="gc06-reference-other-owner",
+        task_command_port=GC04_FORMAL_TASK_COMMAND_PORT,
+    )
+    assert other_owner["relationMode"] == "reference"
+
+    detail = event_line_detail(repository, identity, event_line_id=line["id"])
+    assert {item["id"] for item in detail["tasks"]} == {
+        "task_owned_same_project",
+        "task_owned_unassigned",
+    }
+    assert {item["id"] for item in detail["referencedTasks"]} == {
+        "task_owned_other_project",
+        "task_other_owner_same_project",
+    }
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        rows = {
+            str(row["id"]): tuple(row)
+            for row in connection.execute(
+                "SELECT id,client_id,event_line_id,version FROM tasks WHERE id IN "
+                "('task_owned_unassigned','task_owned_other_project',"
+                "'task_other_owner_same_project')"
+            ).fetchall()
+        }
+    assert rows["task_owned_unassigned"] == (
+        "task_owned_unassigned",
+        seed["projectId"],
+        line["id"],
+        2,
+    )
+    assert rows["task_owned_other_project"] == (
+        "task_owned_other_project",
+        other_project["projectId"],
+        None,
+        1,
+    )
+    assert rows["task_other_owner_same_project"] == (
+        "task_other_owner_same_project",
+        seed["projectId"],
+        None,
+        1,
+    )
+
+    viewer_membership_id = _seed_event_line_participant(
+        repository, identity, suffix="reference-viewer"
+    )
+    current_line = event_line_detail(
+        repository, identity, event_line_id=line["id"]
+    )["eventLine"]
+    update_event_line(
+        repository,
+        identity,
+        event_line_id=line["id"],
+        payload={
+            "expectedVersion": current_line["version"],
+            "participantIds": [viewer_membership_id],
+        },
+        idempotency_key="gc06-reference-viewer-invite",
+    )
+    viewer_identity = replace(
+        identity,
+        principal_id="principal_event_line_reference-viewer",
+        membership_id=viewer_membership_id,
+        system_role="member",
+        display_name="事件线参与者 reference-viewer",
+    )
+    viewer_detail = event_line_detail(
+        repository, viewer_identity, event_line_id=line["id"]
+    )
+    assert viewer_detail["referencedTasks"] == []
+    reference_activities = [
+        item
+        for item in viewer_detail["activities"]
+        if item["sourceType"] == "task_reference"
+    ]
+    assert reference_activities
+    assert {item["title"] for item in reference_activities} == {"引用任务"}
+    assert all("GC-06 任务" not in item["summary"] for item in reference_activities)
 
 
 def test_event_line_requires_client_is_idempotent_and_has_cas_lifecycle(

@@ -3636,6 +3636,10 @@ export interface EventLineTaskCandidate {
   eventLineName?: string | null;
   progressStatus: string;
   updatedAt: string;
+  taskVersion: number;
+  viewerIsOwner: boolean;
+  relationMode: 'formal' | 'reference';
+  alreadyReferenced: boolean;
 }
 
 export interface EventLineReportAttachment {
@@ -3697,6 +3701,7 @@ export interface EventLineReportSnapshot {
   eventLine: EventLine;
   activities: EventLineActivity[];
   tasks: Task[];
+  referencedTasks: Task[];
   attachments: EventLineReportAttachment[];
   timelineNodes?: EventLineTimelineNode[];
   participantNames: string[];

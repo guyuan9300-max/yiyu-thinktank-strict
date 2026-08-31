@@ -138,6 +138,11 @@ def _event_line_detail_ui(compatibility: Any, payload: Mapping[str, Any]) -> dic
             for item in payload.get("tasks") or []
             if isinstance(item, Mapping)
         ],
+        "referencedTasks": [
+            _task_ui(item)
+            for item in payload.get("referencedTasks") or []
+            if isinstance(item, Mapping)
+        ],
         "activities": [
             {
                 "id": str(item.get("id") or ""),
@@ -223,22 +228,55 @@ def _event_line_report_attachments(
 
 def _event_line_timeline_nodes(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
+    referenced_tasks = {
+        str(item.get("id") or ""): item
+        for item in payload.get("referencedTasks") or []
+        if isinstance(item, Mapping) and str(item.get("id") or "")
+    }
     for item in payload.get("activities") or []:
         if not isinstance(item, Mapping):
             continue
+        source_type = str(item.get("sourceType") or "")
+        referenced_task = (
+            referenced_tasks.get(str(item.get("sourceId") or ""))
+            if source_type == "task_reference"
+            else None
+        )
         nodes.append({
             "id": str(item.get("id") or ""),
-            "kind": "project_review" if item.get("sourceType") == "weekly_review" else "system_trace",
-            "title": str(item.get("title") or "事件线进展"),
+            "kind": (
+                "project_review"
+                if source_type == "weekly_review"
+                else "continuing_task"
+                if referenced_task is not None
+                else "system_trace"
+            ),
+            "title": str(
+                (referenced_task or {}).get("title")
+                or item.get("title")
+                or "事件线进展"
+            ),
             "time": str(item.get("happenedAt") or ""),
-            "summary": str(item.get("summary") or ""),
-            "sourceTaskIds": [str(item.get("sourceId"))] if item.get("sourceType") == "task" else [],
+            "summary": str(
+                (referenced_task or {}).get("description")
+                or item.get("summary")
+                or ""
+            ),
+            "sourceTaskIds": (
+                [str(item.get("sourceId"))]
+                if item.get("sourceType") in {"task", "task_reference"}
+                else []
+            ),
             "sourceActivityIds": [str(item.get("id") or "")],
             "attachments": [],
             "includeInReport": bool(item.get("includeInNarrative")),
-            "evidenceSummary": str(item.get("summary") or item.get("title") or ""),
+            "evidenceSummary": (
+                "引用任务事实（未改变原任务归属）"
+                if referenced_task is not None
+                else str(item.get("summary") or item.get("title") or "")
+            ),
             "warnings": [],
-            "tags": [str(item.get("sourceType") or "activity")],
+            "tags": [source_type or "activity"],
             "actorName": None,
             "ownerName": None,
         })
@@ -2225,6 +2263,11 @@ def event_line_report_snapshot(
             for item in result.get("tasks") or []
             if isinstance(item, Mapping)
         ],
+        "referencedTasks": [
+            _task_ui(item)
+            for item in result.get("referencedTasks") or []
+            if isinstance(item, Mapping)
+        ],
         "attachments": attachments,
         "timelineNodes": _event_line_timeline_nodes(result),
         "participantNames": participants,
@@ -2820,6 +2863,12 @@ def event_line_task_candidates(
         compatibility, match.group("event_line_id"), request
     )
     line = detail.get("eventLine") or {}
+    referenced_task_ids = {
+        str(item.get("sourceId") or "")
+        for item in detail.get("activities") or []
+        if isinstance(item, Mapping)
+        and str(item.get("sourceType") or "") == "task_reference"
+    }
     task_result = compatibility.runtime.cloud_query("/api/v2/domain/tasks")
     query = str(request.query.get("q") or "").casefold()
     limit = max(1, min(int(request.query.get("limit") or 40), 100))
@@ -2832,6 +2881,18 @@ def event_line_task_candidates(
         if query and query not in (str(row.get("title") or "") + " " + str(row.get("description") or "")).casefold():
             continue
         task = _task_ui(row)
+        viewer_is_owner = (
+            task.get("viewerCollaborationRole") == "owner"
+            and task.get("viewerInboxStatus") == "accepted"
+        )
+        task_client_id = str(task.get("clientId") or "")
+        line_client_id = str(line.get("clientId") or "")
+        relation_mode = (
+            "formal"
+            if viewer_is_owner
+            and (not task_client_id or task_client_id == line_client_id)
+            else "reference"
+        )
         result.append({
             "id": task["id"],
             "title": task["title"],
@@ -2842,6 +2903,10 @@ def event_line_task_candidates(
             "eventLineName": task.get("eventLineName"),
             "progressStatus": task.get("status") or "todo",
             "updatedAt": task.get("updatedAt") or "",
+            "taskVersion": int(task.get("version") or 1),
+            "viewerIsOwner": viewer_is_owner,
+            "relationMode": relation_mode,
+            "alreadyReferenced": task["id"] in referenced_task_ids,
         })
         if len(result) >= limit:
             break

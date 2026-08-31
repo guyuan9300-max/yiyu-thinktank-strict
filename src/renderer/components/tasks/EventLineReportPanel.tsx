@@ -1400,6 +1400,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
   const [taskCandidateError, setTaskCandidateError] = useState<string | null>(null);
   const [linkingTaskId, setLinkingTaskId] = useState<string | null>(null);
   const [taskLinkError, setTaskLinkError] = useState<string | null>(null);
+  const [taskLinkMessage, setTaskLinkMessage] = useState<string | null>(null);
   const [milestoneTaskId, setMilestoneTaskId] = useState<string | null>(null);
   const [milestoneError, setMilestoneError] = useState<string | null>(null);
   const [reportArtifacts, setReportArtifacts] = useState<ReportArtifactSummary[]>([]);
@@ -1452,7 +1453,10 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
           : 'text-amber-700 bg-amber-50 ring-amber-200';
     const timeLabel = node.time ? (node.time.slice(0, 10) || node.time) : '时间待补';
     const expanded = expandedNarrativeNodes.has(node.id);
-    const linkedTasks = (snapshot?.tasks || []).filter((task) => node.linkedTaskIds.includes(task.id));
+    const linkedTasks = [
+      ...(snapshot?.tasks || []),
+      ...(snapshot?.referencedTasks || []),
+    ].filter((task) => node.linkedTaskIds.includes(task.id));
     const linkedAttachments = (snapshot?.attachments || []).filter((attachment) => node.linkedAttachmentIds.includes(attachment.id));
     const linkedActivities = (snapshot?.activities || []).filter((activity) => node.linkedActivityIds?.includes(activity.id));
     const evidenceCount = linkedTasks.length + linkedAttachments.length + linkedActivities.length;
@@ -1570,6 +1574,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
     setTaskCandidateError(null);
     setLinkingTaskId(null);
     setTaskLinkError(null);
+    setTaskLinkMessage(null);
     setMilestoneTaskId(null);
     setMilestoneError(null);
     setReportArtifacts([]);
@@ -1815,6 +1820,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
     setTaskCandidateState('loading');
     setTaskCandidateError(null);
     setTaskLinkError(null);
+    setTaskLinkMessage(null);
     try {
       const items = await getEventLineTaskCandidates(eventLineId, {
         q: taskSearch,
@@ -1833,24 +1839,43 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
   const handleLinkCandidate = useCallback(async (candidate: EventLineTaskCandidate) => {
     if (!snapshot?.canEdit || linkingTaskId) return;
     const currentCloudId = snapshot.eventLine.cloudId || snapshot.eventLine.id;
-    if (candidate.eventLineId && candidate.eventLineId !== currentCloudId && candidate.eventLineId !== eventLineId) {
+    if (
+      candidate.relationMode === 'formal'
+      && candidate.eventLineId
+      && candidate.eventLineId !== currentCloudId
+      && candidate.eventLineId !== eventLineId
+    ) {
       const approved = window.confirm(`任务“${candidate.title}”已关联“${candidate.eventLineName || '其他事件线'}”，是否改挂到当前事件线？`);
       if (!approved) return;
     }
     setLinkingTaskId(candidate.id);
     setTaskLinkError(null);
+    setTaskLinkMessage(null);
     try {
       const result = await linkTaskToEventLine(
         eventLineId,
         candidate.id,
+        candidate.taskVersion,
         eventLineVersionRef.current,
-        Boolean(candidate.eventLineId && candidate.eventLineId !== currentCloudId && candidate.eventLineId !== eventLineId),
+        Boolean(
+          candidate.relationMode === 'formal'
+          && candidate.eventLineId
+          && candidate.eventLineId !== currentCloudId
+          && candidate.eventLineId !== eventLineId
+        ),
       );
       applyUpdatedEventLine(result.eventLine);
       await loadSnapshot();
       await loadTaskCandidates();
+      setTaskLinkMessage(
+        result.relationMode === 'formal'
+          ? result.taskProjectAssigned
+            ? '已将本人负责的未归属任务补入当前项目，并纳入本事件线。'
+            : '已将本人负责的同项目任务纳入本事件线。'
+          : '已作为引用加入事件线，原任务的负责人、项目和事件线归属均未修改。',
+      );
     } catch (err) {
-      const message = err instanceof Error ? err.message : '关联任务失败';
+      const message = err instanceof Error ? err.message : '引用任务失败';
       if (message.includes('已在其他设备更新') || message.includes('已更新，请刷新')) {
         await loadSnapshot({ silent: true });
         setTaskLinkError('事件线已更新，已刷新最新内容，请确认后重试关联。');
@@ -2091,6 +2116,10 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
   const milestoneTasks = useMemo(
     () => [...(snapshot?.tasks || [])].sort(compareTasksByBusinessDate),
     [snapshot?.tasks],
+  );
+  const referencedTasks = useMemo(
+    () => [...(snapshot?.referencedTasks || [])].sort(compareTasksByBusinessDate),
+    [snapshot?.referencedTasks],
   );
   // 这里只展示可重建的证据读模型；正式证据资格仍由云端 source set 裁决。
   const evidenceTaskRows = useMemo<EvidenceTaskRow[]>(() => {
@@ -2745,7 +2774,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                       {humanMilestoneTaskIds.size > 0 ? `已确认 ${humanMilestoneTaskIds.size} 项` : '至少确认一项'}
                     </span>
                   </div>
-                  <p className="mt-1 text-[10.5px] leading-5 text-gray-400">只有已正式关联的任务可由人工设为里程碑，AI不能自行增删或改序。</p>
+                  <p className="mt-1 text-[10.5px] leading-5 text-gray-400">只有已正式纳入当前项目与事件线的任务可设为里程碑；轻量引用不会改变原任务归属。</p>
                 </div>
                 <span className={`rounded-md px-2 py-1 text-[10px] font-medium ${formalInputsReady ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>
                   {formalInputsReady ? '可生成正式主线' : '当前只能生成素材概览'}
@@ -2789,16 +2818,39 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                   );
                 })}
                 {milestoneTasks.length === 0 && (
-                  <p className="rounded-md border border-dashed border-gray-200 px-3 py-4 text-center text-[11px] text-gray-400">当前还没有正式关联任务。</p>
+                  <p className="rounded-md border border-dashed border-gray-200 px-3 py-4 text-center text-[11px] text-gray-400">当前还没有正式纳入事件线的任务。</p>
                 )}
               </div>
+              {referencedTasks.length > 0 && (
+                <div className="mt-4">
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-[11px] font-semibold text-gray-700">引用任务</h4>
+                    <span className="text-[10px] text-gray-400">仅补充事件线脉络，不改变原任务</span>
+                  </div>
+                  <div className="mt-2 space-y-1.5">
+                    {referencedTasks.map((task) => (
+                      <div key={`referenced-task:${task.id}`} className="flex items-center justify-between gap-3 rounded-md border border-blue-100 bg-blue-50/30 px-3 py-2">
+                        <div className="min-w-0">
+                          <button type="button" onClick={() => onOpenTask?.(task)} className="block max-w-full truncate text-left text-[11.5px] font-medium text-gray-700 hover:text-gray-950">
+                            {task.title}
+                          </button>
+                          <p className="mt-0.5 truncate text-[10px] text-gray-400">
+                            {task.clientName || '未归属项目'}{task.eventLineName ? ` · 原事件线：${task.eventLineName}` : ''}
+                          </p>
+                        </div>
+                        <span className="shrink-0 rounded-md bg-white px-2 py-1 text-[10px] font-medium text-blue-600 ring-1 ring-blue-100">引用</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               {milestoneError && (
                 <p className="mt-2 text-[10.5px] text-rose-600">{milestoneError}</p>
               )}
 
               {snapshot.canEdit && (
                 <details className="mt-3 rounded-md border border-gray-100 bg-white px-3 py-2.5">
-                  <summary className="cursor-pointer text-[11px] font-medium text-gray-600">查找并关联遗漏任务</summary>
+                  <summary className="cursor-pointer text-[11px] font-medium text-gray-600">查找并引用任务</summary>
                   <div className="mt-3 flex flex-wrap items-center gap-2">
                     <div className="flex min-w-[220px] flex-1 items-center gap-2 rounded-md border border-gray-200 px-2.5">
                       <Search size={12} className="text-gray-400" />
@@ -2846,7 +2898,11 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                   {taskCandidates.length > 0 && (
                     <div className="mt-3 max-h-52 space-y-1 overflow-y-auto">
                       {taskCandidates.map((candidate) => {
-                        const alreadyLinked = candidate.eventLineId === currentEventLineIdentity || candidate.eventLineId === eventLineId;
+                        const alreadyLinked = (
+                          candidate.eventLineId === currentEventLineIdentity
+                          || candidate.eventLineId === eventLineId
+                          || candidate.alreadyReferenced
+                        );
                         return (
                           <div key={`candidate:${candidate.id}`} className="flex items-center justify-between gap-3 rounded-md px-2 py-2 hover:bg-gray-50">
                             <div className="min-w-0">
@@ -2854,6 +2910,15 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                               <p className="mt-0.5 truncate text-[9.5px] text-gray-400">
                                 {candidate.clientName || '未关联项目'}{candidate.eventLineName ? ` · 已关联 ${candidate.eventLineName}` : ''}
                               </p>
+                              {!alreadyLinked && (
+                                <p className="mt-0.5 truncate text-[9.5px] text-gray-400">
+                                  {candidate.relationMode === 'formal'
+                                    ? candidate.clientId
+                                      ? '本人负责且同项目，将纳入本事件线'
+                                      : '本人负责且未归属项目，将补入本项目和事件线'
+                                    : '仅引用，不修改原任务信息'}
+                                </p>
+                              )}
                             </div>
                             <button
                               type="button"
@@ -2862,7 +2927,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                               className="inline-flex shrink-0 items-center gap-1 text-[10.5px] font-medium text-[#4D6BFE] disabled:text-gray-300"
                             >
                               {alreadyLinked ? <Check size={11} /> : <Link2 size={11} />}
-                              {alreadyLinked ? '已关联' : linkingTaskId === candidate.id ? '关联中' : '关联'}
+                              {alreadyLinked ? '已引用' : linkingTaskId === candidate.id ? '引用中' : '引用'}
                             </button>
                           </div>
                         );
@@ -2870,6 +2935,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                     </div>
                   )}
                   {taskLinkError && <p className="mt-2 text-[10.5px] text-rose-600">{taskLinkError}</p>}
+                  {!taskLinkError && taskLinkMessage && <p className="mt-2 text-[10.5px] text-emerald-600">{taskLinkMessage}</p>}
                 </details>
               )}
             </section>

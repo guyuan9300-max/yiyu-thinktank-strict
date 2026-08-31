@@ -17045,27 +17045,6 @@ export default function App() {
       );
     };
 
-    const renderEventLineCompletenessBadge = (el: EventLine) => {
-      const level = el.readinessLevel || 'incomplete';
-      const cfg: Record<EventLine['readinessLevel'], { label: string; dot: string; ring: string; text: string; bg: string }> = {
-        substantial: { label: '较完整', dot: 'bg-emerald-500', ring: 'ring-emerald-200', text: 'text-emerald-700', bg: 'bg-emerald-50' },
-        general: { label: '一般', dot: 'bg-amber-500', ring: 'ring-amber-200', text: 'text-amber-700', bg: 'bg-amber-50' },
-        incomplete: { label: '不完整', dot: 'bg-rose-500', ring: 'ring-rose-200', text: 'text-rose-700', bg: 'bg-rose-50' },
-      };
-      const item = cfg[level];
-      const missingHint = (el.readinessMissingItems || []).slice(0, 4).join('、');
-      const title = missingHint ? `报告准备度${item.label}，主要缺：${missingHint}` : `报告准备度${item.label}`;
-      return (
-        <span
-          className={`inline-flex items-center gap-1 rounded-md ${item.bg} px-1.5 py-0.5 text-[10px] font-medium tracking-wide uppercase ${item.text} ring-1 ${item.ring}/60`}
-          title={title}
-        >
-          <span className={`h-1 w-1 rounded-full ${item.dot}`} />
-          {item.label}
-        </span>
-      );
-    };
-
     const handleCreateProjectModuleFromTask = () => {
       if (editingTask.scopeMode === 'PERSONAL_ONLY') {
         flash('error', '个人日程不进入任务模板。');
@@ -22463,7 +22442,7 @@ export default function App() {
                           </div>
                         </div>
 
-                        {/* 右侧 KPI 区：大数字 + 完整度 / 同步徽章 */}
+                        {/* 右侧 KPI 区：只展示客观任务数与异常同步状态。 */}
                         <div className="shrink-0 flex flex-col items-end gap-2 pt-0.5">
                           <div className="text-right">
                             <div className={`text-[26px] font-bold leading-none tabular-nums tracking-tight ${taskCount === 0 ? 'text-gray-300' : 'text-gray-900'}`}>
@@ -22473,9 +22452,7 @@ export default function App() {
                               任务
                             </div>
                           </div>
-                          {/* 准备度 / 同步徽章移到 KPI 下方 — 不再挤主信息行 */}
                           <div className="flex flex-col items-end gap-1">
-                            {renderEventLineCompletenessBadge(el)}
                             {renderEventLineSyncBadge(el)}
                           </div>
                         </div>

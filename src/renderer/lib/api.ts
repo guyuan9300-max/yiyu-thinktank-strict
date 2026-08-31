@@ -6715,7 +6715,8 @@ export async function getEventLineTaskCandidates(
 export async function linkTaskToEventLine(
   eventLineId: string,
   taskId: string,
-  expectedVersion: number,
+  expectedTaskVersion: number,
+  expectedEventLineVersion: number,
   allowReassign: boolean,
 ) {
   return request<{
@@ -6723,9 +6724,16 @@ export async function linkTaskToEventLine(
     task: import('../../shared/types').Task;
     activity?: import('../../shared/types').EventLineActivity | null;
     previousEventLine?: EventLine | null;
+    relationMode: 'formal' | 'reference';
+    taskProjectAssigned: boolean;
+    taskEventLineLinked: boolean;
   }>(`/api/v2/ui/event-lines/${eventLineId}/tasks/${taskId}/link`, {
     method: 'POST',
-    body: JSON.stringify({ expectedVersion, allowReassign }),
+    body: JSON.stringify({
+      expectedTaskVersion,
+      expectedVersion: expectedEventLineVersion,
+      allowReassign,
+    }),
   });
 }
 

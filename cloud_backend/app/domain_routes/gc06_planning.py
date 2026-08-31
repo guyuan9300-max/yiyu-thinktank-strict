@@ -101,7 +101,11 @@ def register_gc06_planning_routes(
             identity,
             event_line_id=event_line_id,
             task_id=task_id,
-            expected_task_version=payload.get("expectedVersion"),
+            expected_task_version=(
+                payload.get("expectedTaskVersion")
+                if payload.get("expectedTaskVersion") is not None
+                else payload.get("expectedVersion")
+            ),
             allow_reassign=bool(payload.get("allowReassign", False)),
             idempotency_key=idempotency_key,
             task_command_port=task_command_port,

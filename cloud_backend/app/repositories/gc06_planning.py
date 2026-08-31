@@ -25,7 +25,14 @@ EVENT_LINE_KINDS = frozenset(
     {"project_line", "issue_line", "coordination_line", "case_line", "custom"}
 )
 EVENT_ACTIVITY_SOURCES = frozenset(
-    {"task", "meeting", "weekly_review", "manual_note", "decision_action"}
+    {
+        "task",
+        "task_reference",
+        "meeting",
+        "weekly_review",
+        "manual_note",
+        "decision_action",
+    }
 )
 PLAN_KINDS = frozenset({"organization_plan", "department_plan"})
 PLAN_STATUSES = frozenset({"draft", "published", "archived"})
@@ -620,22 +627,26 @@ def _upsert_event_activity(
     activity_id = "ela_" + sha256_text(
         f"{identity.scope_id}|{event_line['id']}|{source_type}|{source_id}"
     )[:30]
-    previous = connection.execute(
-        "SELECT * FROM event_lines WHERE scope_id=? AND record_kind='activity' "
-        "AND source_type=? AND source_id=? AND lifecycle_state!='deleted'",
-        (identity.scope_id, source_type, source_id),
-    ).fetchone()
-    if previous is not None and str(previous["id"]) != activity_id:
-        connection.execute(
-            "UPDATE event_lines SET lifecycle_state='deleted', deleted_at=?, "
-            "updated_at=?, version=version+1 WHERE id=?",
-            (now, now, str(previous["id"])),
-        )
-        connection.execute(
-            "UPDATE secured_resources SET lifecycle_state='deleted', deleted_at=?, "
-            "updated_at=?, version=version+1 WHERE id=?",
-            (now, now, str(previous["id"])),
-        )
+    # Formal task/meeting activities follow their single authoritative parent.
+    # A task reference is deliberately one-way and may appear in several event
+    # lines, so it must not revoke another line's reference to the same task.
+    if source_type != "task_reference":
+        previous = connection.execute(
+            "SELECT * FROM event_lines WHERE scope_id=? AND record_kind='activity' "
+            "AND source_type=? AND source_id=? AND lifecycle_state!='deleted'",
+            (identity.scope_id, source_type, source_id),
+        ).fetchone()
+        if previous is not None and str(previous["id"]) != activity_id:
+            connection.execute(
+                "UPDATE event_lines SET lifecycle_state='deleted', deleted_at=?, "
+                "updated_at=?, version=version+1 WHERE id=?",
+                (now, now, str(previous["id"])),
+            )
+            connection.execute(
+                "UPDATE secured_resources SET lifecycle_state='deleted', deleted_at=?, "
+                "updated_at=?, version=version+1 WHERE id=?",
+                (now, now, str(previous["id"])),
+            )
     row = connection.execute(
         "SELECT * FROM event_lines WHERE scope_id=? AND id=?",
         (identity.scope_id, activity_id),
@@ -770,6 +781,29 @@ def event_line_detail(
             "AND lifecycle_state!='deleted' ORDER BY updated_at DESC, id DESC",
             (identity.scope_id, event_line_id),
         ).fetchall()
+        referenced_task_ids = {
+            str(item["source_id"])
+            for item in activities
+            if str(item["source_type"] or "") == "task_reference"
+            and str(item["source_id"] or "")
+        }
+        referenced_tasks: list[sqlite3.Row] = []
+        if referenced_task_ids:
+            placeholders = ",".join("?" for _ in referenced_task_ids)
+            candidates = connection.execute(
+                "SELECT * FROM tasks WHERE scope_id=? AND id IN ("
+                + placeholders
+                + ") AND lifecycle_state!='deleted' ORDER BY updated_at DESC, id DESC",
+                (identity.scope_id, *sorted(referenced_task_ids)),
+            ).fetchall()
+            task_repository = GC04TaskRepository(repository)
+            referenced_tasks = [
+                item
+                for item in candidates
+                if task_repository._can_read_task(  # noqa: SLF001
+                    connection, identity, item
+                )
+            ]
         meetings = connection.execute(
             "SELECT * FROM meetings WHERE scope_id=? AND event_line_id=? "
             "AND lifecycle_state!='deleted' ORDER BY starts_at, id",
@@ -777,7 +811,9 @@ def event_line_detail(
         ).fetchall()
         task_repository = GC04TaskRepository(repository)
         owner_departments_by_task = task_repository._owner_departments_by_task(  # noqa: SLF001
-            connection, identity, (str(item["id"]) for item in tasks)
+            connection,
+            identity,
+            (str(item["id"]) for item in [*tasks, *referenced_tasks]),
         )
         task_payloads = [
             task_repository._task_payload(  # noqa: SLF001
@@ -789,10 +825,22 @@ def event_line_detail(
             )
             for item in tasks
         ]
+        referenced_task_payloads = [
+            task_repository._task_payload(  # noqa: SLF001
+                connection,
+                identity,
+                item,
+                owner_departments_by_task=owner_departments_by_task,
+                event_line_detail=True,
+            )
+            for item in referenced_tasks
+            if str(item["event_line_id"] or "") != event_line_id
+        ]
         return {
             "eventLine": _event_line_payload(connection, row),
             "activities": [_activity_payload(item) for item in activities],
             "tasks": task_payloads,
+            "referencedTasks": referenced_task_payloads,
             "meetings": [_meeting_payload(connection, item) for item in meetings],
         }
 
@@ -1343,6 +1391,10 @@ def record_event_line_activity(
                 )
                 if str(source["event_line_id"] or "") != event_line_id:
                     raise RepositoryError(409, "task_event_line_not_attached", "任务尚未通过正式命令挂入事件线")
+            if source_type == "task_reference":
+                GC04TaskRepository(repository)._require_task_read(  # noqa: SLF001
+                    connection, identity, source_id
+                )
             if source_type == "meeting":
                 source = connection.execute(
                     "SELECT client_id,event_line_id FROM meetings WHERE scope_id=? AND id=? "
@@ -1402,12 +1454,12 @@ def attach_task_to_event_line(
     *,
     event_line_id: str,
     task_id: str,
-    expected_task_version: int,
+    expected_task_version: int | None,
     allow_reassign: bool,
     idempotency_key: str,
     task_command_port: FormalTaskCommandPort = UNAVAILABLE_FORMAL_TASK_COMMAND_PORT,
 ) -> dict[str, Any]:
-    expected = _positive_int(expected_task_version)
+    task_repository = GC04TaskRepository(repository)
     with repository._connection() as connection:  # noqa: SLF001
         line = require_active_event_line(
             connection,
@@ -1420,25 +1472,80 @@ def attach_task_to_event_line(
             project_id=str(line["client_id"]),
             capability="project_write",
         )
-        task = connection.execute(
-            "SELECT * FROM tasks WHERE scope_id=? AND id=? AND lifecycle_state!='deleted'",
-            (identity.scope_id, task_id),
-        ).fetchone()
-        if task is None:
-            raise RepositoryError(404, "task_missing", "任务不存在")
-        validate_task_client_binding(
-            connection,
-            scope_id=identity.scope_id,
-            client_id=task["client_id"],
-            event_line_id=event_line_id,
+        task = task_repository._require_task_read(  # noqa: SLF001
+            connection, identity, task_id
         )
-        if task["event_line_id"] and str(task["event_line_id"]) != event_line_id and not allow_reassign:
-            raise RepositoryError(409, "task_event_line_reassign_required", "任务已挂入其他事件线")
+        owner = connection.execute(
+            "SELECT 1 FROM task_collaborators WHERE scope_id=? AND task_id=? "
+            "AND subject_membership_id=? AND role_key='owner' "
+            "AND assignment_state='assigned' AND inbox_status='accepted' "
+            "AND lifecycle_state='active' LIMIT 1",
+            (identity.scope_id, task_id, identity.membership_id),
+        ).fetchone()
+        task_client_id = str(task["client_id"] or "")
+        line_client_id = str(line["client_id"])
+        formal_link = owner is not None and (
+            not task_client_id or task_client_id == line_client_id
+        )
+        if (
+            formal_link
+            and task["event_line_id"]
+            and str(task["event_line_id"]) != event_line_id
+            and not allow_reassign
+        ):
+            raise RepositoryError(
+                409,
+                "task_event_line_reassign_required",
+                "任务已挂入其他事件线",
+            )
+    if not formal_link:
+        activity = record_event_line_activity(
+            repository,
+            identity,
+            event_line_id=event_line_id,
+            payload={
+                "sourceType": "task_reference",
+                "sourceId": task_id,
+                "happenedAt": utc_now(),
+                "title": "引用任务",
+                "summary": "仅供当前事件线梳理上下文；任务内容仍按任务自身权限读取",
+                "includeInNarrative": True,
+            },
+            idempotency_key=f"{idempotency_key}:task-reference",
+        )
+        detail = event_line_detail(
+            repository, identity, event_line_id=event_line_id
+        )
+        referenced_task = next(
+            (
+                item
+                for item in detail.get("referencedTasks") or []
+                if str(item.get("id") or "") == task_id
+            ),
+            None,
+        )
+        if referenced_task is None:
+            raise RepositoryError(
+                502,
+                "task_reference_receipt_invalid",
+                "任务引用未形成可读取的事件线记录",
+            )
+        return {
+            "eventLine": detail["eventLine"],
+            "task": referenced_task,
+            "taskCommandReceipt": None,
+            "activity": activity["activity"],
+            "relationMode": "reference",
+            "taskProjectAssigned": False,
+            "taskEventLineLinked": False,
+        }
+    expected = _positive_int(expected_task_version)
     receipt = task_command_port.attach_event_line(
         repository,
         identity,
         task_id=task_id,
         event_line_id=event_line_id,
+        target_client_id=line_client_id if not task_client_id else None,
         expected_version=expected,
         allow_reassign=allow_reassign,
         idempotency_key=f"{idempotency_key}:formal-task-link",
@@ -1450,6 +1557,25 @@ def attach_task_to_event_line(
         ).fetchone()
         if task is None or str(task["event_line_id"] or "") != event_line_id:
             raise RepositoryError(502, "formal_task_receipt_invalid", "正式任务命令未形成事件线关联")
+        reference = connection.execute(
+            "SELECT id FROM event_lines WHERE scope_id=? AND parent_event_line_id=? "
+            "AND record_kind='activity' AND source_type='task_reference' "
+            "AND source_id=? AND lifecycle_state!='deleted'",
+            (identity.scope_id, event_line_id, task_id),
+        ).fetchone()
+        if reference is not None:
+            now = utc_now()
+            connection.execute(
+                "UPDATE event_lines SET lifecycle_state='deleted',deleted_at=?,"
+                "updated_at=?,version=version+1 WHERE id=?",
+                (now, now, str(reference["id"])),
+            )
+            connection.execute(
+                "UPDATE secured_resources SET lifecycle_state='deleted',deleted_at=?,"
+                "updated_at=?,version=version+1 WHERE id=?",
+                (now, now, str(reference["id"])),
+            )
+            connection.commit()
     activity = record_event_line_activity(
         repository,
         identity,
@@ -1469,6 +1595,9 @@ def attach_task_to_event_line(
         "task": dict(task),
         "taskCommandReceipt": dict(receipt),
         "activity": activity["activity"],
+        "relationMode": "formal",
+        "taskProjectAssigned": not bool(task_client_id),
+        "taskEventLineLinked": True,
     }
 
 
@@ -1630,6 +1759,7 @@ def merge_event_lines(
                 identity,
                 task_id=str(task["id"]),
                 event_line_id=target_event_line_id,
+                target_client_id=None,
                 expected_version=int(task["version"]),
                 allow_reassign=True,
                 idempotency_key=f"{idempotency_key}:source:{source_index}:task:{task_index}",
