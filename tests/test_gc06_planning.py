@@ -1074,6 +1074,78 @@ def test_event_line_report_readiness_checks_current_six_dimensions() -> None:
     assert complete == {"level": "substantial", "missingItems": []}
 
 
+def test_event_line_list_uses_the_same_report_readiness_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = {
+        "id": "event_line_list_readiness",
+        "clientId": "client_list_readiness",
+        "name": "列表准备度",
+        "goal": "完成真实验收",
+        "background": "",
+        "lifecycleState": "active",
+        "version": 1,
+        "createdAt": "2026-08-01T09:00:00Z",
+        "updatedAt": "2026-08-02T09:00:00Z",
+    }
+    detail = {
+        "eventLine": row,
+        "tasks": [{
+            "id": "task_list_readiness",
+            "desc": "完成一项推进",
+            "status": "done",
+            "completedAt": "2026-08-02T09:00:00Z",
+            "createdAt": "2026-08-01T09:00:00Z",
+            "attachments": [],
+        }],
+        "activities": [],
+    }
+
+    class Runtime:
+        @staticmethod
+        def cloud_query(path: str, *, query=None):
+            if path == "/api/v2/gc06/event-lines":
+                return [row]
+            assert path == "/api/v2/gc06/event-lines/event_line_list_readiness"
+            return detail
+
+    class Projector:
+        @staticmethod
+        def apply_event_lines(_rows):
+            return None
+
+        @staticmethod
+        def apply_event_activities(_rows):
+            return None
+
+        @staticmethod
+        def client_name(_client_id: str):
+            return "测试项目"
+
+    monkeypatch.setattr(gc06_ui_domain, "_planning_projector", lambda _: Projector())
+    result = gc06_ui_domain.list_event_lines_legacy_surface(
+        SimpleNamespace(
+            runtime=Runtime(),
+            _member_names=lambda: {},
+            auth_state=lambda: {"user": {}},
+        ),
+        UiRequest(
+            method="GET",
+            path="event-lines",
+            query={},
+            body={},
+            idempotency_key=None,
+        ),
+        None,
+    )
+    assert result[0]["readinessLevel"] == "incomplete"
+    assert result[0]["readinessMissingItems"] == [
+        "背景",
+        "人工里程碑",
+        "关键证据",
+    ]
+
+
 def test_retained_event_line_reads_build_only_traceable_fact_views() -> None:
     detail = {
         "eventLine": {

@@ -53,6 +53,8 @@ import {
 import type { EventLineTimelineNarrative, EventLineNarrativeNode } from '../../../shared/types';
 import AIReportGeneratorModal from '../reports/AIReportGeneratorModal.js';
 
+const EVENT_LINE_READINESS_DIMENSIONS = ['目标', '背景', '人工里程碑', '推进事实', '关键证据', '时间顺序'];
+
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
 /* ------------------------------------------------------------------ */
@@ -2727,12 +2729,13 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
             <span className={`font-semibold ${snapshot.eventLine.readinessLevel === 'substantial' ? 'text-emerald-700' : snapshot.eventLine.readinessLevel === 'general' ? 'text-amber-700' : 'text-rose-700'}`}>
               {snapshot.eventLine.readinessLevel === 'substantial' ? '较完整' : snapshot.eventLine.readinessLevel === 'general' ? '一般' : '不完整'}
             </span>
-            {(snapshot.eventLine.readinessMissingItems || []).length > 0 ? (
-              <span className="text-gray-500">
-                主要缺：{(snapshot.eventLine.readinessMissingItems || []).slice(0, 4).join('、')}{(snapshot.eventLine.readinessMissingItems || []).length > 4 ? '…' : ''}
+            <span className="text-emerald-700">
+              已有：{EVENT_LINE_READINESS_DIMENSIONS.filter((item) => !(snapshot.eventLine.readinessMissingItems || []).includes(item)).join('、') || '暂无'}
+            </span>
+            {(snapshot.eventLine.readinessMissingItems || []).length > 0 && (
+              <span className="text-amber-700">
+                主要缺：{(snapshot.eventLine.readinessMissingItems || []).join('、')}
               </span>
-            ) : (
-              <span className="text-gray-400">目标、背景、人工里程碑、推进事实、关键证据和时间顺序已具备</span>
             )}
           </div>
           {snapshotRefreshError && (

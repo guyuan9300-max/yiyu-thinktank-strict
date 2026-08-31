@@ -132,7 +132,7 @@ def _event_line_ui(compatibility: Any, row: Mapping[str, Any]) -> dict[str, Any]
 
 def _event_line_detail_ui(compatibility: Any, payload: Mapping[str, Any]) -> dict[str, Any]:
     return {
-        "eventLine": _event_line_ui(compatibility, payload.get("eventLine") or {}),
+        "eventLine": _event_line_ui_with_report_readiness(compatibility, payload),
         "tasks": [
             _task_ui(item)
             for item in payload.get("tasks") or []
@@ -302,6 +302,21 @@ def _event_line_report_readiness(
         ),
         "missingItems": missing,
     }
+
+
+def _event_line_ui_with_report_readiness(
+    compatibility: Any,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one event line with the same current report rules everywhere."""
+    event_line = _event_line_ui(compatibility, payload.get("eventLine") or {})
+    readiness = _event_line_report_readiness(
+        payload,
+        _event_line_report_attachments(compatibility, payload),
+    )
+    event_line["readinessLevel"] = readiness["level"]
+    event_line["readinessMissingItems"] = readiness["missingItems"]
+    return event_line
 
 
 def _event_line_timeline_nodes(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2282,11 +2297,17 @@ def list_event_lines_legacy_surface(
         query={**request.query, "includeArchived": "true"},
     )
     _planning_projector(compatibility).apply_event_lines(rows)
-    return [
-        _event_line_ui(compatibility, item)
-        for item in rows or []
-        if isinstance(item, Mapping)
-    ]
+    result: list[dict[str, Any]] = []
+    for item in rows or []:
+        if not isinstance(item, Mapping):
+            continue
+        detail = _strict_event_line_detail(
+            compatibility,
+            str(item.get("id") or ""),
+            request,
+        )
+        result.append(_event_line_ui_with_report_readiness(compatibility, detail))
+    return result
 
 
 @router.post(r"event-lines")
@@ -2331,10 +2352,7 @@ def event_line_report_snapshot(
         if isinstance(collaborator, Mapping) and collaborator.get("display_name")
     })
     attachments = _event_line_report_attachments(compatibility, result)
-    event_line = _event_line_ui(compatibility, result.get("eventLine") or {})
-    readiness = _event_line_report_readiness(result, attachments)
-    event_line["readinessLevel"] = readiness["level"]
-    event_line["readinessMissingItems"] = readiness["missingItems"]
+    event_line = _event_line_ui_with_report_readiness(compatibility, result)
     archived = event_line.get("status") == "archived"
     return {
         "eventLine": event_line,

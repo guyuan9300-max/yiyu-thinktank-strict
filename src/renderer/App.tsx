@@ -22140,6 +22140,7 @@ export default function App() {
           )}
 
           {taskViewMode === 'event_lines' && (() => {
+            const readinessDimensions = ['目标', '背景', '人工里程碑', '推进事实', '关键证据', '时间顺序'];
             const statusMeta: Record<string, { label: string; line: string; dot: string; ring: string; text: string; bg: string }> = {
               active: { label: '进行中', line: 'bg-emerald-500', dot: 'bg-emerald-500', ring: 'ring-emerald-200', text: 'text-emerald-700', bg: 'bg-emerald-50' },
               blocked: { label: '受阻', line: 'bg-rose-500', dot: 'bg-rose-500', ring: 'ring-rose-200', text: 'text-rose-700', bg: 'bg-rose-50' },
@@ -22324,6 +22325,9 @@ export default function App() {
                   const canArchive = Boolean(el.viewerCapabilities?.canArchive);
                   const isInactive = ['paused', 'done', 'archived'].includes(el.status);
                   const permissionHint = '只有事件线创建人、归属部门协作者、明确参与者、管理层或管理员可以执行此操作';
+                  const readinessMissingItems = el.readinessMissingItems || [];
+                  const readinessMissingSet = new Set(readinessMissingItems);
+                  const readinessReadyItems = readinessDimensions.filter((item) => !readinessMissingSet.has(item));
 
                   return (
                     <article
@@ -22372,10 +22376,11 @@ export default function App() {
                             {(el.primaryClientName || el.createdByName) && <span className="text-gray-200">·</span>}
                             <span>{el.updatedAt.slice(0, 10)} 更新</span>
                           </div>
-                          <p className={`mt-2 text-[11px] leading-5 ${(el.readinessMissingItems || []).length > 0 ? 'text-amber-700' : 'text-emerald-700'}`}>
-                            {(el.readinessMissingItems || []).length > 0
-                              ? `主要缺：${(el.readinessMissingItems || []).slice(0, 3).join('、')}${(el.readinessMissingItems || []).length > 3 ? '…' : ''}`
-                              : '目标、背景、里程碑和关键证据已具备'}
+                          <p className="mt-2 text-[11px] leading-5">
+                            <span className="text-emerald-700">已有：{readinessReadyItems.length > 0 ? readinessReadyItems.join('、') : '暂无'}</span>
+                            {readinessMissingItems.length > 0 && (
+                              <span className="ml-2 text-amber-700">主要缺：{readinessMissingItems.join('、')}</span>
+                            )}
                           </p>
                           <div className="mt-3 flex flex-wrap items-center gap-2">
                             <button
