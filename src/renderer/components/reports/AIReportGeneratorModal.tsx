@@ -122,6 +122,7 @@ export default function AIReportGeneratorModal({
   const [versionsOpen, setVersionsOpen] = useState(false);
   const [blueprintSaving, setBlueprintSaving] = useState(false);
   const [blueprintDirty, setBlueprintDirty] = useState(false);
+  const [regenerateOpen, setRegenerateOpen] = useState(false);
   const pollRef = useRef<number | null>(null);
   const onRunChangeRef = useRef(onRunChange);
 
@@ -147,6 +148,7 @@ export default function AIReportGeneratorModal({
       setRun(result);
       setBlueprintDraft(result.blueprint);
       setBlueprintDirty(false);
+      setRegenerateOpen(false);
       onRunChangeRef.current?.(result);
       setPhase(result.status === 'failed' ? 'failed' : 'reviewing-blueprint');
       if (result.status === 'failed') setErrorMsg(result.error_message || '报告骨架生成失败');
@@ -320,6 +322,14 @@ export default function AIReportGeneratorModal({
     if (!initialRun) return;
     setRun(initialRun);
     setBlueprintDraft(initialRun.blueprint);
+    setIntent((current) => ({
+      ...current,
+      periodStart: initialRun.period_start || current.periodStart,
+      periodEnd: initialRun.period_end || current.periodEnd,
+      intentHint: initialRun.intent_hint || '',
+      audienceHint: initialRun.blueprint?.audience || current.audienceHint,
+      toneHint: initialRun.blueprint?.tone || current.toneHint,
+    }));
     setBlueprintDirty(false);
     setErrorMsg(initialRun.error_message || null);
     if (blueprintOnly && initialRun.blueprint) {
@@ -371,6 +381,7 @@ export default function AIReportGeneratorModal({
             </>
           )}
           {phase === 'reviewing-blueprint' && blueprintDraft && (
+            <>
               <BlueprintEditor
                 blueprint={blueprintDraft}
                 onChange={(value) => {
@@ -383,6 +394,30 @@ export default function AIReportGeneratorModal({
                 blueprintSaving={blueprintSaving}
                 busy={busy}
             />
+            {blueprintOnly && (
+              <div className="border-t border-gray-100 pt-4">
+                <button
+                  type="button"
+                  onClick={() => setRegenerateOpen((value) => !value)}
+                  className="text-[11.5px] font-medium text-blue-600 hover:text-blue-700"
+                >
+                  {regenerateOpen ? '收起生成依据' : '调整生成依据并重新生成'}
+                </button>
+                {regenerateOpen && (
+                  <div className="mt-3 rounded-lg border border-blue-100 bg-blue-50/30 p-4">
+                    <IntentBlock
+                      intent={intent}
+                      onChange={setIntent}
+                      onSubmit={handleStart}
+                      busy={busy}
+                      compact
+                      actionLabel="按新依据重新生成骨架"
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+            </>
           )}
           {phase === 'drafting-sections' && run?.blueprint && <DraftingBlock run={run} />}
           {phase === 'reviewing-body' && run?.blueprint && (
@@ -457,16 +492,18 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   return <label className="block"><span className="mb-1.5 block text-[11.5px] font-medium text-gray-600">{label}</span>{children}</label>;
 }
 
-function IntentBlock({ intent, onChange, onSubmit, busy }: {
+function IntentBlock({ intent, onChange, onSubmit, busy, compact = false, actionLabel = '生成报告骨架' }: {
   intent: IntentForm;
   onChange: (value: IntentForm) => void;
   onSubmit: () => void;
   busy: boolean;
+  compact?: boolean;
+  actionLabel?: string;
 }) {
   const inputClass = 'w-full rounded-md border border-gray-200 px-3 py-2 text-[12px] outline-none focus:border-blue-500';
   return (
     <div className="space-y-4">
-      <p className="text-[12.5px] leading-6 text-gray-600">Agent 会沿已确认的正式主线，结合报告意图、读者和基调直接生成可编辑骨架；项目知识只补充背景与证据。</p>
+      {!compact && <p className="text-[12.5px] leading-6 text-gray-600">Agent 会沿已确认的正式主线，结合报告意图、读者和基调直接生成可编辑骨架；项目知识只补充背景与证据。</p>}
       <div className="grid grid-cols-2 gap-3">
         <Field label="报告期间起"><input type="date" value={intent.periodStart} onChange={(e) => onChange({ ...intent, periodStart: e.target.value })} className={inputClass} /></Field>
         <Field label="报告期间止"><input type="date" value={intent.periodEnd} onChange={(e) => onChange({ ...intent, periodEnd: e.target.value })} className={inputClass} /></Field>
@@ -476,7 +513,7 @@ function IntentBlock({ intent, onChange, onSubmit, busy }: {
         <Field label="目标读者"><input value={intent.audienceHint} onChange={(e) => onChange({ ...intent, audienceHint: e.target.value })} className={inputClass} /></Field>
         <Field label="期望基调"><input value={intent.toneHint} onChange={(e) => onChange({ ...intent, toneHint: e.target.value })} className={inputClass} /></Field>
       </div>
-      <div className="flex justify-end border-t border-gray-100 pt-4"><button type="button" onClick={onSubmit} disabled={busy || !intent.periodStart || !intent.periodEnd} className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-4 py-2 text-xs font-medium text-white disabled:bg-gray-300">{busy && <Loader2 size={14} className="animate-spin" />}{busy ? 'Agent 正在梳理骨架' : '生成报告骨架'}</button></div>
+      <div className="flex justify-end border-t border-gray-100 pt-4"><button type="button" onClick={onSubmit} disabled={busy || !intent.periodStart || !intent.periodEnd} className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-4 py-2 text-xs font-medium text-white disabled:bg-gray-300">{busy && <Loader2 size={14} className="animate-spin" />}{busy ? 'Agent 正在梳理骨架' : actionLabel}</button></div>
     </div>
   );
 }

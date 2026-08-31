@@ -5576,7 +5576,9 @@ class LocalProjectMaterialsRepository:
             **dict(draft),
             "id": report_id,
             "client_id": project_id,
-            "sourceScope": "local_private_draft",
+            "sourceScope": str(
+                draft.get("sourceScope") or "local_private_draft"
+            ),
             "updated_at": utc_now(),
         }
         drafts = dict(state.get("reportDrafts") or {})

@@ -39,13 +39,11 @@ import {
   getEventLineReportDraft,
   getEventLineTimelineNarrative,
   listEventLineReportArtifacts,
-  listLegacyEventLineReportRuns,
   polishEventLineGoal,
   regenerateEventLineTimelineNarrative,
   renderReportArtifact,
   retryEventLineAttachmentParse,
   retryFailedEventLineAttachments,
-  saveReport,
   setEventLineTaskMilestone,
   updateEventLine,
   uploadEventLineAttachment,
@@ -53,6 +51,7 @@ import {
 import type { EventLineTimelineNarrative, EventLineNarrativeNode } from '../../../shared/types';
 import { getTaskReportPeriod, splitTaskDateTime } from '../../../shared/taskTime.js';
 import AIReportGeneratorModal from '../reports/AIReportGeneratorModal.js';
+import ProjectReportEditor from '../reports/ProjectReportEditor.js';
 
 const EVENT_LINE_READINESS_DIMENSIONS = ['目标', '背景', '人工里程碑', '推进事实', '关键证据', '时间顺序'];
 
@@ -1423,11 +1422,9 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
   const [milestoneTaskId, setMilestoneTaskId] = useState<string | null>(null);
   const [milestoneError, setMilestoneError] = useState<string | null>(null);
   const [reportArtifacts, setReportArtifacts] = useState<ReportArtifactSummary[]>([]);
-  const [legacyReportRuns, setLegacyReportRuns] = useState<ReportRunSummary[]>([]);
   const [reportListState, setReportListState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [reportListError, setReportListError] = useState<string | null>(null);
   const [reportActionId, setReportActionId] = useState<string | null>(null);
-  const [showLegacyReports, setShowLegacyReports] = useState(false);
   const [reportDraft, setReportDraft] = useState<ReportRunSummary | null>(null);
   const [reportDraftState, setReportDraftState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [reportDraftError, setReportDraftError] = useState<string | null>(null);
@@ -1582,11 +1579,9 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
     setMilestoneTaskId(null);
     setMilestoneError(null);
     setReportArtifacts([]);
-    setLegacyReportRuns([]);
     setReportListState('idle');
     setReportListError(null);
     setReportActionId(null);
-    setShowLegacyReports(false);
     setReportDraft(null);
     setReportDraftState('idle');
     setReportDraftError(null);
@@ -2159,14 +2154,12 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
     setReportListState('loading');
     setReportListError(null);
     try {
-      const [artifactsResult, legacyRunsResult] = await Promise.allSettled([
+      const [artifactsResult] = await Promise.allSettled([
         listEventLineReportArtifacts(eventLineId),
-        listLegacyEventLineReportRuns(eventLineId),
       ]);
       if (loadId !== reportLoadIdRef.current) return;
       setReportArtifacts(artifactsResult.status === 'fulfilled' ? artifactsResult.value : []);
-      setLegacyReportRuns(legacyRunsResult.status === 'fulfilled' ? legacyRunsResult.value : []);
-      const failures = [artifactsResult, legacyRunsResult]
+      const failures = [artifactsResult]
         .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
         .map((result) => result.reason instanceof Error ? result.reason.message : '项目报告加载失败');
       if (failures.length > 0) {
@@ -2233,20 +2226,6 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
       setReportActionId(null);
     }
   }, [onDownloadReport, reportActionId]);
-
-  const handlePromoteLegacyReport = useCallback(async (run: ReportRunSummary) => {
-    if (reportActionId) return;
-    setReportActionId(`promote:${run.id}`);
-    setReportListError(null);
-    try {
-      await saveReport(run.id, { change_summary: '将历史生成结果保存为正式报告' });
-      await loadReportEntries();
-    } catch (err) {
-      setReportListError(err instanceof Error ? err.message : '历史报告已失效，请依据当前正式主线重新生成');
-    } finally {
-      setReportActionId(null);
-    }
-  }, [loadReportEntries, reportActionId]);
 
   const materialModel = useMemo(() => {
     if (!draft || !snapshot) return null;
@@ -3290,23 +3269,15 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                 </div>
               )}
 
-              {reportDraftState === 'ready' && reportDraft && reportDraft.status !== 'saved' && (
-                <AIReportGeneratorModal
+              {reportDraftState === 'ready' && reportDraft && (
+                <ProjectReportEditor
                   key={`${eventLineId}:${reportDraft.id}:report`}
-                  embedded
-                  initialRun={reportDraft}
-                  eventLineId={eventLineId}
+                  run={reportDraft}
                   eventLineName={draft?.eventLineName}
-                  clientId={snapshot?.eventLine.primaryClientId || undefined}
-                  clientName={snapshot?.eventLine.primaryClientName || undefined}
+                  clientId={snapshot?.eventLine.primaryClientId || ''}
+                  readOnly={snapshot?.canEdit === false}
                   onRunChange={handleReportRunChange}
                   onDownload={onDownloadReport}
-                  onOpenSmartEditor={(artifact) => onOpenSavedReport?.(artifact)}
-                  onSaved={(artifact) => {
-                    setReportArtifacts((current) => [artifact, ...current.filter((item) => item.id !== artifact.id)]);
-                    setReportListState('ready');
-                    setReportDraft(null);
-                  }}
                 />
               )}
 
@@ -3326,9 +3297,16 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
               {reportListState === 'ready' && reportArtifacts.length === 0 && !reportDraft && (
                 <div className="rounded-xl border border-dashed border-gray-200 py-10 text-center">
                   <FileText size={22} className="mx-auto text-gray-300" />
-                  <p className="mt-3 text-[13px] font-medium text-gray-600">还没有已保存的项目报告</p>
-                  <p className="mt-1 text-[11px] text-gray-400">生成中的正文不会出现在这里，人工保存后才成为共享报告。</p>
+                  <p className="mt-3 text-[13px] font-medium text-gray-600">还没有可生成的项目报告</p>
+                  <p className="mt-1 text-[11px] text-gray-400">请先生成并确认报告骨架。</p>
                   <button type="button" onClick={() => setViewMode('blueprint')} className="mt-3 rounded-md bg-gray-900 px-3 py-1.5 text-[11px] font-medium text-white">前往报告骨架</button>
+                </div>
+              )}
+
+              {reportArtifacts.length > 0 && (
+                <div className="border-t border-gray-100 pt-4">
+                  <p className="text-[11.5px] font-semibold text-gray-700">历史已同步到工作台项目的报告</p>
+                  <p className="mt-1 text-[10.5px] text-gray-400">以下仅保留既有记录；当前事件线报告不会再自动加入这里。</p>
                 </div>
               )}
 
@@ -3381,34 +3359,6 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                 );
               })}
 
-              {legacyReportRuns.length > 0 && (
-                <section className="border-t border-gray-100 pt-4">
-                  <button type="button" onClick={() => setShowLegacyReports((value) => !value)} className="flex w-full items-center justify-between text-left">
-                    <span className="text-[12px] font-semibold text-gray-700">历史生成结果 · {legacyReportRuns.length}</span>
-                    <span className="text-[10.5px] text-gray-400">{showLegacyReports ? '收起' : '展开'}</span>
-                  </button>
-                  {showLegacyReports && (
-                    <div className="mt-3 space-y-2">
-                      {legacyReportRuns.map((run) => (
-                        <div key={run.id} className="flex items-center justify-between gap-4 rounded-lg border border-gray-100 bg-gray-50 px-4 py-3">
-                          <div className="min-w-0">
-                            <p className="truncate text-[11.5px] font-medium text-gray-700">{run.blueprint?.title || '历史项目报告'}</p>
-                            <p className="mt-1 text-[10px] text-gray-400">{formatTs(run.updated_at)} · 尚未成为正式共享报告</p>
-                          </div>
-                          <button
-                            type="button"
-                            disabled={Boolean(reportActionId)}
-                            onClick={() => void handlePromoteLegacyReport(run)}
-                            className="shrink-0 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-[10.5px] font-medium text-gray-700 disabled:opacity-40"
-                          >
-                            {reportActionId === `promote:${run.id}` ? '保存中' : '保存为新版报告'}
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </section>
-              )}
             </div>
           ) : null}
 

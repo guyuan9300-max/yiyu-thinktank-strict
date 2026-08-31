@@ -145,6 +145,8 @@ export type RichTextDocumentEditorProps = {
    * popover 里直接显示刚加进来的 chip,用户接着输入指令就可以执行。
    */
   triggerOpenAiPromptKey?: number;
+  /** 事件线报告已有独立的保存和下载区时，可隐藏会造成共享语义歧义的“文档”页。 */
+  showDocumentTab?: boolean;
 };
 
 export type RichTextDocumentEditorWorkingDoc = {
@@ -198,6 +200,7 @@ export const RichTextDocumentEditor = React.forwardRef<MDXEditorMethods, RichTex
       workingDocuments,
       onRemoveWorkingDocument,
       triggerOpenAiPromptKey,
+      showDocumentTab = true,
     },
     ref,
   ) {
@@ -251,6 +254,7 @@ export const RichTextDocumentEditor = React.forwardRef<MDXEditorMethods, RichTex
                   workingDocuments={workingDocuments || []}
                   onRemoveWorkingDocument={onRemoveWorkingDocument}
                   triggerOpenAiPromptKey={triggerOpenAiPromptKey}
+                  showDocumentTab={showDocumentTab}
                   fontSize={fontSize}
                   setFontSize={setFontSize}
                   theme={theme}
@@ -317,6 +321,7 @@ function RibbonToolbar({
   workingDocuments,
   onRemoveWorkingDocument,
   triggerOpenAiPromptKey,
+  showDocumentTab,
   fontSize,
   setFontSize,
   theme,
@@ -338,12 +343,16 @@ function RibbonToolbar({
   workingDocuments: RichTextDocumentEditorWorkingDoc[];
   onRemoveWorkingDocument?: (documentId: string) => void;
   triggerOpenAiPromptKey?: number;
+  showDocumentTab: boolean;
   fontSize: EditorFontSize;
   setFontSize: React.Dispatch<React.SetStateAction<EditorFontSize>>;
   theme: EditorTheme;
   setTheme: React.Dispatch<React.SetStateAction<EditorTheme>>;
 }) {
   const [active, setActive] = useState<RibbonTab>('start');
+  const ribbonTabs = showDocumentTab
+    ? RIBBON_TABS
+    : RIBBON_TABS.filter((tab) => tab.key !== 'document');
   const [aiPrompt, setAiPrompt] = useState<AiPromptState | null>(null);
   // P14a：用户点 AI 按钮"那一刻"的选区快照（用于送到后端做 prompt 上下文）。
   const [capturedSelection, setCapturedSelection] = useState<string>('');
@@ -745,7 +754,7 @@ function RibbonToolbar({
       {/* Tab Bar — AI 生成走"在编辑器内右键"触发;Tab Bar 右侧条件渲染 AI 进度 icon(只在飞行期可见) */}
       <div className="flex items-center justify-between border-b border-gray-100 bg-[#FAFAFB] px-3">
         <div className="flex items-center gap-0">
-          {RIBBON_TABS.map((tab) => {
+          {ribbonTabs.map((tab) => {
             const isActive = active === tab.key;
             return (
               <button

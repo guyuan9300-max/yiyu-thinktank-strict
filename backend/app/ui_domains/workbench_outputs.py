@@ -4726,6 +4726,50 @@ def save_report_run(
     store = LocalProjectMaterialsRepository(compatibility.runtime)
     draft = store.report_draft(match.group(1))
     _require_project_read(compatibility, _string(draft.get("client_id")))
+    event_line_id = _string(draft.get("event_line_id"))
+    if event_line_id:
+        if draft.get("status") not in {
+            "blueprint_confirmed",
+            "body_ready",
+            "saved",
+            "failed",
+        }:
+            raise LocalRuntimeError(
+                409,
+                "report_body_not_ready",
+                "报告正文尚未完整生成，不能保存修改",
+            )
+        content_markdown = _string(
+            request.body.get("content_markdown")
+            or request.body.get("contentMarkdown")
+            or draft.get("body_markdown")
+        )
+        if not content_markdown:
+            raise LocalRuntimeError(
+                422,
+                "report_body_empty",
+                "报告正文为空，不能保存修改",
+            )
+        blueprint = dict(draft.get("blueprint") or {})
+        title = _string(request.body.get("title")) or _string(
+            blueprint.get("title")
+        ) or "项目报告"
+        blueprint["title"] = title
+        return store.save_report_draft(
+            _string(draft.get("client_id")),
+            {
+                **draft,
+                "status": "body_ready",
+                "blueprint": blueprint,
+                "body_markdown": content_markdown,
+                "saved_at": _now(),
+                "local_save_version": int(draft.get("local_save_version") or 0) + 1,
+                "last_change_summary": _string(request.body.get("change_summary"))
+                or "保存事件线报告修改",
+                "artifact": None,
+                "sourceScope": "local_private_event_line_report",
+            },
+        )
     if draft.get("status") == "saved":
         return draft
     if draft.get("status") != "body_ready":
@@ -4774,6 +4818,35 @@ def save_report_run(
         },
     )
     return saved
+
+
+@router.post(r"reports/([^/]+)/render")
+def render_report_run(
+    compatibility: Any,
+    request: UiRequest,
+    match: re.Match[str],
+) -> dict[str, Any]:
+    store = LocalProjectMaterialsRepository(compatibility.runtime)
+    draft = store.report_draft(match.group(1))
+    _require_project_read(compatibility, _string(draft.get("client_id")))
+    if not _string(draft.get("event_line_id")):
+        raise LocalRuntimeError(
+            409,
+            "report_run_render_scope_invalid",
+            "只有事件线本机报告可以从草稿直接下载",
+        )
+    markdown = _string(draft.get("body_markdown"))
+    if not markdown:
+        raise LocalRuntimeError(409, "report_body_not_ready", "请先生成报告正文")
+    output_format = _string(request.query.get("format")) or "docx"
+    blueprint = draft.get("blueprint") or {}
+    return store.render_report(
+        report_id=_string(draft.get("id")),
+        report_version=max(1, int(draft.get("local_save_version") or 1)),
+        title=_string(blueprint.get("title")) or "项目报告",
+        markdown=markdown,
+        output_format=output_format,
+    )
 
 
 @router.get(r"retrieval/shadow-runs")

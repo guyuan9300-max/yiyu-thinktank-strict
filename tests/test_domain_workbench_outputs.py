@@ -214,6 +214,127 @@ def test_report_blueprint_rejects_mismatched_event_line_project() -> None:
         )
 
 
+def test_event_line_report_save_stays_local_and_never_calls_project_report_cloud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    draft = {
+        "id": "report-local-1",
+        "client_id": "project-report-1",
+        "event_line_id": "line-report-1",
+        "status": "body_ready",
+        "blueprint": {"title": "原报告标题"},
+        "body_markdown": "原正文",
+    }
+
+    class Runtime:
+        @staticmethod
+        def require_project_capability(project_id: str, capability: str) -> dict:
+            assert (project_id, capability) == ("project-report-1", "read")
+            return {"allowed": True}
+
+        @staticmethod
+        def cloud_command(*_args: object, **_kwargs: object) -> dict:
+            raise AssertionError("事件线报告保存不得写入工作台项目报告")
+
+    class Store:
+        saved: dict = {}
+
+        @staticmethod
+        def report_draft(report_id: str) -> dict:
+            assert report_id == "report-local-1"
+            return draft
+
+        @classmethod
+        def save_report_draft(cls, project_id: str, value: dict) -> dict:
+            assert project_id == "project-report-1"
+            cls.saved = value
+            return value
+
+    monkeypatch.setattr(
+        workbench_outputs,
+        "LocalProjectMaterialsRepository",
+        lambda _runtime: Store(),
+    )
+    result = workbench_outputs.save_report_run(
+        SimpleNamespace(runtime=Runtime()),
+        UiRequest(
+            method="POST",
+            path="reports/report-local-1/save",
+            query={},
+            body={
+                "title": "修改后的标题",
+                "content_markdown": "# 修改后的正文",
+            },
+            idempotency_key="save-local-event-line-report",
+        ),
+        re.match(r"reports/([^/]+)/save", "reports/report-local-1/save"),
+    )
+
+    assert result["status"] == "body_ready"
+    assert result["blueprint"]["title"] == "修改后的标题"
+    assert result["body_markdown"] == "# 修改后的正文"
+    assert result["sourceScope"] == "local_private_event_line_report"
+    assert result["artifact"] is None
+
+
+def test_event_line_report_run_renders_from_local_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Runtime:
+        @staticmethod
+        def require_project_capability(project_id: str, capability: str) -> dict:
+            assert (project_id, capability) == ("project-report-1", "read")
+            return {"allowed": True}
+
+    class Store:
+        @staticmethod
+        def report_draft(report_id: str) -> dict:
+            assert report_id == "report-local-1"
+            return {
+                "id": report_id,
+                "client_id": "project-report-1",
+                "event_line_id": "line-report-1",
+                "blueprint": {"title": "事件线报告"},
+                "body_markdown": "# 正文",
+                "local_save_version": 2,
+            }
+
+        @staticmethod
+        def render_report(**kwargs: object) -> dict:
+            assert kwargs == {
+                "report_id": "report-local-1",
+                "report_version": 2,
+                "title": "事件线报告",
+                "markdown": "# 正文",
+                "output_format": "docx",
+            }
+            return {
+                "artifact_id": "report-local-1",
+                "artifact_version": 2,
+                "format": "docx",
+                "file_path": "/tmp/report.docx",
+                "file_name": "事件线报告-v2.docx",
+            }
+
+    monkeypatch.setattr(
+        workbench_outputs,
+        "LocalProjectMaterialsRepository",
+        lambda _runtime: Store(),
+    )
+    result = workbench_outputs.render_report_run(
+        SimpleNamespace(runtime=Runtime()),
+        UiRequest(
+            method="POST",
+            path="reports/report-local-1/render",
+            query={"format": "docx"},
+            body={},
+            idempotency_key="render-local-event-line-report",
+        ),
+        re.match(r"reports/([^/]+)/render", "reports/report-local-1/render"),
+    )
+    assert result["file_name"] == "事件线报告-v2.docx"
+
+
 def test_answer_export_replay_reuses_local_material_intent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -7553,7 +7553,7 @@ export async function updateReportBlueprint(
 
 export async function saveReport(
   reportRunId: string,
-  payload: { title?: string | null; change_summary?: string } = {},
+  payload: { title?: string | null; content_markdown?: string; change_summary?: string } = {},
 ): Promise<import('../../shared/types.js').ReportRunSummary> {
   return request<import('../../shared/types.js').ReportRunSummary>(
     `/api/v2/ui/reports/${encodeURIComponent(reportRunId)}/save`,
@@ -7562,6 +7562,16 @@ export async function saveReport(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     },
+  );
+}
+
+export async function renderReportRun(
+  reportRunId: string,
+  format: 'docx' | 'md' = 'docx',
+): Promise<import('../../shared/types.js').RenderedReportArtifactFile> {
+  return request<import('../../shared/types.js').RenderedReportArtifactFile>(
+    `/api/v2/ui/reports/${encodeURIComponent(reportRunId)}/render?format=${format}`,
+    { method: 'POST' },
   );
 }
 

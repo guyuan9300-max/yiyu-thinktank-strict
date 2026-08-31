@@ -39,6 +39,10 @@ const reportGeneratorSource = fs.readFileSync(
   path.join(root, 'src', 'renderer', 'components', 'reports', 'AIReportGeneratorModal.tsx'),
   'utf8',
 );
+const projectReportEditorSource = fs.readFileSync(
+  path.join(root, 'src', 'renderer', 'components', 'reports', 'ProjectReportEditor.tsx'),
+  'utf8',
+);
 const uiCompatSource = fs.readFileSync(
   path.join(root, 'backend', 'app', 'ui_compat.py'),
   'utf8',
@@ -106,6 +110,13 @@ test('event-line report inherits its project without redundant setup copy', () =
   assert.ok(reportGeneratorSource.includes('<Field label="时间范围">'));
   assert.equal(reportGeneratorSource.includes('本次使用：'), false);
   assert.equal(reportGeneratorSource.includes('报告模板：'), false);
+  assert.ok(reportGeneratorSource.includes('调整生成依据并重新生成'));
+  assert.ok(projectReportEditorSource.includes('生成报告'));
+  assert.ok(projectReportEditorSource.includes('保存修改'));
+  assert.ok(projectReportEditorSource.includes('下载报告'));
+  assert.ok(projectReportEditorSource.includes('showDocumentTab={false}'));
+  assert.ok(projectReportEditorSource.includes('不会自动同步到工作台项目'));
+  assert.ok(eventLineReportSource.includes('<ProjectReportEditor'));
 });
 
 test('renderer only calls v2 and never calls legacy endpoints', () => {
