@@ -24,6 +24,7 @@ class LocalGC06PlanningProjection:
     """Project verified cloud rows into the matching local 88-table objects."""
 
     WEEKLY_OVERVIEW_MEDIA_TYPE = "application/vnd.yiyu.gc06-weekly-overview+json"
+    EVENT_LINE_NARRATIVE_MEDIA_TYPE = "application/vnd.yiyu.gc06-event-line-narrative+json"
 
     def __init__(self, runtime: WorkspaceRuntime):
         self.runtime = runtime
@@ -146,6 +147,75 @@ class LocalGC06PlanningProjection:
                 byte_size=len(serialized.encode("utf-8")),
                 expected_version=expected_version,
             )
+
+    def _event_line_narrative_identity(self, event_line_id: str) -> tuple[str, str]:
+        fingerprint = hashlib.sha256(event_line_id.encode("utf-8")).hexdigest()[:32]
+        return (
+            f"gc06-event-line-narrative:{fingerprint}",
+            f"managed/gc06/event-line-narratives/{fingerprint}.json",
+        )
+
+    def load_event_line_narrative(self, event_line_id: str) -> dict[str, Any] | None:
+        _context, sandbox_id = self._context()
+        object_id, storage_key = self._event_line_narrative_identity(event_line_id)
+        row = self.runtime.local_storage_object_get(
+            sandbox_id=sandbox_id,
+            object_id=object_id,
+            storage_key=storage_key,
+        )
+        if row is None or str(row.get("lifecycle_state") or "") != "active":
+            return None
+        data_root = Path(self.runtime.database_path).resolve().parent
+        path = (data_root / storage_key).resolve()
+        if data_root not in path.parents:
+            raise LocalRuntimeError(409, "gc06_event_line_narrative_path_invalid", "主线还原缓存路径无效")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def save_event_line_narrative(
+        self,
+        event_line_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        _context, sandbox_id = self._context()
+        object_id, storage_key = self._event_line_narrative_identity(event_line_id)
+        serialized = json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        content_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        data_root = Path(self.runtime.database_path).resolve().parent
+        path = (data_root / storage_key).resolve()
+        if data_root not in path.parents:
+            raise LocalRuntimeError(409, "gc06_event_line_narrative_path_invalid", "主线还原缓存路径无效")
+        with self.runtime.local_storage_object_lock(
+            sandbox_id=sandbox_id,
+            object_id=object_id,
+        ):
+            current = self.runtime.local_storage_object_get(
+                sandbox_id=sandbox_id,
+                object_id=object_id,
+            )
+            expected_version = int(current.get("version") or 0) if current else 0
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(f".tmp-{os.getpid()}")
+            temporary.write_text(serialized, encoding="utf-8")
+            os.replace(temporary, path)
+            self.runtime.local_storage_object_put(
+                sandbox_id=sandbox_id,
+                object_id=object_id,
+                storage_key=storage_key,
+                content_hash=content_hash,
+                media_type=self.EVENT_LINE_NARRATIVE_MEDIA_TYPE,
+                byte_size=len(serialized.encode("utf-8")),
+                expected_version=expected_version,
+            )
+        return dict(payload)
 
     @staticmethod
     def _columns(connection: Any, table: str) -> set[str]:

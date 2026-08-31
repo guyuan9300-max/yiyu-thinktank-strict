@@ -396,42 +396,278 @@ def _event_line_timeline_nodes(payload: Mapping[str, Any]) -> list[dict[str, Any
     return sorted(nodes, key=lambda item: (item.get("time") or "", item.get("id") or ""))
 
 
-def _event_line_narrative(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _event_line_value(item: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _event_line_trim(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    return text if len(text) <= limit else f"{text[:limit].rstrip()}…"
+
+
+def _event_line_task_business_time(item: Mapping[str, Any]) -> str:
+    return str(
+        _event_line_value(
+            item,
+            "completedAt",
+            "completed_at",
+            "dueDate",
+            "due_date",
+            "scheduledStartAt",
+            "scheduled_start_at",
+            "createdAt",
+            "created_at",
+        )
+        or ""
+    ).strip()
+
+
+def _event_line_agent_json(raw: str) -> Mapping[str, Any]:
+    text = str(raw or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        text = fenced.group(1)
+    else:
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start : end + 1]
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise LocalRuntimeError(502, "event_line_agent_json_invalid", "主线还原结果格式无效，可以重新生成") from exc
+    if not isinstance(value, Mapping):
+        raise LocalRuntimeError(502, "event_line_agent_json_invalid", "主线还原结果格式无效，可以重新生成")
+    return value
+
+
+def _event_line_narrative_source_pack(
+    compatibility: Any,
+    payload: Mapping[str, Any],
+    attachments: list[Mapping[str, Any]],
+) -> dict[str, Any]:
     event_line = payload.get("eventLine") if isinstance(payload.get("eventLine"), Mapping) else {}
-    nodes = _event_line_timeline_nodes(payload)
-    narrative_nodes = [{
-        "id": str(item.get("id") or ""),
-        "time": str(item.get("time") or ""),
-        "title": str(item.get("title") or ""),
-        "narrative": str(item.get("summary") or item.get("evidenceSummary") or ""),
-        "confidence": "high",
-        "linkedTaskIds": list(item.get("sourceTaskIds") or []),
-        "linkedActivityIds": list(item.get("sourceActivityIds") or []),
-        "linkedAttachmentIds": [],
-        "evidenceSummary": str(item.get("evidenceSummary") or ""),
-        "evidenceGaps": [],
-    } for item in nodes]
-    missing = [] if nodes else ["尚无任务或活动事实"]
+    tasks = [item for item in payload.get("tasks") or [] if isinstance(item, Mapping)]
+    referenced_tasks = [
+        item for item in payload.get("referencedTasks") or []
+        if isinstance(item, Mapping)
+    ]
+    task_ids = {str(item.get("id") or "") for item in tasks if str(item.get("id") or "")}
+    attachment_ids = {str(item.get("id") or "") for item in attachments if str(item.get("id") or "")}
+    milestone_task_ids = list(dict.fromkeys(
+        str(item.get("sourceId") or "")
+        for item in payload.get("activities") or []
+        if isinstance(item, Mapping)
+        and str(item.get("sourceType") or "") == "task"
+        and str(item.get("title") or "").startswith("里程碑任务：")
+        and str(item.get("sourceId") or "") in task_ids
+    ))
+    system_title = re.compile(
+        r"^(?:里程碑任务：|任务归入事件线：|合并来源事件线：)|"
+        r"(?:上传附件|归档到任务附件|归档到事件线附件|事件线已归档|创建事件线|更新事件线)",
+    )
+    activities: list[dict[str, Any]] = []
+    for item in payload.get("activities") or []:
+        if not isinstance(item, Mapping):
+            continue
+        source_type = str(item.get("sourceType") or "")
+        source_id = str(item.get("sourceId") or "")
+        title = str(item.get("title") or "").strip()
+        if source_type in {"task", "task_reference", "attachment"}:
+            continue
+        if source_type == "manual_note" and source_id in attachment_ids:
+            continue
+        if system_title.search(title):
+            continue
+        activities.append({
+            "id": str(item.get("id") or ""),
+            "sourceType": source_type,
+            "title": _event_line_trim(title, 240),
+            "summary": _event_line_trim(item.get("summary"), 800),
+            "happenedAt": str(item.get("happenedAt") or ""),
+        })
+
+    def task_input(item: Mapping[str, Any], *, relation: str) -> dict[str, Any]:
+        task_id = str(item.get("id") or "")
+        return {
+            "id": task_id,
+            "relation": relation,
+            "isHumanMilestone": task_id in milestone_task_ids,
+            "title": _event_line_trim(item.get("title"), 240),
+            "description": _event_line_trim(
+                _event_line_value(item, "description", "desc"),
+                1_000,
+            ),
+            "status": str(item.get("status") or ""),
+            "businessDate": _event_line_task_business_time(item),
+            "createdAt": str(_event_line_value(item, "createdAt", "created_at") or ""),
+            "completedAt": str(_event_line_value(item, "completedAt", "completed_at") or ""),
+        }
+
+    client_id = str(event_line.get("clientId") or "")
+    project_knowledge: list[dict[str, str]] = []
+    if client_id:
+        try:
+            project_knowledge = _event_line_knowledge_sources(
+                compatibility.runtime.project_knowledge_context(client_id)
+            )[:8]
+        except LocalRuntimeError:
+            project_knowledge = []
+    return {
+        "eventLine": {
+            "id": str(event_line.get("id") or ""),
+            "name": _event_line_trim(event_line.get("name"), 240),
+            "goal": _event_line_trim(event_line.get("goal"), 1_000),
+            "background": _event_line_trim(event_line.get("background"), 1_500),
+            "createdAt": str(event_line.get("createdAt") or ""),
+            "updatedAt": str(event_line.get("updatedAt") or ""),
+            "version": int(event_line.get("version") or 1),
+        },
+        "milestoneTaskIds": milestone_task_ids,
+        "tasks": [task_input(item, relation="formal") for item in tasks],
+        "referencedTasks": [
+            task_input(item, relation="reference") for item in referenced_tasks
+        ],
+        "businessActivities": activities,
+        "evidence": [{
+            "id": str(item.get("id") or ""),
+            "taskId": str(item.get("taskId") or ""),
+            "title": _event_line_trim(item.get("title"), 240),
+            "purpose": _event_line_trim(item.get("purpose"), 400),
+            "parsedPreview": _event_line_trim(item.get("parsedPreview"), 1_200),
+            "createdAt": str(item.get("createdAt") or ""),
+        } for item in attachments],
+        "projectKnowledge": project_knowledge,
+    }
+
+
+def _event_line_source_set_id(source_pack: Mapping[str, Any]) -> str:
+    serialized = json.dumps(source_pack, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "event-line-mainline:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _normalize_event_line_agent_narrative(
+    parsed: Mapping[str, Any],
+    *,
+    source_pack: Mapping[str, Any],
+    source_set_id: str,
+    previous_rev: int,
+    model_name: str,
+) -> dict[str, Any]:
+    event_line = source_pack.get("eventLine") or {}
+    task_rows = [
+        item for bucket in ("tasks", "referencedTasks")
+        for item in source_pack.get(bucket) or []
+        if isinstance(item, Mapping)
+    ]
+    task_by_id = {str(item.get("id") or ""): item for item in task_rows}
+    activity_by_id = {
+        str(item.get("id") or ""): item
+        for item in source_pack.get("businessActivities") or []
+        if isinstance(item, Mapping)
+    }
+    attachment_by_id = {
+        str(item.get("id") or ""): item
+        for item in source_pack.get("evidence") or []
+        if isinstance(item, Mapping)
+    }
+    milestone_ids = [
+        str(value) for value in source_pack.get("milestoneTaskIds") or []
+        if str(value) in task_by_id
+    ]
+    used_tasks: set[str] = set()
+    nodes: list[dict[str, Any]] = []
+    confidence_values = {"high": 1.0, "medium": 0.7, "low": 0.4}
+    for index, raw in enumerate(parsed.get("nodes") or []):
+        if not isinstance(raw, Mapping) or len(nodes) >= 5:
+            continue
+        task_ids = [
+            str(value) for value in raw.get("linkedTaskIds") or []
+            if str(value) in task_by_id and str(value) not in used_tasks
+        ]
+        task_ids = list(dict.fromkeys(task_ids))
+        activity_ids = list(dict.fromkeys(
+            str(value) for value in raw.get("linkedActivityIds") or []
+            if str(value) in activity_by_id
+        ))
+        if not task_ids and not activity_ids:
+            continue
+        attachment_ids = list(dict.fromkeys(
+            str(value) for value in raw.get("linkedAttachmentIds") or []
+            if str(value) in attachment_by_id
+        ))
+        attachment_ids.extend(
+            attachment_id
+            for attachment_id, attachment in attachment_by_id.items()
+            if str(attachment.get("taskId") or "") in task_ids
+            and attachment_id not in attachment_ids
+        )
+        title = _event_line_trim(raw.get("title"), 80)
+        narrative = _event_line_trim(raw.get("narrative"), 180)
+        if not title or not narrative:
+            continue
+        confidence = str(raw.get("confidence") or "medium").lower()
+        if confidence not in confidence_values:
+            confidence = "medium"
+        source_times = [
+            str(task_by_id[task_id].get("businessDate") or "")
+            for task_id in task_ids
+            if str(task_by_id[task_id].get("businessDate") or "")
+        ] + [
+            str(activity_by_id[activity_id].get("happenedAt") or "")
+            for activity_id in activity_ids
+            if str(activity_by_id[activity_id].get("happenedAt") or "")
+        ]
+        nodes.append({
+            "id": f"{event_line.get('id')}:mainline:{index + 1}",
+            "time": str(raw.get("time") or (sorted(source_times)[0] if source_times else "")),
+            "title": title,
+            "narrative": narrative,
+            "confidence": confidence,
+            "linkedTaskIds": task_ids,
+            "linkedActivityIds": activity_ids,
+            "linkedAttachmentIds": attachment_ids,
+            "evidenceSummary": "",
+            "evidenceGaps": [
+                _event_line_trim(value, 120)
+                for value in raw.get("evidenceGaps") or []
+                if str(value or "").strip()
+            ][:2],
+        })
+        used_tasks.update(task_ids)
+    if not nodes:
+        raise LocalRuntimeError(502, "event_line_agent_nodes_empty", "模型没有还原出可追溯的主线，可以重新生成")
+    missing_milestones = [task_id for task_id in milestone_ids if task_id not in used_tasks]
+    if missing_milestones:
+        raise LocalRuntimeError(502, "event_line_agent_milestone_missing", "模型遗漏了人工确认的里程碑，可以重新生成")
+    output_kind = "formal_mainline" if milestone_ids else "material_overview"
+    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     return {
         "eventLineId": str(event_line.get("id") or ""),
-        "rev": int(event_line.get("version") or 1),
-        "headline": str(event_line.get("name") or "事件线"),
-        "opening": str(event_line.get("background") or event_line.get("goal") or ""),
-        "closing": "已按当前正式任务和活动整理" if nodes else "尚无可整理的进展事实",
-        "nodes": narrative_nodes,
-        "overallConfidence": 1 if nodes else 0,
-        "generator": "strict_deterministic_event_line_v1",
-        "modelName": "",
-        "updatedAt": str(event_line.get("updatedAt") or ""),
-        "outputKind": "formal_mainline",
-        "sourceSetId": None,
+        "rev": max(1, previous_rev + 1),
+        "headline": _event_line_trim(parsed.get("headline") or event_line.get("name") or "事件线", 100),
+        "opening": _event_line_trim(parsed.get("opening") or event_line.get("goal"), 160),
+        "closing": _event_line_trim(parsed.get("closing"), 140),
+        "nodes": nodes,
+        "overallConfidence": round(
+            sum(confidence_values[str(item["confidence"])] for item in nodes) / len(nodes),
+            2,
+        ),
+        "generator": "organization_event_line_agent_v1",
+        "modelName": model_name,
+        "updatedAt": now,
+        "outputKind": output_kind,
+        "sourceSetId": source_set_id,
         "eventLineVersion": int(event_line.get("version") or 1),
-        "milestoneTaskIds": [],
+        "milestoneTaskIds": milestone_ids,
         "isStale": False,
-        "formalReady": bool(nodes),
-        "missingRequirements": missing,
-        "availabilityStatus": "ready" if nodes else "blocked",
-        "availabilityReason": "" if nodes else missing[0],
+        "formalReady": output_kind == "formal_mainline",
+        "missingRequirements": [] if milestone_ids else ["人工里程碑"],
+        "availabilityStatus": "ready",
+        "availabilityReason": "",
         "staleReasons": [],
     }
 
@@ -2803,7 +3039,7 @@ def upload_event_line_attachment(
             "sourceId": document_id,
             "title": title,
             "summary": purpose,
-            "includeInNarrative": True,
+            "includeInNarrative": False,
         },
         idempotency_key=f"{request.idempotency_key}:activity",
         refresh_business=False,
@@ -2921,12 +3157,28 @@ def event_line_timeline_narrative(
     compatibility: Any,
     request: UiRequest,
     match: Any,
-) -> dict[str, Any]:
-    return _event_line_narrative(
-        _strict_event_line_detail(
-            compatibility, match.group("event_line_id"), request
-        )
+) -> dict[str, Any] | None:
+    event_line_id = unquote(match.group("event_line_id"))
+    detail = _strict_event_line_detail(compatibility, event_line_id, request)
+    attachments = _event_line_report_attachments(compatibility, detail)
+    source_pack = _event_line_narrative_source_pack(
+        compatibility,
+        detail,
+        attachments,
     )
+    saved = _planning_projector(compatibility).load_event_line_narrative(event_line_id)
+    if not saved:
+        return None
+    current_source_set_id = _event_line_source_set_id(source_pack)
+    if str(saved.get("sourceSetId") or "") == current_source_set_id:
+        return saved
+    return {
+        **saved,
+        "isStale": True,
+        "formalReady": False,
+        "availabilityStatus": "stale",
+        "staleReasons": ["目标、里程碑、任务或证据已经变化"],
+    }
 
 
 @router.post(r"event-lines/(?P<event_line_id>[^/]+)/timeline-narrative/regenerate")
@@ -2935,7 +3187,65 @@ def regenerate_event_line_timeline_narrative(
     request: UiRequest,
     match: Any,
 ) -> dict[str, Any]:
-    return event_line_timeline_narrative(compatibility, request, match)
+    event_line_id = unquote(match.group("event_line_id"))
+    detail = _strict_event_line_detail(compatibility, event_line_id, request)
+    attachments = _event_line_report_attachments(compatibility, detail)
+    source_pack = _event_line_narrative_source_pack(
+        compatibility,
+        detail,
+        attachments,
+    )
+    milestone_ids = list(source_pack.get("milestoneTaskIds") or [])
+    completion = compatibility.runtime.private_ai_completion(
+        system_prompt=(
+            "你是益语智库的事件线主线还原 Agent。你的任务是把零散事实压缩成简短、清楚、可追溯的推进主线，"
+            "不是写项目报告，也不是按时间抄录任务清单。人工确认的里程碑是正式主线骨架：每个里程碑任务必须"
+            "且只能出现在一个节点中；语义相近、共同构成一个阶段的多个里程碑可以归入同一节点。其他任务、"
+            "会议、复盘、决策和材料只用于说明里程碑的前因、推进与结果。节点按真实推进关系和因果顺序排列，"
+            "时间仅用于核验和辅助排序；里程碑的时间使用任务业务日期，不使用成员后来点击确认里程碑的时间。"
+            "严禁把上传材料、任务关联、创建更新、事件线合并、同步归档等系统操作写成主线节点。材料只能作为"
+            "节点证据；同一事实以任务、会议、活动或材料多次出现时必须合并去重。正式关联任务是主事实，引用"
+            "任务只补充语境，不得据此改写原任务。项目知识只帮助理解事实的重要性，不得补造结果。"
+            "任务状态为已完成只代表该项动作已经结束，不等于测试通过、功能可用、符合预期或形成正式版本；"
+            "只有输入正文明确给出这些结论时才能如此表述。属于同一能力链、同一轮验收或同一阶段的里程碑"
+            "应优先合并，禁止机械地为每个里程碑各写一个节点。全文保持主线语言，不用“本报告、综上、建议”"
+            "等报告口吻，也不要在closing中解释材料不足、信息未知或为什么不能下结论，只需实事求是说明当前"
+            "推进到哪里。通常生成2至4个节点；每个节点标题用4至14个汉字概括阶段，不罗列任务名称；"
+            "每个节点代表一个阶段或转折，说明限1至2句，交代发生了什么和推进到哪里，不展开分析。"
+            "opening和closing各限1句。"
+            "若没有人工里程碑，可以保守归纳阶段线索，但不得声称是正式主线。"
+            "只引用输入中真实存在的ID。输出严格JSON："
+            '{"headline":"简短主线标题","opening":"一句总体脉络","nodes":['
+            '{"title":"阶段标题","time":"主要业务时间","narrative":"1至2句简述",'
+            '"confidence":"high|medium|low","linkedTaskIds":["..."],'
+            '"linkedActivityIds":["..."],"linkedAttachmentIds":["..."],'
+            '"evidenceGaps":[]}],"closing":"一句当前所处位置"}。'
+            "不要输出代码围栏或解释。"
+        ),
+        prompt=json.dumps(source_pack, ensure_ascii=False)[:48_000],
+        creativity_mode="strict",
+        capability="event_line_mainline_restore",
+        read_timeout_seconds=120.0,
+        max_output_tokens=3_000,
+    )
+    parsed = _event_line_agent_json(str(completion.get("content") or ""))
+    source_set_id = _event_line_source_set_id(source_pack)
+    previous = _planning_projector(compatibility).load_event_line_narrative(
+        event_line_id
+    )
+    narrative = _normalize_event_line_agent_narrative(
+        parsed,
+        source_pack=source_pack,
+        source_set_id=source_set_id,
+        previous_rev=int((previous or {}).get("rev") or 0),
+        model_name=str(completion.get("modelName") or ""),
+    )
+    if milestone_ids and narrative.get("outputKind") != "formal_mainline":
+        raise LocalRuntimeError(502, "event_line_agent_formal_invalid", "模型未按人工里程碑形成正式主线，可以重新生成")
+    return _planning_projector(compatibility).save_event_line_narrative(
+        event_line_id,
+        narrative,
+    )
 
 
 @router.post(r"event-lines/(?P<event_line_id>[^/]+)/readiness-analysis")

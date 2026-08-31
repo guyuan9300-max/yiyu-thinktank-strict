@@ -1387,7 +1387,6 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
   /* Per-activity toggle: which activities have docs expanded / images expanded */
   const [docsExpandedActivities, setDocsExpandedActivities] = useState<Set<string>>(new Set());
   const [imagesExpandedActivities, setImagesExpandedActivities] = useState<Set<string>>(new Set());
-  const [showSystemTraces, setShowSystemTraces] = useState(false);
   const [viewMode, setViewMode] = useState<'context' | 'milestones' | 'evidence' | 'timeline' | 'blueprint' | 'report'>('context');
 
   /* P1 主线还原 LLM 叙事 */
@@ -1462,12 +1461,6 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
 
   const renderNarrativeNode = (node: EventLineNarrativeNode, index: number) => {
     const rankText = String(index + 1).padStart(2, '0');
-    const confColor =
-      node.confidence === 'high'
-        ? 'text-emerald-700 bg-emerald-50 ring-emerald-200'
-        : node.confidence === 'low'
-          ? 'text-rose-700 bg-rose-50 ring-rose-200'
-          : 'text-amber-700 bg-amber-50 ring-amber-200';
     const timeLabel = node.time ? (node.time.slice(0, 10) || node.time) : '时间待补';
     const expanded = expandedNarrativeNodes.has(node.id);
     const linkedTasks = [
@@ -1487,18 +1480,9 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
           <div className="flex-1 min-w-0">
             <div className="flex items-baseline gap-3 flex-wrap">
               <h4 className="text-[16px] font-semibold leading-snug text-gray-900">{node.title}</h4>
-              <span className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium tracking-wide uppercase ring-1 ${confColor}`}>
-                <span className={`h-1 w-1 rounded-full ${node.confidence === 'high' ? 'bg-emerald-500' : node.confidence === 'low' ? 'bg-rose-500' : 'bg-amber-500'}`} />
-                {node.confidence}
-              </span>
               <span className="text-[11px] text-gray-400 tabular-nums">{timeLabel}</span>
             </div>
             <p className="mt-2 text-[14px] leading-relaxed text-gray-700">{node.narrative}</p>
-            {node.evidenceSummary && (
-              <p className="mt-2 border-l border-gray-200 pl-3 text-[11px] leading-5 text-gray-500">
-                证据：{node.evidenceSummary}
-              </p>
-            )}
             {node.evidenceGaps && node.evidenceGaps.length > 0 && (
               <p className="mt-1.5 text-[10.5px] leading-5 text-amber-700">
                 证据缺口：{node.evidenceGaps.join('；')}
@@ -1516,7 +1500,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                   })}
                   className="text-[10.5px] font-medium text-gray-500 hover:text-gray-900"
                 >
-                  {expanded ? '收起证据' : `查看证据（${evidenceCount}）`}
+                  {expanded ? '收起依据' : `查看依据（${evidenceCount}）`}
                 </button>
                 {expanded && (
                   <div className="mt-2 space-y-1.5 rounded-md border border-gray-100 bg-gray-50/70 p-2.5">
@@ -1569,7 +1553,6 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
     setRetryingFailedMaterials(false);
     setDocsExpandedActivities(new Set());
     setImagesExpandedActivities(new Set());
-    setShowSystemTraces(false);
     setViewMode('context');
     setGoalText('');
     setBackgroundText('');
@@ -2027,11 +2010,15 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
     snapshot,
   ]);
 
-  const humanMilestoneTaskIds = useMemo(() => new Set(
-    (snapshot?.activities || [])
-      .filter((activity) => activity.sourceType === 'task_activity' && activity.isKey && activity.keySource === 'human')
-      .map((activity) => activity.sourceId),
-  ), [snapshot?.activities]);
+  const humanMilestoneTaskIds = useMemo(() => {
+    const formalTaskIds = new Set((snapshot?.tasks || []).map((task) => task.id));
+    return new Set(
+      (snapshot?.activities || [])
+        .filter((activity) => activity.sourceType === 'task_activity' && activity.isKey && activity.keySource === 'human')
+        .map((activity) => activity.sourceId)
+        .filter((taskId) => formalTaskIds.has(taskId)),
+    );
+  }, [snapshot?.activities, snapshot?.tasks]);
 
   const handleToggleMilestone = useCallback(async (task: Task) => {
     if (!snapshot?.eventLine.viewerCapabilities.canSetMilestone || milestoneTaskId) return;
@@ -2311,11 +2298,6 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
   const failedMaterialAttachments = directEventLineAttachments.filter(canRetryAttachmentParse);
   const processingMaterialCount = directEventLineAttachments.filter(isAttachmentParsePending).length;
   const materialUploadTask = (snapshot?.tasks || []).find((task) => task.id === materialUploadTaskId) || null;
-
-  const timelineModel = useMemo(() => {
-    if (!draft || !snapshot) return null;
-    return buildEventLineTimelineModel(snapshot, draft);
-  }, [draft, snapshot]);
 
   /* ---------------------------------------------------------------- */
   /*  Render                                                           */
@@ -3125,16 +3107,15 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
             </section>
           )}
 
-          {viewMode === 'timeline' && timelineModel ? (
+          {viewMode === 'timeline' && draft && snapshot ? (
             <div className="space-y-5 pb-6">
-              {/* P1 · AI 主线还原 banner */}
               {timelineNarrative ? (
                 <section className="rounded-2xl border border-gray-900 bg-gray-900 px-5 py-5 text-white">
                   <div className="flex items-baseline justify-between gap-4 mb-3">
                     <div className="flex items-center gap-2">
                       <Sparkles size={14} className="text-amber-300" />
                       <h3 className="text-[15px] font-semibold tracking-tight">
-                        {timelineNarrative.outputKind === 'formal_mainline' ? '正式主线' : '素材概览'} · {timelineNarrative.headline || '事件线还原'}
+                        {timelineNarrative.outputKind === 'formal_mainline' ? '正式主线' : '阶段线索'} · {timelineNarrative.headline || '事件线还原'}
                       </h3>
                     </div>
                     <div className="flex items-center gap-3 text-[10px] text-gray-400">
@@ -3153,7 +3134,7 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                         {narrativeRegenerating ? (
                           <>
                             <RefreshCw size={10} className="animate-spin" />
-                            重新生成中
+                            Agent 整理中
                           </>
                         ) : (
                           <>
@@ -3187,8 +3168,8 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                   <p className="text-[13px] font-semibold text-gray-700">主线还原尚未生成</p>
                   <p className="mt-1 text-[11.5px] text-gray-500">
                     {formalInputsReady
-                      ? 'AI 将严格按人工确认的里程碑顺序组织证据和进展。'
-                      : '目标或人工里程碑尚未齐全，只能先生成素材概览。'}
+                      ? 'Agent 将围绕人工里程碑归组任务、会议和材料，形成简短推进脉络。'
+                      : '没有人工里程碑时，Agent 只会保守整理阶段线索。'}
                   </p>
                   <button
                     type="button"
@@ -3199,12 +3180,12 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                     {narrativeRegenerating ? (
                       <>
                         <RefreshCw size={12} className="animate-spin" />
-                        AI 生成中 · 约 1-2 分钟
+                        Agent 整理中
                       </>
                     ) : (
                       <>
                         <Sparkles size={12} />
-                        {formalInputsReady ? '生成正式主线' : '生成素材概览'}
+                        {formalInputsReady ? '生成正式主线' : '整理阶段线索'}
                       </>
                     )}
                   </button>
@@ -3223,67 +3204,12 @@ export default function EventLineReportPanel({ eventLineId, backendBaseUrl, onCl
                       <p className="text-[13px] leading-relaxed text-gray-700">{timelineNarrative.closing}</p>
                     </section>
                   )}
-                  {timelineModel.mainNodes.length > 0 && (
-                    <details className="mt-6 rounded-xl border border-gray-100 bg-gray-50/40 px-4 py-3">
-                      <summary className="cursor-pointer text-[11px] font-medium text-gray-500 hover:text-gray-700">
-                        查看原始时间线节点 ({timelineModel.mainNodes.length} 个) — 由规则切分, 仅供参考
-                      </summary>
-                      <div className="mt-3 space-y-3">
-                        {timelineModel.mainNodes.map((node, index) => renderTimelineNode(node, index))}
-                      </div>
-                    </details>
-                  )}
                 </div>
-              ) : timelineModel.mainNodes.length > 0 ? (
-                <div className="space-y-3">
-                  {timelineModel.mainNodes.map((node, index) => renderTimelineNode(node, index))}
-                </div>
-              ) : (
+              ) : timelineNarrative ? (
                 <div className="rounded-2xl border border-gray-100 bg-white px-4 py-8 text-center text-[12px] text-gray-400">
                   当前还没有足够信息形成主线节点。
                 </div>
-              )}
-
-              {timelineModel.reviewNodes.length > 0 && (
-                <section className="pt-5 border-t border-gray-100">
-                  <div className="mb-3 flex items-baseline gap-3">
-                    <h3 className="text-[10px] font-bold uppercase tracking-[0.18em] text-amber-600">待确认节点</h3>
-                    <span className="text-[11px] text-gray-400 tabular-nums">{timelineModel.reviewNodes.length} 项</span>
-                  </div>
-                  <p className="mb-4 text-[11.5px] leading-relaxed text-gray-500">
-                    缺少归属、含测试文件或解析状态不完整 · 暂不进入主线叙事
-                  </p>
-                  <div className="space-y-2">
-                    {timelineModel.reviewNodes.map((node, index) => renderTimelineNode(node, index, 'review'))}
-                  </div>
-                </section>
-              )}
-
-              {timelineModel.systemNodes.length > 0 && (
-                <section className="pt-5 border-t border-gray-100">
-                  <button
-                    type="button"
-                    onClick={() => setShowSystemTraces((prev) => !prev)}
-                    className="flex w-full items-baseline justify-between gap-3 text-left group/sys"
-                  >
-                    <div className="flex items-baseline gap-3">
-                      <h3 className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400 group-hover/sys:text-gray-700">系统痕迹</h3>
-                      <span className="text-[11px] text-gray-400 tabular-nums">{timelineModel.systemNodes.length} 项</span>
-                    </div>
-                    <span className="text-[11px] font-medium text-gray-400 group-hover/sys:text-gray-900 transition-colors">
-                      {showSystemTraces ? '收起 ↑' : '展开 ↓'}
-                    </span>
-                  </button>
-                  <p className="mt-1 text-[11.5px] leading-relaxed text-gray-400">
-                    创建 · 上传 · 更新等审计流水
-                  </p>
-                  {showSystemTraces && (
-                    <div className="mt-4 space-y-2">
-                      {timelineModel.systemNodes.map((node, index) => renderTimelineNode(node, index, 'system'))}
-                    </div>
-                  )}
-                </section>
-              )}
+              ) : null}
             </div>
           ) : null}
 

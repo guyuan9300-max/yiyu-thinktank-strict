@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -14,7 +16,6 @@ from backend.app.ui_domains.gc06_planning import (
     _apply_weekly_event_grouping_overrides,
     _enforce_weekly_explicit_event_groups,
     _event_line_ui,
-    _event_line_narrative,
     _event_line_timeline_nodes,
     _merge_review_task_entries,
     _normalize_weekly_event_cards,
@@ -982,6 +983,7 @@ def test_event_line_evidence_upload_keeps_body_local_and_registers_safe_metadata
         "cloudMetadataState": "ready",
     }
     assert runtime.commands[-1][1].endswith("/event-lines/line_upload/activities")
+    assert runtime.commands[-1][2]["includeInNarrative"] is False
     relation = next(item for kind, item in store.bound if kind == "event-line")
     assert relation == {
         "project_id": "client_upload",
@@ -1165,16 +1167,181 @@ def test_retained_event_line_reads_build_only_traceable_fact_views() -> None:
             "title": "周复盘已提交",
             "summary": "本周完成真实闭环",
             "includeInNarrative": True,
+        }, {
+            "id": "activity_milestone",
+            "sourceType": "task",
+            "sourceId": "task_retained",
+            "happenedAt": "2026-08-31T09:00:00Z",
+            "title": "里程碑任务：完成闭环验收",
+            "summary": "由成员确认为事件线里程碑",
+            "includeInNarrative": True,
+        }, {
+            "id": "activity_attachment",
+            "sourceType": "manual_note",
+            "sourceId": "attachment_retained",
+            "happenedAt": "2026-08-31T10:00:00Z",
+            "title": "补充验收截图",
+            "summary": "事件线补充证据",
+            "includeInNarrative": True,
         }],
-        "tasks": [],
+        "tasks": [{
+            "id": "task_retained",
+            "title": "完成闭环验收",
+            "description": "核对项目闭环",
+            "status": "done",
+            "completed_at": "2026-08-07T08:00:00Z",
+        }],
     }
     nodes = _event_line_timeline_nodes(detail)
-    assert [item["sourceActivityIds"] for item in nodes] == [["activity_retained"]]
-    narrative = _event_line_narrative(detail)
-    assert narrative["generator"] == "strict_deterministic_event_line_v1"
-    assert narrative["nodes"][0]["linkedActivityIds"] == ["activity_retained"]
-    assert narrative["formalReady"] is True
-    assert narrative["modelName"] == ""
+    assert {item["id"] for item in nodes} >= {
+        "activity_retained",
+        "activity_milestone",
+        "activity_attachment",
+        "task:task_retained",
+    }
+    source_pack = gc06_ui_domain._event_line_narrative_source_pack(
+        SimpleNamespace(
+            runtime=SimpleNamespace(project_knowledge_context=lambda _client_id: {})
+        ),
+        detail,
+        [{
+            "id": "attachment_retained",
+            "taskId": "task_retained",
+            "title": "补充验收截图",
+            "purpose": "事件线补充证据",
+        }],
+    )
+    assert source_pack["milestoneTaskIds"] == ["task_retained"]
+    assert [item["id"] for item in source_pack["businessActivities"]] == [
+        "activity_retained"
+    ]
+    narrative = gc06_ui_domain._normalize_event_line_agent_narrative(
+        {
+            "headline": "闭环验收主线",
+            "opening": "围绕闭环目标推进验收。",
+            "nodes": [{
+                "title": "形成并完成闭环验收",
+                "narrative": "复盘形成验收方向，并完成正式任务核对。",
+                "confidence": "high",
+                "linkedTaskIds": ["task_retained"],
+                "linkedActivityIds": ["activity_retained"],
+                "linkedAttachmentIds": [],
+            }],
+            "closing": "核心闭环已经完成验收。",
+        },
+        source_pack=source_pack,
+        source_set_id="event-line-mainline:test",
+        previous_rev=0,
+        model_name="test-model",
+    )
+    assert narrative["generator"] == "organization_event_line_agent_v1"
+    assert narrative["outputKind"] == "formal_mainline"
+    assert narrative["milestoneTaskIds"] == ["task_retained"]
+    assert narrative["nodes"][0]["linkedAttachmentIds"] == [
+        "attachment_retained"
+    ]
+    assert narrative["nodes"][0]["time"] == "2026-08-07T08:00:00Z"
+
+
+def test_event_line_regenerate_runs_agent_and_persists_validated_mainline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detail = {
+        "eventLine": {
+            "id": "event_line_agent",
+            "clientId": "client_agent",
+            "name": "新版软件测试",
+            "goal": "持续修复问题",
+            "background": "严格架构已经建立",
+            "version": 4,
+            "createdAt": "2026-08-01T09:00:00Z",
+            "updatedAt": "2026-08-08T09:00:00Z",
+        },
+        "tasks": [{
+            "id": "task_agent_milestone",
+            "title": "完成手机版点测",
+            "description": "点测手机版功能",
+            "status": "done",
+            "completed_at": "2026-08-08T08:00:00Z",
+        }],
+        "referencedTasks": [],
+        "activities": [{
+            "id": "activity_agent_milestone",
+            "sourceType": "task",
+            "sourceId": "task_agent_milestone",
+            "title": "里程碑任务：完成手机版点测",
+            "summary": "由成员确认为事件线里程碑",
+            "happenedAt": "2026-08-31T08:00:00Z",
+        }],
+    }
+    saved: dict[str, Any] = {}
+    completion_calls: list[dict[str, Any]] = []
+
+    class Runtime:
+        @staticmethod
+        def project_knowledge_context(_client_id: str):
+            return {}
+
+        @staticmethod
+        def private_ai_completion(**kwargs):
+            completion_calls.append(kwargs)
+            return {
+                "content": json.dumps({
+                    "headline": "新版测试主线",
+                    "opening": "从手机版点测切入。",
+                    "nodes": [{
+                        "title": "手机版点测",
+                        "narrative": "完成手机版功能点测，进入持续测试阶段。",
+                        "confidence": "high",
+                        "linkedTaskIds": ["task_agent_milestone"],
+                        "linkedActivityIds": [],
+                        "linkedAttachmentIds": [],
+                        "evidenceGaps": [],
+                    }],
+                    "closing": "当前继续修复问题并完善交互。",
+                }, ensure_ascii=False),
+                "modelName": "agent-model",
+            }
+
+    class Projector:
+        @staticmethod
+        def load_event_line_narrative(_event_line_id: str):
+            return saved or None
+
+        @staticmethod
+        def save_event_line_narrative(_event_line_id: str, payload):
+            saved.update(payload)
+            return dict(payload)
+
+    monkeypatch.setattr(gc06_ui_domain, "_strict_event_line_detail", lambda *_args: detail)
+    monkeypatch.setattr(gc06_ui_domain, "_planning_projector", lambda _compatibility: Projector())
+    compatibility = SimpleNamespace(runtime=Runtime())
+    request = UiRequest(
+        method="POST",
+        path="event-lines/event_line_agent/timeline-narrative/regenerate",
+        query={},
+        body={"trigger": "manual"},
+        idempotency_key="event-line-agent-test",
+    )
+    result = gc06_ui_domain.regenerate_event_line_timeline_narrative(
+        compatibility,
+        request,
+        SimpleNamespace(group=lambda _name: "event_line_agent"),
+    )
+    assert completion_calls[0]["capability"] == "event_line_mainline_restore"
+    assert result["generator"] == "organization_event_line_agent_v1"
+    assert result["modelName"] == "agent-model"
+    assert result["outputKind"] == "formal_mainline"
+    assert result["milestoneTaskIds"] == ["task_agent_milestone"]
+    assert saved["nodes"][0]["time"] == "2026-08-08T08:00:00Z"
+
+    loaded = gc06_ui_domain.event_line_timeline_narrative(
+        compatibility,
+        replace(request, method="GET", body={}),
+        SimpleNamespace(group=lambda _name: "event_line_agent"),
+    )
+    assert loaded == saved
+    assert len(completion_calls) == 1
 
 
 def _create_plan(repository, identity, client_id: str, event_line_id: str):
