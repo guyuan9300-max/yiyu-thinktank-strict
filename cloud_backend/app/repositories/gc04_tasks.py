@@ -2025,21 +2025,31 @@ class GC04TaskRepository:
             raise RepositoryError(409, "task_version_conflict", "任务已更新，请刷新后重试")
         if patch.get("completed_at") and not row["completed_at"]:
             # Completion is the terminal boundary of the current work session.
-            # Close every participant's running focus segment in the same
-            # transaction so an app/device that has not refreshed cannot keep
-            # accumulating time after the task is complete.
-            connection.execute(
-                "UPDATE execution_runs SET status='paused',finished_at=?,"
-                "version=version+1,updated_at=? WHERE scope_id=? AND task_id=? "
-                "AND run_kind=? AND status='running' AND lifecycle_state='active'",
-                (
-                    now,
-                    now,
-                    identity.scope_id,
-                    row["id"],
-                    TASK_FOCUS_RUN_KIND,
-                ),
-            )
+            # Stop each participant's latest active focus segment in the same
+            # transaction. Running segments receive the completion timestamp;
+            # paused segments keep their earlier finished_at and become final.
+            latest_runs = connection.execute(
+                "SELECT id,status FROM ("
+                "SELECT id,status,ROW_NUMBER() OVER ("
+                "PARTITION BY initiator_membership_id "
+                "ORDER BY created_at DESC,id DESC) AS row_number "
+                "FROM execution_runs WHERE scope_id=? AND task_id=? "
+                "AND run_kind=? AND lifecycle_state='active'"
+                ") WHERE row_number=1 AND status IN ('running','paused')",
+                (identity.scope_id, row["id"], TASK_FOCUS_RUN_KIND),
+            ).fetchall()
+            for latest_run in latest_runs:
+                connection.execute(
+                    "UPDATE execution_runs SET status='stopped',"
+                    "finished_at=COALESCE(?,finished_at),version=version+1,updated_at=? "
+                    "WHERE id=? AND status IN ('running','paused') "
+                    "AND lifecycle_state='active'",
+                    (
+                        now if str(latest_run["status"] or "") == "running" else None,
+                        now,
+                        latest_run["id"],
+                    ),
+                )
         if collaborator_patch:
             if "owner_membership_id" in collaborator_patch:
                 owner_id = str(collaborator_patch["owner_membership_id"])

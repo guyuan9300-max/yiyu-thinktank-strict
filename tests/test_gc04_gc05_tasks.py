@@ -1140,11 +1140,17 @@ def test_desktop_close_pauses_only_current_members_running_timers(
     assert domain.task_detail(peer, task_id=task_id)["task"]["task_timer"]["state"] == "running"
 
 
-def test_completing_task_pauses_every_running_personal_timer(
+def test_completing_task_stops_active_personal_timers_and_keeps_idle_untouched(
     tmp_path: Path,
 ) -> None:
     repository, owner, _ = _repository(tmp_path)
     peer = _second_member(repository, owner)
+    untouched = _member(
+        repository,
+        owner,
+        suffix="timer_idle_peer",
+        display_name="未计时协作者",
+    )
     domain = GC04TaskRepository(repository)
     created = _create(
         domain,
@@ -1152,23 +1158,27 @@ def test_completing_task_pauses_every_running_personal_timer(
         "timer-complete-create",
         "完成任务时收口个人用时",
         ownerMembershipId=owner.membership_id,
-        collaboratorMembershipIds=[peer.membership_id],
+        collaboratorMembershipIds=[peer.membership_id, untouched.membership_id],
         visibilityScope="participants",
     )
     task_id = str(created["task"]["id"])
-    peer_assignment = next(
-        item
-        for item in created["task"]["collaborators"]
-        if item["subject_membership_id"] == peer.membership_id
-    )
-    domain.handle_inbox(
-        peer,
-        task_id=task_id,
-        action="accept",
-        expected_version=int(peer_assignment["version"]),
-        reason=None,
-        idempotency_key="timer-complete-peer-accept",
-    )
+    for participant, key in (
+        (peer, "timer-complete-peer-accept"),
+        (untouched, "timer-complete-idle-peer-accept"),
+    ):
+        assignment = next(
+            item
+            for item in created["task"]["collaborators"]
+            if item["subject_membership_id"] == participant.membership_id
+        )
+        domain.handle_inbox(
+            participant,
+            task_id=task_id,
+            action="accept",
+            expected_version=int(assignment["version"]),
+            reason=None,
+            idempotency_key=key,
+        )
     domain.update_task_timer(
         owner,
         task_id=task_id,
@@ -1183,6 +1193,13 @@ def test_completing_task_pauses_every_running_personal_timer(
         expected_timer_version=0,
         idempotency_key="timer-complete-peer-start",
     )
+    domain.update_task_timer(
+        peer,
+        task_id=task_id,
+        action="pause",
+        expected_timer_version=1,
+        idempotency_key="timer-complete-peer-pause",
+    )
     current = domain.task_detail(owner, task_id=task_id)["task"]
     domain.update_task(
         owner,
@@ -1194,8 +1211,9 @@ def test_completing_task_pauses_every_running_personal_timer(
         idempotency_key="timer-complete-task",
     )
 
-    assert domain.task_detail(owner, task_id=task_id)["task"]["task_timer"]["state"] == "paused"
-    assert domain.task_detail(peer, task_id=task_id)["task"]["task_timer"]["state"] == "paused"
+    assert domain.task_detail(owner, task_id=task_id)["task"]["task_timer"]["state"] == "stopped"
+    assert domain.task_detail(peer, task_id=task_id)["task"]["task_timer"]["state"] == "stopped"
+    assert domain.task_detail(untouched, task_id=task_id)["task"]["task_timer"]["state"] == "idle"
 
 
 class _ProjectionRuntime:

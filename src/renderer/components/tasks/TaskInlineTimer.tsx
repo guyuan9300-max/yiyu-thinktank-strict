@@ -65,7 +65,9 @@ export function TaskInlineTimer({
     ? `我的 · 计时中 ${elapsedLabel}`
     : current.state === 'paused'
       ? `我的 · 已暂停 ${elapsedLabel}`
-      : `我的用时 ${elapsedLabel}`;
+      : current.state === 'stopped'
+        ? `我的 · 已停止 ${elapsedLabel}`
+        : `我的用时 ${elapsedLabel}`;
 
   const runAction = async (action: TaskTimerAction) => {
     setBusyAction(action);
