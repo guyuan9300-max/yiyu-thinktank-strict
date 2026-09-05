@@ -26,6 +26,7 @@ from .mobile_sync import register_mobile_sync_routes
 from .mobile_consult import register_mobile_consult_routes
 from .mobile_devices import register_mobile_device_routes
 from .mobile_link_transfers import register_mobile_link_transfer_routes
+from .schedule_assistant import register_schedule_assistant_routes
 from ..repositories.gc06_task_command_port import GC04_FORMAL_TASK_COMMAND_PORT
 
 
@@ -64,3 +65,4 @@ def register_domain_routes(
     register_mobile_consult_routes(app, repository, identity_dependency)
     register_mobile_device_routes(app, repository, identity_dependency)
     register_mobile_link_transfer_routes(app, repository, identity_dependency)
+    register_schedule_assistant_routes(app, repository, identity_dependency)

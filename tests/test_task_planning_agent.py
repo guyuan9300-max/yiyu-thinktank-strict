@@ -347,3 +347,65 @@ def test_task_planning_parse_returns_draft_without_creating_task(tmp_path: Path,
     with runtime_connection(repository.database_path, "cloud") as connection:
         assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM execution_runs WHERE run_kind='task_draft_parse'").fetchone()[0] == 1
+
+
+def test_standard_tencent_invite_is_parsed_without_calling_organization_ai(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    repository, identity, _payload = _repository(tmp_path)
+    now = utc_now()
+    bot_id = builtin_agent_id(identity.organization_id, "task_planning")
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        connection.execute(
+            "INSERT INTO secured_resources (id,scope_id,resource_kind,lifecycle_state,version,"
+            "resource_type_key,created_at,updated_at,deleted_at,authority_role,origin_instance_id) "
+            "VALUES (?,?,?,'active',1,?,?,?,NULL,'cloud',?)",
+            (
+                bot_id,
+                identity.scope_id,
+                "bot_definition",
+                "builtin_function_agent",
+                now,
+                now,
+                identity.cloud_instance_id,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO bot_definitions (id,scope_id,agent_kind,version,handle,description,enabled,"
+            "lifecycle_state,created_at,updated_at,deleted_at) VALUES (?,?,?,1,?,?,1,'active',?,?,NULL)",
+            (bot_id, identity.scope_id, "task_planning", "task-planning", "任务计划", now, now),
+        )
+        connection.commit()
+
+    def unexpected_ai_config(*_args, **_kwargs):
+        raise AssertionError("standard Tencent invitations must not call the model")
+
+    monkeypatch.setattr(repository, "ai_config", unexpected_ai_config)
+    result = TaskPlanningAgentRepository(repository).parse_draft(
+        identity,
+        payload={
+            "currentDate": "2026-09-01",
+            "text": (
+                "顾源源 邀请您参加腾讯会议\n"
+                "会议主题：为爱黔行——纤维（9月1日）\n"
+                "会议时间：2026/09/01 20:00-21:00 (GMT+08:00) 中国标准时间 - 北京\n"
+                "点击链接入会：https://meeting.tencent.com/dm/pJA5ECmloLqc\n"
+                "#腾讯会议：119-385-896"
+            ),
+        },
+    )
+
+    assert result["recordMode"] == "task"
+    assert result["externalCollaboration"] is True
+    assert result["title"] == "为爱黔行——纤维（9月1日）"
+    assert result["date"] == "2026-09-01"
+    assert result["start"] == "20:00"
+    assert result["end"] == "21:00"
+    assert result["meetingCode"] == "119-385-896"
+    assert result["agentRun"]["state"] == "completed"
+    with runtime_connection(repository.database_path, "cloud") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM execution_runs WHERE run_kind='task_draft_parse'"
+        ).fetchone()[0] == 1
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

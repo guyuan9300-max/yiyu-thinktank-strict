@@ -164,6 +164,7 @@ class MobileSyncRepository:
             "tasks": self._filter_tasks(task_board.get("tasks", [])),
             "taskCollaborators": task_board.get("projection", {}).get("task_collaborators", []),
             "taskLists": task_board.get("taskLists", []),
+            "taskTags": task_board.get("taskTags", []),
             "calendarEntries": [*task_board.get("calendarEntries", []), *meeting_calendar],
             "meetings": self._filter_meetings(meetings),
             "planningCycles": plans,

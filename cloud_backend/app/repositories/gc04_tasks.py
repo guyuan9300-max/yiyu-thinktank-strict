@@ -20,6 +20,9 @@ from .gc03_scope import validate_task_client_binding
 
 PRIORITIES = frozenset({"low", "normal", "high"})
 TASK_VISIBILITIES = frozenset({"self", "participants", "organization"})
+TASK_KINDS = frozenset(
+    {"standard", "task", "personal_schedule", "review_pending", "review_returned"}
+)
 LIST_VISIBILITIES = frozenset({"personal", "organization"})
 ACTIVE_INBOX_STATES = frozenset({"pending", "accepted"})
 TASK_VIEW_PROJECTION_CONTRACT = {
@@ -973,6 +976,9 @@ class GC04TaskRepository:
         priority = str(payload.get("priority") or "normal").strip().lower()
         if priority not in PRIORITIES:
             raise RepositoryError(422, "task_priority_invalid", "任务优先级无效")
+        task_kind = _text(payload.get("taskKind")) or "standard"
+        if task_kind not in TASK_KINDS:
+            raise RepositoryError(422, "task_kind_invalid", "任务类型无效")
         visibility = str(
             payload.get("visibilityScope")
             or ("self" if payload.get("scopeMode") == "PERSONAL_ONLY" else "participants")
@@ -1014,7 +1020,7 @@ class GC04TaskRepository:
             "title": title,
             "description": str(payload.get("description") if "description" in payload else payload.get("desc") or "").strip(),
             "priority": priority,
-            "task_kind": _text(payload.get("taskKind")) or "standard",
+            "task_kind": task_kind,
             "visibility_scope": visibility,
             "task_list_id": task_list_id,
             "tag_ids": tag_ids,
@@ -1055,7 +1061,7 @@ class GC04TaskRepository:
             patch["priority"] = priority
         if "taskKind" in payload:
             task_kind = _text(payload.get("taskKind")) or "task"
-            if task_kind not in {"standard", "task", "review_pending", "review_returned"}:
+            if task_kind not in TASK_KINDS:
                 raise RepositoryError(422, "task_kind_invalid", "任务类型无效")
             patch["task_kind"] = task_kind
         for source, column in (

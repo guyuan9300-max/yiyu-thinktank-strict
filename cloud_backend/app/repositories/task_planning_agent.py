@@ -11,6 +11,7 @@ import httpx
 from strict_common.agent_memory import AgentRunReceipt, builtin_agent_id
 from strict_common.ids import canonical_json, new_id, sha256_text, utc_now
 
+from ..meeting_invite_parser import parse_tencent_meeting_invite
 from ..repository import CloudRepository, RepositoryError, SessionIdentity
 from .project_materials import GC07ProjectMaterialsRepository
 from . import gc06_planning
@@ -701,6 +702,32 @@ class TaskPlanningAgentRepository:
             ]
         return _merge_categories(categories), generation_state, supplements
 
+    def _finish_draft(
+        self,
+        identity: SessionIdentity,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        now, run_id = utc_now(), new_id()
+        bot_id = builtin_agent_id(identity.organization_id, "task_planning")
+        with self.repository._connection() as connection:  # noqa: SLF001
+            connection.execute(
+                "INSERT INTO execution_runs (id,scope_id,bot_id,rule_id,task_id,operation_id,status,"
+                "initiator_membership_id,proposal_id,run_kind,progress_object_manifest_id,"
+                "result_object_manifest_id,started_at,finished_at,version,lifecycle_state,created_at,updated_at,deleted_at) "
+                "VALUES (?,?,?,NULL,NULL,NULL,'completed',?,NULL,'task_draft_parse',NULL,NULL,?,?,1,'active',?,?,NULL)",
+                (run_id, identity.scope_id, bot_id, identity.membership_id, now, now, now, now),
+            )
+            connection.commit()
+        result["agentRun"] = AgentRunReceipt(
+            agent_kind="task_planning",
+            run_id=run_id,
+            state="completed",
+            stage="draft_ready",
+            message="草稿已解析，等待人工确认保存",
+            result_version=1,
+        ).as_dict()
+        return result
+
     def parse_draft(
         self,
         identity: SessionIdentity,
@@ -711,6 +738,18 @@ class TaskPlanningAgentRepository:
         text = str(payload.get("text") or "").strip()
         if not text:
             raise RepositoryError(422, "task_draft_text_required", "请输入或说出要记录的事项")
+        deterministic_invite = parse_tencent_meeting_invite(text)
+        if deterministic_invite is not None:
+            deterministic_invite.update(
+                {
+                    "clientId": None,
+                    "planningCycleId": None,
+                    "eventLineId": None,
+                    "ownerMembershipId": None,
+                    "collaboratorMembershipIds": [],
+                }
+            )
+            return self._finish_draft(identity, deterministic_invite)
         current_date = str(payload.get("currentDate") or utc_now()[:10]).strip()
         profiles = self.list_profiles(identity)
         plans = gc06_planning.list_planning_cycles(
@@ -766,14 +805,15 @@ class TaskPlanningAgentRepository:
             raise RepositoryError(409, "organization_ai_not_ready", "组织大模型尚未就绪")
         system = (
             "你是任务计划岗位的草稿解析器。只返回JSON对象，不保存或执行任何业务动作。"
-            "字段：recordMode(task|customer_meeting|personal_schedule)、title、description、date(YYYY-MM-DD或null)、"
+            "字段：recordMode(task|personal_schedule)、externalCollaboration(boolean)、title、description、date(YYYY-MM-DD或null)、"
             "start(HH:MM或null)、end(HH:MM或null)、priority(low|normal|high)、clientId、eventLineId、planningCycleId、"
             "ownerMembershipId、collaboratorMembershipIds、reasons。项目、事件线、计划和成员只能从候选ID原样选择；事件线必须属于已选项目；"
             "任务中的‘负责/主责/牵头/交给’对应ownerMembershipId，‘协助/配合/参与’对应协作者；"
+            "外部会议仍是task；与客户、供应商、合作方或第三方共同安排时externalCollaboration=true。"
             "会议中的‘组织/主持/召集’对应ownerMembershipId（组织者），‘参会/列席/参与’对应协作者。负责人不得同时出现在协作者数组。"
             "今天/明天及上午/下午/晚上必须结合currentDate换算，下午未给时刻默认15:00。"
             "无把握时必须为null或空数组。普通任务默认normal；只有明确紧急、严重阻塞、"
-            "法定或当天硬截止才high，明确可延后且影响小才low。会议须有明确会面/会议意图；个人日程只用于纯个人安排。"
+            "法定或当天硬截止才high，明确可延后且影响小才low。个人日程只用于纯个人安排。"
             "不得编造日期时间，不得自动保存。reasons为简短中文数组，说明项目、计划、优先级判断依据。"
         )
         prompt = canonical_json(
@@ -845,8 +885,15 @@ class TaskPlanningAgentRepository:
             if str(value) in allowed_members and str(value) != identity.membership_id
         ]
         mode = str(parsed.get("recordMode") or "task")
-        if mode not in {"task", "customer_meeting", "personal_schedule"}:
+        external_collaboration = bool(parsed.get("externalCollaboration"))
+        # Backward-compatible correction for an older organization prompt.
+        if mode == "customer_meeting":
             mode = "task"
+            external_collaboration = True
+        if mode not in {"task", "personal_schedule"}:
+            mode = "task"
+        if re.search(r"(?:客户|供应商|合作方|第三方|外部协作|腾讯会议|飞书会议|Zoom)", text, re.I):
+            external_collaboration = True
         # The model is asked to classify member roles, but explicit Chinese
         # role phrases are deterministic enough to correct before returning a
         # draft.  This never saves the business object.
@@ -854,12 +901,12 @@ class TaskPlanningAgentRepository:
             member_id, name = member["membershipId"], re.escape(member["displayName"])
             owner_pattern = (
                 rf"(?:由\s*)?{name}\s*(?:组织|主持|召集)"
-                if mode == "customer_meeting"
+                if external_collaboration
                 else rf"(?:由\s*)?{name}\s*(?:负责|主责|牵头|执行)|(?:负责人(?:是|为)?|交给)\s*{name}"
             )
             collaborator_pattern = (
                 rf"{name}\s*(?:参会|列席|参与)"
-                if mode == "customer_meeting"
+                if external_collaboration
                 else rf"{name}\s*(?:协助|配合|参与|协作|测试)"
             )
             if re.search(owner_pattern, text):
@@ -882,6 +929,7 @@ class TaskPlanningAgentRepository:
             parsed_end = f"{min(23, hour + 1):02d}:{minute:02d}"
         result = {
             "recordMode": mode,
+            "externalCollaboration": external_collaboration,
             "title": str(parsed.get("title") or "").strip()[:300] or text[:300],
             "description": str(parsed.get("description") or "").strip() or text,
             "date": parsed_date,
@@ -896,26 +944,7 @@ class TaskPlanningAgentRepository:
             "reasons": [str(item)[:200] for item in list(parsed.get("reasons") or [])[:5]],
             "sourceText": text,
         }
-        now, run_id = utc_now(), new_id()
-        bot_id = builtin_agent_id(identity.organization_id, "task_planning")
-        with self.repository._connection() as connection:  # noqa: SLF001
-            connection.execute(
-                "INSERT INTO execution_runs (id,scope_id,bot_id,rule_id,task_id,operation_id,status,"
-                "initiator_membership_id,proposal_id,run_kind,progress_object_manifest_id,"
-                "result_object_manifest_id,started_at,finished_at,version,lifecycle_state,created_at,updated_at,deleted_at) "
-                "VALUES (?,?,?,NULL,NULL,NULL,'completed',?,NULL,'task_draft_parse',NULL,NULL,?,?,1,'active',?,?,NULL)",
-                (run_id, identity.scope_id, bot_id, identity.membership_id, now, now, now, now),
-            )
-            connection.commit()
-        result["agentRun"] = AgentRunReceipt(
-            agent_kind="task_planning",
-            run_id=run_id,
-            state="completed",
-            stage="draft_ready",
-            message="草稿已解析，等待人工确认保存",
-            result_version=1,
-        ).as_dict()
-        return result
+        return self._finish_draft(identity, result)
 
     def refresh_profile(
         self,

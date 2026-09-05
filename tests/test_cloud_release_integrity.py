@@ -29,7 +29,60 @@ def test_task_release_capabilities_are_cumulative() -> None:
         "taskViewerProjectionV1": True,
         "taskTimerV1": True,
         "dateOnlyScheduleV1": True,
+        "scheduleAssistantV1": True,
     }
+
+
+def test_schedule_assistant_capability_requires_full_runtime_wiring(
+    tmp_path: Path,
+) -> None:
+    route_path = (
+        tmp_path / "cloud_backend" / "app" / "domain_routes" / "schedule_assistant.py"
+    )
+    registration_path = route_path.parent / "__init__.py"
+    repository_path = (
+        tmp_path / "cloud_backend" / "app" / "repositories" / "schedule_assistant.py"
+    )
+    route_path.parent.mkdir(parents=True)
+    repository_path.parent.mkdir(parents=True)
+    route_path.write_text(
+        '@app.post("/api/v2/ui/tasks/schedule-assistant/ask")\n', encoding="utf-8"
+    )
+    registration_path.write_text(
+        "from .schedule_assistant import register_schedule_assistant_routes\n"
+        "register_schedule_assistant_routes(app, repository, identity_dependency)\n",
+        encoding="utf-8",
+    )
+    repository_path.write_text(
+        "class ScheduleAssistantRepository:\n"
+        "    pass\n\n"
+        "def build_schedule_fact_pack():\n"
+        "    return {'mode': \"local_evidence\"}\n",
+        encoding="utf-8",
+    )
+
+    assert detect_task_capabilities(tmp_path)["scheduleAssistantV1"] is True
+
+    route_path.unlink()
+    assert detect_task_capabilities(tmp_path)["scheduleAssistantV1"] is False
+    route_path.write_text('@app.post("/wrong-path")\n', encoding="utf-8")
+    assert detect_task_capabilities(tmp_path)["scheduleAssistantV1"] is False
+    route_path.write_text(
+        '@app.post("/api/v2/ui/tasks/schedule-assistant/ask")\n', encoding="utf-8"
+    )
+
+    registration_path.write_text("", encoding="utf-8")
+    assert detect_task_capabilities(tmp_path)["scheduleAssistantV1"] is False
+    registration_path.write_text(
+        "from .schedule_assistant import register_schedule_assistant_routes\n"
+        "register_schedule_assistant_routes(app, repository, identity_dependency)\n",
+        encoding="utf-8",
+    )
+
+    repository_path.write_text(
+        "class ScheduleAssistantRepository:\n    pass\n", encoding="utf-8"
+    )
+    assert detect_task_capabilities(tmp_path)["scheduleAssistantV1"] is False
 
 
 def test_cloud_release_inventory_includes_contract_hash_companions() -> None:
@@ -43,6 +96,8 @@ def test_cloud_release_inventory_includes_contract_hash_companions() -> None:
     files = _tracked_runtime_files(REPOSITORY_ROOT, git_sha)
     assert "contracts/strict-cloud-schema-manifest.v1.canonical.sha256" in files
     assert "contracts/strict-local-schema-manifest.v1.canonical.sha256" in files
+    assert "cloud_backend/app/domain_routes/schedule_assistant.py" in files
+    assert "cloud_backend/app/repositories/schedule_assistant.py" in files
 
 
 def test_deployment_provisions_stable_cloud_identity_before_restart() -> None:
@@ -74,6 +129,7 @@ def test_release_verifier_rejects_a_capability_regression(tmp_path: Path) -> Non
             "taskViewerProjectionV1": True,
             "taskTimerV1": False,
             "dateOnlyScheduleV1": True,
+            "scheduleAssistantV1": True,
         },
     }
     (tmp_path / "RELEASE_MANIFEST.json").write_text(

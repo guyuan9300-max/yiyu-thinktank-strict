@@ -158,6 +158,72 @@ def _create(
     )
 
 
+def test_personal_schedule_task_kind_is_valid_for_create_and_update(
+    tmp_path: Path,
+) -> None:
+    repository, admin, _seed_payload = _repository(tmp_path)
+    domain = GC04TaskRepository(repository)
+
+    created = _create(
+        domain,
+        admin,
+        "gc04-personal-schedule-create",
+        "个人日程",
+        taskKind="personal_schedule",
+        scheduledStartAt="2026-09-01T09:00:00+08:00",
+        scheduledEndAt="2026-09-01T10:00:00+08:00",
+    )["task"]
+
+    updated = domain.update_task(
+        admin,
+        task_id=created["id"],
+        payload={
+            "expectedVersion": created["version"],
+            "taskKind": "personal_schedule",
+            "scheduledStartAt": "2026-09-01T14:00:00+08:00",
+            "scheduledEndAt": "2026-09-01T15:00:00+08:00",
+        },
+        idempotency_key="gc04-personal-schedule-update",
+    )["task"]
+
+    assert created["task_kind"] == "personal_schedule"
+    assert updated["task_kind"] == "personal_schedule"
+    assert updated["scheduled_start_at"] == "2026-09-01T14:00:00+08:00"
+
+
+def test_unknown_task_kind_is_rejected_on_create_and_update(tmp_path: Path) -> None:
+    repository, admin, _seed_payload = _repository(tmp_path)
+    domain = GC04TaskRepository(repository)
+
+    with pytest.raises(RepositoryError) as create_error:
+        _create(
+            domain,
+            admin,
+            "gc04-invalid-kind-create",
+            "非法任务类型",
+            taskKind="customer_meeting",
+        )
+    assert create_error.value.code == "task_kind_invalid"
+
+    created = _create(
+        domain,
+        admin,
+        "gc04-valid-kind-create",
+        "普通任务",
+    )["task"]
+    with pytest.raises(RepositoryError) as update_error:
+        domain.update_task(
+            admin,
+            task_id=created["id"],
+            payload={
+                "expectedVersion": created["version"],
+                "taskKind": "customer_meeting",
+            },
+            idempotency_key="gc04-invalid-kind-update",
+        )
+    assert update_error.value.code == "task_kind_invalid"
+
+
 def test_task_context_relationship_requires_task_specific_evidence() -> None:
     sources = [
         {

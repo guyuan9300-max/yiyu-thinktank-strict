@@ -19,6 +19,7 @@ REQUIRED_CAPABILITIES = (
     "taskViewerProjectionV1",
     "taskTimerV1",
     "dateOnlyScheduleV1",
+    "scheduleAssistantV1",
 )
 RUNTIME_ROOTS = ("cloud_backend", "strict_common")
 EXPLICIT_RUNTIME_FILES = (
@@ -70,6 +71,13 @@ def _source(root: Path, relative_path: str) -> str:
 def detect_task_capabilities(root: Path) -> dict[str, bool]:
     repository = _source(root, "cloud_backend/app/repositories/gc04_tasks.py")
     routes = _source(root, "cloud_backend/app/domain_routes/gc04_tasks.py")
+    schedule_routes = _source(
+        root, "cloud_backend/app/domain_routes/schedule_assistant.py"
+    )
+    schedule_repository = _source(
+        root, "cloud_backend/app/repositories/schedule_assistant.py"
+    )
+    domain_registration = _source(root, "cloud_backend/app/domain_routes/__init__.py")
     return {
         "taskViewerProjectionV1": all(
             marker in repository
@@ -92,6 +100,23 @@ def detect_task_capabilities(root: Path) -> dict[str, bool]:
                 'payload.get("scheduledStartAt")',
                 '"scheduled_start_at": scheduled_start',
             )
+        ),
+        "scheduleAssistantV1": (
+            bool(schedule_routes)
+            and '@app.post("/api/v2/ui/tasks/schedule-assistant/ask")'
+            in schedule_routes
+            and all(
+                marker in schedule_repository
+                for marker in (
+                    "class ScheduleAssistantRepository:",
+                    "def build_schedule_fact_pack(",
+                    '"local_evidence"',
+                )
+            )
+            and "from .schedule_assistant import register_schedule_assistant_routes"
+            in domain_registration
+            and "register_schedule_assistant_routes(app, repository, identity_dependency)"
+            in domain_registration
         ),
     }
 
