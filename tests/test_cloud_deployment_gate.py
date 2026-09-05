@@ -20,6 +20,7 @@ def test_runtime_python_comes_from_systemd_or_explicit_override() -> None:
     deployment = _deployment_source()
 
     assert "--runtime-python" in deployment
+    assert 'runtime_python_override="${5:-}"' in deployment
     assert "runtime Python override must be a safe absolute path" in deployment
     assert 'systemctl show "$service_name" --property=ExecStart --value' in deployment
     assert "runtime Python is not an executable absolute path" in deployment
